@@ -30,6 +30,8 @@ pub enum Weight {
     /// arithmetic around it stays F32. Casting the weight up instead would double what it
     /// occupies, on the path chosen precisely because memory was the constraint.
     ///
+    /// On the host the activation keeps its dtype and the product widens the weight.
+    ///
     /// The `Linear` is a bare weight here: the bias and the adapters belong to the `QLinear`
     /// around it, so there is one place each lives rather than two that must agree.
     Dense(Linear, DType),
@@ -44,7 +46,8 @@ impl Weight {
         match self {
             Weight::Quant(w) => w.forward(x),
             Weight::Dense(l, wdtype) => {
-                let xw = if x.dtype() == *wdtype {
+                // On the host the rows stay as they come: the product widens a half weight.
+                let xw = if x.dtype() == *wdtype || l.device().is_cpu() {
                     x.clone()
                 } else {
                     x.to_dtype(*wdtype)?
@@ -90,6 +93,14 @@ impl QLinear {
 
     pub fn weight(&self) -> &Weight {
         &self.weight
+    }
+
+    /// The format the weight is held in: the dense dtype, or the block format.
+    pub fn held_format(&self) -> String {
+        match &self.weight {
+            Weight::Dense(_, dtype) => dtype.as_str().to_string(),
+            Weight::Quant(q) => format!("{:?}", q.dtype()).to_lowercase(),
+        }
     }
 
     pub fn bias(&self) -> Option<&Tensor> {
@@ -423,6 +434,11 @@ pub struct QSwiGlu {
 impl QSwiGlu {
     pub fn new(gate: QLinear, up: QLinear, down: QLinear) -> Self {
         Self { gate, up, down }
+    }
+
+    /// The gate, up and down projections.
+    pub fn projections(&self) -> [&QLinear; 3] {
+        [&self.gate, &self.up, &self.down]
     }
 
     pub fn forward(&self, xs: &Tensor) -> Result<Tensor> {

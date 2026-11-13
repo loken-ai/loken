@@ -65,6 +65,23 @@ pub fn record_kept(
     });
 }
 
+/// The narrowest float dtype that holds every value of every tensor in `tensors` exactly.
+///
+/// BF16 holds a value whose lower 16 bits are zero.
+/// F16 holds a value that comes back from F16 with the same bits.
+/// F32 holds every value.
+pub fn narrowest_exact_dtype(tensors: &[&[f32]]) -> crate::tensor::DType {
+    use crate::tensor::DType;
+    let all = |exact: &dyn Fn(f32) -> bool| tensors.iter().all(|t| t.iter().all(|v| exact(*v)));
+    if all(&|v| v.to_bits() & 0xffff == 0) {
+        DType::BF16
+    } else if all(&|v| half::f16::from_f32(v).to_f32().to_bits() == v.to_bits()) {
+        DType::F16
+    } else {
+        DType::F32
+    }
+}
+
 /// Record an owned copy of a weight that stays in its stored format: bytes the file's own
 /// mapping did not hold in process memory.
 pub fn record_copy(
@@ -282,5 +299,37 @@ mod tests {
     #[test]
     fn an_empty_ledger_says_so() {
         assert!(summary_line(&Summary::default()).contains("none"));
+    }
+
+    #[test]
+    fn values_bf16_holds_go_to_bf16() {
+        use crate::tensor::DType;
+        let v = [0.0f32, -1.5, 0.0078125, half::bf16::from_f32(0.3).to_f32()];
+        assert_eq!(narrowest_exact_dtype(&[&v]), DType::BF16);
+    }
+
+    #[test]
+    fn values_only_f16_holds_go_to_f16() {
+        use crate::tensor::DType;
+        let v = [1.0f32, 1.0 + 1.0 / 1024.0];
+        assert_eq!(narrowest_exact_dtype(&[&v]), DType::F16);
+    }
+
+    #[test]
+    fn a_value_no_narrower_form_holds_keeps_the_tensor_f32() {
+        use crate::tensor::DType;
+        let v = [0.5f32, 1.0 + 1.0 / 1048576.0];
+        assert_eq!(narrowest_exact_dtype(&[&v]), DType::F32);
+    }
+
+    #[test]
+    fn tensors_read_together_share_the_narrowest_form_exact_for_all() {
+        use crate::tensor::DType;
+        // BF16 holds the first and not the second, F16 holds the second and not the first.
+        let wide = [131072.0f32];
+        let fine = [1.0f32 + 1.0 / 1024.0];
+        assert_eq!(narrowest_exact_dtype(&[&wide]), DType::BF16);
+        assert_eq!(narrowest_exact_dtype(&[&fine]), DType::F16);
+        assert_eq!(narrowest_exact_dtype(&[&wide, &fine]), DType::F32);
     }
 }

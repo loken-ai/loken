@@ -5,8 +5,10 @@
 //!   f32_matmul, rms_norm, image_attention, apply_rotary_emb, silu_mul, scale_after_norm,
 //!   gated_residual, broadcast_mul, add.
 //!
-//! Weight layout: All weights stored as row-major F32 in OpenCL buffers.
-//! BF16 safetensors are converted to F32 on load (OpenCL hardware may not support BF16 natively).
+//! Weight layout: every weight is row-major.
+//! The projections of attention and feed-forward are held in the narrowest float form that keeps
+//! every stored value exact: BF16, then F16, else F32.
+//! The norms, the modulation and its bias are held as F32.
 
 #![allow(clippy::too_many_arguments)]
 
@@ -45,6 +47,83 @@ struct F32Weight {
                      //  `rows` is derived from out-buffer shape)
 }
 
+/// The float form a projection weight is held in on the OpenCL device.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WeightForm {
+    F32,
+    F16,
+    Bf16,
+}
+
+impl WeightForm {
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            WeightForm::F32 => "f32",
+            WeightForm::F16 => "f16",
+            WeightForm::Bf16 => "bf16",
+        }
+    }
+
+    fn bytes(self) -> usize {
+        match self {
+            WeightForm::F32 => 4,
+            WeightForm::F16 | WeightForm::Bf16 => 2,
+        }
+    }
+
+    /// The tiled product that reads weights of this form.
+    fn tiled_matmul(self, p: &OpenCLPipelines) -> &opencl3::kernel::Kernel {
+        match self {
+            WeightForm::F32 => &p.f32w_tiled_matmul,
+            WeightForm::F16 => &p.f16w_tiled_matmul,
+            WeightForm::Bf16 => &p.bf16w_tiled_matmul,
+        }
+    }
+
+    /// The fused gate and up product that reads weights of this form.
+    fn tiled_gate_up_silu(self, p: &OpenCLPipelines) -> &opencl3::kernel::Kernel {
+        match self {
+            WeightForm::F32 => &p.f32w_tiled_gate_up_silu,
+            WeightForm::F16 => &p.f16w_tiled_gate_up_silu,
+            WeightForm::Bf16 => &p.bf16w_tiled_gate_up_silu,
+        }
+    }
+
+    /// The bytes of `values` in this form, little-endian.
+    ///
+    /// Each value must be exact in the form: the narrow forms take its bits, they round nothing.
+    fn encode(self, values: &[f32]) -> Vec<u8> {
+        match self {
+            WeightForm::F32 => values.iter().flat_map(|v| v.to_le_bytes()).collect(),
+            WeightForm::F16 => values
+                .iter()
+                .flat_map(|v| half::f16::from_f32(*v).to_le_bytes())
+                .collect(),
+            WeightForm::Bf16 => values
+                .iter()
+                .flat_map(|v| ((v.to_bits() >> 16) as u16).to_le_bytes())
+                .collect(),
+        }
+    }
+}
+
+/// The narrowest form that holds every value of every tensor in `tensors` exactly.
+///
+/// The choice is the one every dense projection follows, on the host and on every card.
+pub(crate) fn narrowest_exact_form(tensors: &[&[f32]]) -> WeightForm {
+    match crate::tensor::conversion::narrowest_exact_dtype(tensors) {
+        crate::tensor::DType::BF16 => WeightForm::Bf16,
+        crate::tensor::DType::F16 => WeightForm::F16,
+        _ => WeightForm::F32,
+    }
+}
+
+/// A projection weight on the OpenCL device, in the form its values allow.
+struct ProjWeight {
+    buf: Buffer<u8>,
+    form: WeightForm,
+}
+
 /// F32 bias buffer on OpenCL device
 struct F32Bias {
     buf: Buffer<u8>, // Raw F32 bytes on GPU [out_dim]
@@ -70,10 +149,10 @@ struct OclQkNorm {
 
 /// OpenCL Z-Image attention weights
 struct OclZImageAttention {
-    to_q: F32Weight,   // [n_heads * head_dim, dim]
-    to_k: F32Weight,   // [n_kv_heads * head_dim, dim]
-    to_v: F32Weight,   // [n_kv_heads * head_dim, dim]
-    to_out: F32Weight, // [dim, n_heads * head_dim]
+    to_q: ProjWeight,   // [n_heads * head_dim, dim]
+    to_k: ProjWeight,   // [n_kv_heads * head_dim, dim]
+    to_v: ProjWeight,   // [n_kv_heads * head_dim, dim]
+    to_out: ProjWeight, // [dim, n_heads * head_dim]
     qk_norm: Option<OclQkNorm>,
     n_heads: usize,
     n_kv_heads: usize,
@@ -82,9 +161,9 @@ struct OclZImageAttention {
 
 /// OpenCL Z-Image FeedForward (SwiGLU) weights
 struct OclFeedForward {
-    w1: F32Weight, // gate: [hidden_dim, dim]
-    w2: F32Weight, // down: [dim, hidden_dim]
-    w3: F32Weight, // up:   [hidden_dim, dim]
+    w1: ProjWeight, // gate: [hidden_dim, dim]
+    w2: ProjWeight, // down: [dim, hidden_dim]
+    w3: ProjWeight, // up:   [hidden_dim, dim]
 }
 
 /// OpenCL Z-Image transformer block
@@ -204,8 +283,8 @@ fn bf16_to_f32(data: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Upload raw F32 data to OpenCL buffer
-fn upload_f32(data: &[u8], pipelines: &OpenCLPipelines) -> Result<Buffer<u8>> {
+/// Upload raw bytes to a read-only OpenCL buffer
+fn upload_bytes(data: &[u8], pipelines: &OpenCLPipelines) -> Result<Buffer<u8>> {
     unsafe {
         let mut buf =
             Buffer::<u8>::create(&pipelines.context, CL_MEM_READ_ONLY, data.len(), null_mut())?;
@@ -261,8 +340,84 @@ fn load_weight(
         ));
     }
 
-    let buf = upload_f32(&f32_data, pipelines)?;
+    let buf = upload_bytes(&f32_data, pipelines)?;
     Ok(F32Weight { buf, cols })
+}
+
+/// The values of a float tensor, widened to F32 exactly.
+fn tensor_values(tv: &safetensors::tensor::TensorView<'_>, name: &str) -> Result<Vec<f32>> {
+    let data = tv.data();
+    Ok(match tv.dtype() {
+        safetensors::Dtype::F32 => data
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect(),
+        safetensors::Dtype::BF16 => data
+            .chunks_exact(2)
+            .map(|c| half::bf16::from_le_bytes([c[0], c[1]]).to_f32())
+            .collect(),
+        safetensors::Dtype::F16 => data
+            .chunks_exact(2)
+            .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
+            .collect(),
+        dt => {
+            return Err(anyhow::anyhow!(
+                "Unsupported dtype {:?} for tensor '{}'",
+                dt,
+                name
+            ))
+        }
+    })
+}
+
+/// Load projection weights that one kernel reads together, in the narrowest form exact for all.
+///
+/// Each entry is a tensor name with its rows and columns.
+/// A form narrower than the stored one goes in the conversion ledger.
+fn load_projections(
+    shards: &[safetensors::SafeTensors<'_>],
+    tensors: &[(String, usize, usize)],
+    pipelines: &OpenCLPipelines,
+) -> Result<Vec<ProjWeight>> {
+    let mut stored = Vec::with_capacity(tensors.len());
+    let mut values = Vec::with_capacity(tensors.len());
+    for (name, rows, cols) in tensors {
+        let tv = find_tensor(shards, name)?;
+        let v = tensor_values(&tv, name)?;
+        if v.len() != rows * cols {
+            return Err(anyhow::anyhow!(
+                "Tensor '{}' size mismatch: got {} elements, expected {} ({}x{})",
+                name,
+                v.len(),
+                rows * cols,
+                rows,
+                cols
+            ));
+        }
+        stored.push(tv.dtype());
+        values.push(v);
+    }
+    let views: Vec<&[f32]> = values.iter().map(Vec::as_slice).collect();
+    let form = narrowest_exact_form(&views);
+    let mut out = Vec::with_capacity(tensors.len());
+    for (v, dtype) in values.iter().zip(&stored) {
+        let stored_bytes = dtype.bitsize() / 8;
+        if form.bytes() < stored_bytes {
+            crate::tensor::conversion::record_kept(
+                "projection",
+                format!("{dtype:?}").to_lowercase(),
+                form.name(),
+                (v.len() * stored_bytes) as u64,
+                (v.len() * form.bytes()) as u64,
+                "every value is exact in the narrower form the OpenCL image products read",
+            );
+        }
+        out.push(ProjWeight {
+            buf: upload_bytes(&form.encode(v), pipelines)?,
+            form,
+        });
+    }
+    Ok(out)
 }
 
 /// Load a bias tensor
@@ -296,7 +451,7 @@ fn load_bias(
         }
     };
 
-    let buf = upload_f32(&f32_data, pipelines)?;
+    let buf = upload_bytes(&f32_data, pipelines)?;
     Ok(F32Bias { buf })
 }
 
@@ -327,7 +482,7 @@ fn load_rms_norm(
         dt => return Err(anyhow::anyhow!("Unsupported dtype {:?} for '{}'", dt, name)),
     };
 
-    let scale = upload_f32(&f32_data, pipelines)?;
+    let scale = upload_bytes(&f32_data, pipelines)?;
     Ok(OclRmsNorm {
         scale,
         eps: eps as f32,
@@ -335,6 +490,20 @@ fn load_rms_norm(
 }
 
 impl OpenCLZImageBlock {
+    /// The format each of its projections is held in.
+    pub(crate) fn held_formats(&self) -> Vec<String> {
+        let a = &self.attention;
+        let f = &self.ffn;
+        let mut formats: Vec<String> = [&a.to_q, &a.to_k, &a.to_v, &a.to_out, &f.w1, &f.w2, &f.w3]
+            .into_iter()
+            .map(|p| p.form.name().to_string())
+            .collect();
+        if self.adaln.is_some() {
+            formats.push(WeightForm::F32.name().to_string());
+        }
+        formats
+    }
+
     /// Load a Z-Image transformer block from safetensors data into OpenCL buffers.
     ///
     /// `prefix` is e.g. "layers.0" for main layer 0, "noise_refiner.0", etc.
@@ -362,34 +531,15 @@ impl OpenCLZImageBlock {
         );
 
         // Attention weights (no bias - linear_no_bias)
-        let to_q = load_weight(
-            shards,
-            &format!("{}.attention.to_q.weight", prefix),
-            n_heads * head_dim,
-            dim,
-            pipelines,
-        )?;
-        let to_k = load_weight(
-            shards,
-            &format!("{}.attention.to_k.weight", prefix),
-            n_kv_heads * head_dim,
-            dim,
-            pipelines,
-        )?;
-        let to_v = load_weight(
-            shards,
-            &format!("{}.attention.to_v.weight", prefix),
-            n_kv_heads * head_dim,
-            dim,
-            pipelines,
-        )?;
-        let to_out = load_weight(
-            shards,
-            &format!("{}.attention.to_out.0.weight", prefix),
-            dim,
-            n_heads * head_dim,
-            pipelines,
-        )?;
+        // One projection alone, in the narrowest form exact for it.
+        let one = |field: &str, rows: usize, cols: usize| -> Result<ProjWeight> {
+            let name = format!("{prefix}.{field}");
+            Ok(load_projections(shards, &[(name, rows, cols)], pipelines)?.remove(0))
+        };
+        let to_q = one("attention.to_q.weight", n_heads * head_dim, dim)?;
+        let to_k = one("attention.to_k.weight", n_kv_heads * head_dim, dim)?;
+        let to_v = one("attention.to_v.weight", n_kv_heads * head_dim, dim)?;
+        let to_out = one("attention.to_out.0.weight", dim, n_heads * head_dim)?;
 
         // QK norm (optional - check if tensors exist)
         let qk_norm = {
@@ -442,29 +592,32 @@ impl OpenCLZImageBlock {
         };
 
         // FFN weights (no bias)
+        // Gate and up are read by one kernel, so they share a form.
+        let mut gate_up = load_projections(
+            shards,
+            &[
+                (format!("{prefix}.feed_forward.w1.weight"), hidden_dim, dim),
+                (format!("{prefix}.feed_forward.w3.weight"), hidden_dim, dim),
+            ],
+            pipelines,
+        )?;
+        let w3 = gate_up.remove(1);
+        let w1 = gate_up.remove(0);
         let ffn = OclFeedForward {
-            w1: load_weight(
-                shards,
-                &format!("{}.feed_forward.w1.weight", prefix),
-                hidden_dim,
-                dim,
-                pipelines,
-            )?,
-            w2: load_weight(
-                shards,
-                &format!("{}.feed_forward.w2.weight", prefix),
-                dim,
-                hidden_dim,
-                pipelines,
-            )?,
-            w3: load_weight(
-                shards,
-                &format!("{}.feed_forward.w3.weight", prefix),
-                hidden_dim,
-                dim,
-                pipelines,
-            )?,
+            w1,
+            w2: one("feed_forward.w2.weight", dim, hidden_dim)?,
+            w3,
         };
+        info!(
+            "  OpenCL Z-Image block '{}': projections held as q {}, k {}, v {}, out {}, gate and up {}, down {}, each exact",
+            prefix,
+            attention.to_q.form.name(),
+            attention.to_k.form.name(),
+            attention.to_v.form.name(),
+            attention.to_out.form.name(),
+            ffn.w1.form.name(),
+            ffn.w2.form.name()
+        );
 
         // Norms
         let attention_norm1 = load_rms_norm(
@@ -882,7 +1035,7 @@ impl OpenCLZImageBlock {
         // Q projection: [seq, dim] x [n_heads*head_dim, dim]^T -> [seq, n_heads*head_dim]
         let n_q = (attn.n_heads * attn.head_dim) as u32;
         Self::dispatch_tiled_matmul(
-            &p.f32_tiled_matmul,
+            attn.to_q.form.tiled_matmul(p),
             input,
             &attn.to_q.buf,
             &scratch.q_buf,
@@ -895,7 +1048,7 @@ impl OpenCLZImageBlock {
         // K projection
         let n_k = (attn.n_kv_heads * attn.head_dim) as u32;
         Self::dispatch_tiled_matmul(
-            &p.f32_tiled_matmul,
+            attn.to_k.form.tiled_matmul(p),
             input,
             &attn.to_k.buf,
             &scratch.k_buf,
@@ -908,7 +1061,7 @@ impl OpenCLZImageBlock {
         // V projection
         let n_v = (attn.n_kv_heads * attn.head_dim) as u32;
         Self::dispatch_tiled_matmul(
-            &p.f32_tiled_matmul,
+            attn.to_v.form.tiled_matmul(p),
             input,
             &attn.to_v.buf,
             &scratch.v_buf,
@@ -1108,7 +1261,7 @@ impl OpenCLZImageBlock {
 
         // attn_out [seq, n_heads * head_dim] -> buf_a [seq, dim]
         Self::dispatch_tiled_matmul(
-            &p.f32_tiled_matmul,
+            attn.to_out.form.tiled_matmul(p),
             &scratch.attn_out,
             &attn.to_out.buf,
             &scratch.buf_a,
@@ -1134,7 +1287,7 @@ impl OpenCLZImageBlock {
 
         // Fused tiled gate_up_silu: ffn_act = silu(input x w1^T) * (input x w3^T)
         unsafe {
-            ExecuteKernel::new(&p.f32_tiled_gate_up_silu)
+            ExecuteKernel::new(self.ffn.w1.form.tiled_gate_up_silu(p))
                 .set_arg(&self.ffn.w1.buf)
                 .set_arg(&self.ffn.w3.buf)
                 .set_arg(input)
@@ -1149,7 +1302,7 @@ impl OpenCLZImageBlock {
 
         // Down projection: buf_a = ffn_act x w2^T -> [seq, dim]
         Self::dispatch_tiled_matmul(
-            &p.f32_tiled_matmul,
+            self.ffn.w2.form.tiled_matmul(p),
             &scratch.ffn_act,
             &self.ffn.w2.buf,
             &scratch.buf_a,
@@ -1270,7 +1423,18 @@ mod tiled_gemm_on_device {
 
     fn upload(p: &OpenCLPipelines, v: &[f32]) -> Buffer<u8> {
         let bytes: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
-        upload_f32(&bytes, p).expect("upload")
+        upload_bytes(&bytes, p).expect("upload")
+    }
+
+    /// `v` rounded to the nearest value of `form`.
+    fn rounded(form: WeightForm, v: &[f32]) -> Vec<f32> {
+        v.iter()
+            .map(|x| match form {
+                WeightForm::F32 => *x,
+                WeightForm::F16 => half::f16::from_f32(*x).to_f32(),
+                WeightForm::Bf16 => half::bf16::from_f32(*x).to_f32(),
+            })
+            .collect()
     }
 
     fn read(p: &OpenCLPipelines, buf: &Buffer<u8>, len: usize) -> Vec<f32> {
@@ -1302,49 +1466,90 @@ mod tiled_gemm_on_device {
     fn the_tiled_products_match_the_host() {
         let devices = enumerate_opencl_devices();
         assert!(!devices.is_empty(), "no OpenCL device");
-        let (a, gate, up) = (values(M * K, 7), values(N * K, 11), values(N * K, 13));
-        let want_gate = host_product(&a, &gate);
-        let want_up = host_product(&a, &up);
-        let want_act: Vec<f32> = want_gate
-            .iter()
-            .zip(&want_up)
-            .map(|(g, u)| g / (1.0 + (-g).exp()) * u)
-            .collect();
-        for dev in devices {
-            let p = OpenCLPipelines::new(dev).expect("pipelines");
-            let (a_buf, g_buf, u_buf) = (upload(&p, &a), upload(&p, &gate), upload(&p, &up));
-            let c_buf = unsafe {
-                Buffer::<u8>::create(&p.context, CL_MEM_READ_WRITE, M * N * 4, null_mut())
+        let a = values(M * K, 7);
+        for form in [WeightForm::F32, WeightForm::F16, WeightForm::Bf16] {
+            let (gate, up) = (
+                rounded(form, &values(N * K, 11)),
+                rounded(form, &values(N * K, 13)),
+            );
+            assert!(narrowest_exact_form(&[&gate, &up]).bytes() <= form.bytes());
+            let want_gate = host_product(&a, &gate);
+            let want_up = host_product(&a, &up);
+            let want_act: Vec<f32> = want_gate
+                .iter()
+                .zip(&want_up)
+                .map(|(g, u)| g / (1.0 + (-g).exp()) * u)
+                .collect();
+            for &dev in &devices {
+                let p = OpenCLPipelines::new(dev).expect("pipelines");
+                let upload_form = |v: &[f32]| upload_bytes(&form.encode(v), &p).expect("upload");
+                let (a_buf, g_buf, u_buf) = (upload(&p, &a), upload_form(&gate), upload_form(&up));
+                let c_buf = unsafe {
+                    Buffer::<u8>::create(&p.context, CL_MEM_READ_WRITE, M * N * 4, null_mut())
+                }
+                .expect("alloc");
+                let (m, n, k) = (M as u32, N as u32, K as u32);
+                let what = form.name();
+                OpenCLZImageBlock::dispatch_tiled_matmul(
+                    form.tiled_matmul(&p),
+                    &a_buf,
+                    &g_buf,
+                    &c_buf,
+                    m,
+                    n,
+                    k,
+                    &p,
+                )
+                .expect("product");
+                assert_close(&read(&p, &c_buf, M * N), &want_gate, what);
+                unsafe {
+                    ExecuteKernel::new(form.tiled_gate_up_silu(&p))
+                        .set_arg(&g_buf)
+                        .set_arg(&u_buf)
+                        .set_arg(&a_buf)
+                        .set_arg(&c_buf)
+                        .set_arg(&m)
+                        .set_arg(&n)
+                        .set_arg(&k)
+                        .set_global_work_sizes(&gemm_global(m, n))
+                        .set_local_work_sizes(&[GEMM_TS, GEMM_TS])
+                        .enqueue_nd_range(&p.queue)
+                        .expect("gate and up");
+                }
+                assert_close(&read(&p, &c_buf, M * N), &want_act, what);
             }
-            .expect("alloc");
-            let (m, n, k) = (M as u32, N as u32, K as u32);
-            OpenCLZImageBlock::dispatch_tiled_matmul(
-                &p.f32_tiled_matmul,
-                &a_buf,
-                &g_buf,
-                &c_buf,
-                m,
-                n,
-                k,
-                &p,
-            )
-            .expect("product");
-            assert_close(&read(&p, &c_buf, M * N), &want_gate, "product");
-            unsafe {
-                ExecuteKernel::new(&p.f32_tiled_gate_up_silu)
-                    .set_arg(&g_buf)
-                    .set_arg(&u_buf)
-                    .set_arg(&a_buf)
-                    .set_arg(&c_buf)
-                    .set_arg(&m)
-                    .set_arg(&n)
-                    .set_arg(&k)
-                    .set_global_work_sizes(&gemm_global(m, n))
-                    .set_local_work_sizes(&[GEMM_TS, GEMM_TS])
-                    .enqueue_nd_range(&p.queue)
-                    .expect("gate and up");
-            }
-            assert_close(&read(&p, &c_buf, M * N), &want_act, "gate and up");
         }
+    }
+}
+
+/// The form a projection is held in, chosen from its stored values alone.
+#[cfg(test)]
+mod weight_form {
+    use super::{narrowest_exact_form, WeightForm};
+
+    #[test]
+    fn each_dtype_the_shared_choice_names_maps_to_its_form() {
+        let fine = [1.0f32 + 1.0 / 1024.0];
+        let finer = [1.0f32 + 1.0 / 1048576.0];
+        assert_eq!(narrowest_exact_form(&[&[0.5f32]]), WeightForm::Bf16);
+        assert_eq!(narrowest_exact_form(&[&fine]), WeightForm::F16);
+        assert_eq!(narrowest_exact_form(&[&finer]), WeightForm::F32);
+    }
+
+    #[test]
+    fn the_narrow_forms_keep_the_bits_of_an_exact_value() {
+        let v = [1.0f32 + 1.0 / 1024.0, -0.25];
+        let f16: Vec<u16> = WeightForm::F16
+            .encode(&v)
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        assert_eq!(f16, [0x3c01, 0xb400]);
+        let bf16: Vec<u16> = WeightForm::Bf16
+            .encode(&v[1..])
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        assert_eq!(bf16, [0xbe80]);
     }
 }

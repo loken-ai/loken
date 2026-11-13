@@ -58,6 +58,59 @@ pub(super) fn wan_lora_diff(
     lora.load_to(&key, DType::F32, dev).map(Some)
 }
 
+/// Whether an adapter holds a correction of the weight `{stem}.weight`.
+pub(super) fn wan_lora_corrects(lora: &SafeTensorsLoader, stem: &str) -> bool {
+    let key = |part: &str| format!("diffusion_model.{stem}.{part}");
+    lora.contains(&key("diff")) || lora.contains(&key("lora_down.weight"))
+}
+
+/// The dtype the dense projection weight `name` of `ld` is held in on `dv`.
+///
+/// It is the narrowest form exact for every stored value of `name`.
+/// A form narrower than the stored one goes in the conversion ledger.
+///
+/// With `merged` set, the weight is the sum of its stored values and an adapter's correction.
+/// That sum is held in the same form, rounded once.
+/// The rounding goes in the conversion ledger.
+///
+/// A dry device records nothing.
+pub(super) fn wan_held_dtype(
+    ld: &SafeTensorsLoader,
+    name: &str,
+    merged: bool,
+    dv: &Device,
+) -> Result<DType> {
+    let held = ld.narrowest_exact_dtype(name)?;
+    let (stored, width) = ld
+        .stored_format(name)
+        .ok_or_else(|| crate::tensor::Error(format!("wan: no tensor `{name}`")))?;
+    if dv.is_dry() {
+        return Ok(held);
+    }
+    let elems: usize = ld.shape_of(name).unwrap_or_default().iter().product();
+    let after = (elems * held.size_in_bytes()) as u64;
+    if merged && held != DType::F32 {
+        crate::tensor::conversion::record_kept(
+            "projection",
+            DType::F32.as_str(),
+            held.as_str(),
+            (elems * DType::F32.size_in_bytes()) as u64,
+            after,
+            "a weight merged with an adapter is rounded once to the form of its stored values",
+        );
+    } else if held.size_in_bytes() < width {
+        crate::tensor::conversion::record_kept(
+            "projection",
+            stored,
+            held.as_str(),
+            (elems * width) as u64,
+            after,
+            "every value is exact in the narrower form",
+        );
+    }
+    Ok(held)
+}
+
 /// Build a quantized `WanLinear` for the 14B path: Q8 weight `[out,in]` on `dev` (via the
 /// QVarBuilder, dequant-on-the-fly) plus its separate F32 `.bias` tensor.
 pub(super) fn wan_qlin(
@@ -454,7 +507,7 @@ impl WanDit {
             runtime_reserve: dit_activation_bytes(clip_tokens, dim, n_heads),
             ..Default::default()
         };
-        crate::inference::place::ladder::load("Wan DiT", &demand, |plan| {
+        let dit = crate::inference::place::ladder::load("Wan DiT", &demand, |plan| {
             let layer_devices = crate::inference::place::ladder::layer_devices(plan, n_layers);
             // The stem and head are not blocks; they live on the first card the plan uses.
             let device = crate::inference::place::ladder::primary_device(plan);
@@ -469,20 +522,17 @@ impl WanDit {
             let f16_on =
                 |name: &str, dv: &Device| -> Result<Tensor> { corrected(name, DType::F16, dv) };
             let f16 = |name: &str| -> Result<Tensor> { f16_on(name, &device) };
-            // Load each projection in the dtype it will be MULTIPLIED in, once, instead of
-            // widening it on every call. BF16 on a card because that is the tensor-core path and
-            // the checkpoint is BF16 on disk anyway - there is no precision to give up. The host
-            // has no BF16 matmul, so a CPU-resident block keeps the F16 store and the F32 widen
-            // it always had. The bias is pre-widened for the same reason: it was being converted
-            // per call to be added once.
+            // Each projection weight is held in the form `wan_held_dtype` gives, on a card and on
+            // the host alike.
+            // The bias is held in F32.
             let lin_on = |prefix: &str, dv: &Device| -> Result<WanLinear> {
-                let wdt = if dv.is_cuda() {
-                    DType::BF16
-                } else {
-                    DType::F16
-                };
+                let name = format!("{prefix}.weight");
+                let merged = lora_ld
+                    .as_ref()
+                    .is_some_and(|l| wan_lora_corrects(l, prefix));
+                let wdt = wan_held_dtype(&ld, &name, merged, dv)?;
                 Ok(WanLinear::Dense(Linear::from_published(
-                    corrected(&format!("{prefix}.weight"), wdt, dv)?,
+                    corrected(&name, wdt, dv)?,
                     Some(corrected(&format!("{prefix}.bias"), DType::F32, dv)?),
                 )?))
             };
@@ -528,7 +578,7 @@ impl WanDit {
                     device: dv,
                 });
             }
-            Ok(WanDit {
+            Ok::<_, crate::tensor::Error>(WanDit {
                 patch_w,
                 patch_b: f16("patch_embedding.bias")?,
                 text0: lin("text_embedding.0")?,
@@ -546,7 +596,39 @@ impl WanDit {
                 freq_dim,
                 img_emb: None,
             })
-        })
+        })?;
+        eprintln!(
+            "[wan-dit] the projections of its blocks run in {}",
+            dit.running_format()
+                .as_deref()
+                .unwrap_or("no format of this substrate")
+        );
+        Ok(dit)
+    }
+
+    /// The formats the projections of the blocks are held in.
+    ///
+    /// The formats are distinct, in the order first met, joined with `+`.
+    /// `None` without a block.
+    pub fn running_format(&self) -> Option<String> {
+        let mut seen: Vec<String> = Vec::new();
+        for b in &self.blocks {
+            let projections = [
+                &b.sa_q, &b.sa_k, &b.sa_v, &b.sa_o, &b.ca_q, &b.ca_k, &b.ca_v, &b.ca_o, &b.ffn0,
+                &b.ffn2,
+            ];
+            let image = [&b.ca_k_img, &b.ca_v_img].into_iter().flatten();
+            for f in projections
+                .into_iter()
+                .chain(image)
+                .map(WanLinear::held_format)
+            {
+                if !seen.contains(&f) {
+                    seen.push(f);
+                }
+            }
+        }
+        (!seen.is_empty()).then(|| seen.join("+"))
     }
 
     /// Load the Wan 14B DiT from the Q8_0 GGUF (city96 community quant). Architecture is
@@ -2025,5 +2107,111 @@ mod lora_reader_tests {
             .unwrap()
             .is_none());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod held_form_tests {
+    use super::*;
+
+    /// A value BF16 cannot hold and F16 can.
+    const ONLY_F16: f32 = 1.0 + 1.0 / 1024.0;
+    /// A value neither BF16 nor F16 can hold.
+    const ONLY_F32: f32 = 1.0 + 1.0 / 1048576.0;
+    /// A value BF16 holds.
+    const PLAIN: f32 = 0.5;
+
+    /// An F32 checkpoint of 3 projections of 2 by 2, each holding one of the values above,
+    /// and an adapter that corrects the first.
+    fn checkpoint(dir: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
+        let bytes = |v: f32| -> Vec<u8> { [v; 4].iter().flat_map(|x| x.to_le_bytes()).collect() };
+        let values = [("plain", PLAIN), ("half", ONLY_F16), ("fine", ONLY_F32)]
+            .map(|(name, v)| (format!("blocks.0.{name}.weight"), bytes(v)));
+        fn view(b: &[u8]) -> safetensors::tensor::TensorView<'_> {
+            safetensors::tensor::TensorView::new(safetensors::Dtype::F32, vec![2, 2], b).unwrap()
+        }
+        let tensors: Vec<_> = values
+            .iter()
+            .map(|(name, b)| (name.clone(), view(b)))
+            .collect();
+        let path = dir.join("dit.safetensors");
+        safetensors::serialize_to_file(tensors, None, &path).unwrap();
+        let diff = bytes(1.0 / 1048576.0);
+        let adapter = dir.join("adapter.safetensors");
+        safetensors::serialize_to_file(
+            vec![(
+                "diffusion_model.blocks.0.plain.diff".to_string(),
+                view(&diff),
+            )],
+            None,
+            &adapter,
+        )
+        .unwrap();
+        (path, adapter)
+    }
+
+    /// The first value of `name` as loaded in `dtype` on `dev`, read back on the host.
+    fn first_value(ld: &SafeTensorsLoader, name: &str, dtype: DType, dev: &Device) -> f32 {
+        let t = ld.load_to(name, dtype, dev).unwrap();
+        t.to_dtype(DType::F32).unwrap().to_vec_f32()[0]
+    }
+
+    /// Each projection is held on `dev` in the narrowest form exact for its stored values.
+    fn each_value_is_kept_on(dev: &Device, tag: &str) {
+        let dir = std::env::temp_dir().join(format!("wan_held_{tag}_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (path, adapter) = checkpoint(&dir);
+        let ld = unsafe { SafeTensorsLoader::multi(&[&path]) }.unwrap();
+        let lora = unsafe { SafeTensorsLoader::multi(&[&adapter]) }.unwrap();
+        for (name, held, value) in [
+            ("blocks.0.plain.weight", DType::BF16, PLAIN),
+            ("blocks.0.half.weight", DType::F16, ONLY_F16),
+            ("blocks.0.fine.weight", DType::F32, ONLY_F32),
+        ] {
+            assert_eq!(
+                wan_held_dtype(&ld, name, false, dev).unwrap(),
+                held,
+                "{name}"
+            );
+            assert_eq!(first_value(&ld, name, held, dev), value, "{name}");
+        }
+        // The ledger is read right after the call that records in it.
+        wan_held_dtype(&ld, "blocks.0.half.weight", false, dev).unwrap();
+        let declared = crate::tensor::conversion::entries()
+            .into_iter()
+            .any(|e| e.class == "projection" && e.from == "f32" && e.to == "f16" && e.after == 8);
+        assert!(
+            declared,
+            "the exact narrowing to F16 is not in the conversion ledger"
+        );
+
+        assert!(wan_lora_corrects(&lora, "blocks.0.plain"));
+        assert!(!wan_lora_corrects(&lora, "blocks.0.half"));
+        let merged = wan_held_dtype(&ld, "blocks.0.plain.weight", true, dev).unwrap();
+        assert_eq!(merged, DType::BF16);
+        let rounded = crate::tensor::conversion::entries()
+            .into_iter()
+            .any(|e| e.class == "projection" && e.to == "bf16" && e.reason.contains("adapter"));
+        assert!(
+            rounded,
+            "the rounding of a merged weight is not in the conversion ledger"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_projection_on_the_host_keeps_every_stored_value() {
+        each_value_is_kept_on(&Device::Cpu, "host");
+    }
+
+    /// It runs on card 0 of the runtime the build carries: CUDA, or HIP for a ROCm build.
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn a_projection_on_a_card_keeps_every_stored_value() {
+        let Ok(card) = Device::new_cuda(0) else {
+            eprintln!("skipping: no card");
+            return;
+        };
+        each_value_is_kept_on(&card, "card");
     }
 }

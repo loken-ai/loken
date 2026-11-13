@@ -218,6 +218,7 @@ A card that CUDA or ROCm drives is told by its PCI address and is not offered fo
 A device that reports its memory as the host's offers a placement no more than the host can spare.
 A Z-Image block runs through Intel's OpenCL runtime and gives the host's output within 1% on average.
 On the laptop's processor, at 512 by 512, a block takes 1.7 s through OpenCL against 3.1 s on the host.
+A Z-Image block holds its projections on the GPU in the narrowest float form that keeps every stored value exact.
 A whole 512 by 512 Z-Image picture renders with every block on the laptop's GPU, 48 s a step.
 The same picture renders with every block on the laptop's processor, 90 s a step.
 The host holds that transformer in 12.4 GB and its caption encoder in 9.1 GB.

@@ -11,6 +11,12 @@
 //
 // Note: B is stored [N, K] but we need B^T for standard GEMM. The tiled kernel
 // reads B row-by-row (each row = one output channel), effectively transposing.
+//
+// The tiled kernels read B in one of 3 forms: F32, F16 or BF16.
+// F16 is read with vload_half, part of OpenCL C itself.
+// BF16 is read as 16 bits shifted into the upper half of a float.
+// Neither needs an extension.
+// Every product and sum is computed in float.
 
 // ============================================================================
 // GEMV kernels (seq_len=1 or small) - original design, good for single-token
@@ -129,134 +135,142 @@ __kernel void f32_matmul_bias(
 // Dispatch: local = (GEMM_TS, GEMM_TS).
 // Dispatch: global = (ceil(N / GEMM_BT).GEMM_TS, ceil(M / GEMM_BT).GEMM_TS).
 // Dimension 0 runs along the columns of C, dimension 1 along its rows.
+//
+// Each kernel exists once for each form of B: f32w_, f16w_ and bf16w_.
 
 #define GEMM_TS 16
 #define GEMM_RB 4
 #define GEMM_BT (GEMM_TS * GEMM_RB)
 #define GEMM_BT_PAD (GEMM_BT + 1)
 
+// The value at index i of B in each form.
+#define LOAD_F32(src, i) ((src)[i])
+#define LOAD_F16(src, i) vload_half((i), (src))
+#define LOAD_BF16(src, i) as_float(((uint)(src)[i]) << 16)
+
 // Stages rows [base, base + GEMM_BT) by k [k0, k0 + GEMM_TS) of a row-major [rows, K]
-// matrix into tile[k][row].
+// matrix into tile[k][row], each value read by LOAD.
 // Entries past the edges are zero.
-#define GEMM_STAGE_TILE(tile, src, base, rows, k0, K, lc, lr)                    \
+#define GEMM_STAGE_TILE(tile, src, LOAD, base, rows, k0, K, lc, lr)              \
     for (uint s = 0; s < GEMM_RB; s++) {                                         \
         uint r = (lr) + GEMM_TS * s;                                             \
         uint gr = (base) + r;                                                    \
         uint gk = (k0) + (lc);                                                   \
-        tile[(lc)][r] = (gr < (rows) && gk < (K)) ? (src)[(ulong)gr * (K) + gk] : 0.0f; \
+        tile[(lc)][r] = (gr < (rows) && gk < (K)) ? LOAD(src, (ulong)gr * (K) + gk) : 0.0f; \
     }
 
-__kernel void f32_tiled_matmul(
-    __global const float* A,        // [M, K] = input [seq_len, in_dim]
-    __global const float* B,        // [N, K] = weight [out_dim, in_dim] (row-major)
-    __global float* C,              // [M, N] = output [seq_len, out_dim]
-    const uint M,                   // seq_len
-    const uint N,                   // out_dim
-    const uint K)                   // in_dim
-{
-    uint lc = get_local_id(0);
-    uint lr = get_local_id(1);
-    uint col0 = get_group_id(0) * GEMM_BT;
-    uint row0 = get_group_id(1) * GEMM_BT;
-
-    __local float tileA[GEMM_TS][GEMM_BT_PAD];
-    __local float tileB[GEMM_TS][GEMM_BT_PAD];
-
-    float acc[GEMM_RB][GEMM_RB];
-    for (uint i = 0; i < GEMM_RB; i++)
-        for (uint j = 0; j < GEMM_RB; j++)
-            acc[i][j] = 0.0f;
-
-    for (uint k0 = 0; k0 < K; k0 += GEMM_TS) {
-        GEMM_STAGE_TILE(tileA, A, row0, M, k0, K, lc, lr)
-        GEMM_STAGE_TILE(tileB, B, col0, N, k0, K, lc, lr)
-        barrier(CLK_LOCAL_MEM_FENCE);
-        for (uint k = 0; k < GEMM_TS; k++) {
-            float a[GEMM_RB];
-            float b[GEMM_RB];
-            for (uint i = 0; i < GEMM_RB; i++) a[i] = tileA[k][lr + GEMM_TS * i];
-            for (uint j = 0; j < GEMM_RB; j++) b[j] = tileB[k][lc + GEMM_TS * j];
-            for (uint i = 0; i < GEMM_RB; i++)
-                for (uint j = 0; j < GEMM_RB; j++)
-                    acc[i][j] = fma(a[i], b[j], acc[i][j]);
-        }
-        barrier(CLK_LOCAL_MEM_FENCE);
-    }
-
-    for (uint i = 0; i < GEMM_RB; i++) {
-        uint gr = row0 + lr + GEMM_TS * i;
-        if (gr >= M) continue;
-        for (uint j = 0; j < GEMM_RB; j++) {
-            uint gc = col0 + lc + GEMM_TS * j;
-            if (gc < N) C[(ulong)gr * N + gc] = acc[i][j];
-        }
-    }
+// C = A x B^T, B of type WTYPE read by LOAD.
+#define TILED_MATMUL(NAME, WTYPE, LOAD)                                          \
+__kernel void NAME(                                                              \
+    __global const float* A,                                                     \
+    __global const WTYPE* B,                                                     \
+    __global float* C,                                                           \
+    const uint M,                                                                \
+    const uint N,                                                                \
+    const uint K)                                                                \
+{                                                                                \
+    uint lc = get_local_id(0);                                                   \
+    uint lr = get_local_id(1);                                                   \
+    uint col0 = get_group_id(0) * GEMM_BT;                                       \
+    uint row0 = get_group_id(1) * GEMM_BT;                                       \
+    __local float tileA[GEMM_TS][GEMM_BT_PAD];                                   \
+    __local float tileB[GEMM_TS][GEMM_BT_PAD];                                   \
+    float acc[GEMM_RB][GEMM_RB];                                                 \
+    for (uint i = 0; i < GEMM_RB; i++)                                           \
+        for (uint j = 0; j < GEMM_RB; j++)                                       \
+            acc[i][j] = 0.0f;                                                    \
+    for (uint k0 = 0; k0 < K; k0 += GEMM_TS) {                                   \
+        GEMM_STAGE_TILE(tileA, A, LOAD_F32, row0, M, k0, K, lc, lr)              \
+        GEMM_STAGE_TILE(tileB, B, LOAD, col0, N, k0, K, lc, lr)                  \
+        barrier(CLK_LOCAL_MEM_FENCE);                                            \
+        for (uint k = 0; k < GEMM_TS; k++) {                                     \
+            float a[GEMM_RB];                                                    \
+            float b[GEMM_RB];                                                    \
+            for (uint i = 0; i < GEMM_RB; i++) a[i] = tileA[k][lr + GEMM_TS * i]; \
+            for (uint j = 0; j < GEMM_RB; j++) b[j] = tileB[k][lc + GEMM_TS * j]; \
+            for (uint i = 0; i < GEMM_RB; i++)                                   \
+                for (uint j = 0; j < GEMM_RB; j++)                               \
+                    acc[i][j] = fma(a[i], b[j], acc[i][j]);                      \
+        }                                                                        \
+        barrier(CLK_LOCAL_MEM_FENCE);                                            \
+    }                                                                            \
+    for (uint i = 0; i < GEMM_RB; i++) {                                         \
+        uint gr = row0 + lr + GEMM_TS * i;                                       \
+        if (gr >= M) continue;                                                   \
+        for (uint j = 0; j < GEMM_RB; j++) {                                     \
+            uint gc = col0 + lc + GEMM_TS * j;                                   \
+            if (gc < N) C[(ulong)gr * N + gc] = acc[i][j];                       \
+        }                                                                        \
+    }                                                                            \
 }
 
-// Tiled fused gate_up_silu: C = silu(A x gate^T) * (A x up^T)
-// Two products sharing the same input, fused with the activation.
-// Same tiling and dispatch as f32_tiled_matmul.
-__kernel void f32_tiled_gate_up_silu(
-    __global const float* gate_weight,  // [N, K]
-    __global const float* up_weight,    // [N, K]
-    __global const float* A,            // [M, K] = input
-    __global float* act,                // [M, N] = silu(gate) * up
-    const uint M,
-    const uint N,
-    const uint K)
-{
-    uint lc = get_local_id(0);
-    uint lr = get_local_id(1);
-    uint col0 = get_group_id(0) * GEMM_BT;
-    uint row0 = get_group_id(1) * GEMM_BT;
-
-    __local float tileA[GEMM_TS][GEMM_BT_PAD];
-    __local float tileG[GEMM_TS][GEMM_BT_PAD];
-    __local float tileU[GEMM_TS][GEMM_BT_PAD];
-
-    float acc_g[GEMM_RB][GEMM_RB];
-    float acc_u[GEMM_RB][GEMM_RB];
-    for (uint i = 0; i < GEMM_RB; i++)
-        for (uint j = 0; j < GEMM_RB; j++) {
-            acc_g[i][j] = 0.0f;
-            acc_u[i][j] = 0.0f;
-        }
-
-    for (uint k0 = 0; k0 < K; k0 += GEMM_TS) {
-        GEMM_STAGE_TILE(tileA, A, row0, M, k0, K, lc, lr)
-        GEMM_STAGE_TILE(tileG, gate_weight, col0, N, k0, K, lc, lr)
-        GEMM_STAGE_TILE(tileU, up_weight, col0, N, k0, K, lc, lr)
-        barrier(CLK_LOCAL_MEM_FENCE);
-        for (uint k = 0; k < GEMM_TS; k++) {
-            float a[GEMM_RB];
-            float g[GEMM_RB];
-            float u[GEMM_RB];
-            for (uint i = 0; i < GEMM_RB; i++) a[i] = tileA[k][lr + GEMM_TS * i];
-            for (uint j = 0; j < GEMM_RB; j++) {
-                g[j] = tileG[k][lc + GEMM_TS * j];
-                u[j] = tileU[k][lc + GEMM_TS * j];
-            }
-            for (uint i = 0; i < GEMM_RB; i++)
-                for (uint j = 0; j < GEMM_RB; j++) {
-                    acc_g[i][j] = fma(a[i], g[j], acc_g[i][j]);
-                    acc_u[i][j] = fma(a[i], u[j], acc_u[i][j]);
-                }
-        }
-        barrier(CLK_LOCAL_MEM_FENCE);
-    }
-
-    for (uint i = 0; i < GEMM_RB; i++) {
-        uint gr = row0 + lr + GEMM_TS * i;
-        if (gr >= M) continue;
-        for (uint j = 0; j < GEMM_RB; j++) {
-            uint gc = col0 + lc + GEMM_TS * j;
-            if (gc < N) {
-                float gate = acc_g[i][j];
-                act[(ulong)gr * N + gc] = gate / (1.0f + exp(-gate)) * acc_u[i][j];
-            }
-        }
-    }
+// act = silu(A x gate^T) * (A x up^T), gate and up of type WTYPE read by LOAD.
+// Two products share the same input and are fused with the activation.
+#define TILED_GATE_UP_SILU(NAME, WTYPE, LOAD)                                    \
+__kernel void NAME(                                                              \
+    __global const WTYPE* gate_weight,                                           \
+    __global const WTYPE* up_weight,                                             \
+    __global const float* A,                                                     \
+    __global float* act,                                                         \
+    const uint M,                                                                \
+    const uint N,                                                                \
+    const uint K)                                                                \
+{                                                                                \
+    uint lc = get_local_id(0);                                                   \
+    uint lr = get_local_id(1);                                                   \
+    uint col0 = get_group_id(0) * GEMM_BT;                                       \
+    uint row0 = get_group_id(1) * GEMM_BT;                                       \
+    __local float tileA[GEMM_TS][GEMM_BT_PAD];                                   \
+    __local float tileG[GEMM_TS][GEMM_BT_PAD];                                   \
+    __local float tileU[GEMM_TS][GEMM_BT_PAD];                                   \
+    float acc_g[GEMM_RB][GEMM_RB];                                               \
+    float acc_u[GEMM_RB][GEMM_RB];                                               \
+    for (uint i = 0; i < GEMM_RB; i++)                                           \
+        for (uint j = 0; j < GEMM_RB; j++) {                                     \
+            acc_g[i][j] = 0.0f;                                                  \
+            acc_u[i][j] = 0.0f;                                                  \
+        }                                                                        \
+    for (uint k0 = 0; k0 < K; k0 += GEMM_TS) {                                   \
+        GEMM_STAGE_TILE(tileA, A, LOAD_F32, row0, M, k0, K, lc, lr)              \
+        GEMM_STAGE_TILE(tileG, gate_weight, LOAD, col0, N, k0, K, lc, lr)        \
+        GEMM_STAGE_TILE(tileU, up_weight, LOAD, col0, N, k0, K, lc, lr)          \
+        barrier(CLK_LOCAL_MEM_FENCE);                                            \
+        for (uint k = 0; k < GEMM_TS; k++) {                                     \
+            float a[GEMM_RB];                                                    \
+            float g[GEMM_RB];                                                    \
+            float u[GEMM_RB];                                                    \
+            for (uint i = 0; i < GEMM_RB; i++) a[i] = tileA[k][lr + GEMM_TS * i]; \
+            for (uint j = 0; j < GEMM_RB; j++) {                                 \
+                g[j] = tileG[k][lc + GEMM_TS * j];                               \
+                u[j] = tileU[k][lc + GEMM_TS * j];                               \
+            }                                                                    \
+            for (uint i = 0; i < GEMM_RB; i++)                                   \
+                for (uint j = 0; j < GEMM_RB; j++) {                             \
+                    acc_g[i][j] = fma(a[i], g[j], acc_g[i][j]);                  \
+                    acc_u[i][j] = fma(a[i], u[j], acc_u[i][j]);                  \
+                }                                                                \
+        }                                                                        \
+        barrier(CLK_LOCAL_MEM_FENCE);                                            \
+    }                                                                            \
+    for (uint i = 0; i < GEMM_RB; i++) {                                         \
+        uint gr = row0 + lr + GEMM_TS * i;                                       \
+        if (gr >= M) continue;                                                   \
+        for (uint j = 0; j < GEMM_RB; j++) {                                     \
+            uint gc = col0 + lc + GEMM_TS * j;                                   \
+            if (gc < N) {                                                        \
+                float gate = acc_g[i][j];                                        \
+                act[(ulong)gr * N + gc] = gate / (1.0f + exp(-gate)) * acc_u[i][j]; \
+            }                                                                    \
+        }                                                                        \
+    }                                                                            \
 }
+
+TILED_MATMUL(f32w_tiled_matmul, float, LOAD_F32)
+TILED_MATMUL(f16w_tiled_matmul, half, LOAD_F16)
+TILED_MATMUL(bf16w_tiled_matmul, ushort, LOAD_BF16)
+TILED_GATE_UP_SILU(f32w_tiled_gate_up_silu, float, LOAD_F32)
+TILED_GATE_UP_SILU(f16w_tiled_gate_up_silu, half, LOAD_F16)
+TILED_GATE_UP_SILU(bf16w_tiled_gate_up_silu, ushort, LOAD_BF16)
 
 // ============================================================================
 // Original fused kernels kept for GEMV path (seq_len=1)

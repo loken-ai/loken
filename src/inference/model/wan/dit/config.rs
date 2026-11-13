@@ -365,4 +365,12 @@ impl WanLinear {
             WanLinear::Quant(q) => q.forward(x),
         }
     }
+
+    /// The format the weight is held in: the dense dtype, or the block format.
+    pub(super) fn held_format(&self) -> String {
+        match self {
+            WanLinear::Dense(l) => l.held_dtype().as_str().to_string(),
+            WanLinear::Quant(q) => q.held_format(),
+        }
+    }
 }

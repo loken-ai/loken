@@ -514,9 +514,13 @@ pub struct OpenCLPipelines {
     pub f32_matmul_bias: Kernel,
     pub f32_gate_up_silu: Kernel,
     pub f32_matmul_add: Kernel,
-    // Tiled GEMM variants (5-10x faster for seq_len > 1)
-    pub f32_tiled_matmul: Kernel,
-    pub f32_tiled_gate_up_silu: Kernel,
+    // Tiled products, one for each form of the weights: F32, F16 and BF16.
+    pub f32w_tiled_matmul: Kernel,
+    pub f16w_tiled_matmul: Kernel,
+    pub bf16w_tiled_matmul: Kernel,
+    pub f32w_tiled_gate_up_silu: Kernel,
+    pub f16w_tiled_gate_up_silu: Kernel,
+    pub bf16w_tiled_gate_up_silu: Kernel,
     pub image_attention: Kernel,
     pub image_attention_token_major: Kernel,
     pub apply_rotary_emb: Kernel,
@@ -606,8 +610,12 @@ impl OpenCLPipelines {
         let f32_matmul_bias = Kernel::create(&program, "f32_matmul_bias")?;
         let f32_gate_up_silu = Kernel::create(&program, "f32_gate_up_silu")?;
         let f32_matmul_add = Kernel::create(&program, "f32_matmul_add")?;
-        let f32_tiled_matmul = Kernel::create(&program, "f32_tiled_matmul")?;
-        let f32_tiled_gate_up_silu = Kernel::create(&program, "f32_tiled_gate_up_silu")?;
+        let f32w_tiled_matmul = Kernel::create(&program, "f32w_tiled_matmul")?;
+        let f16w_tiled_matmul = Kernel::create(&program, "f16w_tiled_matmul")?;
+        let bf16w_tiled_matmul = Kernel::create(&program, "bf16w_tiled_matmul")?;
+        let f32w_tiled_gate_up_silu = Kernel::create(&program, "f32w_tiled_gate_up_silu")?;
+        let f16w_tiled_gate_up_silu = Kernel::create(&program, "f16w_tiled_gate_up_silu")?;
+        let bf16w_tiled_gate_up_silu = Kernel::create(&program, "bf16w_tiled_gate_up_silu")?;
         let image_attention = Kernel::create(&program, "image_attention")?;
         let image_attention_token_major = Kernel::create(&program, "image_attention_token_major")?;
         let apply_rotary_emb = Kernel::create(&program, "apply_rotary_emb")?;
@@ -648,8 +656,12 @@ impl OpenCLPipelines {
             f32_matmul_bias,
             f32_gate_up_silu,
             f32_matmul_add,
-            f32_tiled_matmul,
-            f32_tiled_gate_up_silu,
+            f32w_tiled_matmul,
+            f16w_tiled_matmul,
+            bf16w_tiled_matmul,
+            f32w_tiled_gate_up_silu,
+            f16w_tiled_gate_up_silu,
+            bf16w_tiled_gate_up_silu,
             image_attention,
             image_attention_token_major,
             apply_rotary_emb,

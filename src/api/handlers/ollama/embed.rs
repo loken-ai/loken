@@ -224,7 +224,7 @@ pub(crate) async fn ollama_ps(
                 families: None,
                 parameter_size,
                 quantization_level: None,
-                running_format: None,
+                running_format: img_info.running_format.clone(),
             },
             expires_at: "never".to_string(),
             size_vram: img_vram,

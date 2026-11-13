@@ -756,29 +756,35 @@ native_scalar_op_impl!(Div, div, |r: f64| 1.0 / r, |_r| 0.0);
 /// more than it saves on decode-sized tensors.
 const PAR_CPU_MIN: usize = 1 << 17;
 
+/// The dot product of two rows of equal length that [`gemm_nt_f32_cpu`] and
+/// [`gemm_nt_halfw_f32_cpu`] sum: 4 accumulators, then their pairs.
+#[inline]
+fn nt_dot(x: &[f32], y: &[f32]) -> f32 {
+    // 4 independent accumulators so the loop autovectorizes
+    let k = x.len();
+    let (mut s0, mut s1, mut s2, mut s3) = (0f32, 0f32, 0f32, 0f32);
+    let c4 = k / 4 * 4;
+    let mut i = 0;
+    while i < c4 {
+        s0 += x[i] * y[i];
+        s1 += x[i + 1] * y[i + 1];
+        s2 += x[i + 2] * y[i + 2];
+        s3 += x[i + 3] * y[i + 3];
+        i += 4;
+    }
+    while i < k {
+        s0 += x[i] * y[i];
+        i += 1;
+    }
+    (s0 + s1) + (s2 + s3)
+}
+
 /// NT (dot-product) f32 gemm: `out[m,n] = a[m,k] . b[n,k]ᵀ` with `b` given
 /// UNtransposed - both operand rows are contiguous, so the `x @ wᵀ` linear
 /// pattern needs no transpose materialization. Parallelized over output
 /// columns (decode has m=1, so row-parallelism would serialize).
 pub(super) fn gemm_nt_f32_cpu(a: &[f32], b: &[f32], m: usize, k: usize, n: usize, out: &mut [f32]) {
-    let dot = |x: &[f32], y: &[f32]| -> f32 {
-        // 4 independent accumulators so the loop autovectorizes
-        let (mut s0, mut s1, mut s2, mut s3) = (0f32, 0f32, 0f32, 0f32);
-        let c4 = k / 4 * 4;
-        let mut i = 0;
-        while i < c4 {
-            s0 += x[i] * y[i];
-            s1 += x[i + 1] * y[i + 1];
-            s2 += x[i + 2] * y[i + 2];
-            s3 += x[i + 3] * y[i + 3];
-            i += 4;
-        }
-        while i < k {
-            s0 += x[i] * y[i];
-            i += 1;
-        }
-        (s0 + s1) + (s2 + s3)
-    };
+    let dot = nt_dot;
     let par = m * n * k >= PAR_CPU_MIN;
     if !par {
         for r in 0..m {
@@ -904,20 +910,22 @@ pub(super) fn gemm_f32_cpu(a: &[f32], b: &[f32], m: usize, k: usize, n: usize, o
     }
 }
 
-/// `gemm_f32_cpu` with an F16 `b` operand streamed through a per-(stripe,
+/// `gemm_f32_cpu` with an F16 or BF16 `b` operand streamed through a per-(stripe,
 /// k-block) L2-resident f32 scratch. Same tile geometry and accumulation
 /// order as `gemm_f32_cpu`, and f16->f32 conversion is exact, so the result
 /// is bit-identical to upcasting `b` wholesale first - while reading the
 /// (large, per-call) rhs at 2 B/elem from memory instead of materializing a
 /// 4 B/elem f32 copy per call. Each `b` element is converted exactly once.
-pub(super) fn gemm_f16w_f32_cpu(
+pub(super) fn gemm_f16w_f32_cpu<H: Sync>(
     a: &[f32],
-    b: &[half::f16],
+    b: &[H],
     m: usize,
     k: usize,
     n: usize,
     out: &mut [f32],
-) {
+) where
+    [H]: half::slice::HalfFloatSliceExt,
+{
     use half::slice::HalfFloatSliceExt;
     const NT: usize = 512; // column-stripe width (matches gemm_f32_cpu)
     const KB: usize = 256; // k block: f32 b k-tile = KB*NT*4B = 512 KB, L2-resident
@@ -989,6 +997,46 @@ pub(super) fn gemm_f16w_f32_cpu(
             out[i * n + j0..][..nt].copy_from_slice(&tile[i * nt..][..nt]);
         }
     }
+}
+
+/// [`gemm_nt_f32_cpu`] with a half-precision `b` `[n, k]` (F16 or BF16): each weight row is
+/// widened once, exactly, into a scratch row and dotted with every row of `a` by the same
+/// dot. The result is bit-identical to widening `b` whole first. The columns are sharded
+/// across the GEMV pool.
+pub(super) fn gemm_nt_halfw_f32_cpu<H: Sync>(
+    a: &[f32],
+    b: &[H],
+    m: usize,
+    k: usize,
+    n: usize,
+    out: &mut [f32],
+) where
+    [H]: half::slice::HalfFloatSliceExt,
+{
+    use half::slice::HalfFloatSliceExt;
+    if m == 0 || n == 0 {
+        return;
+    }
+    let pool = super::quant_cpu::gemv_pool::pool();
+    let (chunk_cols, n_chunks) = super::quant_cpu::gemv_grid(1, n, pool.threads);
+    struct MutPtr(*mut f32);
+    unsafe impl Send for MutPtr {}
+    unsafe impl Sync for MutPtr {}
+    let out_ptr = MutPtr(out.as_mut_ptr());
+    pool.run(n_chunks, &|chunk| {
+        let out_ptr = &out_ptr;
+        let col0 = chunk * chunk_cols;
+        let col1 = (col0 + chunk_cols).min(n);
+        let mut row = vec![0f32; k];
+        for col in col0..col1 {
+            b[col * k..][..k].convert_to_f32_slice(&mut row);
+            for r in 0..m {
+                let s = nt_dot(&a[r * k..][..k], &row);
+                // SAFETY: chunks address disjoint column ranges of `out`.
+                unsafe { *out_ptr.0.add(r * n + col) = s };
+            }
+        }
+    });
 }
 
 /// Lanes of the F32 accumulators a dot product of [`gemm_nt_half_f32`] keeps.

@@ -131,6 +131,22 @@ struct HeteroZImagePerImageCache {
 }
 
 impl HeteroZImage {
+    /// The formats the projections of the main blocks are held in, on every device.
+    ///
+    /// The formats are distinct, in the order first met, joined with `+`.
+    pub fn running_format(&self) -> Option<String> {
+        let held = self.main_layers.iter().flatten();
+        let formats = held.flat_map(|b| b.held_formats());
+        #[cfg(feature = "opencl")]
+        let formats = formats.chain(
+            self.ocl_blocks
+                .iter()
+                .flatten()
+                .flat_map(|b| b.held_formats()),
+        );
+        crate::inference::model::zimage::dit::join_formats(formats)
+    }
+
     /// Build HeteroZImage from safetensors files with per-device block placement.
     ///
     /// The `plan` assigns the 30 main layers across devices. Noise/context refiners

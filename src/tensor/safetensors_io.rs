@@ -50,6 +50,8 @@ fn f8_e5m2_to_f32(b: u8) -> f32 {
 pub struct SafeTensorsLoader {
     maps: Vec<memmap2::Mmap>,
     index: HashMap<String, usize>,
+    /// One identity per file: its path, length and modification time.
+    identities: Vec<String>,
     /// Tensors read out of this bundle so far, for the progress a client sees.
     ///
     /// Reading the weights is the longest phase of a render and reported nothing: every
@@ -71,9 +73,17 @@ impl SafeTensorsLoader {
     pub unsafe fn multi<P: AsRef<Path>>(paths: &[P]) -> Result<Self> {
         let mut maps = Vec::with_capacity(paths.len());
         let mut index = HashMap::new();
+        let mut identities = Vec::with_capacity(paths.len());
         for (i, p) in paths.iter().enumerate() {
             let file = std::fs::File::open(p)
                 .map_err(|e| Error(format!("safetensors open {:?}: {e}", p.as_ref())))?;
+            let meta = file.metadata().ok();
+            identities.push(format!(
+                "{}:{}:{:?}",
+                p.as_ref().display(),
+                meta.as_ref().map_or(0, |m| m.len()),
+                meta.and_then(|m| m.modified().ok())
+            ));
             let map = memmap2::Mmap::map(&file)
                 .map_err(|e| Error(format!("safetensors mmap {:?}: {e}", p.as_ref())))?;
             let (_, meta) = safetensors::SafeTensors::read_metadata(&map)
@@ -86,6 +96,7 @@ impl SafeTensorsLoader {
         Ok(Self {
             maps,
             index,
+            identities,
             read: std::sync::atomic::AtomicUsize::new(0),
         })
     }
@@ -121,6 +132,49 @@ impl SafeTensorsLoader {
         let &fi = self.index.get(name)?;
         let st = safetensors::SafeTensors::deserialize(&self.maps[fi]).ok()?;
         Some(st.tensor(name).ok()?.shape().to_vec())
+    }
+
+    /// A tensor's stored format, as its checkpoint spells it, and its element width in bytes.
+    ///
+    /// Read from the header only.
+    pub fn stored_format(&self, name: &str) -> Option<(String, usize)> {
+        let &fi = self.index.get(name)?;
+        let st = safetensors::SafeTensors::deserialize(&self.maps[fi]).ok()?;
+        let dtype = st.tensor(name).ok()?.dtype();
+        Some((format!("{dtype:?}").to_lowercase(), dtype.bitsize() / 8))
+    }
+
+    /// The narrowest float dtype exact for every stored value of tensor `name`.
+    ///
+    /// A tensor stored in BF16 or F16 is answered from the header.
+    /// Any other tensor is read once per file and name, and the answer is kept for the process.
+    pub fn narrowest_exact_dtype(&self, name: &str) -> Result<super::DType> {
+        use super::DType;
+        type Known = Option<HashMap<String, DType>>;
+        static KNOWN: std::sync::Mutex<Known> = std::sync::Mutex::new(None);
+        let missing = || Error(format!("safetensors: no tensor `{name}`"));
+        let &fi = self.index.get(name).ok_or_else(missing)?;
+        let st = safetensors::SafeTensors::deserialize(&self.maps[fi])
+            .map_err(|e| Error(format!("safetensors header: {e}")))?;
+        match st.tensor(name).map_err(|_| missing())?.dtype() {
+            safetensors::Dtype::BF16 => return Ok(DType::BF16),
+            safetensors::Dtype::F16 => return Ok(DType::F16),
+            _ => {}
+        }
+        let key = format!("{}#{name}", self.identities[fi]);
+        let lock = || KNOWN.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(dtype) = lock().as_ref().and_then(|m| m.get(&key).copied()) {
+            return Ok(dtype);
+        }
+        // CONVERSION: the stored values are widened to F32 to be read, and dropped once read.
+        let values = self
+            .load(name)?
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        let dtype = super::conversion::narrowest_exact_dtype(&[&values]);
+        lock().get_or_insert_with(HashMap::new).insert(key, dtype);
+        Ok(dtype)
     }
 
     /// Load one tensor to host as a native tensor (dtype preserved).

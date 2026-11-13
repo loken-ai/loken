@@ -76,6 +76,11 @@ pub struct Linear {
 }
 
 impl Linear {
+    /// The dtype the weight is held in.
+    pub fn held_dtype(&self) -> DType {
+        self.held.tensor().dtype()
+    }
+
     /// The weight as the checkpoint published it, `[out, in]`.
     ///
     /// Built from the stored transpose on first call and kept, so a caller in a per-token path
@@ -89,6 +94,11 @@ impl Linear {
         }
         let _ = self.weight_orig.set(self.held.tensor().t()?);
         Ok(self.weight_orig.get().expect("just set"))
+    }
+
+    /// The device the weight is held on.
+    pub fn device(&self) -> Device {
+        self.held.tensor().device()
     }
 
     /// `weight` in the file layout `[out, in]`.
@@ -227,12 +237,22 @@ impl Linear {
         }
 
         let wdt = self.held.tensor().dtype();
-        let follow = wdt != x.dtype() && matches!(wdt, DType::BF16 | DType::F16);
+        // F32 rows through a half weight on the host stay F32.
+        // The weight is widened to F32 for the product, exactly.
+        let host_widens = x.dtype() == DType::F32 && self.held.tensor().device().is_cpu();
+        let follow = wdt != x.dtype() && matches!(wdt, DType::BF16 | DType::F16) && !host_widens;
         let xm = if follow { x.to_dtype(wdt)? } else { x.clone() };
+        // The host product widens the half weight a block at a time, not whole.
+        let blocked = match &self.held {
+            _ if !host_widens || !matches!(wdt, DType::BF16 | DType::F16) => None,
+            Held::Published(w) => xm.reshape(vec![rows, k])?.matmul_halfw_f32(w, true)?,
+            Held::Transposed(wt) => xm.reshape(vec![rows, k])?.matmul_halfw_f32(wt, false)?,
+        };
 
         // A published F16 weight under an F32 stream on a card: cuBLAS writes the F32 sum
         // directly, so the product is neither rounded to F16 nor cast back.
         let widened = match &self.held {
+            _ if blocked.is_some() => blocked,
             Held::Published(w) if follow && wdt == DType::F16 && x.dtype() == DType::F32 => {
                 xm.reshape(vec![rows, k])?.matmul_t_f16_f32(w)?
             }

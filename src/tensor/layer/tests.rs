@@ -65,6 +65,54 @@ mod tests {
         }
     }
 
+    /// A half weight on the host gives F32 rows the product of the weight widened to F32.
+    #[test]
+    fn a_half_weight_on_the_host_reads_f32_rows() {
+        use crate::tensor::DType;
+        let (s, i, o) = (3usize, 8usize, 5usize);
+        let w = Tensor::from_vec_f32(data(o * i, 7), vec![o, i]).unwrap();
+        let x = Tensor::from_vec_f32(data(s * i, 8), vec![s, i]).unwrap();
+        for half in [DType::F16, DType::BF16] {
+            let stored = w.to_dtype(half).unwrap();
+            let wide = Linear::new(stored.to_dtype(DType::F32).unwrap(), None).unwrap();
+            let held = Linear::new(stored, None).unwrap();
+            let got = held.forward(&x).unwrap();
+            assert_eq!(got.dtype(), DType::F32);
+            let want = wide.forward(&x).unwrap().to_vec_f32();
+            assert_eq!(got.to_vec_f32(), want, "{half:?}");
+        }
+    }
+
+    /// A half weight on the host, transposed or as published, gives F32 rows the product of
+    /// the weight widened whole, bit for bit, at shapes past the product's tile edges.
+    #[test]
+    fn a_half_weight_on_the_host_widens_by_blocks_exactly() {
+        use crate::tensor::DType;
+        for (s, i, o) in [(1usize, 300usize, 600usize), (5, 257, 513), (6, 64, 40)] {
+            let w = Tensor::from_vec_f32(data(o * i, 3), vec![o, i]).unwrap();
+            let x = Tensor::from_vec_f32(data(s * i, 4), vec![s, i]).unwrap();
+            for half in [DType::F16, DType::BF16] {
+                let stored = w.to_dtype(half).unwrap();
+                let wide = stored.to_dtype(DType::F32).unwrap();
+                let pairs = [
+                    (
+                        Linear::new(stored.clone(), None).unwrap(),
+                        Linear::new(wide.clone(), None).unwrap(),
+                    ),
+                    (
+                        Linear::from_published(stored.clone(), None).unwrap(),
+                        Linear::from_published(wide.clone(), None).unwrap(),
+                    ),
+                ];
+                for (held, widened) in pairs {
+                    let got = held.forward(&x).unwrap().to_vec_f32();
+                    let want = widened.forward(&x).unwrap().to_vec_f32();
+                    assert_eq!(got, want, "{half:?} {s}x{i}x{o}");
+                }
+            }
+        }
+    }
+
     /// A half precision table widens only the rows a lookup returns, to the values the
     /// widened whole table gives, and owns half the bytes of the F32 table.
     #[test]

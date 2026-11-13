@@ -286,4 +286,8 @@ pub struct ImageModelInfo {
     pub model_type: String,
     pub total_layers: u32,
     pub layer_distribution: Vec<ImageLayerDist>,
+    /// The formats the projections of the hot component are held in, joined with `+`.
+    ///
+    /// `None` for a family that does not name them.
+    pub running_format: Option<String>,
 }

@@ -886,6 +886,48 @@ impl Tensor {
         )))
     }
 
+    /// `self @ w` on the host for F32 rows `[rows, k]` and a weight held in F16 or BF16, either
+    /// `[n, k]` as published (`published`) or `[k, n]`: `[rows, n]` F32. The product widens
+    /// the weight a block at a time and gives, bit for bit, the product of the weight widened
+    /// whole. `None` where the operands are not that.
+    pub fn matmul_halfw_f32(&self, w: &Self, published: bool) -> Result<Option<Self>> {
+        let (xd, wd) = (self.dims(), w.dims());
+        if xd.len() != 2 || wd.len() != 2 || self.dtype() != DType::F32 {
+            return Ok(None);
+        }
+        if !self.device().is_cpu() || !w.device().is_cpu() {
+            return Ok(None);
+        }
+        let (rows, k) = (xd[0], xd[1]);
+        let n = match published {
+            true if wd[1] == k => wd[0],
+            false if wd[0] == k => wd[1],
+            _ => return Ok(None),
+        };
+        // A storage holding exactly the tensor is the tensor, read from its first element.
+        let x = self.contiguous()?;
+        let a = x.f32_data()?;
+        if a.len() != rows * k {
+            return Ok(None);
+        }
+        let mut out = vec![0f32; rows * n];
+        match w.storage().as_ref() {
+            Storage::Cpu(CpuStorage::F16(b)) if b.len() == n * k => match published {
+                true => gemm_nt_halfw_f32_cpu(a, b, rows, k, n, &mut out),
+                false => gemm_f16w_f32_cpu(a, b, rows, k, n, &mut out),
+            },
+            Storage::Cpu(CpuStorage::BF16(b)) if b.len() == n * k => match published {
+                true => gemm_nt_halfw_f32_cpu(a, b, rows, k, n, &mut out),
+                false => gemm_f16w_f32_cpu(a, b, rows, k, n, &mut out),
+            },
+            _ => return Ok(None),
+        }
+        Ok(Some(Self::from_packed(
+            Arc::new(Storage::Cpu(CpuStorage::F32(out))),
+            Shape::from(vec![rows, n]),
+        )))
+    }
+
     /// Standard-normal tensor matching `self`'s shape/device (Box-Muller
     /// over the process RNG; generated host-side, uploaded once - the VAE
     /// encode-path reparameterization sample).

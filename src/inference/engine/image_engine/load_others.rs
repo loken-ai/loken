@@ -125,19 +125,21 @@ impl ImageEngine {
                 .as_ref()
                 .map(crate::inference::serve::cancel::scoped::publish);
             send("Loading SDXL (UNet + CLIP-L + bigG + VAE)...");
+            let path = checkpoint
+                .to_str()
+                .ok_or_else(|| anyhow!("bad SDXL path"))?;
+            // The UNet is held in the format the checkpoint stores it in.
+            let dtype = crate::inference::model::sdxl::pipeline::held_dtype(
+                path,
+                crate::inference::model::sdxl::unet::CHECKPOINT_PREFIX,
+            );
+            info!("  [SDXL] UNet held as stored: {dtype:?}");
             let pipe = crate::inference::model::sdxl::pipeline::SdxlPipeline::load(
-                checkpoint
-                    .to_str()
-                    .ok_or_else(|| anyhow!("bad SDXL path"))?,
+                path,
                 tokenizer_json
                     .to_str()
                     .ok_or_else(|| anyhow!("bad tokenizer path"))?,
-                // F32, because the tensor layer has no half-precision convolution:
-                // conv2d's device path needs f32 slices for the input AND the kernel,
-                // so a BF16 UNet - which is almost entirely convolutions - finds no
-                // path at all and fails on the host. Halving it is worth doing, but it
-                // is a tensor-layer change, not a dtype flip here.
-                crate::tensor::DType::F32,
+                dtype,
                 geom,
             )
             .map_err(|e| anyhow!("SDXL load: {e}"))?;
@@ -155,7 +157,7 @@ impl ImageEngine {
                     .map(|f| f.to_string_lossy().into_owned()),
                 model: LoadedImageModel::Sdxl(pipe),
                 device,
-                dtype: DType::F32,
+                dtype,
             });
             send("SDXL ready.");
             Ok(())
@@ -344,13 +346,26 @@ impl ImageEngine {
         if total == 0 {
             return 0;
         }
-        // Bytes per element of the dtype the blocks are BUILT at, against the dtype they
-        // are stored at. A checkpoint already at or below it is loaded as it stands.
-        const RESIDENT_ELEM: u64 = 2;
-        match files.first().and_then(|p| Self::safetensors_elem_bytes(p)) {
-            Some(bpe) if bpe > RESIDENT_ELEM => total * RESIDENT_ELEM / bpe,
-            _ => total,
+        // One reading of the stored values per checkpoint: the forms depend on nothing else.
+        static HELD: std::sync::Mutex<Vec<(Vec<std::path::PathBuf>, u64)>> =
+            std::sync::Mutex::new(Vec::new());
+        let mut held = HELD.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((_, bytes)) = held.iter().find(|(f, _)| f == files) {
+            return *bytes;
         }
+        let names: Vec<&str> = files.iter().filter_map(|p| p.to_str()).collect();
+        // SAFETY: the same mmap contract every load of these files takes.
+        let read = unsafe { crate::inference::model::zimage::dit::card_resident_bytes(&names) };
+        let bytes = match read {
+            Ok(bytes) => bytes,
+            // Files whose values cannot be read are charged as stored.
+            Err(e) => {
+                info!("Z-Image: the stored values could not be read ({e}), charged as stored");
+                total
+            }
+        };
+        held.push((files.to_vec(), bytes));
+        bytes
     }
 
     /// The official transformer's shards in the HuggingFace cache, in shard order.
@@ -703,6 +718,14 @@ impl ImageEngine {
                 },
             )?;
             let primary_dtype = if primary_device.is_cuda() { DType::BF16 } else { DType::F32 };
+            let running_format = match &transformer {
+                ZImageVariant::NativeSingle(model) => model.running_format(),
+                ZImageVariant::Hetero(hetero) => hetero.running_format(),
+            };
+            info!(
+                "Z-Image transformer: the projections of its blocks run in {}",
+                running_format.as_deref().unwrap_or("no format of this substrate")
+            );
             send_progress("Transformer loaded");
 
             // Initialize layer performance tracker for Z-Image

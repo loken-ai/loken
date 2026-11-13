@@ -164,6 +164,13 @@ fn describe(state: &LoadedImageModelState) -> Presence {
             ("SDXL".into(), total, dist)
         }
     };
+    let running_format = match &state.model {
+        LoadedImageModel::ZImage(zimg) => match &zimg.transformer {
+            ZImageVariant::NativeSingle(model) => model.running_format(),
+            ZImageVariant::Hetero(hetero) => hetero.running_format(),
+        },
+        _ => None,
+    };
     Presence {
         family: family_of(state),
         info: ImageModelInfo {
@@ -171,6 +178,7 @@ fn describe(state: &LoadedImageModelState) -> Presence {
             model_type,
             total_layers,
             layer_distribution,
+            running_format,
         },
     }
 }

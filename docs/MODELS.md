@@ -318,6 +318,17 @@ A GGUF file with block projections rebuilds its stray float matrices in `Q8_0`, 
 | Vulkan | A `BF16` or `F32` matrix runs the mat-vec kernel at every token count. Only `F16` has a mat-mat kernel |
 | OpenCL | The kernels do not read `BF16`. A `BF16` matrix kept as stored runs there widened to `F32`, and the load log says so |
 
+Z-Image holds each projection on a CUDA or ROCm card in the narrowest form exact for its stored values: `BF16`, then `F16`, else `F32`.
+Its blocks on the host hold each projection in the same form, and the host products read it with `F32` rows.
+The placement weighs each projection in the form it is held in.
+A narrower form than the stored one goes in the conversion ledger.
+The load log and `/api/ps` name the formats the blocks run in.
+
+The Wan 1.3B video DiT holds each block projection in the narrowest form exact for its stored values, on a card and on the host.
+A narrower form than the stored one goes in the conversion ledger.
+A projection merged with an adapter is held in the form of its stored values, rounded once, and the ledger says so.
+The load log names the formats the blocks run in.
+
 A layer on Vulkan or OpenCL runs its projections in the format the rung and the fidelity level give every layer.
 
 The expert stacks of a mixture-of-experts checkpoint follow the kernels instead.
@@ -383,6 +394,9 @@ A loader that lacks a file says which one it looked for.
 | SDXL | `sdxl` | An SDXL checkpoint in safetensors, adapters through `/v1/loras` |
 | Boogu | `boogu` | The Boogu checkpoint |
 <!-- site: end -->
+
+An SDXL checkpoint's UNet and text towers are held in the float format it stores.
+Its VAE is held in F32.
 
 Image parity across machines is a hash of 1 render per family.
 The hash depends on the placement, see [Status](https://github.com/loken-ai/loken/blob/main/docs/STATUS.md).

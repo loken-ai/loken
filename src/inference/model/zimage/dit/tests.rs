@@ -533,6 +533,13 @@ fn real_checkpoint_shards() -> Vec<String> {
 /// exercised is the production one - a fixture that only a dry run could open
 /// would be measuring itself.
 fn tiny_checkpoint(cfg: &Config, path: &std::path::Path) {
+    tiny_checkpoint_with(cfg, path, &[]);
+}
+
+/// [`tiny_checkpoint`] with the first value of each named tensor set as given.
+///
+/// Every other value is zero.
+fn tiny_checkpoint_with(cfg: &Config, path: &std::path::Path, first: &[(&str, f32)]) {
     use safetensors::tensor::{Dtype, TensorView};
     let d = cfg.dim;
     let head = cfg.head_dim();
@@ -604,7 +611,13 @@ fn tiny_checkpoint(cfg: &Config, path: &std::path::Path) {
     }
     let bufs: Vec<Vec<u8>> = shapes
         .iter()
-        .map(|(_, s)| vec![0u8; s.iter().product::<usize>() * 4])
+        .map(|(name, s)| {
+            let mut buf = vec![0u8; s.iter().product::<usize>() * 4];
+            if let Some((_, v)) = first.iter().find(|(n, _)| n == name) {
+                buf[..4].copy_from_slice(&v.to_le_bytes());
+            }
+            buf
+        })
         .collect();
     let tensors: Vec<(String, TensorView<'_>)> = shapes
         .iter()
@@ -1282,4 +1295,187 @@ fn print_fixtures() {
     let (p2, size2) = patchify(&px2, 2, 2).unwrap();
     println!("PATCH2_DIMS {:?} size {:?}", p2.dims(), size2);
     println!("PATCH2 {:?}", &p2.to_vec_f32()[..16]);
+}
+
+/// A value BF16 cannot hold, in an F32 checkpoint.
+const ONLY_F32: f32 = 1.0 + 1.0 / 1048576.0;
+
+/// A value BF16 cannot hold and F16 can.
+const ONLY_F16: f32 = 1.0 + 1.0 / 1024.0;
+
+/// The tiny checkpoint with one projection only F32 holds and one only F16 holds.
+fn checkpoint_with_fine_values(cfg: &Config, path: &std::path::Path) {
+    tiny_checkpoint_with(
+        cfg,
+        path,
+        &[
+            ("layers.0.attention.to_q.weight", ONLY_F32),
+            ("layers.0.feed_forward.w1.weight", ONLY_F16),
+        ],
+    );
+}
+
+/// The first output of `p` for the first unit input, on `device`.
+fn first_weight(p: &QLinear, device: &Device) -> f32 {
+    let mut x = vec![0f32; p.in_dim()];
+    x[0] = 1.0;
+    let x = Tensor::from_vec(x, (1, p.in_dim()), device).unwrap();
+    p.forward(&x)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap()[0]
+}
+
+/// A matrix on a card is charged in the narrowest form exact for its stored values.
+#[test]
+fn a_matrix_is_charged_in_the_form_its_values_need() {
+    let cfg = tiny_config();
+    let dir = std::env::temp_dir().join(format!("zimage_held_bytes_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let plain = dir.join("plain.safetensors");
+    let fine = dir.join("fine.safetensors");
+    tiny_checkpoint(&cfg, &plain);
+    checkpoint_with_fine_values(&cfg, &fine);
+    let bytes =
+        |p: &std::path::Path| unsafe { card_resident_bytes(&[p.to_str().unwrap()]) }.unwrap();
+    let (plain_bytes, fine_bytes) = (bytes(&plain), bytes(&fine));
+    let _ = std::fs::remove_dir_all(&dir);
+    let q = cfg.n_heads * cfg.head_dim() * cfg.dim;
+    assert_eq!(
+        fine_bytes - plain_bytes,
+        (q * 2) as u64,
+        "only the projection F32 alone holds weighs 4 bytes an element"
+    );
+}
+
+/// The first output of `p` for an input whose first value is `value` and the rest zero, on the host.
+fn first_output(p: &QLinear, value: f32) -> f32 {
+    let mut x = vec![0f32; p.in_dim()];
+    x[0] = value;
+    let x = Tensor::from_vec(x, (1, p.in_dim()), &Device::Cpu).unwrap();
+    p.forward(&x)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap()[0]
+}
+
+/// A projection built on the host is held in the narrowest form exact for its stored values.
+///
+/// Its product reads the rows in F32.
+#[test]
+fn a_projection_on_the_host_keeps_every_stored_value() {
+    let cfg = tiny_config();
+    let dir = std::env::temp_dir().join(format!("zimage_held_host_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("fine.safetensors");
+    checkpoint_with_fine_values(&cfg, &path);
+    let files = [path.to_str().unwrap()];
+    let layer_slot = vec![0; cfg.n_layers];
+    let model =
+        unsafe { from_files_placed(&cfg, &files, None, DType::BF16, &[Device::Cpu], &layer_slot) }
+            .unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(model.running_format().as_deref(), Some("f32+bf16+f16"));
+    let block = model.layers[0].as_ref().unwrap();
+    assert_eq!(block.attention.to_k.held_format(), "bf16");
+    let gate = block.feed_forward.projections()[0];
+    assert_eq!(gate.held_format(), "f16");
+    assert_eq!(first_weight(&block.attention.to_q, &Device::Cpu), ONLY_F32);
+    assert_eq!(first_output(gate, ONLY_F32), ONLY_F32 * ONLY_F16);
+}
+
+/// A projection built on a card is held in the narrowest form exact for its stored values.
+///
+/// It runs on card 0 of the runtime the build carries: CUDA, or HIP for a ROCm build.
+#[cfg(feature = "gpu")]
+#[test]
+fn a_projection_on_a_card_keeps_every_stored_value() {
+    let Ok(card) = Device::new_cuda(0) else {
+        eprintln!("skipping: no card");
+        return;
+    };
+    let cfg = tiny_config();
+    let dir = std::env::temp_dir().join(format!("zimage_held_card_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("fine.safetensors");
+    checkpoint_with_fine_values(&cfg, &path);
+    let files = [path.to_str().unwrap()];
+    let layer_slot = vec![0; cfg.n_layers];
+    let model = unsafe {
+        from_files_placed(
+            &cfg,
+            &files,
+            None,
+            DType::BF16,
+            &[card.clone()],
+            &layer_slot,
+        )
+    }
+    .unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(model.running_format().as_deref(), Some("f32+bf16+f16"));
+    let block = model.layers[0].as_ref().unwrap();
+    assert_eq!(block.attention.to_q.held_format(), "f32");
+    assert_eq!(block.attention.to_k.held_format(), "bf16");
+    assert_eq!(block.feed_forward.projections()[0].held_format(), "f16");
+    assert_eq!(first_weight(&block.attention.to_q, &card), ONLY_F32);
+    assert_eq!(
+        first_weight(block.feed_forward.projections()[0], &card),
+        ONLY_F16
+    );
+    let hidden = cfg.hidden_dim() * cfg.dim;
+    let declared = crate::tensor::conversion::entries().into_iter().any(|e| {
+        e.class == "projection"
+            && e.from == "f32"
+            && e.to == "f16"
+            && e.before == (hidden * 4) as u64
+            && e.after == (hidden * 2) as u64
+    });
+    assert!(
+        declared,
+        "the exact narrowing to F16 is not in the conversion ledger"
+    );
+}
+
+/// The walk that chooses a placement charges each projection in the form the load holds.
+#[test]
+fn the_placed_walk_weighs_the_form_the_values_need() {
+    let cfg = tiny_config();
+    let dir = std::env::temp_dir().join(format!("zimage_held_walk_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let plain = dir.join("plain.safetensors");
+    let fine = dir.join("fine.safetensors");
+    tiny_checkpoint(&cfg, &plain);
+    checkpoint_with_fine_values(&cfg, &fine);
+    let card_weights = |p: &std::path::Path| {
+        let files = [p.to_str().unwrap()];
+        super::dry_forward_planned(
+            &cfg,
+            &files,
+            None,
+            DType::BF16,
+            DType::F32,
+            8,
+            8,
+            8,
+            &plan_of(&[(0, 0, cfg.n_layers)], cfg.n_layers),
+            None,
+        )
+        .expect("the placed dry run")
+        .load
+        .devices[0]
+            .weights
+    };
+    let (plain_weights, fine_weights) = (card_weights(&plain), card_weights(&fine));
+    let _ = std::fs::remove_dir_all(&dir);
+    let q = cfg.n_heads * cfg.head_dim() * cfg.dim;
+    assert_eq!(
+        fine_weights - plain_weights,
+        (q * 2) as u64,
+        "the walk charged the projection F32 alone holds at another width"
+    );
 }

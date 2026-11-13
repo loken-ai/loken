@@ -165,31 +165,11 @@ fn sample_rows(
 /// that widens a block makes them quietly wrong, in the direction that under-reserves.
 /// The file is open at this point anyway, and it knows.
 fn component_bytes(checkpoint: &str, prefix: &str, elem: u64) -> u64 {
-    use std::io::Read;
-    let Ok(mut f) = std::fs::File::open(checkpoint) else {
-        return 0;
-    };
-    let mut len = [0u8; 8];
-    if f.read_exact(&mut len).is_err() {
-        return 0;
-    }
-    let n = u64::from_le_bytes(len) as usize;
-    // not-a-vram-size: a bound on a header length read out of the file.
-    if n == 0 || n > (64 << 20) {
-        return 0;
-    }
-    let mut buf = vec![0u8; n];
-    if f.read_exact(&mut buf).is_err() {
-        return 0;
-    }
-    let Ok(json) = serde_json::from_slice::<serde_json::Value>(&buf) else {
-        return 0;
-    };
-    let Some(obj) = json.as_object() else {
+    let Some(obj) = header(checkpoint) else {
         return 0;
     };
     let mut total = 0u64;
-    for (name, info) in obj {
+    for (name, info) in &obj {
         if name == "__metadata__" || !name.starts_with(prefix) {
             continue;
         }
@@ -201,6 +181,62 @@ fn component_bytes(checkpoint: &str, prefix: &str, elem: u64) -> u64 {
         total += count;
     }
     total * elem
+}
+
+/// The tensor table of a single-file checkpoint, read from its safetensors header alone.
+fn header(checkpoint: &str) -> Option<serde_json::Map<String, serde_json::Value>> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(checkpoint).ok()?;
+    let mut len = [0u8; 8];
+    f.read_exact(&mut len).ok()?;
+    let n = u64::from_le_bytes(len) as usize;
+    // not-a-vram-size: a bound on a header length read out of the file.
+    if n == 0 || n > (64 << 20) {
+        return None;
+    }
+    let mut buf = vec![0u8; n];
+    f.read_exact(&mut buf).ok()?;
+    match serde_json::from_slice::<serde_json::Value>(&buf).ok()? {
+        serde_json::Value::Object(obj) => Some(obj),
+        _ => None,
+    }
+}
+
+/// The float format a component of a single-file checkpoint is held in on its device.
+///
+/// It is the format the float tensors under `prefix` are stored in, when they all share F32,
+/// F16 or BF16.
+/// Integer tensors do not count.
+/// Any other case is held in F32.
+pub fn held_dtype(checkpoint: &str, prefix: &str) -> DType {
+    let Some(obj) = header(checkpoint) else {
+        return DType::F32;
+    };
+    held_dtype_of(
+        obj.iter()
+            .filter(|(name, _)| *name != "__metadata__" && name.starts_with(prefix))
+            .map(|(_, info)| info.get("dtype").and_then(|d| d.as_str()).unwrap_or("")),
+    )
+}
+
+/// [`held_dtype`] from the stored format names of a component's tensors.
+fn held_dtype_of<'a>(stored: impl Iterator<Item = &'a str>) -> DType {
+    let mut held = None;
+    for name in stored {
+        let dtype = match name {
+            "F32" => DType::F32,
+            "F16" => DType::F16,
+            "BF16" => DType::BF16,
+            "BOOL" => continue,
+            n if n.starts_with('I') || n.starts_with('U') => continue,
+            _ => return DType::F32,
+        };
+        if held.is_some_and(|h| h != dtype) {
+            return DType::F32;
+        }
+        held = Some(dtype);
+    }
+    held.unwrap_or(DType::F32)
 }
 
 impl SdxlPipeline {
@@ -261,21 +297,19 @@ impl SdxlPipeline {
         };
         let to_tensor = |e: anyhow::Error| crate::tensor::Error(format!("{e:#}"));
 
-        // The text towers stay F32 even when the denoiser is halved. They were never
-        // the memory problem - the UNet was - and their embedding lookup has no
-        // half-precision path on the device, so a BF16 table falls back to the host
-        // and fails there. 0.8 B parameters at F32 is 3.2 GB, which fits beside a
-        // BF16 UNet; the conditioning they produce is converted at the UNet's door.
-        let text_dtype = DType::F32;
+        // The text towers are held in the format the checkpoint stores them in.
+        // The conditioning they produce is converted at the UNet's door.
+        let text_dtype = held_dtype(checkpoint, TEXT_PREFIX);
         // The towers see a fixed, short prompt window, so their scratch is a function
         // of that window and their own width - not of the image being rendered.
-        let text_bytes = component_bytes(checkpoint, TEXT_PREFIX, 4)
-            + crate::inference::place::runtime_demand::dit_activation_bytes(
-                CLIP_CONTEXT_TOKENS,
-                crate::inference::model::sdxl::unet::CONTEXT_DIM,
-                CLIP_CONTEXT_DIM / crate::inference::model::sdxl::unet::HEAD_DIM,
-                UNET_MLP_RATIO,
-            );
+        let text_bytes =
+            component_bytes(checkpoint, TEXT_PREFIX, text_dtype.size_in_bytes() as u64)
+                + crate::inference::place::runtime_demand::dit_activation_bytes(
+                    CLIP_CONTEXT_TOKENS,
+                    crate::inference::model::sdxl::unet::CONTEXT_DIM,
+                    CLIP_CONTEXT_DIM / crate::inference::model::sdxl::unet::HEAD_DIM,
+                    UNET_MLP_RATIO,
+                );
         let (text, _) = crate::inference::place::ladder::load_whole_on(
             "SDXL text",
             text_bytes,
@@ -883,6 +917,20 @@ mod tests {
     //!   cargo test --release -p loken --lib NAME -- --ignored --nocapture
     use super::*;
 
+    /// A component is held in the one float format its tensors are stored in.
+    /// Integer tensors do not count.
+    /// Mixed float formats, other float formats and an empty component are held in F32.
+    #[test]
+    fn a_component_is_held_in_the_float_format_it_stores() {
+        assert_eq!(held_dtype_of(["BF16", "BF16"].into_iter()), DType::BF16);
+        assert_eq!(held_dtype_of(["F16"].into_iter()), DType::F16);
+        assert_eq!(held_dtype_of(["F32", "F32"].into_iter()), DType::F32);
+        assert_eq!(held_dtype_of(["BF16", "F16"].into_iter()), DType::F32);
+        assert_eq!(held_dtype_of(["BF16", "I64"].into_iter()), DType::BF16);
+        assert_eq!(held_dtype_of(["BF16", "F64"].into_iter()), DType::F32);
+        assert_eq!(held_dtype_of(std::iter::empty()), DType::F32);
+    }
+
     /// Same negative the engine conditions SDXL against.
     const SDXL_NEGATIVE_FOR_TEST: &str =
         "blurry, low quality, distorted, deformed, watermark, text";
@@ -1043,13 +1091,13 @@ mod tests {
         let tok = walk_for(&dir.join("hub"), "tokenizer.json", "clip-vit-large-patch14")
             .expect("the CLIP tokenizer in the HF cache");
         let t0 = std::time::Instant::now();
-        // The engine runs this family in BF16; the gate follows it so a dtype the
-        // production path uses cannot pass here and fail there.
-        let dtype = if std::env::var("SDXL_F32").is_ok() {
-            DType::F32
-        } else {
-            DType::BF16
-        };
+        // The engine holds the UNet in the format the checkpoint stores.
+        // The gate follows it.
+        // A format the production path uses cannot pass here and fail there.
+        let dtype = held_dtype(
+            ckpt.to_str().unwrap(),
+            crate::inference::model::sdxl::unet::CHECKPOINT_PREFIX,
+        );
         println!("loading SDXL in {dtype:?}");
         let pipe = SdxlPipeline::load(
             ckpt.to_str().unwrap(),

@@ -24,8 +24,8 @@
 //!     [`ZImageTransformer2DModel::from_varbuilder`] over the DENSE native
 //!     safetensors `VarBuilder` - the production Tongyi-MAI/Z-Image-Turbo
 //!     checkpoint is F32 safetensors with no GGUF anywhere. Dense 2-D matmul
-//!     weights load at the builder dtype (BF16 on CUDA, matching the facade
-//!     production path) wrapped in [`layer::Linear`]; activations stay F32
+//!     weights load in the narrowest form exact for their stored values on a
+//!     card, and in F32 on the host, wrapped in [`layer::Linear`]; activations stay F32
 //!     (the substrate's elementwise/broadcast kernels are F32-native; halves
 //!     run via cast wrappers) and are cast to the weight dtype only at the
 //!     matmul boundary, so the GEMM precision matches the facade while the
@@ -353,6 +353,29 @@ pub unsafe fn from_files_placed(
     ZImageTransformer2DModel::build_across(cfg, &slots[0].0, Some((&slots, layer_slot)))
 }
 
+/// The bytes the tensors of `files` take on a card.
+///
+/// A matrix is held in the narrowest form exact for its stored values, as the load holds it.
+/// Every other tensor is held in F32.
+///
+/// # Safety
+/// The same mmap contract every load of these files takes.
+pub unsafe fn card_resident_bytes(files: &[&str]) -> Result<u64> {
+    let vb = unsafe { VarBuilder::from_files(files, DType::F32, &Device::Cpu) }?;
+    let mut total = 0u64;
+    for name in vb.tensor_names() {
+        let shape = vb.shape_of(&name)?;
+        let elems: usize = shape.iter().product();
+        let width = if shape.len() == 2 {
+            vb.narrowest_exact_dtype(&name)?.size_in_bytes()
+        } else {
+            DType::F32.size_in_bytes()
+        };
+        total += (elems * width) as u64;
+    }
+    Ok(total)
+}
+
 /// What one forward of a CANDIDATE PLACEMENT would hold, card by card.
 #[derive(Debug, Clone)]
 pub struct DryPlacedForward {
@@ -494,9 +517,8 @@ pub fn dry_forward_planned(
 pub enum Vb {
     /// GGUF: 2-D weights as [`QMatMul`], everything else dequantized F32.
     Q(QVarBuilder),
-    /// Dense safetensors: 2-D matmul weights at the builder dtype (BF16 on
-    /// CUDA - the facade production dtype), norms/biases/pad tokens at
-    /// exact F32 (the checkpoint dtype).
+    /// Dense safetensors: 2-D matmul weights in the form [`held_dtype`]
+    /// gives, norms/biases/pad tokens at exact F32.
     Dense(VarBuilder),
 }
 
@@ -543,19 +565,47 @@ fn weight(in_dim: usize, out_dim: usize, vb: &Vb) -> Result<Weight> {
             let w = vb
                 .to(DType::F32, &crate::tensor::Device::Cpu)
                 .get((out_dim, in_dim), "weight")?;
+            let held = held_dtype(vb, "weight")?;
             let wt = w.transpose(0, 1)?;
-            let wt = if vb.dtype() == DType::F32 {
+            let wt = if held == DType::F32 {
                 wt
             } else {
-                wt.to_dtype(vb.dtype())?
+                wt.to_dtype(held)?
             };
             let wt = wt.to_device(vb.device())?;
             Ok(Weight::Dense(
                 layer::Linear::from_transposed(wt, None)?,
-                vb.dtype(),
+                held,
             ))
         }
     }
+}
+
+/// The dtype the dense projection `name` is held in on the device of `vb`.
+///
+/// A builder at F32 off the host holds F32.
+/// The host and a narrower builder hold the narrowest form exact for every stored value.
+/// The host products read that form with F32 rows.
+/// A form narrower than the stored one goes in the conversion ledger.
+/// A dry builder performs no conversion and records none.
+fn held_dtype(vb: &VarBuilder, name: &str) -> Result<DType> {
+    if vb.dtype() == DType::F32 && !vb.device().is_cpu() {
+        return Ok(DType::F32);
+    }
+    let held = vb.narrowest_exact_dtype(name)?;
+    let (stored, width) = vb.stored_format(name)?;
+    if held.size_in_bytes() < width && !vb.device().is_dry() {
+        let elems: usize = vb.shape_of(name)?.iter().product();
+        crate::tensor::conversion::record_kept(
+            "projection",
+            stored,
+            held.as_str(),
+            (elems * width) as u64,
+            (elems * held.size_in_bytes()) as u64,
+            "every value is exact in the narrower form the products read",
+        );
+    }
+    Ok(held)
 }
 
 /// The fused research dialect packs Q|K|V into one `qkv` weight `[q+2kv, in]`
@@ -579,17 +629,18 @@ fn fused_qkv(
             let w = d
                 .to(DType::F32, &crate::tensor::Device::Cpu)
                 .get((q_dim + 2 * kv_dim, in_dim), "weight")?;
+            let held = held_dtype(d, "weight")?;
             let mut parts = Vec::with_capacity(3);
             for (offset, rows) in [(0, q_dim), (q_dim, kv_dim), (q_dim + kv_dim, kv_dim)] {
                 let wt = w.narrow(0, offset, rows)?.contiguous()?.transpose(0, 1)?;
-                let wt = if d.dtype() == DType::F32 {
+                let wt = if held == DType::F32 {
                     wt
                 } else {
-                    wt.to_dtype(d.dtype())?
+                    wt.to_dtype(held)?
                 };
                 let wt = wt.to_device(d.device())?;
                 parts.push(QLinear::new(
-                    Weight::Dense(layer::Linear::from_transposed(wt, None)?, d.dtype()),
+                    Weight::Dense(layer::Linear::from_transposed(wt, None)?, held),
                     None,
                     in_dim,
                     rows,
@@ -1028,6 +1079,17 @@ pub(crate) fn refiner_stack(
 }
 
 impl ZImageTransformerBlock {
+    /// The format each of its projections is held in.
+    pub(crate) fn held_formats(&self) -> Vec<String> {
+        let a = &self.attention;
+        [&a.to_q, &a.to_k, &a.to_v, &a.to_out]
+            .into_iter()
+            .chain(self.feed_forward.projections())
+            .chain(self.adaln_modulation.as_ref())
+            .map(QLinear::held_format)
+            .collect()
+    }
+
     pub fn new(cfg: &Config, modulation: bool, vb: Vb) -> Result<Self> {
         let dim = cfg.dim;
         // Both halves of the block sit between a pair of scales - one over what the half reads,
@@ -1710,6 +1772,27 @@ impl ZImageTransformer2DModel {
     pub fn config(&self) -> &Config {
         &self.cfg
     }
+
+    /// The formats the projections of the main blocks this substrate holds are held in.
+    ///
+    /// The formats are distinct, in the order first met, joined with `+`.
+    /// `None` when no main block is held here.
+    pub fn running_format(&self) -> Option<String> {
+        join_formats(self.layers.iter().flatten().flat_map(|b| b.held_formats()))
+    }
+}
+
+/// The distinct formats of `formats`, in the order first met, joined with `+`.
+///
+/// `None` for an empty set.
+pub(crate) fn join_formats(formats: impl IntoIterator<Item = String>) -> Option<String> {
+    let mut seen: Vec<String> = Vec::new();
+    for f in formats {
+        if !seen.contains(&f) {
+            seen.push(f);
+        }
+    }
+    (!seen.is_empty()).then(|| seen.join("+"))
 }
 
 // ---------------------------------------------------------------------------

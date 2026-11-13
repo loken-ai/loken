@@ -610,6 +610,11 @@ impl QKernelMatMul {
         self.lora.len()
     }
 
+    /// The block format the weight is held in.
+    pub fn dtype(&self) -> GgmlDType {
+        self.dtype
+    }
+
     /// Quantised matmul, plus any attached low-rank terms.
     ///
     /// Wrapping the base rather than editing it: the quantised forward has several

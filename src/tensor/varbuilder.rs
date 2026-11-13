@@ -197,6 +197,38 @@ impl VarBuilder {
         shape.ok_or_else(|| Error(format!("VarBuilder: no tensor `{path}`")))
     }
 
+    /// The narrowest float dtype exact for every stored value of `{prefix}.{name}`.
+    ///
+    /// The values are read on a dry builder too.
+    pub fn narrowest_exact_dtype(&self, name: &str) -> Result<DType> {
+        let path = self.resolved(name);
+        match &self.loader {
+            Source::Files(l) => l.narrowest_exact_dtype(&path),
+            Source::Memory(m) => {
+                let t = m
+                    .get(&path)
+                    .ok_or_else(|| Error(format!("VarBuilder: no tensor `{path}`")))?;
+                // CONVERSION: the stored values are widened to F32 to be read, and dropped once read.
+                let values = t.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+                Ok(super::conversion::narrowest_exact_dtype(&[&values]))
+            }
+        }
+    }
+
+    /// The format `{prefix}.{name}` is stored in and its element width in bytes.
+    ///
+    /// Read from the header without its data.
+    pub fn stored_format(&self, name: &str) -> Result<(String, usize)> {
+        let path = self.resolved(name);
+        let format = match &self.loader {
+            Source::Files(l) => l.stored_format(&path),
+            Source::Memory(m) => m
+                .get(&path)
+                .map(|t| (t.dtype().as_str().to_string(), t.dtype().size_in_bytes())),
+        };
+        format.ok_or_else(|| Error(format!("VarBuilder: no tensor `{path}`")))
+    }
+
     /// How many numbered children `{prefix}.{parent}.0`, `.1`, ... the file stores, counted
     /// up to the first missing index.
     pub fn count_children(&self, parent: &str) -> usize {
