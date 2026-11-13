@@ -1025,6 +1025,10 @@ impl PackedDev {
             (Vec::new(), 0.0)
         };
         let route = choose(&errors, &times, tick);
+        crate::inference::stage_prof::prof_record(
+            "card products: measure",
+            started.elapsed().as_nanos() as u64,
+        );
         let shown_errors = errors
             .routes
             .iter()

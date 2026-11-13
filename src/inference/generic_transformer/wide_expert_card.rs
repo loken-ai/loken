@@ -1119,6 +1119,12 @@ pub(super) mod gpu {
         }
     }
 
+    /// Records the time since `since` as stage `stage` of card `ordinal`.
+    fn card_stage(ordinal: usize, stage: &'static str, since: std::time::Instant) {
+        use crate::inference::stage_prof::{on_card, prof_record};
+        prof_record(on_card(ordinal, stage), since.elapsed().as_nanos() as u64);
+    }
+
     /// A run of kept experts queued on a card's stream.
     pub(crate) struct Launched {
         dev: Arc<CudaDevice>,
@@ -1135,13 +1141,22 @@ pub(super) mod gpu {
             let Some((_xq, _h, y)) = &self.held else {
                 return Ok(vec![Vec::new(); self.lens.len()]);
             };
-            let flat = self
-                .dev
-                .stream()
+            let ordinal = self.dev.ordinal();
+            let stream = self.dev.stream();
+            // Under the stage profile the kernels' end is waited for apart from the copy.
+            if crate::inference::stage_prof::stage_prof_enabled() {
+                let since = std::time::Instant::now();
+                let _ = stream.synchronize();
+                card_stage(ordinal, "experts: kept wait", since);
+            }
+            let since = std::time::Instant::now();
+            let flat = stream
                 .clone_dtoh(y)
                 .map_err(|e| Error::msg(format!("card expert outputs: {e}")))?;
+            card_stage(ordinal, "experts: kept down", since);
+            let since = std::time::Instant::now();
             let mut at = 0;
-            Ok(self
+            let outs = self
                 .lens
                 .iter()
                 .map(|&n| {
@@ -1149,7 +1164,9 @@ pub(super) mod gpu {
                     at += n;
                     part
                 })
-                .collect())
+                .collect();
+            card_stage(ordinal, "experts: kept split", since);
+            Ok(outs)
         }
     }
 

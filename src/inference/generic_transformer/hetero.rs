@@ -35,6 +35,16 @@ fn note_if_non_finite(stage: &str, x: &Tensor) {
     }
 }
 
+/// Records the time since `since` as stage `name` of a forward, then restarts `since`.
+///
+/// A no-op when the stage profile is off.
+fn forward_mark(name: &'static str, since: &mut std::time::Instant) {
+    if crate::inference::stage_prof::stage_prof_enabled() {
+        crate::inference::stage_prof::prof_record(name, since.elapsed().as_nanos() as u64);
+        *since = std::time::Instant::now();
+    }
+}
+
 /// `x` `[rows, heads, head_dim]` rotated by `layer`'s own tables, row `i` at `positions[i]`.
 ///
 /// Each row gets the rotation the layer's serial forward gives a token at that position.
@@ -2830,7 +2840,11 @@ impl GenericHeteroTransformer {
     ) -> Result<Tensor> {
         let (_, seq_len) = input_ids.dims2()?;
         self.spec_clear();
+        let mut since = std::time::Instant::now();
         let (hidden, ple_inputs) = self.embed_stage(input_ids, index_pos)?;
+        forward_mark("forward: embedding", &mut since);
+        let (hidden, on_cuda) = self.run_layers(hidden, ple_inputs, index_pos, seq_len)?;
+        forward_mark("forward: layers", &mut since);
         // A prompt chunk also goes through the draft head, so the head's cache holds the prompt
         // by the time the first token is drafted.
         if self.capture_feature && self.draft.is_some() && seq_len > 1 && !all_positions {
@@ -2838,11 +2852,12 @@ impl GenericHeteroTransformer {
                 .flatten_all()?
                 .to_dtype(crate::tensor::DType::U32)?
                 .to_vec1::<u32>()?;
-            let (hidden, on_cuda) = self.run_layers(hidden, ple_inputs, index_pos, seq_len)?;
             self.draft_ingest(&ids, &hidden, index_pos)?;
-            return self.output_stage(hidden, on_cuda, seq_len, all_positions);
+            forward_mark("forward: draft head", &mut since);
         }
-        self.forward_layers_and_output(hidden, ple_inputs, index_pos, seq_len, all_positions)
+        let out = self.output_stage(hidden, on_cuda, seq_len, all_positions);
+        forward_mark("forward: output", &mut since);
+        out
     }
 
     /// The n-gram table's rows for `input_ids`, which start at `index_pos`, gathered for the

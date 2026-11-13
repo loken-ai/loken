@@ -1104,10 +1104,19 @@ impl GenericTransformerLayer {
     /// One layer over the residual rows `x` `[1, seq, streams * hidden]` at positions
     /// `index_pos..`, on the host.
     pub(super) fn forward_sinkhorn(&mut self, x: &Tensor, index_pos: usize) -> Result<Tensor> {
-        let r = x
-            .to_device(&Device::Cpu)?
-            .to_dtype(DType::F32)?
-            .contiguous()?;
+        let started = std::time::Instant::now();
+        let out = self.forward_sinkhorn_rows(x, index_pos);
+        crate::inference::stage_prof::prof_record("layer", started.elapsed().as_nanos() as u64);
+        out
+    }
+
+    /// [`Self::forward_sinkhorn`] untimed as a whole.
+    fn forward_sinkhorn_rows(&mut self, x: &Tensor, index_pos: usize) -> Result<Tensor> {
+        let r = staged("layer: rows in", &Device::Cpu, false, || {
+            x.to_device(&Device::Cpu)?
+                .to_dtype(DType::F32)?
+                .contiguous()
+        })?;
         let seq = r.dims3()?.1;
         if self.spec_record {
             self.spec_begin(&r, None, index_pos)?;
@@ -1135,11 +1144,16 @@ impl GenericTransformerLayer {
                 let inputs: Vec<&Tensor> = inputs.iter().collect();
                 (Tensor::cat(&mids, 1)?, pres, Tensor::cat(&inputs, 1)?)
             } else {
-                let r = with_engram(block, &r, index_pos)?;
+                let r = staged("engram", &Device::Cpu, false, || {
+                    with_engram(block, &r, index_pos)
+                })?;
                 attention_half(block, &mut self.mixer, &r, &pre, index_pos)?
             }
         };
-        self.spec_input(&input);
+        staged("layer: draft input", &Device::Cpu, false, || {
+            self.spec_input(&input);
+            Ok(())
+        })?;
         let block = self
             .sinkhorn
             .as_ref()
@@ -1150,7 +1164,9 @@ impl GenericTransformerLayer {
                 .mixes_and_input(&mid, &attn_pre, &block.ffn_norm, block.eps)
         })?;
         let out = staged("experts", &Device::Cpu, false, || block.ffn.forward(&input))?;
-        let next = block.ffn_mix.post(&out, &mid, &mixes.post, &mixes.comb)?;
+        let next = staged("combine", &Device::Cpu, false, || {
+            block.ffn_mix.post(&out, &mid, &mixes.post, &mixes.comb)
+        })?;
         block.carry.put(index_pos, seq, mixes.pre);
         Ok(next)
     }
