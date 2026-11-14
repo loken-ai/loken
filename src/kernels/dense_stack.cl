@@ -75,10 +75,11 @@ inline uint hi_nibbles(uint v) {
 
 // An activation row quantised for the integer formats, one row after another:
 //   qz   the q8_0 codes, cols of them;
-//   dz   the scale of each block of 32;
-//   sk   the sum of the codes of each block of 32.
+//   ds   for each block of 32, its scale and its scale times the sum of its codes, side by
+//        side, so that one load reads both.
 #ifdef MEGA
-// In the single-launch layer the activations are in local memory.
+// In the single-launch layer the activations are in local memory: the scales in dz and the
+// sums of the codes in sk.
 typedef struct {
     __local const char* qz;
     __local const int* sk;
@@ -88,14 +89,12 @@ typedef struct {
 #else
 typedef struct {
     __global const char* qz;
-    __global const int* sk;
-    __global const float* dz;
+    __global const float2* ds;
 } XQ;
 #endif
 
 #define ACT_ARGS                                                                                 \
-    __global const float *x, __global const char *qz, __global const int *sk,                    \
-        __global const float *dz
+    __global const float *x, __global const char *qz, __global const float2 *ds
 
 // Weights meet activations in groups of 256 values, eight sub-blocks of 32. The eight lanes
 // of a row share a group: lane i takes values 4i..4i+3 of every sub-block, so the loads of a
@@ -121,19 +120,20 @@ typedef struct {
 
 #define EIGHT(F) F(0) F(1) F(2) F(3) F(4) F(5) F(6) F(7)
 
-// The code word, scale and (k-quant) code sum of sub-block C of row r.
+// The code word and scale of sub-block C of row r, and its scale with its scale times its
+// code sum, which the k-quants read.
 #if defined(MEGA)
 #define LW(r, C) (((__local const uint*)(xq.qz + 256 * g + 32 * (C)))[lane])
 #define LD(r, C) (xq.dz[8 * g + (C)])
-#define KS(r, C) ((float)xq.sk[8 * g + (C)])
+#define LDS(r, C) ((float2)(LD(r, C), LD(r, C) * (float)xq.sk[8 * g + (C)]))
 #elif R == 1
 #define LW(r, C) (xw[C])
 #define LD(r, C) (xs[C])
-#define KS(r, C) (xm[C])
+#define LDS(r, C) ((float2)(xs[C], xm[C]))
 #else
 #define LW(r, C) (((__global const uint*)(xq.qz + (ulong)(r) * cols + 256 * g + 32 * (C)))[lane])
-#define LD(r, C) (xq.dz[(ulong)(r) * nb + 8 * g + (C)])
-#define KS(r, C) ((float)xq.sk[(ulong)(r) * nb + 8 * g + (C)])
+#define LDS(r, C) (xq.ds[(ulong)(r) * nb + 8 * g + (C)])
+#define LD(r, C) (LDS(r, C).x)
 #endif
 
 // A prompt chunk: lane c of a group takes the whole of sub-block c, so that the eight integer
@@ -371,10 +371,10 @@ inline void grp_q4_k(GRP_ARGS) {
         UNROLL for (uint r = 0; r < R; r++) {                                                           \
             if (r >= nr) break;                                                                  \
             uint xv = LW(r, cc);                                                                 \
-            float s = KS(r, cc), y = LD(r, cc);                                                  \
-            accA[r] += y * (da * sca * (float)DP_US(wqa, xv, 0) - first * dma * mna * s);        \
+            float2 ys = LDS(r, cc);                                                              \
+            accA[r] += ys.x * da * sca * (float)DP_US(wqa, xv, 0) - first * dma * mna * ys.y;    \
             if (use_b)                                                                           \
-                accB[r] += y * (db * scb * (float)DP_US(wqb, xv, 0) - first * dmb * mnb * s);    \
+                accB[r] += ys.x * db * scb * (float)DP_US(wqb, xv, 0) - first * dmb * mnb * ys.y; \
         }                                                                                        \
     }
     EIGHT(STEP)
@@ -484,14 +484,15 @@ inline void grp_q6_k(GRP_ARGS) {
     UNROLL for (int c = 0; c < 8; c++) {                                                                \
         bool live = 8 * g + c < nb;                                                              \
         xw[c] = live ? ((__global const uint*)(qz + 256 * g + 32 * c))[lane] : 0;                \
-        xs[c] = live ? dz[8 * g + c] : 0.0f;                                                     \
+        xs[c] = live ? ds[8 * g + c].x : 0.0f;                                                   \
     }
 #define PRELOAD_KQUANT()                                                                         \
     UNROLL for (int c = 0; c < 8; c++) {                                                                \
         bool live = 8 * g + c < nb;                                                              \
         xw[c] = live ? ((__global const uint*)(qz + 256 * g + 32 * c))[lane] : 0;                \
-        xs[c] = live ? dz[8 * g + c] : 0.0f;                                                     \
-        xm[c] = live ? (float)sk[8 * g + c] : 0.0f;                                              \
+        float2 v = live ? ds[8 * g + c] : (float2)0;                                             \
+        xs[c] = v.x;                                                                             \
+        xm[c] = v.y;                                                                             \
     }
 #define PRELOAD_FLOAT()                                                                          \
     UNROLL for (int c = 0; c < 8; c++)                                                                  \
@@ -515,7 +516,7 @@ inline void grp_q6_k(GRP_ARGS) {
         uint rl = tid / (SLICES * LANES), sl = tid % (SLICES * LANES);                           \
         uint lane = sl % LANES, slice = sl / LANES;                                              \
         uint row0 = (get_group_id(0) * SLOTS + rl) * RB;                                         \
-        XQ xq = {qz, sk, dz};                                                                \
+        XQ xq = {qz, ds};                                                                \
         float acc[RB][R], none[R];                                                               \
         UNROLL for (uint i = 0; i < RB; i++)                                                            \
             UNROLL for (uint r = 0; r < R; r++) acc[i][r] = 0;                                          \
@@ -570,7 +571,7 @@ MATVEC(mv_q6_k, grp_q6_k, PRELOAD_KQUANT, NOTHING)
         uint rl = tid / (SLICES * LANES), sl = tid % (SLICES * LANES);                           \
         uint lane = sl % LANES, slice = sl / LANES;                                              \
         uint row0 = (get_group_id(0) * SLOTS + rl) * RB;                                         \
-        XQ xq = {qz, sk, dz};                                                                \
+        XQ xq = {qz, ds};                                                                \
         float ag[RB][R], au[RB][R];                                                              \
         UNROLL for (uint i = 0; i < RB; i++)                                                            \
             UNROLL for (uint r = 0; r < R; r++) { ag[i][r] = 0; au[i][r] = 0; }                         \
@@ -615,12 +616,11 @@ MATVEC_GATE_UP(gu_f32, grp_f32, PRELOAD_FLOAT, EXTRA_XC)
 MATVEC_GATE_UP(gu_q4_k, grp_q4_k, PRELOAD_KQUANT, NOTHING)
 MATVEC_GATE_UP(gu_q6_k, grp_q6_k, PRELOAD_KQUANT, NOTHING)
 
-// Quantises activation rows into q8_0 blocks of 32, each with its own scale, and the sum of
-// each block's codes. One workgroup of 256 per (row, block of 256 values); `cols` is the rows'
+// Quantises activation rows into q8_0 blocks of 32, each with its own scale, and the scale
+// times the sum of each block's codes. One workgroup of 256 per (row, block of 256 values); `cols` is the rows'
 // length.
 __kernel __attribute__((reqd_work_group_size(256, 1, 1))) void quant_rows(
-    __global const float* x, __global char* qz, __global int* sk, __global float* dz, uint cols,
-    uint x_off) {
+    __global const float* x, __global char* qz, __global float2* ds, uint cols, uint x_off) {
     __local float red[256];
     __local int isum[256];
     __local ushort dh[8];
@@ -653,8 +653,8 @@ __kernel __attribute__((reqd_work_group_size(256, 1, 1))) void quant_rows(
     }
     if (lane32 == 0 && blk * 8 + grp < nb) {
         ulong at = (ulong)row * nb + blk * 8 + grp;
-        dz[at] = vload_half(0, (__local half*)&dh[grp]);
-        sk[at] = isum[t];
+        float d = vload_half(0, (__local half*)&dh[grp]);
+        ds[at] = (float2)(d, d * (float)isum[t]);
     }
 }
 

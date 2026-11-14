@@ -217,8 +217,9 @@ The laptop also holds an RTX 4060 with 8 GB.
 The layers of a language model run on an Intel GPU through Intel's OpenCL runtime, and give the host's text (qwen3 0.6b, greedy).
 A model whose RoPE has frequency factors runs there too (llama3.2 1b).
 On the laptop's processor llama3.2 1b runs faster there than on the host.
-A prompt of about 1100 tokens reads at 309 tok/s against 192, and a decode runs at 29 tok/s against 28.
-qwen3 0.6b reads a prompt of about 1100 tokens slower there: 332 tok/s against 356.
+A prompt of about 1100 tokens reads at 342 tok/s against 195, and a decode runs at 38 tok/s against 28.
+qwen3 0.6b reads a prompt of about 1100 tokens slower there: 381 tok/s against 403.
+These rates were measured on 2026-11-14.
 
 Devices of Mesa's OpenCL platform are not offered for layers, because the layers measured wrong on them.
 A card that CUDA or ROCm drives is told by its PCI address and is not offered for OpenCL layers.

@@ -22,7 +22,7 @@ Major, by state then by priority:
 | Expert parallelism | Parallelism | A MoE model's experts are spread across cards when that is faster. | Done |
 | Prefill and decode on different instances | Serving | One instance reads the prompt and another one writes the answer. | Done |
 | Video input | Multimodal input | A vision model answers about a video as the reference implementation does. | Done |
-| OpenCL faster than the CPU | Performance | A language model and an image model run through OpenCL on an Intel GPU faster than on its CPU. | Started |
+| OpenCL faster than the CPU | Performance | A language model and an image model run through OpenCL on an Intel GPU faster than on its CPU. | Partial |
 | Qwen3-TTS | Audio | Qwen3-TTS speaks English and French through the speech route from its published checkpoint, within the bounds of the acceptance table, and a voice named, described in words or cloned from a clip stays the same from one request to the next. | Started |
 
 Smaller, by state then by priority:
@@ -90,6 +90,7 @@ Major, by state then by priority:
 | Tensor parallelism across machines | Cluster | A layer split across the cards of several machines runs faster than the layer cut alone. | Planned |
 | More weight formats | Models | GPTQ, AWQ and BitsAndBytes checkpoints load and answer as the reference implementation does. | Planned |
 | Mistral 4 Large | Models | The published Mistral 4 Large checkpoint loads and answers as the reference implementation does. | Planned |
+| OpenCL faster than the CPU for every model | Performance | qwen3 0.6b reads a long prompt through OpenCL on an Intel GPU faster than on its CPU, as llama3.2 1b does, and a whole Z-Image picture renders there faster than on its CPU. | Planned |
 
 Smaller, by state then by priority:
 

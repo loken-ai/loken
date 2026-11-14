@@ -8,6 +8,9 @@
 // `dense_stack.cl` runs as a dozen launches, with the same arithmetic.
 //
 // Built only for R == 1 and where the device has device-scope acquire/release atomics.
+//
+// Local memory holds the codes of MAXP columns of an activation. The FFN activation, when it
+// is wider, goes through it a piece at a time.
 
 #define NT 256
 // Spins of a workgroup at a barrier before it gives up: a round trip to the counter is a
@@ -107,14 +110,18 @@ inline void prep_x(__global const float* src, __global const float* nw, uint use
 
 // The partial dot products of lane `lane` of slice `slice` for row `row` of a matrix (and of
 // a second, when use_b) against the activations in local memory.
+// The groups of 256 columns from g0 up to g1 are read, and local memory holds the activations
+// from group g0 on.
 inline void row_partial(uint fmt, __global const uchar* wa, __global const uchar* wb, uint use_b,
-                        ulong total, uint row, uint cols, uint lane, uint slice, Smem m,
-                        float* accA, float* accB) {
+                        ulong total, uint row, uint cols, uint g0, uint g1, uint lane, uint slice,
+                        Smem m, float* accA, float* accB) {
     XQ xq = {m.qz, m.sk, m.dz, m.xf};
-    uint nb = cols / 32, ng = (nb + 7) / 8;
-    for (uint g = slice; g < ng; g += SLICES) {
-        ulong blk0 = (ulong)row * nb + 8 * g;
-        uint nsub = min(8u, nb - 8 * g);
+    uint nb = cols / 32, ng = min((nb + 7) / 8, g1);
+    for (uint gg = g0 + slice; gg < ng; gg += SLICES) {
+        ulong blk0 = (ulong)row * nb + 8 * gg;
+        uint nsub = min(8u, nb - 8 * gg);
+        // The group in local memory.
+        uint g = gg - g0;
         // The activations are read from local memory where the format needs them.
         const uint* xw = 0;
         const float* xs = 0;
@@ -169,9 +176,9 @@ __kernel __attribute__((reqd_work_group_size(NT, 1, 1))) void layer_step(
     __global float* att_parts) {
     volatile __global atomic_uint* ctr = counters + slot_no * 8;
     __local float xf[MAXH];
-    __local char qz[MAXC];
-    __local int sk[MAXC / 32];
-    __local float dz[MAXC / 32];
+    __local char qz[MAXP];
+    __local int sk[MAXP / 32];
+    __local float dz[MAXP / 32];
     __local float red[NT];
     __local float part[NT];
     __local float partb[NT];
@@ -197,7 +204,7 @@ __kernel __attribute__((reqd_work_group_size(NT, 1, 1))) void layer_step(
             uint fmt = fq, r = row;
             if (row >= q_dim + kv_dim) { w = wv; total = tv; fmt = fv; r = row - q_dim - kv_dim; }
             else if (row >= q_dim) { w = wk; total = tk; fmt = fk; r = row - q_dim; }
-            if (row < rows_total) row_partial(fmt, w, w, 0, total, r, hidden, lane, slice, m, acc, none);
+            if (row < rows_total) row_partial(fmt, w, w, 0, total, r, hidden, 0, ~0u, lane, slice, m, acc, none);
             part[t] = acc[0];
             barrier(CLK_LOCAL_MEM_FENCE);
             if (sl == 0 && row < rows_total) {
@@ -378,7 +385,7 @@ __kernel __attribute__((reqd_work_group_size(NT, 1, 1))) void layer_step(
     for (uint tile = wg_id; tile < (hidden + SL_SLOTS - 1) / SL_SLOTS; tile += nwg) {
         uint row = tile * SL_SLOTS + slot;
         float acc[1] = {0}, none[1] = {0};
-        if (row < hidden) row_partial(fo, wo, wo, 0, to, row, q_dim, lane, slice, m, acc, none);
+        if (row < hidden) row_partial(fo, wo, wo, 0, to, row, q_dim, 0, ~0u, lane, slice, m, acc, none);
         part[t] = acc[0];
         barrier(CLK_LOCAL_MEM_FENCE);
         if (sl == 0 && row < hidden) xout[row] = slot_sum(part, slot) + xin[row];
@@ -391,7 +398,7 @@ __kernel __attribute__((reqd_work_group_size(NT, 1, 1))) void layer_step(
     for (uint tile = wg_id; tile < (ffn + SL_SLOTS - 1) / SL_SLOTS; tile += nwg) {
         uint row = tile * SL_SLOTS + slot;
         float ag[1] = {0}, au[1] = {0};
-        if (row < ffn) row_partial(fg, wg, wu, 1, tg, row, hidden, lane, slice, m, ag, au);
+        if (row < ffn) row_partial(fg, wg, wu, 1, tg, row, hidden, 0, ~0u, lane, slice, m, ag, au);
         part[t] = ag[0];
         partb[t] = au[0];
         barrier(CLK_LOCAL_MEM_FENCE);
@@ -404,15 +411,20 @@ __kernel __attribute__((reqd_work_group_size(NT, 1, 1))) void layer_step(
     grid_sync(ctr, ++barrier_no, fail, SPIN_LIMIT);
 
     // ---- Phase 5: down projection and the residual, in place on the output.
-    prep_x(actbuf, (__global const float*)0, 0, 0, ffn, eps, m);
-    for (uint tile = wg_id; tile < (hidden + SL_SLOTS - 1) / SL_SLOTS; tile += nwg) {
-        uint row = tile * SL_SLOTS + slot;
-        float acc[1] = {0}, none[1] = {0};
-        if (row < hidden) row_partial(fd, wd, wd, 0, td, row, ffn, lane, slice, m, acc, none);
-        part[t] = acc[0];
-        barrier(CLK_LOCAL_MEM_FENCE);
-        if (sl == 0 && row < hidden) xout[row] += slot_sum(part, slot);
-        barrier(CLK_LOCAL_MEM_FENCE);
+    // The activations go through local memory MAXP columns at a time.
+    for (uint c0 = 0; c0 < ffn; c0 += MAXP) {
+        prep_x(actbuf + c0, (__global const float*)0, 0, 0, min((uint)MAXP, ffn - c0), eps, m);
+        for (uint tile = wg_id; tile < (hidden + SL_SLOTS - 1) / SL_SLOTS; tile += nwg) {
+            uint row = tile * SL_SLOTS + slot;
+            float acc[1] = {0}, none[1] = {0};
+            if (row < hidden)
+                row_partial(fd, wd, wd, 0, td, row, ffn, c0 / 256, (c0 + MAXP) / 256, lane, slice,
+                            m, acc, none);
+            part[t] = acc[0];
+            barrier(CLK_LOCAL_MEM_FENCE);
+            if (sl == 0 && row < hidden) xout[row] += slot_sum(part, slot);
+            barrier(CLK_LOCAL_MEM_FENCE);
+        }
     }
 }
 
@@ -421,9 +433,9 @@ __kernel __attribute__((reqd_work_group_size(NT, 1, 1))) void head_step(
     __global const float* xin, __global const float* norm, __global const uchar* w, __global float* logits,
     uint fmt, ulong total, uint rows, uint hidden, float eps) {
     __local float xf[MAXH];
-    __local char qz[MAXC];
-    __local int sk[MAXC / 32];
-    __local float dz[MAXC / 32];
+    __local char qz[MAXP];
+    __local int sk[MAXP / 32];
+    __local float dz[MAXP / 32];
     __local float red[NT];
     __local float part[NT];
     Smem m = {xf, qz, sk, dz, red};
@@ -433,7 +445,7 @@ __kernel __attribute__((reqd_work_group_size(NT, 1, 1))) void head_step(
     for (uint tile = get_group_id(0); tile < (rows + SL_SLOTS - 1) / SL_SLOTS; tile += get_num_groups(0)) {
         uint row = tile * SL_SLOTS + slot;
         float acc[1] = {0}, none[1] = {0};
-        if (row < rows) row_partial(fmt, w, w, 0, total, row, hidden, lane, slice, m, acc, none);
+        if (row < rows) row_partial(fmt, w, w, 0, total, row, hidden, 0, ~0u, lane, slice, m, acc, none);
         part[t] = acc[0];
         barrier(CLK_LOCAL_MEM_FENCE);
         if (sl == 0 && row < rows) logits[row] = slot_sum(part, slot);

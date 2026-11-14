@@ -171,6 +171,30 @@ impl OpenClLayers {
         self.segments.iter().all(|s| s.stack.single_launch())
     }
 
+    /// The tile of the prompt attention of the first segment at `pos`, 0 for a workgroup to a
+    /// (row, head), the tiles it can run, and a way to keep one.
+    #[cfg(all(test, feature = "opencl"))]
+    pub(crate) fn prompt_tile(&self, pos: usize) -> usize {
+        self.segments
+            .first()
+            .map_or(0, |s| s.stack.prompt_tile(pos))
+    }
+
+    #[cfg(all(test, feature = "opencl"))]
+    pub(crate) fn prompt_tiles(&self) -> Vec<usize> {
+        self.segments
+            .first()
+            .map_or(Vec::new(), |s| s.stack.prompt_tiles())
+    }
+
+    #[cfg(all(test, feature = "opencl"))]
+    pub(crate) fn set_prompt_tile(&mut self, tile: usize) -> anyhow::Result<()> {
+        for s in &mut self.segments {
+            s.stack.set_prompt_tile(tile)?;
+        }
+        Ok(())
+    }
+
     /// Starts tracing the stages of every segment.
     #[cfg(all(test, feature = "opencl"))]
     pub(crate) fn start_trace(&mut self) {

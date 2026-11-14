@@ -729,6 +729,8 @@ fn opencl_single_launch_layer_by_layer() {
 
 /// Where the time of a prompt goes on each OpenCL device: each stage of the stack waits for the
 /// device and takes its time, against the same prompt untraced.
+/// A short and a long prompt are traced with the prompt attention the stack settled on, then
+/// with a workgroup to a (row, head), then with each tile the device runs.
 #[test]
 #[ignore = "speed bench"]
 fn opencl_prompt_trace() {
@@ -736,36 +738,52 @@ fn opencl_prompt_trace() {
     let tokenizer =
         crate::inference::engine::llm_engine::build_tokenizer_from_gguf(&self_content(&fx.mmap))
             .unwrap();
-    let text = TEXT.repeat(24);
-    let prompt = tokenizer
-        .encode(text.as_str(), false)
-        .unwrap()
-        .get_ids()
-        .to_vec();
-    for d in devices() {
-        let mut m = fx.build(&fx.on_opencl(d.0, fx.n_layers));
-        m.forward(&ids(&prompt), 0).unwrap();
-        let start = std::time::Instant::now();
-        m.forward(&ids(&prompt), 0).unwrap();
-        let plain = start.elapsed().as_secs_f64();
-        m.opencl.start_trace();
-        let start = std::time::Instant::now();
-        m.forward(&ids(&prompt), 0).unwrap();
-        let traced = start.elapsed().as_secs_f64() * 1e3;
-        let stages = m.opencl.take_trace();
-        let in_stack = stages.iter().map(|s| s.1).sum::<f64>() / 1e3;
-        println!(
-            "{TAG} on {}: {} tokens, {:.1} tok/s untraced; traced {traced:.0} ms, {in_stack:.0} ms in the stack",
-            d.1,
-            prompt.len(),
-            prompt.len() as f64 / plain
-        );
-        for (name, us, n) in stages {
-            println!(
-                "  {name:<20} {:>9.1} ms {n:>6} passes {:>9.1} us a pass",
-                us / 1e3,
-                us / n as f64
+    for repeat in [6, 58] {
+        let text = TEXT.repeat(repeat);
+        let prompt = tokenizer
+            .encode(text.as_str(), false)
+            .unwrap()
+            .get_ids()
+            .to_vec();
+        for d in devices() {
+            let mut m = fx.build(&fx.on_opencl(d.0, fx.n_layers));
+            let label = format!(
+                "{TAG} on {}, settled (tile {} at the first chunk, {} at the last)",
+                d.1,
+                m.opencl.prompt_tile(0),
+                m.opencl.prompt_tile(prompt.len())
             );
+            trace_prompt(&label, &mut m, &prompt);
+            for tile in std::iter::once(0).chain(m.opencl.prompt_tiles()) {
+                m.opencl.set_prompt_tile(tile).unwrap();
+                trace_prompt(&format!("{TAG} on {}, tile {tile}", d.1), &mut m, &prompt);
+            }
         }
+    }
+}
+
+/// Runs `prompt` once to warm, once untraced and once traced, and prints each stage.
+fn trace_prompt(label: &str, m: &mut GenericHeteroTransformer, prompt: &[u32]) {
+    m.forward(&ids(prompt), 0).unwrap();
+    let start = std::time::Instant::now();
+    m.forward(&ids(prompt), 0).unwrap();
+    let plain = start.elapsed().as_secs_f64();
+    m.opencl.start_trace();
+    let start = std::time::Instant::now();
+    m.forward(&ids(prompt), 0).unwrap();
+    let traced = start.elapsed().as_secs_f64() * 1e3;
+    let stages = m.opencl.take_trace();
+    let in_stack = stages.iter().map(|s| s.1).sum::<f64>() / 1e3;
+    println!(
+        "{label}: {} tokens, {:.1} tok/s untraced; traced {traced:.0} ms, {in_stack:.0} ms in the stack",
+        prompt.len(),
+        prompt.len() as f64 / plain
+    );
+    for (name, us, n) in stages {
+        println!(
+            "  {name:<20} {:>9.1} ms {n:>6} passes {:>9.1} us a pass",
+            us / 1e3,
+            us / n as f64
+        );
     }
 }

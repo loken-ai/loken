@@ -395,11 +395,14 @@ impl Mega {
             include_str!("../../kernels/dense_stack.cl"),
             include_str!("../../kernels/dense_mega.cl")
         );
+        // Local memory holds the codes of the hidden state or of the attention output whole.
+        // The FFN activation goes through it in pieces of that size.
+        let held = spec.hidden.max(q_dim).div_ceil(256) * 256;
         let program = Program::create_and_build_from_source(
             ctx,
             &source,
             &format!(
-                "-cl-std=CL3.0 -DMEGA -DR=1 -DSLICES={SLICES} -DRB=1 -DMAXC={widest} -DMAXH={}",
+                "-cl-std=CL3.0 -DMEGA -DR=1 -DSLICES={SLICES} -DRB=1 -DMAXP={held} -DMAXH={}",
                 spec.hidden
             ),
         )
@@ -440,13 +443,111 @@ impl Mega {
     }
 }
 
+/// Threads of a workgroup of the prompt attention.
+const ATTENTION_THREADS: usize = 128;
+
+/// The prompt attention: a workgroup reads each tile of keys once for a tile of queries, and the
+/// key tiles are cut into slices over workgroups so that a chunk fills the device.
+struct PromptAttention {
+    tiles: Kernel,
+    merge: Kernel,
+    /// Queries of a workgroup, and keys of a tile.
+    tile: usize,
+    /// The device's compute units: a chunk's workgroups are at least as many where the keys
+    /// allow it.
+    units: usize,
+    /// The sums of each slice of each workgroup, for the largest grid.
+    parts: Buffer<f32>,
+}
+
+impl PromptAttention {
+    /// The programs of every tile, a power of two, whose queries, keys, values and scores fit
+    /// the device's local memory.
+    /// The smallest tile has a score for every other thread of a workgroup.
+    fn candidates(ctx: &Context, dev: &Device, spec: &DenseSpec) -> Result<Vec<Self>> {
+        let local = dev.local_mem_size().unwrap_or(0) as usize;
+        let hd = spec.head_dim;
+        let need = |t: usize| (3 * t * hd + t * t + 3 * t) * 4;
+        let mut out = Vec::new();
+        let mut tile = 1;
+        while 2 * tile * tile < ATTENTION_THREADS {
+            tile *= 2;
+        }
+        while tile <= ATTENTION_THREADS && need(tile) <= local {
+            out.push(Self::with_tile(ctx, dev, spec, tile)?);
+            tile *= 2;
+        }
+        Ok(out)
+    }
+
+    fn with_tile(ctx: &Context, dev: &Device, spec: &DenseSpec, tile: usize) -> Result<Self> {
+        let program = Program::create_and_build_from_source(
+            ctx,
+            include_str!("../../kernels/prompt_attention.cl"),
+            &format!("-DTILE={tile} -DHEAD_DIM={}", spec.head_dim),
+        )
+        .map_err(|e| anyhow!("{e}"))?;
+        let units = (dev.max_compute_units().unwrap_or(1) as usize).max(1);
+        let widest = Self::query_tiles(spec, CHUNK, tile) * spec.n_kv;
+        Ok(Self {
+            tiles: Kernel::create(&program, "prompt_attention")?,
+            merge: Kernel::create(&program, "merge_slices")?,
+            tile,
+            units,
+            parts: scratch(ctx, (units + widest) * tile * (spec.head_dim + 2))?,
+        })
+    }
+
+    /// Workgroups of queries of one key head over `rows` rows.
+    fn query_tiles(spec: &DenseSpec, rows: usize, tile: usize) -> usize {
+        (rows * (spec.n_head / spec.n_kv)).div_ceil(tile)
+    }
+
+    /// The slices the key tiles of a chunk of `rows` rows at `pos` are cut into, and the key
+    /// tiles of each slice.
+    fn slices(&self, spec: &DenseSpec, rows: usize, pos: usize) -> (usize, usize) {
+        let base = Self::query_tiles(spec, rows, self.tile) * spec.n_kv;
+        let key_tiles = (pos + rows).div_ceil(self.tile);
+        let slices = self.units.div_ceil(base).clamp(1, key_tiles);
+        let per_slice = key_tiles.div_ceil(slices);
+        (key_tiles.div_ceil(per_slice), per_slice)
+    }
+}
+
+/// The line of each attention kernel: its time at the first position and its growth with each
+/// position after.
+/// `rounds[r][k]` holds kernel `k`'s times at the first position and at `far` in round `r`.
+/// Each kernel keeps its least time at each position over the rounds.
+fn attention_lines(rounds: &[Vec<(f64, f64)>], far: usize) -> Vec<(f64, f64)> {
+    let n = rounds.iter().map(Vec::len).max().unwrap_or(0);
+    (0..n)
+        .map(|k| {
+            let least = |at: fn(&(f64, f64)) -> f64| {
+                rounds
+                    .iter()
+                    .filter_map(|r| r.get(k).map(at))
+                    .fold(f64::MAX, f64::min)
+            };
+            let (near, far_t) = (least(|t| t.0), least(|t| t.1));
+            (near, (far_t - near) / far.max(1) as f64)
+        })
+        .collect()
+}
+
+/// The index of the line that is lowest at `pos`, 0 without lines.
+fn cheapest_line(lines: &[(f64, f64)], pos: usize) -> usize {
+    let cost = |&(at0, per): &(f64, f64)| at0 + per * pos as f64;
+    (0..lines.len())
+        .min_by(|&a, &b| cost(&lines[a]).total_cmp(&cost(&lines[b])))
+        .unwrap_or(0)
+}
+
 /// An activation row quantised for the integer formats: the codes and scales the kernels read,
 /// for up to `CHUNK` rows of `cols` values.
 struct Quant {
     qz: Buffer<u8>,
-    /// Integer sums, held in float-sized words.
-    sk: Buffer<f32>,
-    dz: Buffer<f32>,
+    /// For each block of 32, its scale, then its scale times the sum of its codes.
+    ds: Buffer<f32>,
 }
 
 impl Quant {
@@ -464,8 +565,7 @@ impl Quant {
         };
         Ok(Self {
             qz: bytes(rows * cols)?,
-            sk: scratch(ctx, rows * cols.div_ceil(32))?,
-            dz: scratch(ctx, rows * cols.div_ceil(32))?,
+            ds: scratch(ctx, 2 * rows * cols.div_ceil(32))?,
         })
     }
 }
@@ -537,6 +637,11 @@ pub struct OpenClStack {
     mega_on: bool,
     /// Whether a prompt chunk runs the gate and up projections in their fused kernel.
     fused_chunk: bool,
+    /// The tiled attention programs of a prompt chunk.
+    prompt_tiles: Vec<PromptAttention>,
+    /// The time of a chunk's attention at the first position and its growth with each position
+    /// after: first with a workgroup to a (row, head), then with each tiled program.
+    attention_cost: Vec<(f64, f64)>,
     /// The time of each stage, while a test traces the stack.
     #[cfg(test)]
     trace: std::sync::Mutex<Option<Trace>>,
@@ -571,8 +676,7 @@ fn launch_quant(
         Ok(ExecuteKernel::new(kernels.get("quant_rows"))
             .set_arg(x)
             .set_arg(&q.qz)
-            .set_arg(&q.sk)
-            .set_arg(&q.dz)
+            .set_arg(&q.ds)
             .set_arg(&(cols as u32))
             .set_arg(&0u32)
             .set_global_work_size(blocks * 256)
@@ -602,8 +706,7 @@ fn launch_mat_vec(
             .set_arg(&m.buf)
             .set_arg(x.f)
             .set_arg(&x.q.qz)
-            .set_arg(&x.q.sk)
-            .set_arg(&x.q.dz)
+            .set_arg(&x.q.ds)
             .set_arg(out)
             .set_arg(&(m.cols as u32))
             .set_arg(&(m.rows as u32))
@@ -690,10 +793,16 @@ impl OpenClStack {
                 None
             }
         };
+        let prompt_tiles = PromptAttention::candidates(&ctx, &dev, &spec).unwrap_or_else(|e| {
+            tracing::info!("OpenCL prompt attention reads the keys for each row: {e}");
+            Vec::new()
+        });
         let mut stack = Self {
             mega_on: mega.is_some(),
             mega,
             fused_chunk: true,
+            prompt_tiles,
+            attention_cost: Vec::new(),
             cos: upload_f32(&ctx, cos)?,
             sin: upload_f32(&ctx, sin)?,
             table_positions: cos.len() / half,
@@ -724,6 +833,7 @@ impl OpenClStack {
         };
         stack.settle_grid();
         stack.settle_gate_up()?;
+        stack.settle_attention()?;
         if let Some(m) = &stack.mega {
             tracing::debug!(
                 "single-launch layer: {} workgroups of {MEGA_THREADS}, {} bytes of local memory",
@@ -1122,20 +1232,9 @@ impl OpenClStack {
                 .enqueue_nd_range(&self.queue)?;
         }
         self.stage("qkv post")?;
-        unsafe {
-            ExecuteKernel::new(kern.get("attention_rows"))
-                .set_arg(&self.q)
-                .set_arg(&l.cache_k)
-                .set_arg(&l.cache_v)
-                .set_arg(&self.att)
-                .set_arg(&(s.n_head as u32))
-                .set_arg(&(s.n_kv as u32))
-                .set_arg(&(s.head_dim as u32))
-                .set_arg(&s.attn_scale)
-                .set_arg(&(pos as u32))
-                .set_global_work_size(c * s.n_head * 128)
-                .set_local_work_size(128)
-                .enqueue_nd_range(&self.queue)?;
+        match self.attention_choice(c, pos) {
+            0 => self.attention_rows(li, c, pos)?,
+            k => self.attention_tiles(&self.prompt_tiles[k - 1], li, c, pos)?,
         }
         self.stage("attention")?;
         self.quantize(&self.att, &self.qa, c, s.n_head * s.head_dim)?;
@@ -1166,6 +1265,152 @@ impl OpenClStack {
         self.stage("down")
     }
 
+    /// The attention of `c` rows at `pos` over layer `li`'s cache, a workgroup to a (row, head)
+    /// reading every key it sees.
+    fn attention_rows(&self, li: usize, c: usize, pos: usize) -> Result<()> {
+        let s = &self.spec;
+        let l = &self.layers[li];
+        unsafe {
+            ExecuteKernel::new(self.kernels(c).get("attention_rows"))
+                .set_arg(&self.q)
+                .set_arg(&l.cache_k)
+                .set_arg(&l.cache_v)
+                .set_arg(&self.att)
+                .set_arg(&(s.n_head as u32))
+                .set_arg(&(s.n_kv as u32))
+                .set_arg(&(s.head_dim as u32))
+                .set_arg(&s.attn_scale)
+                .set_arg(&(pos as u32))
+                .set_global_work_size(c * s.n_head * 128)
+                .set_local_work_size(128)
+                .enqueue_nd_range(&self.queue)?;
+        }
+        Ok(())
+    }
+
+    /// The attention of `c` rows at `pos` over layer `li`'s cache, each tile of keys read once
+    /// for a tile of queries, and the slices of the keys added up when there are several.
+    fn attention_tiles(&self, p: &PromptAttention, li: usize, c: usize, pos: usize) -> Result<()> {
+        let s = &self.spec;
+        let l = &self.layers[li];
+        let (slices, per_slice) = p.slices(s, c, pos);
+        let groups = PromptAttention::query_tiles(s, c, p.tile) * s.n_kv * slices;
+        unsafe {
+            ExecuteKernel::new(&p.tiles)
+                .set_arg(&self.q)
+                .set_arg(&l.cache_k)
+                .set_arg(&l.cache_v)
+                .set_arg(&self.att)
+                .set_arg(&p.parts)
+                .set_arg(&(s.n_head as u32))
+                .set_arg(&(s.n_kv as u32))
+                .set_arg(&(c as u32))
+                .set_arg(&s.attn_scale)
+                .set_arg(&(pos as u32))
+                .set_arg(&(slices as u32))
+                .set_arg(&(per_slice as u32))
+                .set_global_work_size(groups * ATTENTION_THREADS)
+                .set_local_work_size(ATTENTION_THREADS)
+                .enqueue_nd_range(&self.queue)?;
+            if slices > 1 {
+                ExecuteKernel::new(&p.merge)
+                    .set_arg(&p.parts)
+                    .set_arg(&self.att)
+                    .set_arg(&(s.n_head as u32))
+                    .set_arg(&(s.n_kv as u32))
+                    .set_arg(&(slices as u32))
+                    .set_global_work_size(c * s.n_head * ATTENTION_THREADS)
+                    .set_local_work_size(ATTENTION_THREADS)
+                    .enqueue_nd_range(&self.queue)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The attention kernel for `c` rows at `pos`: 0 for a workgroup to a (row, head), else
+    /// one more than the tiled program's index. The cheapest at `pos` by the settled costs.
+    fn attention_choice(&self, c: usize, pos: usize) -> usize {
+        if c == 1 {
+            return 0;
+        }
+        cheapest_line(&self.attention_cost, pos)
+    }
+
+    /// The time of attention kernel `k` over a full chunk of the first layer at `pos`.
+    fn time_attention(&self, k: usize, pos: usize) -> Result<f64> {
+        let start = std::time::Instant::now();
+        match k {
+            0 => self.attention_rows(0, CHUNK, pos)?,
+            k => self.attention_tiles(&self.prompt_tiles[k - 1], 0, CHUNK, pos)?,
+        }
+        self.queue.finish()?;
+        Ok(start.elapsed().as_secs_f64())
+    }
+
+    /// Times each attention kernel over a full chunk of the first layer at its first position and
+    /// at the last chunk its first cache holds, and keeps the line through both.
+    ///
+    /// Each round times every kernel once at both positions.
+    /// Each round starts with the kernel after the one the previous round started with.
+    /// No kernel is always the first on a device that has just woken.
+    /// The first round also builds and loads the kernels.
+    fn settle_attention(&mut self) -> Result<()> {
+        let Some(cap) = self.layers.first().map(|l| l.cache_cap) else {
+            return Ok(());
+        };
+        let far = cap.saturating_sub(CHUNK);
+        let n = self.prompt_tiles.len() + 1;
+        let mut rounds = Vec::new();
+        for round in 0..3 {
+            let mut times = vec![(0.0, 0.0); n];
+            for i in 0..n {
+                let k = (round + i) % n;
+                times[k] = (self.time_attention(k, 0)?, self.time_attention(k, far)?);
+            }
+            rounds.push(times);
+        }
+        self.attention_cost = attention_lines(&rounds, far);
+        tracing::debug!(
+            "OpenCL prompt attention: costs {:?} for the rows and tiles {:?}",
+            self.attention_cost,
+            self.prompt_tiles.iter().map(|p| p.tile).collect::<Vec<_>>()
+        );
+        Ok(())
+    }
+
+    /// Keeps only the attention with a tile of `tile` queries and keys, or with a workgroup to
+    /// a (row, head) when `tile` is 0.
+    #[cfg(test)]
+    pub(crate) fn set_prompt_tile(&mut self, tile: usize) -> Result<()> {
+        if tile == 0 {
+            self.prompt_tiles.clear();
+            self.attention_cost = vec![(0.0, 0.0)];
+        } else {
+            let id = self.queue.device()?;
+            let dev = Device::new(id);
+            self.prompt_tiles = vec![PromptAttention::with_tile(
+                &self.ctx, &dev, &self.spec, tile,
+            )?];
+            self.attention_cost = vec![(f64::MAX, 0.0), (0.0, 0.0)];
+        }
+        Ok(())
+    }
+
+    /// The tile of the attention a chunk at `pos` runs, 0 for a workgroup to a (row, head).
+    #[cfg(test)]
+    pub(crate) fn prompt_tile(&self, pos: usize) -> usize {
+        match self.attention_choice(CHUNK, pos) {
+            0 => 0,
+            k => self.prompt_tiles[k - 1].tile,
+        }
+    }
+
+    /// The tiles the stack can run, smallest first.
+    #[cfg(test)]
+    pub(crate) fn prompt_tiles(&self) -> Vec<usize> {
+        self.prompt_tiles.iter().map(|p| p.tile).collect()
+    }
+
     /// The gate and up projections of layer `li` over `c` rows, with the SiLU, into `act`: in
     /// the one kernel that reads both when `fused`, else in a launch for each and one for the
     /// SiLU.
@@ -1185,8 +1430,7 @@ impl OpenClStack {
                     .set_arg(&l.up.buf)
                     .set_arg(&self.xn)
                     .set_arg(&self.qn.qz)
-                    .set_arg(&self.qn.sk)
-                    .set_arg(&self.qn.dz)
+                    .set_arg(&self.qn.ds)
                     .set_arg(&self.act)
                     .set_arg(&(l.gate.cols as u32))
                     .set_arg(&(l.gate.rows as u32))
@@ -1563,6 +1807,29 @@ mod tests {
         assert!(!heads_grouped(2, 8));
     }
 
+    /// The attention kernel a chunk runs comes from each kernel's least time over the rounds.
+    #[test]
+    fn attention_choice_keeps_the_least_time_of_each_kernel() {
+        // Kernel 0 is the first of round 0 on a slow device, and the cheapest once it is warm.
+        // Kernel 1 grows half as fast with the position.
+        let rounds = vec![
+            vec![(9.0, 109.0), (2.0, 52.0)],
+            vec![(1.0, 101.0), (2.0, 52.0)],
+            vec![(1.5, 101.5), (2.5, 52.5)],
+        ];
+        let lines = attention_lines(&rounds, 100);
+        assert_eq!(lines, vec![(1.0, 1.0), (2.0, 0.5)]);
+        assert_eq!(cheapest_line(&lines, 0), 0);
+        assert_eq!(cheapest_line(&lines, 1), 0);
+        assert_eq!(cheapest_line(&lines, 3), 1);
+        assert_eq!(cheapest_line(&lines, 100), 1);
+        // A kernel timed in a single round only.
+        assert_eq!(attention_lines(&rounds[..1], 100)[0], (9.0, 1.0));
+        assert_eq!(cheapest_line(&attention_lines(&rounds[..1], 100), 0), 1);
+        assert_eq!(cheapest_line(&[], 7), 0);
+        assert!(attention_lines(&[], 100).is_empty());
+    }
+
     /// The rate the device reads a large buffer at, and the host reads memory at: the bound
     /// on a decode step, which reads each weight once.
     #[test]
@@ -1744,17 +2011,13 @@ mod tests {
             launch_quant(&queue, &kernels, &xb, &q, rows, cols).unwrap();
             queue.finish().unwrap();
             let mut qz = vec![0u8; rows * cols];
-            let mut dz = vec![0f32; rows * cols / 32];
-            let mut sk = vec![0f32; rows * cols / 32];
+            let mut ds = vec![0f32; 2 * rows * cols / 32];
             unsafe {
                 queue
                     .enqueue_read_buffer(&q.qz, CL_BLOCKING, 0, &mut qz, &[])
                     .unwrap();
                 queue
-                    .enqueue_read_buffer(&q.dz, CL_BLOCKING, 0, &mut dz, &[])
-                    .unwrap();
-                queue
-                    .enqueue_read_buffer(&q.sk, CL_BLOCKING, 0, &mut sk, &[])
+                    .enqueue_read_buffer(&q.ds, CL_BLOCKING, 0, &mut ds, &[])
                     .unwrap();
             }
             let (mut flips, mut total) = (0, 0);
@@ -1764,14 +2027,15 @@ mod tests {
                 BlockQ8_0::quantize(row, &mut z);
                 for (b, blk) in z.iter().enumerate() {
                     let at = r * (cols / 32) + b;
-                    assert_eq!(blk.d.to_f32(), dz[at], "q8_0 scale {r}/{b}");
+                    let d = blk.d.to_f32();
+                    assert_eq!(d, ds[2 * at], "q8_0 scale {r}/{b}");
                     let codes = &qz[r * cols + b * 32..][..32];
                     for (&got, &c) in codes.iter().zip(&blk.qs) {
                         total += 1;
                         flips += (got as i8 != c) as usize;
                     }
                     let sum: i32 = codes.iter().map(|&c| c as i8 as i32).sum();
-                    assert_eq!(sum, sk[at].to_bits() as i32, "q8_0 sum {r}/{b}");
+                    assert_eq!(d * sum as f32, ds[2 * at + 1], "q8_0 sum {r}/{b}");
                 }
             }
             println!("device {i}: {flips} of {total} codes differ from the host's");
