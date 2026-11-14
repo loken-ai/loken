@@ -867,7 +867,10 @@ impl LlmEngine {
                 let step_start = std::time::Instant::now();
                 generated.push(next_token);
                 recent_tokens.push(next_token);
-                if pld_enabled { pld_cache.push(next_token); }
+                if pld_enabled {
+                    pld_cache.push(next_token);
+                    pld_cost.plain_token(next_token, || pld_cache.lookup());
+                }
                 // diag: fingerprint state at the start of the first
                 // decode iteration. If next_token + pos are identical across
                 // iters but the FORWARD output differs, the bug is in the

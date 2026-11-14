@@ -1881,6 +1881,7 @@ impl LlmEngine {
                 // pushed to recent_tokens; pld_cache needs its own push).
                 if pld_enabled {
                     pld_cache.push(next_token);
+                    pld_cost.plain_token(next_token, || pld_cache.lookup());
                 }
 
                 if token_count >= max_tokens {

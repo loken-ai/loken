@@ -618,6 +618,11 @@ pub(crate) struct PldCost {
     backoff: u32,
     /// A hold ran since the last round: the next round is the trial that ends it.
     trial: bool,
+    /// The lookup's draft at a held step, and how many of its tokens the plain steps wrote.
+    shadow: Option<(Vec<u32>, usize)>,
+    /// Seconds that rounds over the drafts matched during this wait would have saved against
+    /// the plain steps, a draft that would have lost counting against them.
+    shadow_gain: f64,
 }
 
 /// Plain steps between the trials of a lookup whose rounds were losing, doubled at each trial
@@ -636,8 +641,13 @@ impl PldCost {
     /// What the next request starts from: the costs, the length of the wait and the plain
     /// steps of it still to run, as the earlier requests left them. A lookup that was losing
     /// stays held off across requests until its run of plain steps is over, then gets a trial.
+    /// A draft matched against the plain steps belongs to its request and is not carried.
     pub(crate) fn carried(&self) -> Self {
-        self.clone()
+        Self {
+            shadow: None,
+            shadow_gain: 0.0,
+            ..self.clone()
+        }
     }
 
     /// A plain decode step took `secs`.
@@ -666,6 +676,7 @@ impl PldCost {
                 self.hold = held;
                 self.backoff = (held * 2).min(PLD_RETRY_MAX);
                 self.trial = true;
+                self.shadow_gain = 0.0;
             } else {
                 self.backoff = PLD_RETRY_STEPS;
             }
@@ -675,6 +686,43 @@ impl PldCost {
     /// Whether the next lookup hit should be verified.
     pub(crate) fn worth_trying(&self) -> bool {
         self.hold == 0
+    }
+
+    /// A plain step wrote `token`, and `lookup` gives the lookup's draft after it.
+    ///
+    /// While the lookup is held off, its draft is matched against the tokens the plain steps
+    /// write.
+    /// A draft ends at its first wrong token or at its end.
+    /// A round over it would have committed its kept tokens and 1 more, at the measured round
+    /// time: what that saves against the plain steps adds to the wait's gain, a loss takes away.
+    /// The hold ends once the gain pays for what a losing round costs.
+    pub(crate) fn plain_token(&mut self, token: u32, lookup: impl FnOnce() -> Vec<u32>) {
+        if self.hold == 0 {
+            self.shadow = None;
+            return;
+        }
+        if let Some((draft, kept)) = self.shadow.as_mut() {
+            if draft.get(*kept) == Some(&token) {
+                *kept += 1;
+                if *kept < draft.len() {
+                    return;
+                }
+            }
+            let committed = (1 + *kept) as f64;
+            self.shadow = None;
+            if let (Some(plain), Some((secs, tokens))) = (self.plain, self.round) {
+                self.shadow_gain += committed * plain - secs;
+                if self.shadow_gain > secs - tokens * plain {
+                    self.hold = 0;
+                    self.shadow_gain = 0.0;
+                    return;
+                }
+            }
+        }
+        let draft = lookup();
+        if !draft.is_empty() {
+            self.shadow = Some((draft, 0));
+        }
     }
 }
 
@@ -846,6 +894,48 @@ mod tests {
         assert!(
             !next.worth_trying(),
             "the wait grew: the earlier request lost too"
+        );
+    }
+
+    /// A held lookup whose drafts the plain steps write, as a request that copies its prompt
+    /// does, gets its trial once they would have paid for a losing round.
+    /// A draft the plain steps refuse counts against them.
+    #[test]
+    fn a_held_lookup_whose_drafts_the_plain_steps_write_is_tried_again() {
+        let mut c = PldCost::default();
+        c.plain_step(0.040);
+        for _ in 0..12 {
+            if c.worth_trying() {
+                c.round(0.180, 2);
+            }
+        }
+        let mut next = c.carried();
+        assert!(!next.worth_trying());
+        let draft = vec![7, 8, 9, 10, 11, 12, 13, 14];
+        next.plain_token(6, || draft.clone());
+        next.plain_token(1, || draft.clone());
+        assert!(!next.worth_trying(), "a refused draft keeps the hold");
+        for &t in &draft[..draft.len() - 1] {
+            next.plain_token(t, Vec::new);
+            assert!(!next.worth_trying(), "the draft is judged at its end");
+        }
+        next.plain_token(14, || draft.clone());
+        assert!(
+            !next.worth_trying(),
+            "the refused draft counts against the written one"
+        );
+        for &t in &draft[..draft.len() - 1] {
+            next.plain_token(t, Vec::new);
+        }
+        next.plain_token(14, Vec::new);
+        assert!(
+            next.worth_trying(),
+            "the written drafts pay for a losing round"
+        );
+        next.round(0.180, 9);
+        assert!(
+            next.worth_trying(),
+            "the trial that wins keeps the lookup on"
         );
     }
 
