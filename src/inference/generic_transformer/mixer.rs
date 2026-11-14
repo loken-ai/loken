@@ -1896,12 +1896,21 @@ impl GenericTransformerLayer {
                 (x + out.to_dtype(x.dtype())?)?
             }
             _ => {
+                // A verify keeps the state before its rows and the mixer's input, so a cut back
+                // to the rows kept returns to that state and takes in only those rows.
+                if self.spec_record {
+                    self.spec_begin(x, None, index_pos)?;
+                }
                 let x_norm = self.attn_norm.forward(x)?;
-                // A decoded token advances the state where it lies, the way the recorded
-                // step does, so the two can follow each other on the same buffers.
+                if self.spec_record {
+                    self.spec_input(&x_norm);
+                }
+                // A decoded token, or the rows of a verify, advance the state where it lies,
+                // the way the recorded step does, so the two can follow each other on the same
+                // buffers.
                 #[cfg(feature = "gpu")]
                 let _in_place = crate::inference::moe_cuda::in_place_state(
-                    index_pos > 0 && x.dim(1).is_ok_and(|n| n == 1),
+                    index_pos > 0 && (self.spec_record || x.dim(1).is_ok_and(|n| n == 1)),
                 );
                 let mixed = self.mixer.forward(&x_norm, index_pos)?;
                 let mixed = self.attn_output.forward(&mixed)?;

@@ -709,6 +709,75 @@ fn build_gguf_with(
     built
 }
 
+/// Verifies of drafted rows on the hybrid model of `arch`, each cut back to the rows it kept,
+/// give the logits of decoding the kept tokens one at a time, round after round.
+fn hybrid_verifies_keep_the_decoded_state(arch: &str) {
+    let recipe = recipe_of(arch);
+    let built = || build_gguf(&recipe, None).unwrap();
+    let tokens: Vec<u32> = (0..16u32).map(|i| (i * 37 + 5) % VOCAB as u32).collect();
+    let rows_of = |t: Tensor| -> Vec<f32> {
+        t.to_device(&Device::Cpu)
+            .unwrap()
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+    };
+    let ids = |from: usize, n: usize| {
+        Tensor::from_vec(tokens[from..from + n].to_vec(), (1, n), &Device::Cpu).unwrap()
+    };
+    let mut reference = built();
+    let want: Vec<Vec<f32>> = (0..tokens.len())
+        .map(|i| rows_of(reference.forward(&ids(i, 1), i).unwrap()))
+        .collect();
+    let scale = want
+        .iter()
+        .flatten()
+        .fold(0f32, |m, v| m.max(v.abs()))
+        .max(f32::EPSILON);
+    let mut m = built();
+    for i in 0..2 {
+        m.forward(&ids(i, 1), i).unwrap();
+    }
+    let mut pos = 2usize;
+    for (rows, kept) in [(3usize, 1usize), (3, 2), (2, 2), (4, 1), (3, 3), (2, 1)] {
+        if pos + rows > tokens.len() {
+            break;
+        }
+        let got = rows_of(m.forward_all(&ids(pos, rows), pos).unwrap());
+        for r in 0..rows {
+            let d = got[r * VOCAB..(r + 1) * VOCAB]
+                .iter()
+                .zip(&want[pos + r])
+                .fold(0f32, |m, (a, b)| m.max((a - b).abs()));
+            assert!(
+                d < 1e-3 * scale,
+                "{arch}: the verify at {pos}, row {r}, differs from decoding by {d}"
+            );
+        }
+        if kept < rows {
+            m.trim_kv(pos + kept);
+        }
+        pos += kept;
+    }
+    assert!(pos > 8, "{arch}: the chain ran through several rounds");
+}
+
+/// A delta-rule hybrid cut back after a verify decodes on as if it had decoded the kept rows.
+#[test]
+fn a_delta_rule_hybrid_cut_back_after_a_verify_keeps_the_decoded_state() {
+    hybrid_verifies_keep_the_decoded_state("qwen35");
+}
+
+/// A short-convolution hybrid cut back after a verify decodes on as if it had decoded the kept
+/// rows.
+#[test]
+fn a_short_convolution_hybrid_cut_back_after_a_verify_keeps_the_decoded_state() {
+    hybrid_verifies_keep_the_decoded_state("lfm2");
+}
+
 /// An `F16` expert stack the host rebuilds in `Q8_0` is named in the running formats, after
 /// the other projections, and goes in the conversion ledger.
 #[test]
