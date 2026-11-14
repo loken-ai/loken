@@ -195,7 +195,7 @@ A peer that reads fast makes the serial path's prompt rate high, and a long prom
 The prompt is read here when:
 
 - the prompt adds less than 1 prefill chunk to what the cache holds
-- the request carries an image or audio
+- the request carries an image, a video or audio, streamed or not
 - the answer is streamed and the request names a session
 - the model has recurrent or windowed layers and a layer split across the cards
 - the peer cannot answer

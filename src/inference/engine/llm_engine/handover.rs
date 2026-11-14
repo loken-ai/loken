@@ -122,6 +122,15 @@ impl Landed {
     }
 }
 
+/// Whether the prompt of the request `state` is about to serve is text alone: no image, no
+/// Qwen3.5 image or video, and no clip when `clip` is false.
+/// Only a prompt of text alone is handed to the prefill peer.
+pub(super) fn prompt_is_text_alone(state: &LoadedModelState, clip: bool) -> bool {
+    !clip
+        && !(state.model.is_vision_model() && state.image_embeds.is_some())
+        && state.qwen35_vision.is_empty()
+}
+
 /// Has the instance at `peer` read `prompt` when the cache here is at least a prefill chunk short
 /// of the whole and `rates` say a hand-over takes no longer than reading the rest here.
 /// Imports what it hands back as a snapshot that the prefix reuse then restores.

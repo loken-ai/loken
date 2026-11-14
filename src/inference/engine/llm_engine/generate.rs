@@ -346,11 +346,7 @@ impl LlmEngine {
             // A prompt a peer handed over, recorded once the local read after it ends.
             let mut landed = None;
             let cache_session_start: usize = {
-                let is_vision_req = (state.model.is_vision_model() && state.image_embeds.is_some())
-                    || !state.qwen35_vision.is_empty()
-                    || audio_split.is_some();
-                let disabled = is_vision_req
-                    || false;
+                let disabled = !super::handover::prompt_is_text_alone(state, audio_split.is_some());
                 state.model.set_cache_scope(cache_scope);
                 if let (Some(peer), false) = (prefill_peer.as_deref(), disabled) {
                     landed = super::handover::pull_prompt_from_peer(

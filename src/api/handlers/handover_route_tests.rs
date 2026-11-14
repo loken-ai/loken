@@ -300,6 +300,57 @@ async fn a_prompt_is_handed_over_to_and_from_a_cache_cut_over_cards() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// A long prompt with a Qwen3.5 image is read here on the whole and on the streamed answer: the
+/// peer is not asked.
+/// A long prompt of text alone is offered to the same peer.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_prompt_with_an_image_is_read_here_on_both_paths() {
+    let _paused = crate::request_metrics::PREFILL_PAUSE_LOCK.lock().await;
+    let (root, vocab) = models_dir();
+    let peer_port = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", peer_port.local_addr().unwrap());
+    let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = asked.clone();
+    // The peer counts the prompts it is offered and reads none.
+    let refuse = move || {
+        counter.fetch_add(1, Ordering::SeqCst);
+        async { axum::http::StatusCode::SERVICE_UNAVAILABLE }
+    };
+    let app = axum::Router::new().route("/api/cluster/prefill", axum::routing::post(refuse));
+    tokio::spawn(async move { axum::serve(peer_port, app).await.unwrap() });
+    let a = instance(&root, Some(url)).await;
+    let engine = a.get_engine(MODEL).await.expect("the model is loaded");
+    let params = || crate::inference::engine::llm_engine::GenerationParams {
+        max_tokens: Some(MAX_TOKENS as usize),
+        temperature: Some(0.0),
+        ..Default::default()
+    };
+
+    // The tiny model reads no image: each answer fails after the prompt was placed.
+    let long = prompt(LONG_PROMPT_WORDS, vocab, 40);
+    engine.attach_qwen35_image().await;
+    let _ = engine.generate(&long, params()).await;
+    engine.attach_qwen35_image().await;
+    if let Ok(mut rx) = engine.generate_stream(&long, params()).await {
+        while rx.recv().await.is_some() {}
+    }
+    let with_image = asked.load(Ordering::SeqCst);
+    engine.clear_images().await;
+    let text = prompt(LONG_PROMPT_WORDS, vocab, 41);
+    let mut rx = engine.generate_stream(&text, params()).await.unwrap();
+    while rx.recv().await.is_some() {}
+    let _ = std::fs::remove_dir_all(&root);
+    assert_eq!(
+        with_image, 0,
+        "a prompt with an image was offered to the peer"
+    );
+    assert_eq!(
+        asked.load(Ordering::SeqCst),
+        1,
+        "the prompt of text alone was not offered to the peer"
+    );
+}
+
 /// What the comment line of a prompt being read starts with.
 const PREFILL_COMMENT: &str = ": loken-prefill ";
 

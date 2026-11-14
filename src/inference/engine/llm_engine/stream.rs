@@ -985,7 +985,10 @@ impl LlmEngine {
                     // token on a full match).
                     // The resident KV serves only the caller that wrote it.
                     state.model.set_cache_scope(cache_scope);
-                    if let Some(peer) = config.prefill_peer.as_deref() {
+                    let peer = config.prefill_peer.as_deref().filter(|_| {
+                        super::handover::prompt_is_text_alone(state, audio_split.is_some())
+                    });
+                    if let Some(peer) = peer {
                         landed = super::handover::pull_prompt_from_peer(
                             state.model.as_mut(),
                             &spec_engine.handover_rates,

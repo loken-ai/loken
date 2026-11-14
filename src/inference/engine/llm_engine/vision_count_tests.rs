@@ -88,11 +88,19 @@ async fn engine() -> LlmEngine {
         .0
 }
 
+impl LlmEngine {
+    /// Gives the next request one Qwen3.5 image of `GRID`, whatever the model reads.
+    pub(crate) async fn attach_qwen35_image(&self) {
+        let px =
+            Tensor::zeros_on((1usize, 4usize), crate::tensor::DType::F32, &Device::Cpu).unwrap();
+        let mut guard = self.model_state.lock().await;
+        guard.as_mut().unwrap().qwen35_vision = vec![(px, GRID)];
+    }
+}
+
 /// Gives the next request one image of `GRID`.
 async fn attach_image(engine: &LlmEngine) {
-    let px = Tensor::zeros_on((1usize, 4usize), crate::tensor::DType::F32, &Device::Cpu).unwrap();
-    let mut guard = engine.model_state.lock().await;
-    guard.as_mut().unwrap().qwen35_vision = vec![(px, GRID)];
+    engine.attach_qwen35_image().await;
 }
 
 /// A prompt of 6 tokens, 1 of them the placeholder.
