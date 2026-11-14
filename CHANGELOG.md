@@ -79,6 +79,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 - OpenCL: offer no card that CUDA or ROCm already drives.
 - OpenCL: load and render Z-Image on an Intel GPU without host copies or a stalled queue.
 - Image and video: hold SDXL, Z-Image and Wan projections in their narrowest exact form.
+- ACE-Step: declare the F16 rounding of the audio decoder's kernels on a card.
 - Z-Image: build the caption encoder on the host only for a prompt it reads.
 - OpenCL: build the image kernels with Intel's OpenCL runtime.
 - Cluster: let 2 instances each be the prefill peer of the other.

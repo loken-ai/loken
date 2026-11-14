@@ -336,6 +336,11 @@ A narrower form than the stored one goes in the conversion ledger.
 A projection merged with an adapter is held in the form of its stored values, rounded once, and the ledger says so.
 The load log names the formats the blocks run in.
 
+An audio decoder with weight-normed convolutions fuses each kernel in `F32` at load.
+On a CUDA or ROCm card the fused kernel is held in `F16`, the form the convolution products read.
+That rounding goes in the conversion ledger.
+The ACE-Step load log names the format its decoder runs in.
+
 A safetensors checkpoint of Flux, FLUX.2, Qwen-Image or Boogu is rebuilt in a block format at every load.
 Each rebuilt matrix goes in the conversion ledger, and the load log names the stored and the running formats.
 

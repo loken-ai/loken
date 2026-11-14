@@ -529,6 +529,9 @@ impl ConvW {
     /// weight and bias. With `half` on a CUDA device the kernel is held F16 for the
     /// tensor-core GEMMs, which accumulate in F32 - a convT rearranged to `[k * c_out, c_in]`
     /// so its contraction is a plain GEMM. Otherwise, and on the host, it stays F32.
+    ///
+    /// A kernel held F16 is rounded from its fused F32 values.
+    /// That rounding goes in the conversion ledger.
     pub fn from_fused(
         w: Vec<f32>,
         (c_out, c_in, k): (usize, usize, usize),
@@ -538,6 +541,17 @@ impl ConvW {
         dev: &ND,
     ) -> crate::tensor::Result<Self> {
         let half = half && !dev.is_cpu();
+        if half && !dev.is_dry() {
+            use crate::tensor::DType as D;
+            crate::tensor::conversion::record_kept(
+                "conv",
+                D::F32.as_str(),
+                D::F16.as_str(),
+                (w.len() * D::F32.size_in_bytes()) as u64,
+                (w.len() * D::F16.size_in_bytes()) as u64,
+                "a fused kernel is held in the half form the card's convolution products read",
+            );
+        }
         let wt = if is_convt && half {
             // wr[kk*c_out+oc, ci] = w[ci,oc,kk].
             let mut wr = vec![0f32; k * c_out * c_in];
@@ -677,6 +691,26 @@ impl OobleckDecoder {
                 device: dev,
             })
         })
+        .inspect(OobleckDecoder::log_format)
+    }
+
+    /// The format the convolution kernels are held in.
+    pub fn running_format(&self) -> &'static str {
+        self.conv1.wt.dtype().as_str()
+    }
+
+    /// Logs the format the kernels run in, and where.
+    fn log_format(&self) {
+        let rounded = if self.running_format() == crate::tensor::DType::F16.as_str() {
+            ", rounded from their fused f32 values"
+        } else {
+            ""
+        };
+        eprintln!(
+            "[ace-vae] the kernels run in {} on {:?}{rounded}",
+            self.running_format(),
+            self.device.location()
+        );
     }
 
     /// Decode a latent `[c_latent.t_latent]` (channel-major) -> audio `[c_audio.t_audio]`.
@@ -1648,6 +1682,61 @@ mod tests {
     /// Weight-norm fusion: (a) elementwise = g.v/‖v‖ per dim0 row; (b) when
     /// g equals each row's L2 norm, the fused weight is exactly v (the param is
     /// initialized that way so the fused weight starts equal to the direction).
+    /// A fused value neither BF16 nor F16 can hold.
+    const ONLY_F32: f32 = 1.0 + 1.0 / 1048576.0;
+
+    /// A fused kernel on the host keeps every fused value.
+    #[test]
+    fn a_kernel_on_the_host_keeps_its_fused_values() {
+        let cw = ConvW::from_fused(
+            vec![ONLY_F32; 6],
+            (2, 3, 1),
+            vec![0.0; 2],
+            false,
+            true,
+            &ND::Cpu,
+        )
+        .unwrap();
+        assert_eq!(cw.wt.dtype(), crate::tensor::DType::F32);
+        assert!(cw.wt.to_vec_f32().iter().all(|&v| v == ONLY_F32));
+    }
+
+    /// A fused kernel held F16 on a card is declared in the conversion ledger.
+    ///
+    /// It runs on card 0 of the runtime the build carries: CUDA, or HIP for a ROCm build.
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn a_kernel_rounded_to_f16_on_a_card_is_declared() {
+        let Ok(card) = ND::new_cuda(0) else {
+            eprintln!("skipping: no card");
+            return;
+        };
+        // A shape no other test builds, so its entry is this test's own.
+        let (c_out, c_in, k) = (7, 3, 5);
+        let n = c_out * c_in * k;
+        let cw = ConvW::from_fused(
+            vec![ONLY_F32; n],
+            (c_out, c_in, k),
+            vec![0.0; c_out],
+            false,
+            true,
+            &card,
+        )
+        .unwrap();
+        let declared = crate::tensor::conversion::entries().into_iter().any(|e| {
+            e.class == "conv"
+                && e.from == "f32"
+                && e.to == "f16"
+                && e.before == (n * 4) as u64
+                && e.after == (n * 2) as u64
+        });
+        assert!(
+            declared,
+            "the rounding to F16 is not in the conversion ledger"
+        );
+        assert_eq!(cw.wt.dtype(), crate::tensor::DType::F16);
+    }
+
     #[test]
     fn weight_norm_fuse_correct() {
         let (d0, rest) = (4usize, 5usize);
