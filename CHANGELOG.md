@@ -154,6 +154,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 - Vulkan: give each block of 32 activations of a product its own scale.
 - Serving: read a long prompt on the serial path in the rows the cards afford.
 - Speculation: judge a prompt lookup trial after a hold on its own cost.
+- Hub: pull the merges file of a tokenizer that ships no tokenizer.json.
 
 ### Removed
 

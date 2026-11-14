@@ -556,33 +556,15 @@ impl HuggingFaceManager {
         info!("   ✓ Model revision: {}", revision);
 
         // Filter files to download (skip unnecessary files)
+        let listing: Vec<&str> = model_info
+            .siblings
+            .iter()
+            .map(|s| s.rfilename.as_str())
+            .collect();
         let files_to_download: Vec<&HFSibling> = model_info
             .siblings
             .iter()
-            .filter(|f| {
-                let name = f.rfilename.to_lowercase();
-                if name.ends_with(".gguf") {
-                    if let Some(sel) = selector {
-                        return selector_names_file(sel, &f.rfilename);
-                    }
-                }
-                if is_native_shard(&name)
-                    && model_info.siblings.iter().any(|s| {
-                        s.rfilename
-                            .eq_ignore_ascii_case("model.safetensors.index.json")
-                            || s.rfilename.eq_ignore_ascii_case("model.safetensors")
-                    })
-                {
-                    return false;
-                }
-                // Download model files and configs
-                name.ends_with(".safetensors")
-                    || name.ends_with(".gguf")
-                    || name.ends_with(".bin")
-                    || name.ends_with("config.json")
-                    || name.contains("tokenizer")
-                    || name.ends_with(".json") && !name.ends_with(".gitattributes")
-            })
+            .filter(|f| pulls_file(&f.rfilename, &listing, selector))
             .collect();
 
         let total_size: u64 = files_to_download.iter().filter_map(|f| f.size).sum();
@@ -893,6 +875,37 @@ impl HuggingFaceManager {
     }
 }
 
+/// Whether a pull downloads `rfilename`, a file of a repository whose files are `listing`.
+///
+/// A pull takes the weights, the configurations and the tokenizer files.
+/// A GGUF file is taken when `selector` names its quantisation, or when there is no selector.
+/// A vendor's native weight file is left when the repository has the usual weights too.
+/// The merges of a byte-level BPE tokenizer are taken: it is built from them and its vocabulary.
+fn pulls_file(rfilename: &str, listing: &[&str], selector: Option<&str>) -> bool {
+    let name = rfilename.to_lowercase();
+    if name.ends_with(".gguf") {
+        if let Some(sel) = selector {
+            return selector_names_file(sel, rfilename);
+        }
+    }
+    if is_native_shard(&name)
+        && listing.iter().any(|s| {
+            s.eq_ignore_ascii_case("model.safetensors.index.json")
+                || s.eq_ignore_ascii_case("model.safetensors")
+        })
+    {
+        return false;
+    }
+    let file = name.rsplit('/').next().unwrap_or(&name);
+    name.ends_with(".safetensors")
+        || name.ends_with(".gguf")
+        || name.ends_with(".bin")
+        || name.ends_with("config.json")
+        || name.contains("tokenizer")
+        || file == "merges.txt"
+        || name.ends_with(".json") && !name.ends_with(".gitattributes")
+}
+
 /// Whether `name` is a vendor's native weight file (`consolidated*.safetensors`).
 fn is_native_shard(name: &str) -> bool {
     name.to_lowercase().starts_with("consolidated") && name.to_lowercase().ends_with(".safetensors")
@@ -942,6 +955,34 @@ mod selector_tests {
         assert!(!is_native_shard("model-00001-of-00002.safetensors"));
         assert!(!is_native_shard("consolidated.json"));
         assert!(!is_native_shard("sub/consolidated.safetensors"));
+    }
+
+    /// A pull of a speech checkpoint takes every file its loader reads: the weights and
+    /// configurations of the talker and of its codec, and the files of its BPE tokenizer.
+    /// It leaves the model card and the attributes of the repository.
+    #[test]
+    fn a_pull_takes_every_file_a_bpe_tokenizer_is_built_from() {
+        let listing = [
+            ".gitattributes",
+            "README.md",
+            "config.json",
+            "generation_config.json",
+            "merges.txt",
+            "model.safetensors",
+            "preprocessor_config.json",
+            "speech_tokenizer/config.json",
+            "speech_tokenizer/configuration.json",
+            "speech_tokenizer/model.safetensors",
+            "speech_tokenizer/preprocessor_config.json",
+            "tokenizer_config.json",
+            "vocab.json",
+        ];
+        let pulled: Vec<&str> = listing
+            .iter()
+            .copied()
+            .filter(|f| pulls_file(f, &listing, None))
+            .collect();
+        assert_eq!(pulled, listing[2..].to_vec());
     }
 
     #[test]
