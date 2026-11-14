@@ -232,6 +232,57 @@ The same picture renders with every block on the laptop's processor, 90 s a step
 The host holds that transformer in 12.4 GB and its caption encoder in 9.1 GB.
 A server under a memory cap refuses a render on the host at the caption encoder when a quarter of the cap is not left free beside the transformer.
 
+## Speech with Qwen3-TTS
+
+Measured 2026-11-14 on an RX 9070 XT through ROCm, in English and French.
+
+The acceptance table of the roadmap row:
+
+| Measure | Bound |
+|---|---|
+| Word error of a voice in a language, mean of its clips | 6% at most |
+| Cosine between the speaker embeddings of 2 clips of 1 voice | 0.97 at least |
+| Seconds of render per second of audio on a card, over the clips of a voice | under 1 |
+
+What each kind of voice measured:
+
+| Kind of voice | Voices | Clips | Word error, English | Word error, French | Lowest cosine within a voice | Render s per audio s | Same request, same bytes |
+|---|---:|---:|---:|---:|---:|---:|---|
+| Named by the CustomVoice checkpoint | 9 | 103 | 1.8% to 4.7% | 2.8% to 5.6% | 0.981 to 0.990, `ryan` 0.974 | 0.38 to 0.68 | Every text |
+| Cloned from a clip of 15 s by the Base checkpoint | 1 | 15 | 1.6% | 2.2% | 0.9798 | 0.47 | Every text |
+| Described in words and stored | 6 | 444 | 3.8% | 5.1% | 0.989 to 0.991 | 0.42 | Every text |
+
+- The word error is the mean of loken's own transcription of each clip by `openai/whisper-large-v3-turbo`.
+- The named and cloned voices spoke 2 to 3 paragraphs of about 85 words in each language.
+- `ryan` and the cloned voice also spoke a text of about 600 words in each language, in 1 call.
+- A range runs over the voices of a kind.
+- The described voices spoke the 207 clips of the documentation site's narration in each language, 3 voices in each language.
+- Each described voice then spoke 2 paragraphs in each language for the cosine.
+- The cosine compares the speaker embeddings of the Base checkpoint's encoder, across texts and languages.
+- `ryan` has the lowest cosine. His English clip and a piece of his long French narration score 0.974.
+- 1 clip of a named voice rendered at 1.03 s per second of audio. Its voice, `aiden`, rendered at 0.66 over its 8 clips.
+
+The stored voices described in words, each on 4 paragraphs:
+
+| Voice | Description written in | Word error, English | Word error, French | Lowest cosine, English against French | Closest other voice | Render s per audio s |
+|---|---|---:|---:|---:|---:|---:|
+| Mia | English | 1.8% | 2.8% | 0.989 | 0.982 | 0.37 |
+| Sam | English | 1.8% | 2.2% | 0.989 | 0.983 | 0.36 |
+| Alert | English | 1.8% | 1.7% | 0.990 | 0.987 | 0.36 |
+| Mia | French | 2.4% | 4.5% | 0.989 | 0.982 | 0.36 |
+| Sam | French | 1.8% | 1.7% | 0.990 | 0.980 | 0.36 |
+| Alert | French | 1.8% | 1.7% | 0.991 | 0.987 | 0.37 |
+
+- Each voice scored 0.996 to 0.999 between its 2 paragraphs of 1 language.
+- Closest other voice: the mean cosine of the clip pairs with the voice of the 6 that is closest.
+- The word error here is measured on pieces under 25 s, cut at the quietest frame.
+- The same request sent twice gave the same bytes for each voice.
+
+Limits:
+
+- `ryan` speaks French about 5 dB below his English. No loudness is normalised.
+- A stored voice keeps the speaker embedding only.
+
 ## Forecasting
 
 The forecast route serves Chronos-2 and the 4 Timestral checkpoints.  

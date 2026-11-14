@@ -23,7 +23,7 @@ Major, by state then by priority:
 | Prefill and decode on different instances | Serving | One instance reads the prompt and another one writes the answer. | Done |
 | Video input | Multimodal input | A vision model answers about a video as the reference implementation does. | Done |
 | OpenCL faster than the CPU | Performance | A language model and an image model run through OpenCL on an Intel GPU faster than on its CPU. | Partial |
-| Qwen3-TTS | Audio | Qwen3-TTS speaks English and French through the speech route from its published checkpoint, within the bounds of the acceptance table, and a voice named, described in words or cloned from a clip stays the same from one request to the next. | Started |
+| Qwen3-TTS | Audio | Qwen3-TTS speaks English and French through the speech route from its published checkpoint, within the bounds of the acceptance table, and a voice named, described in words or cloned from a clip stays the same from one request to the next. | Done |
 
 Smaller, by state then by priority:
 

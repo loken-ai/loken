@@ -6,6 +6,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Added
 
+- Speech: speak English and French with Qwen3-TTS from its published checkpoint.
 - Serving: batch mixtures, attention sinks and stretched rotations on a card.
 - Serving: keep an idle model in host memory instead of unloading it, and load it from there on the next request.
 - Experts: favour experts in memory at the fast level.
