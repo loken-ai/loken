@@ -198,26 +198,6 @@ impl WideSubject {
         let held = to - from;
         let n = meta.n_layers;
         let ctx = Some(controls.steps() + 1);
-        let build = |plan: &HeteroPlan, demand: Option<&Demand>| {
-            let placed = plan.shifted(from, n);
-            let mut devices: HashMap<usize, Device> = HashMap::new();
-            for card in cards_of(plan) {
-                devices.insert(card, Device::new_cuda(card)?);
-            }
-            let mut m = GenericHeteroTransformer::from_split_gguf(
-                src,
-                &devices,
-                &placed,
-                KvQuant::Off,
-                ctx,
-                false,
-                false,
-            )?;
-            if let Some(d) = demand {
-                m.note_wide_card_rooms(&placed, &[], d.kv_bytes_per_layer, d.runtime_reserve);
-            }
-            Ok::<_, crate::tensor::Error>((m, placed))
-        };
         let cards_wanted = controls.placement == Placement::Auto && crate::gpu::cards_allowed();
         let mixers =
             crate::inference::generic_transformer::wide_sparse_plan::card_mixer_bytes(content)
@@ -233,14 +213,14 @@ impl WideSubject {
                 PREFILL_CHUNK_TOKENS,
             ),
         };
-        if !cards_wanted {
-            let plan = HeteroPlan::calculate_with_kv(held, 1 << 20, &[], &[], 1.0, 0);
-            let (m, placed) =
-                build(&plan, None).map_err(|e| format!("load layers [{from}, {to}): {e}"))?;
-            return Ok((m, placed));
-        }
-        let cards =
-            crate::inference::place::llm::offer(None, demand.whole(), mixers.largest_upload).cards;
+        // Without the cards the ladder plans every held layer on the host.
+        let cards = match cards_wanted {
+            true => {
+                crate::inference::place::llm::offer(None, demand.whole(), mixers.largest_upload)
+                    .cards
+            }
+            false => Vec::new(),
+        };
         let mut last = None;
         let m = load_placed(
             "layer bench",
@@ -248,7 +228,22 @@ impl WideSubject {
             &cards,
             || false,
             |plan| {
-                let (m, placed) = build(plan, Some(&demand))?;
+                let placed = plan.shifted(from, n);
+                let mut devices: HashMap<usize, Device> = HashMap::new();
+                for card in cards_of(plan) {
+                    devices.insert(card, Device::new_cuda(card)?);
+                }
+                let mut m = GenericHeteroTransformer::from_split_gguf(
+                    src,
+                    &devices,
+                    &placed,
+                    KvQuant::Off,
+                    ctx,
+                    false,
+                    false,
+                )?;
+                let (kv, reserve) = (demand.kv_bytes_per_layer, demand.runtime_reserve);
+                m.note_wide_card_rooms(&placed, &[], kv, reserve);
                 last = Some(placed);
                 Ok::<_, crate::tensor::Error>(m)
             },

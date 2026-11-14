@@ -253,6 +253,36 @@ mod tests {
         assert_eq!(tries, 3);
     }
 
+    /// A size that cannot shrink runs once more after room is made, and the second out of
+    /// memory ends the walk.
+    #[test]
+    fn a_size_that_cannot_shrink_runs_once_more_after_room_is_made() {
+        for fails in [1, 2] {
+            let asked = Cell::new(0);
+            let mut tries = 0;
+            let got: Result<(usize, usize), String> = shrink_on_oom(
+                "t",
+                64,
+                |_| None,
+                |_| {
+                    asked.set(asked.get() + 1);
+                    true
+                },
+                |s| {
+                    tries += 1;
+                    if tries > fails {
+                        Ok(s)
+                    } else {
+                        Err("out of memory".to_string())
+                    }
+                },
+            );
+            assert_eq!(asked.get(), 1, "{fails}");
+            assert_eq!(tries, 2, "{fails}");
+            assert_eq!(got.is_ok(), fails == 1, "{fails}");
+        }
+    }
+
     #[test]
     fn another_failure_does_not_shrink() {
         let mut tries = 0;

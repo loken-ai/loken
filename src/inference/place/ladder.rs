@@ -1269,6 +1269,31 @@ mod tests {
         assert!(!refuses(true, &host));
     }
 
+    /// A demand offered no card is planned on the host whole, as a host plan of its layers is.
+    #[test]
+    fn a_demand_offered_no_card_is_planned_on_the_host() {
+        for layers in [1, 2, 7] {
+            let demand = Demand {
+                layers,
+                block_bytes: (layers as u64) << 20,
+                head_bytes: 0,
+                kv_bytes_per_layer: GB / 8,
+                runtime_reserve: GB,
+            };
+            let host = HeteroPlan::calculate_with_kv(layers, 1 << 20, &[], &[], 1.0, 0);
+            let planned = demand.plan(&[]);
+            assert!(
+                super::super::dry_plan::same_plan(&planned, &host),
+                "{layers}"
+            );
+            assert_eq!(
+                kinds(&planned),
+                vec![DeviceKind::Cpu.to_string()],
+                "{layers}"
+            );
+        }
+    }
+
     const GB: u64 = 1 << 30;
 
     fn demand(layers: usize, block_gb: u64) -> Demand {

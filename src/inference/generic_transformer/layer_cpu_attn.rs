@@ -1203,20 +1203,18 @@ pub(super) fn sink_attention_matmul(
     let per_row = (b * n_head * kv_len).max(1) * std::mem::size_of::<f32>();
     // A decoded row is one tile.
     // A prompt's tile holds the scores the card's free memory gives it.
-    let mut tile = match seq {
+    let tile = match seq {
         0 | 1 => 1,
         _ => (GenericTransformerLayer::scores_budget(&q.device()) / per_row).clamp(1, seq),
     };
     // A tile that runs out of card memory runs again at half its rows, down to 1 row.
-    let out = loop {
-        match tiled(tile) {
-            Err(e) if e.is_oom() && tile > 1 => {
-                tile /= 2;
-                tracing::debug!("sink attention out of card memory: {tile} query rows a tile");
-            }
-            done => break done?,
-        }
-    };
+    let (out, _) = crate::inference::place::recover::shrink_on_oom(
+        "sink attention",
+        tile,
+        |rows| (rows > 1).then_some(rows / 2),
+        |_| false,
+        tiled,
+    )?;
     out.to_dtype(q.dtype())
 }
 
