@@ -174,6 +174,10 @@ A peer measured slow is asked again after the local prefill has run as long as i
 2 instances may each be the prefill peer of the other.
 A prompt read for a peer is read there and never handed over again.
 
+The peer reads the prompt on its serial path, under its serial gate.
+A peer whose model sits in its batch worker waits for the worker's requests to end, then takes the model out of the worker.
+Requests that arrive at the peer meanwhile still enter its worker.
+
 A model with recurrent or windowed layers hands over its whole decode state instead of rows.
 
 The decode state holds every recurrent state, the windowed layers' rows, the global layers' rows and the logits to resume from.

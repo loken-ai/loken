@@ -2319,10 +2319,43 @@ impl APIServer {
             .get_engine(model_id)
             .await
             .map_err(|e| format!("{e:?}"))?;
+        let _gate = self.serial_path_for_peer(&engine, model_id).await?;
         engine
             .read_prompt_for_peer(prompt, probe)
             .await
             .map_err(|e| e.to_string())
+    }
+
+    /// The serial gate of `model_id`, held with its model out of the batch worker.
+    ///
+    /// A peer's prompt is read on the serial path, which keeps the snapshot handed over.
+    /// The read waits for the requests the worker serves to end.
+    /// New requests enter the worker meanwhile.
+    /// A serial generation holds the gate to its end: none runs beside the read.
+    async fn serial_path_for_peer(
+        &self,
+        engine: &LlmEngine,
+        model_id: &str,
+    ) -> Result<crate::api::gate::RequestGuard, String> {
+        loop {
+            engine.until_worker_idle().await;
+            // The asking instance's request waits on this read.
+            let gate = acquire_gate(
+                self,
+                crate::api::gate::Priority::Interactive,
+                model_id.to_string(),
+                "/api/cluster/prefill",
+            )
+            .await
+            .map_err(|e| format!("{e:?}"))?;
+            if engine.leave_idle_worker().await {
+                return Ok(gate);
+            }
+            // A worker that keeps the model with no request admitted is not waited for.
+            if engine.in_flight() == 0 {
+                return Err("the batch worker keeps the model".to_string());
+            }
+        }
     }
 
     /// What a layer of `model_id` costs on this node, measured once and kept: `(card ms, host ms,

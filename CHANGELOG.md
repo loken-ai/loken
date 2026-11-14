@@ -82,6 +82,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 - Z-Image: build the caption encoder on the host only for a prompt it reads.
 - OpenCL: build the image kernels with Intel's OpenCL runtime.
 - Cluster: let 2 instances each be the prefill peer of the other.
+- Cluster: hand a prompt over from a peer whose model sits in its batch worker.
 - API: answer about an image sent to the generate route of a Qwen vision model.
 - API: count images, cached tokens and batched answers in the prompt tokens of every route.
 - Placement: keep a model on 1 card when an unasked context would spread it.

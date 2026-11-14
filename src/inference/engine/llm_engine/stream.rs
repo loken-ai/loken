@@ -60,19 +60,42 @@ impl LlmEngine {
     }
 
     /// Takes the model out of its batch worker when no request runs on it.
-    pub async fn leave_idle_worker(&self) {
+    /// Says whether no model serves from the worker.
+    ///
+    /// The requests are counted under the model lock.
+    /// A request admitted after the count finds the model on the serial path.
+    pub async fn leave_idle_worker(&self) -> bool {
+        let mut guard = self.model_state.lock().await;
+        let Some(state) = guard.as_mut() else {
+            return true;
+        };
+        if state.model.batched_server().is_none() {
+            return true;
+        }
         if self.active.load(std::sync::atomic::Ordering::Acquire) > 0 {
+            return false;
+        }
+        let left = super::load::demote_to_serial(state);
+        if left {
+            info!(
+                "{}: a request the worker cannot serve came: serving serially",
+                state.name
+            );
+        }
+        left
+    }
+
+    /// Returns once no admitted request runs on the batch worker.
+    /// Returns at once when the model serves serially.
+    pub async fn until_worker_idle(&self) {
+        if !self.is_continuous().await
+            || self.active.load(std::sync::atomic::Ordering::Acquire) == 0
+        {
             return;
         }
-        let mut guard = self.model_state.lock().await;
-        if let Some(state) = guard.as_mut() {
-            if state.model.batched_server().is_some() && super::load::demote_to_serial(state) {
-                info!(
-                    "{}: a request reads its log-probabilities: serving serially",
-                    state.name
-                );
-            }
-        }
+        let active = std::sync::Arc::clone(&self.active);
+        let _ =
+            tokio::task::spawn_blocking(move || super::batching::wait_no_request(&active)).await;
     }
 
     /// Returns once the model serves from its batch worker.

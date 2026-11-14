@@ -6,6 +6,7 @@
 //! A short prompt is read where it arrives.
 //! The peer's reading is relayed to the request as it goes.
 //! A peer that answers the handover alone still serves.
+//! A peer whose model sits in its batch worker reads the prompt on its serial path.
 
 use super::model_manager::LoadedModelEntry;
 use super::*;
@@ -23,6 +24,8 @@ const MAX_TOKENS: u64 = 4;
 const LONG_PROMPT_WORDS: usize = 3000;
 /// Words of a short prompt, less than any prefill chunk.
 const SHORT_PROMPT_WORDS: usize = 8;
+/// Requests of its own a busy peer serves while it reads a prompt for another instance.
+const OWN_REQUESTS: usize = 4;
 /// Positions the copied checkpoint declares: room for a long prompt and its answer.
 const CONTEXT: usize = 4096;
 
@@ -108,6 +111,26 @@ async fn instance_with(
     state
 }
 
+/// Keeps the lone requests of `asker` on the serial path, the one that asks a peer.
+/// Keeps the lone requests of `peer` in its batch worker and moves its model there with a
+/// short request of its own, as a server on a card does.
+async fn ask(asker: &APIServer, peer: &APIServer, vocab_size: usize) {
+    let engine = |s: &APIServer| {
+        let s = s.clone();
+        async move { s.get_engine(MODEL).await.expect("the model is loaded") }
+    };
+    engine(asker).await.hold_lone_requests_on(false);
+    let peer_engine = engine(peer).await;
+    peer_engine.hold_lone_requests_on(true);
+    answer(peer, prompt(SHORT_PROMPT_WORDS, vocab_size, 6)).await;
+    #[cfg(feature = "gpu")]
+    assert!(
+        crate::inference::place::device_probe::card_count() == 0
+            || peer_engine.is_continuous().await,
+        "the peer's model is not in its batch worker"
+    );
+}
+
 /// A prompt of `words` words of the vocabulary, starting at word `first`.
 fn prompt(words: usize, vocab_size: usize, first: usize) -> String {
     (0..words)
@@ -156,7 +179,8 @@ async fn a_prompt_is_handed_over_between_2_instances_both_ways() {
     }
 
     // Each direction reads a prompt that shares no prefix with the prompts before it.
-    for (to, first) in [(&a, 1), (&b, 2)] {
+    for (to, peer, first) in [(&a, &b, 1), (&b, &a, 2)] {
+        ask(to, peer, vocab).await;
         let long = prompt(LONG_PROMPT_WORDS, vocab, first);
         let (text, cached) = answer(to, long.clone()).await;
         let (want, read_alone) = answer(&alone, long).await;
@@ -164,9 +188,40 @@ async fn a_prompt_is_handed_over_between_2_instances_both_ways() {
         assert!(cached > 0, "the peer did not hand the prompt over");
         assert_eq!(text, want, "the handed prompt gave another answer");
     }
+    ask(&a, &b, vocab).await;
     let (_, cached) = answer(&a, prompt(SHORT_PROMPT_WORDS, vocab, 3)).await;
     assert_eq!(cached, 0, "a short prompt was handed over");
     let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A peer whose batch worker serves requests of its own when a prompt comes to read still
+/// hands it over, and its own requests are answered.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_peer_whose_worker_is_busy_still_hands_a_prompt_over() {
+    let _paused = crate::request_metrics::PREFILL_PAUSE_LOCK.lock().await;
+    let (root, vocab) = models_dir();
+    let peer_port = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", peer_port.local_addr().unwrap());
+    let a = instance(&root, Some(url)).await;
+    let peer = instance(&root, None).await;
+    let alone = instance(&root, None).await;
+    let app = peer.create_router();
+    tokio::spawn(async move { axum::serve(peer_port, app).await.unwrap() });
+    ask(&a, &peer, vocab).await;
+
+    let long = prompt(LONG_PROMPT_WORDS, vocab, 9);
+    let own = (0..OWN_REQUESTS).map(|i| answer(&peer, prompt(LONG_PROMPT_WORDS, vocab, 20 + i)));
+    let ((text, cached), own) =
+        tokio::join!(answer(&a, long.clone()), futures::future::join_all(own));
+    let (want, _) = answer(&alone, long).await;
+    let _ = std::fs::remove_dir_all(&root);
+    assert_eq!(
+        own.len(),
+        OWN_REQUESTS,
+        "the peer's own requests were not all answered"
+    );
+    assert!(cached > 0, "the peer did not hand the prompt over");
+    assert_eq!(text, want, "the handed prompt gave another answer");
 }
 
 /// An instance whose cache is cut over 2 cards takes a long prompt that an instance with a whole
@@ -198,7 +253,8 @@ async fn a_prompt_is_handed_over_to_and_from_a_cache_cut_over_cards() {
     }
 
     // The cut cache takes a prompt first, then gives one.
-    for (to, alone, first) in [(&b, &b_alone, 11), (&a, &a_alone, 12)] {
+    for (to, peer, alone, first) in [(&b, &a, &b_alone, 11), (&a, &b, &a_alone, 12)] {
+        ask(to, peer, vocab).await;
         let long = prompt(LONG_PROMPT_WORDS, vocab, first);
         let (text, cached) = answer(to, long.clone()).await;
         let (want, read_alone) = answer(alone, long).await;

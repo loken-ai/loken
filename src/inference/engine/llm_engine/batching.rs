@@ -392,6 +392,15 @@ pub(crate) fn busy(count: &AtomicUsize) -> bool {
     count.load(Ordering::Acquire) > 0 || ARRIVED.load(Ordering::Acquire) > 0
 }
 
+/// Waits until no request counted in `count` runs.
+/// The server may still be handling requests of other engines.
+pub(crate) fn wait_no_request(count: &AtomicUsize) {
+    let mut held = IDLE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    while count.load(Ordering::Acquire) > 0 {
+        held = IDLE.wait(held).unwrap_or_else(|e| e.into_inner());
+    }
+}
+
 /// Waits until [`busy`] is false.
 pub(crate) fn wait_idle(count: &AtomicUsize) {
     let mut held = IDLE_LOCK.lock().unwrap_or_else(|e| e.into_inner());

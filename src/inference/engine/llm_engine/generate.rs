@@ -150,7 +150,14 @@ impl LlmEngine {
         // A request that reads log-probabilities stays where they are drawn.
         let admitted = self.active.load(std::sync::atomic::Ordering::Acquire) > 0
             && params.top_logprobs.is_none();
-        if self.is_continuous().await || (admitted && self.hands_over_to_worker().await) {
+        // A prompt read for a peer stays on the serial path, which keeps the snapshot it hands
+        // over.
+        if params.for_peer && self.is_continuous().await {
+            return Err("the model serves from its batch worker, which keeps no snapshot".into());
+        }
+        if !params.for_peer
+            && (self.is_continuous().await || (admitted && self.hands_over_to_worker().await))
+        {
             let t0 = std::time::Instant::now();
             // The request's own probe receives its counts from the path that serves it.
             let probe = params.probe.clone().unwrap_or_default();
