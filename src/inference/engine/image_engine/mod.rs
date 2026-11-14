@@ -396,12 +396,7 @@ fn encode_flux_text(
         };
         info!("Flux: rebuilding the text encoder for a prompt that is not cached");
         let ndev = &state.t5_device.clone();
-        let ndtype = if state.t5_device.is_cuda() {
-            crate::tensor::DType::BF16
-        } else {
-            crate::tensor::DType::F32
-        };
-        let vb = unsafe { crate::tensor::VarBuilder::from_files(&[&path], ndtype, ndev) }
+        let vb = unsafe { crate::tensor::VarBuilder::from_files(&[&path], state.t5_dtype, ndev) }
             .map_err(|e| anyhow!("T5 rebuild: {e}"))?;
         state.t5_model = Some(
             crate::inference::model::t5::encoder::T5EncoderModel::load(vb, &cfg)
@@ -1923,6 +1918,58 @@ mod t5_size_tests {
             (9.0..10.0).contains(&gb),
             "expected ~9.5 GB, got {gb:.2} GB"
         );
+    }
+
+    /// A card holds the encoder in BF16 where the level narrows, and in F32 at `reference`.
+    /// The host holds it in F32 at every level.
+    #[test]
+    fn the_t5_encoder_is_held_in_bf16_on_a_card_only_where_the_level_narrows() {
+        use super::t5_held_dtype;
+        use crate::tensor::DType;
+        assert_eq!(t5_held_dtype(true, true), DType::BF16);
+        assert_eq!(t5_held_dtype(true, false), DType::F32);
+        assert_eq!(t5_held_dtype(false, true), DType::F32);
+        assert_eq!(t5_held_dtype(false, false), DType::F32);
+    }
+
+    /// An encoder stored in F32 and held in BF16 goes in the ledger with the bytes of both
+    /// forms.
+    /// One held as stored does not.
+    #[test]
+    fn a_t5_encoder_narrowed_on_a_card_is_in_the_ledger() {
+        use super::declare_t5_narrowing;
+        use crate::tensor::DType;
+        let cfg: Config = serde_json::from_value(serde_json::json!({
+            "vocab_size": 8, "d_model": 4, "d_kv": 2, "d_ff": 8,
+            "num_layers": 1, "num_heads": 2,
+            "relative_attention_num_buckets": 4, "relative_attention_max_distance": 8,
+            "dropout_rate": 0.1, "layer_norm_epsilon": 1e-6, "initializer_factor": 1.0,
+            "feed_forward_proj": "gated-gelu", "is_encoder_decoder": true,
+            "pad_token_id": 0, "eos_token_id": 1,
+        }))
+        .expect("a small t5 config");
+        let dir = std::env::temp_dir().join(format!("t5_ledger_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("model.safetensors");
+        let data: Vec<u8> = [0.5f32; 4].iter().flat_map(|v| v.to_le_bytes()).collect();
+        let view =
+            safetensors::tensor::TensorView::new(safetensors::Dtype::F32, vec![4], &data).unwrap();
+        safetensors::serialize_to_file(vec![("shared.weight".to_string(), view)], None, &path)
+            .unwrap();
+        let declared = |held: DType| {
+            declare_t5_narrowing(&path, &cfg, held).unwrap();
+            // The ledger is read right after the call that records in it.
+            crate::tensor::conversion::entries().into_iter().any(|e| {
+                e.class == "text_encoder"
+                    && e.from == "f32"
+                    && e.to == held.as_str()
+                    && e.before == t5_encoder_bytes(&cfg, 4)
+                    && e.after == t5_encoder_bytes(&cfg, held.size_in_bytes() as u64)
+            })
+        };
+        assert!(declared(DType::BF16), "the narrowing is not in the ledger");
+        assert!(!declared(DType::F32), "a kept encoder is in the ledger");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

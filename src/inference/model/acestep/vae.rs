@@ -244,12 +244,15 @@ pub fn vae_best_device_with_reserve(model_size: u64, reserve: u64) -> ND {
 
 /// What the decoder puts on the card, from the checkpoint's own tensor directory.
 ///
-/// Every kernel is dequantised, fused and held in half precision on a card, the per-channel
-/// vectors in F32, so the bytes on disk are not what goes resident - and the file also holds
-/// the encoder, which this loader does not read.
-fn decoder_resident_bytes(c: &crate::tensor::quantized::gguf_file::Content) -> u64 {
+/// Every kernel is dequantised and fused.
+/// It is held in half precision on a card when `half` is set, and in F32 otherwise.
+/// The per-channel vectors are held in F32.
+/// The file also holds the encoder, which this loader does not read.
+fn decoder_resident_bytes(c: &crate::tensor::quantized::gguf_file::Content, half: bool) -> u64 {
     let bytes = |(n, i): (&String, &crate::tensor::quantized::gguf_file::TensorInfo)| {
-        crate::inference::model::half::card_bytes(n, i.shape.dims())
+        let held = crate::inference::model::half::card_bytes(n, i.shape.dims());
+        let widened = !half && n.ends_with(".weight_v");
+        held * if widened { 2 } else { 1 }
     };
     let matched: u64 = c
         .tensor_infos
@@ -500,11 +503,12 @@ fn vae_load_t(
 /// Load a conv (`is_convt=false`, weight `[Cout,Cin,K]`) or convT (`is_convt=true`,
 /// weight `[Cin,Cout,K]`), fusing weight-norm (g per dim0; row-major flatten already
 /// matches the kernels' layouts). Bias is optional (decoder.conv2 has none).
+/// The kernel is held in half precision on a card when `half` is set.
 fn vae_load_conv(
     content: &crate::tensor::quantized::gguf_file::Content,
     file: &mut std::fs::File,
     prefix: &str,
-    is_convt: bool,
+    (is_convt, half): (bool, bool),
     eps: f32,
     dev: &ND,
 ) -> crate::tensor::Result<ConvW> {
@@ -521,7 +525,7 @@ fn vae_load_conv(
         Ok((b, _)) => b,
         Err(_) => vec![0.0; c_out],
     };
-    ConvW::from_fused(w, (c_out, c_in, k), b, is_convt, true, dev)
+    ConvW::from_fused(w, (c_out, c_in, k), b, is_convt, half, dev)
 }
 
 impl ConvW {
@@ -615,7 +619,11 @@ impl OobleckDecoder {
     /// the known Oobleck ratios [10,6,4,4,2] (pad=stride/2); the EXACT padding +
     /// fusion eps must still be confirmed per-tensor vs `acestep.cpp --dump`
     /// (cmake-blocked) before trusting the output numerically.
-    pub fn from_gguf(path: &str, eps: f32) -> crate::tensor::Result<Self> {
+    ///
+    /// `narrows` says whether the fidelity level lets a card hold the kernels in half
+    /// precision.
+    /// Otherwise they are held in F32, the form their fusion computes.
+    pub fn from_gguf(path: &str, eps: f32, narrows: bool) -> crate::tensor::Result<Self> {
         use crate::tensor::quantized::gguf_file;
         let mut file = std::fs::File::open(path)
             .map_err(|e| crate::tensor::Error(format!("ace-vae: open `{path}`: {e}")))?;
@@ -626,7 +634,7 @@ impl OobleckDecoder {
         // in when the file could not be stat'd was a figure nobody measured deciding a
         // real placement, and the 2 GB reserve behind it was the 48 kHz decoder's - handed
         // unchanged to a 24 kHz one that upsamples by a quarter as much.
-        let model_size = decoder_resident_bytes(&content);
+        let model_size = decoder_resident_bytes(&content, narrows);
         let reserve = crate::inference::place::audio_demand::oobleck_reserve(
             crate::inference::place::audio_demand::ACE_VAE_REFERENCE_WINDOW,
             &decoder_levels(&content, "decoder.block", &strides),
@@ -634,7 +642,14 @@ impl OobleckDecoder {
         );
         crate::inference::place::ladder::load_whole("ACE-Step VAE", model_size, reserve, |dev| {
             let dev = dev.clone();
-            let conv1 = vae_load_conv(&content, &mut file, "decoder.conv1", false, eps, &dev)?;
+            let conv1 = vae_load_conv(
+                &content,
+                &mut file,
+                "decoder.conv1",
+                (false, narrows),
+                eps,
+                &dev,
+            )?;
             let dils = [1usize, 3, 9];
             let mut blocks = Vec::with_capacity(5);
             for (i, &stride) in strides.iter().enumerate() {
@@ -644,7 +659,7 @@ impl OobleckDecoder {
                     &content,
                     &mut file,
                     &format!("{bp}.conv_t1"),
-                    true,
+                    (true, narrows),
                     eps,
                     &dev,
                 )?;
@@ -657,7 +672,7 @@ impl OobleckDecoder {
                             &content,
                             &mut file,
                             &format!("{rp}.conv1"),
-                            false,
+                            (false, narrows),
                             eps,
                             &dev,
                         )?,
@@ -666,7 +681,7 @@ impl OobleckDecoder {
                             &content,
                             &mut file,
                             &format!("{rp}.conv2"),
-                            false,
+                            (false, narrows),
                             eps,
                             &dev,
                         )?,
@@ -682,7 +697,14 @@ impl OobleckDecoder {
                 });
             }
             let snake_final = vae_load_snake(&content, &mut file, "decoder.snake1", &dev)?;
-            let conv2 = vae_load_conv(&content, &mut file, "decoder.conv2", false, eps, &dev)?;
+            let conv2 = vae_load_conv(
+                &content,
+                &mut file,
+                "decoder.conv2",
+                (false, narrows),
+                eps,
+                &dev,
+            )?;
             Ok(OobleckDecoder {
                 conv1,
                 blocks,
@@ -1316,6 +1338,7 @@ mod tests {
                 .to_str()
                 .unwrap(),
             1e-12,
+            true,
         )
         .expect("load vae gguf");
         // Sanity on the loaded geometry.
@@ -1337,6 +1360,58 @@ mod tests {
         assert!(finite, "non-finite audio");
     }
 
+    /// On a card the decoder holds its fused kernels in F32 where the level does not narrow.
+    /// Where it narrows it holds them in F16, and the ledger says so.
+    /// The F16 decode stays within the rounding of F16 of the F32 decode.
+    ///
+    /// The bound is first order.
+    /// Each of the decoder's rounded kernels adds at most a unit roundoff of F16 to the
+    /// relative error of the audio, in norm.
+    #[test]
+    #[ignore = "needs the ACE-Step VAE file and a card"]
+    fn the_decoder_holds_f32_kernels_on_a_card_where_the_level_keeps_them() {
+        let path = crate::inference::model::acestep::fsq::acestep_gguf("vae-BF16.gguf");
+        let path = path.to_str().unwrap();
+        let declared = || {
+            crate::tensor::conversion::entries()
+                .into_iter()
+                .filter(|e| e.class == "conv" && e.from == "f32" && e.to == "f16")
+                .count()
+        };
+        crate::tensor::conversion::open();
+        let kept = OobleckDecoder::from_gguf(path, 1e-12, false).expect("load at reference");
+        assert!(!kept.device.is_cpu(), "the decoder did not land on a card");
+        assert_eq!(kept.running_format(), "f32");
+        assert_eq!(declared(), 0, "a kept kernel is in the ledger");
+        crate::tensor::conversion::open();
+        let narrowed = OobleckDecoder::from_gguf(path, 1e-12, true).expect("load narrowed");
+        assert_eq!(narrowed.running_format(), "f16");
+        let kernels = 2 + narrowed
+            .blocks
+            .iter()
+            .map(|b| 1 + 2 * b.res.len())
+            .sum::<usize>();
+        assert_eq!(declared(), kernels, "each rounded kernel is in the ledger");
+        let t_latent = 6usize;
+        let latent = fill(64 * t_latent, 0.2);
+        let timed = |d: &OobleckDecoder| {
+            let t = std::time::Instant::now();
+            let (audio, _, _) = d.decode(&latent, 64, t_latent).unwrap();
+            println!("decode in {}: {:?}", d.running_format(), t.elapsed());
+            audio
+        };
+        // The first decode on the card is not timed.
+        narrowed.decode(&latent, 64, t_latent).unwrap();
+        let (want, got) = (timed(&kept), timed(&narrowed));
+        assert_eq!(want.len(), got.len());
+        let norm = |v: &mut dyn Iterator<Item = f32>| v.map(|x| x * x).sum::<f32>().sqrt();
+        let error = norm(&mut want.iter().zip(&got).map(|(a, b)| a - b));
+        let relative = error / norm(&mut want.iter().copied());
+        let bound = kernels as f32 * half::f16::EPSILON.to_f32() / 2.0;
+        println!("{kernels} kernels: relative error {relative:.3e} against {bound:.3e}");
+        assert!(relative <= bound, "{relative} over {bound}");
+    }
+
     /// Encoder geometry + VAE round-trip: a structured latent -> decode -> encode -> decode.
     /// Asserts the encoder mirrors the decoder (2->128 in, 128 out, 5 blocks, 1920x down)
     /// and that `encode∘decode ≈ identity` on the latent manifold (audio cosine high).
@@ -1345,7 +1420,7 @@ mod tests {
     fn encode_decode_roundtrip() {
         let p = crate::inference::model::acestep::fsq::acestep_gguf("vae-BF16.gguf");
         let p = p.to_str().unwrap();
-        let dec = OobleckDecoder::from_gguf(p, 1e-12).expect("load vae decoder");
+        let dec = OobleckDecoder::from_gguf(p, 1e-12, true).expect("load vae decoder");
         let enc = OobleckEncoder::from_gguf(p, 1e-12).expect("load vae encoder");
         assert_eq!(enc.conv1.c_in, 2, "stereo in");
         assert_eq!(enc.conv1.c_out, 128);
@@ -1392,6 +1467,7 @@ mod tests {
                 .to_str()
                 .unwrap(),
             1e-12,
+            true,
         )
         .expect("load vae gguf");
         let t = 192usize;
@@ -1458,6 +1534,7 @@ mod tests {
                 .to_str()
                 .unwrap(),
             1e-12,
+            true,
         )
         .expect("load vae");
         let (audio, c_audio, t_audio) = dec.decode(&latent, c_lat, t_lat).unwrap();
@@ -1501,6 +1578,7 @@ mod tests {
                 .to_str()
                 .unwrap(),
             1e-12,
+            true,
         )
         .unwrap();
         let (audio, c_audio, t_audio) = dec.decode(&latent, c, t_lat).unwrap();

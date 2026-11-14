@@ -71,7 +71,8 @@ pub(super) const WAN_VECTORS: DType = DType::F32;
 
 /// The dtype the dense projection weight `name` of `ld` is held in on `dv`.
 ///
-/// It is the narrowest form exact for every stored value of `name`.
+/// On the host, where the host narrows, a weight stored in F32 is held in F16.
+/// Otherwise it is the narrowest form exact for every stored value of `name`.
 /// A form narrower than the stored one goes in the conversion ledger.
 ///
 /// With `merged` set, the weight is the sum of its stored values and an adapter's correction.
@@ -85,16 +86,30 @@ pub(super) fn wan_held_dtype(
     merged: bool,
     dv: &Device,
 ) -> Result<DType> {
-    let held = ld.narrowest_exact_dtype(name)?;
     let (stored, width) = ld
         .stored_format(name)
         .ok_or_else(|| crate::tensor::Error(format!("wan: no tensor `{name}`")))?;
+    let narrowed =
+        dv.is_cpu() && width == DType::F32.size_in_bytes() && crate::tensor::layer::host_narrows();
+    let held = match narrowed {
+        true => DType::F16,
+        false => ld.narrowest_exact_dtype(name)?,
+    };
     if dv.is_dry() {
         return Ok(held);
     }
     let elems: usize = ld.shape_of(name).unwrap_or_default().iter().product();
     let after = (elems * held.size_in_bytes()) as u64;
-    if merged && held != DType::F32 {
+    if narrowed {
+        crate::tensor::conversion::record_kept(
+            "projection",
+            stored,
+            held.as_str(),
+            (elems * width) as u64,
+            after,
+            "the level holds a float checkpoint in half precision on the host",
+        );
+    } else if merged && held != DType::F32 {
         crate::tensor::conversion::record_kept(
             "projection",
             DType::F32.as_str(),
@@ -2227,9 +2242,117 @@ mod held_form_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// At `reference` the host keeps every stored value.
     #[test]
     fn a_projection_on_the_host_keeps_every_stored_value() {
+        let _reference = crate::tensor::layer::HostNarrows::enter(false);
         each_value_is_kept_on(&Device::Cpu, "host");
+    }
+
+    /// Where the host narrows, every projection of an F32 checkpoint is held in F16 on the
+    /// host, merged with an adapter or not, and the ledger says so.
+    #[test]
+    fn a_projection_of_a_float_checkpoint_is_held_in_f16_on_the_host_where_it_narrows() {
+        let _narrows = crate::tensor::layer::HostNarrows::enter(true);
+        let dir = std::env::temp_dir().join(format!("wan_narrowed_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (path, _) = checkpoint(&dir);
+        let ld = unsafe { SafeTensorsLoader::multi(&[&path]) }.unwrap();
+        for name in [
+            "blocks.0.plain.weight",
+            "blocks.0.half.weight",
+            "blocks.0.fine.weight",
+        ] {
+            for merged in [false, true] {
+                let held = wan_held_dtype(&ld, name, merged, &Device::Cpu).unwrap();
+                assert_eq!(held, DType::F16, "{name} merged {merged}");
+                // The ledger is read right after the call that records in it.
+                let declared = crate::tensor::conversion::entries().into_iter().any(|e| {
+                    e.class == "projection"
+                        && e.from == "f32"
+                        && e.to == "f16"
+                        && e.after == 8
+                        && e.reason.contains("level")
+                });
+                assert!(declared, "{name}: the narrowing is not in the ledger");
+            }
+        }
+        assert_eq!(
+            first_value(&ld, "blocks.0.fine.weight", DType::F16, &Device::Cpu),
+            half::f16::from_f32(ONLY_F32).to_f32()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Where the host narrows, a block projection of an F32 checkpoint on the host gives a row
+    /// within the rounding of F16 of what the projection held as stored gives.
+    ///
+    /// The bound counts the rounding of each weight, of each row value and of each output, at
+    /// the unit roundoff of F16, plus the F32 sums of both products and of the bias, plus the
+    /// smallest F16 value for each rounding that falls under its normal range.
+    #[test]
+    fn a_narrowed_projection_stays_within_the_rounding_of_f16() {
+        let (rows, inp, out) = (3usize, 96usize, 40usize);
+        let value = |i: usize, s: f32| ((i as f32 * s).sin() * 0.75) + 1.0 / 1048576.0;
+        let w: Vec<f32> = (0..out * inp).map(|i| value(i, 0.37)).collect();
+        let b: Vec<f32> = (0..out).map(|i| value(i, 0.11)).collect();
+        let x: Vec<f32> = (0..rows * inp).map(|i| value(i, 0.53)).collect();
+        let dir = std::env::temp_dir().join(format!("wan_rounding_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("dit.safetensors");
+        let bytes = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
+        let (wb, bb) = (bytes(&w), bytes(&b));
+        fn view(shape: Vec<usize>, data: &[u8]) -> safetensors::tensor::TensorView<'_> {
+            safetensors::tensor::TensorView::new(safetensors::Dtype::F32, shape, data).unwrap()
+        }
+        safetensors::serialize_to_file(
+            vec![
+                (
+                    "blocks.0.ffn.0.weight".to_string(),
+                    view(vec![out, inp], &wb),
+                ),
+                ("blocks.0.ffn.0.bias".to_string(), view(vec![out], &bb)),
+            ],
+            None,
+            &path,
+        )
+        .unwrap();
+        let ld = unsafe { SafeTensorsLoader::multi(&[&path]) }.unwrap();
+        let name = "blocks.0.ffn.0.weight";
+        let project = |narrows: bool| -> Vec<f32> {
+            let _level = crate::tensor::layer::HostNarrows::enter(narrows);
+            let held = wan_held_dtype(&ld, name, false, &Device::Cpu).unwrap();
+            let lin = WanLinear::Dense(
+                Linear::from_published(
+                    ld.load_to(name, held, &Device::Cpu).unwrap(),
+                    Some(
+                        ld.load_to("blocks.0.ffn.0.bias", DType::F32, &Device::Cpu)
+                            .unwrap(),
+                    ),
+                )
+                .unwrap(),
+            );
+            assert_eq!(lin.held_format(), if narrows { "f16" } else { "f32" });
+            let xt = Tensor::from_vec_f32(x.clone(), (rows, inp)).unwrap();
+            lin.forward(&xt).unwrap().to_vec_f32()
+        };
+        let (stored, narrowed) = (project(false), project(true));
+        let _ = std::fs::remove_dir_all(&dir);
+        let u = half::f16::EPSILON.to_f32() / 2.0;
+        let tiny = half::f16::from_bits(1).to_f32();
+        for (n, (s, g)) in stored.iter().zip(&narrowed).enumerate() {
+            let (r, c) = (n / out, n % out);
+            let products: f32 = (0..inp)
+                .map(|j| (x[r * inp + j] * w[c * inp + j]).abs())
+                .sum();
+            let magnitude = products + b[c].abs();
+            let allowed = (4.0 * u + 2.0 * inp as f32 * f32::EPSILON) * magnitude
+                + (2 * inp + 1) as f32 * tiny;
+            assert!(
+                (s - g).abs() <= allowed,
+                "[{r},{c}]: {g} against {s}, allowed {allowed}"
+            );
+        }
     }
 
     /// It runs on card 0 of the runtime the build carries: CUDA, or HIP for a ROCm build.

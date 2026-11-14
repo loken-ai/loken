@@ -5,6 +5,57 @@
 
 use super::*;
 
+/// Whether the host may compute with values narrower than the model computes them.
+/// A product on the host then reads F32 rows in F16 through an F16 weight.
+/// The server sets it from its fidelity level at start.
+/// It allows it until set.
+static HOST_NARROWS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+thread_local! {
+    /// The choice of this thread while a [`HostNarrows`] scope lives.
+    /// `None` leaves it to the process.
+    static HOST_NARROWS_SCOPE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Say whether the host may compute with values narrower than the model computes them.
+pub fn set_host_narrows(allowed: bool) {
+    HOST_NARROWS.store(allowed, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether the host may compute with values narrower than the model computes them, on this
+/// thread.
+pub fn host_narrows() -> bool {
+    HOST_NARROWS_SCOPE
+        .with(std::cell::Cell::get)
+        .unwrap_or_else(|| HOST_NARROWS.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// While alive, the host computations of this thread narrow as `allowed` says, whatever the
+/// process's level.
+/// Another thread keeps its own choice.
+/// The previous choice of this thread comes back on drop.
+#[must_use = "the choice ends when the scope drops"]
+pub struct HostNarrows {
+    previous: Option<bool>,
+    /// The scope belongs to the thread that entered it.
+    _thread: std::marker::PhantomData<*const ()>,
+}
+
+impl HostNarrows {
+    pub fn enter(allowed: bool) -> Self {
+        Self {
+            previous: HOST_NARROWS_SCOPE.with(|s| s.replace(Some(allowed))),
+            _thread: std::marker::PhantomData,
+        }
+    }
+}
+
+impl Drop for HostNarrows {
+    fn drop(&mut self) {
+        HOST_NARROWS_SCOPE.with(|s| s.set(self.previous));
+    }
+}
+
 /// Which orientation the weight is held in.
 ///
 /// Both reach the same GEMM: `[in, out]` is multiplied directly, and `[out, in]` goes through
@@ -239,9 +290,13 @@ impl Linear {
         }
 
         let wdt = self.held.tensor().dtype();
-        // F32 rows through a half weight on the host stay F32.
-        // The weight is widened to F32 for the product, exactly.
-        let host_widens = x.dtype() == DType::F32 && self.held.tensor().device().is_cpu();
+        // F32 rows through a BF16 weight on the host stay F32.
+        // F32 rows through an F16 weight on the host stay F32 where the host may not narrow.
+        // The weight is then widened to F32 for the product, exactly.
+        // Where the host may narrow, the rows are read in F16 through an F16 weight.
+        let host_widens = x.dtype() == DType::F32
+            && self.held.tensor().device().is_cpu()
+            && !(wdt == DType::F16 && host_narrows());
         let follow = wdt != x.dtype() && matches!(wdt, DType::BF16 | DType::F16) && !host_widens;
         let xm = if follow { x.to_dtype(wdt)? } else { x.clone() };
         // The host product widens the half weight a block at a time, not whole.

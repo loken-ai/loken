@@ -225,6 +225,8 @@ pub struct AudioEngine {
     /// Transcriptions queued behind the one running on a model run as the next group:
     /// their audio windows go through the encoder as one batch.
     gather: TranscribeGather,
+    /// Whether the fidelity level lets a card hold the projections in half precision.
+    narrows: bool,
 }
 
 /// Transcriptions gathered by the model they run on; each job is the PCM and its
@@ -236,7 +238,8 @@ type TranscribeGather = crate::inference::serve::gather::Gather<
 >;
 
 impl AudioEngine {
-    pub fn new() -> Self {
+    /// An engine whose loads follow the fidelity level `fidelity`.
+    pub fn new(fidelity: crate::inference::engine::llm_engine::Fidelity) -> Self {
         Self {
             model_state: Arc::new(Mutex::new(None)),
             name: Arc::new(Mutex::new(None)),
@@ -245,6 +248,7 @@ impl AudioEngine {
             resident_bytes: Arc::new(Mutex::new(0)),
             window_bytes: Arc::new(Mutex::new(0)),
             gather: TranscribeGather::default(),
+            narrows: fidelity.narrows(),
         }
     }
 
@@ -318,9 +322,10 @@ impl AudioEngine {
         // hf-hub is sync. Do the I/O on a blocking thread so we don't stall
         // the tokio runtime.
         let model_id_clone = model_id.clone();
+        let narrows = self.narrows;
         let (state, running_format) = tokio::task::spawn_blocking(move || {
             let held = crate::tensor::layer::held::collect();
-            load_whisper_blocking(&model_id_clone).map(|state| (state, held.formats()))
+            load_whisper_blocking(&model_id_clone, narrows).map(|state| (state, held.formats()))
         })
         .await
         .map_err(|e| anyhow!("whisper load join: {e}"))??;
@@ -406,7 +411,7 @@ impl AudioEngine {
 
 impl Default for AudioEngine {
     fn default() -> Self {
-        Self::new()
+        Self::new(crate::inference::engine::llm_engine::Fidelity::default())
     }
 }
 
@@ -414,7 +419,9 @@ impl Default for AudioEngine {
 // Internal: HF download + load
 // ------------------------------------------------------------
 
-fn load_whisper_blocking(model_id: &str) -> AnyResult<WhisperModelState> {
+/// `narrows` says whether the fidelity level lets a card hold the projections in half
+/// precision.
+fn load_whisper_blocking(model_id: &str, narrows: bool) -> AnyResult<WhisperModelState> {
     let api = {
         let mut b = ApiBuilder::new();
         if let Ok(tok) = std::env::var("HF_TOKEN") {
@@ -477,7 +484,7 @@ fn load_whisper_blocking(model_id: &str) -> AnyResult<WhisperModelState> {
     let (device, model) =
         crate::inference::place::ladder::load_whole("Whisper", weights_size, reserve, |device| {
             let vb = unsafe { VarBuilder::from_files(&[&weights_path], DType::F32, device)? };
-            let model = WhisperF32::load(&vb, config.clone())?;
+            let model = WhisperF32::load(&vb, config.clone(), narrows)?;
             Ok::<_, crate::tensor::Error>((device.clone(), model))
         })
         .map_err(|e| anyhow!("load whisper weights: {e}"))?;

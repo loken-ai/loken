@@ -585,7 +585,7 @@ fn weight(in_dim: usize, out_dim: usize, vb: &Vb) -> Result<Weight> {
 ///
 /// A builder at F32 off the host holds F32.
 /// The host and a narrower builder hold the narrowest form exact for every stored value.
-/// The host products read that form with F32 rows.
+/// At `reference` the host products read that form with F32 rows.
 /// A form narrower than the stored one goes in the conversion ledger.
 /// A dry builder performs no conversion and records none.
 fn held_dtype(vb: &VarBuilder, name: &str) -> Result<DType> {

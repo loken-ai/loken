@@ -751,7 +751,7 @@ mod tests {
     fn render_dumped_latent_to_wav() {
         use crate::inference::model::acestep::vae::{encode_wav_s16le, OobleckDecoder};
         let gguf = acestep_gguf("vae-BF16.gguf");
-        let dec = OobleckDecoder::from_gguf(gguf.to_str().unwrap(), 1e-12).unwrap();
+        let dec = OobleckDecoder::from_gguf(gguf.to_str().unwrap(), 1e-12, true).unwrap();
         let (lat_tmajor, ls) = load_dump("/tmp/acedump/dit_output.bin"); // [T,64] token-major
         let (t_lat, oc) = (ls[0], ls[1]);
         // -> channel-major [oc.T] for the VAE.

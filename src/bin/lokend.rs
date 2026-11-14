@@ -226,6 +226,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let fidelity = inference_config.fidelity;
             loken::tensor::cuda_ext::set_gemm_reduced_precision(fidelity.reduces_gemm());
             loken::tensor::quantized::set_half_rows(fidelity.narrows());
+            loken::tensor::layer::set_host_narrows(fidelity.narrows());
 
             // Initialize NVML and detect GPUs
             info!("🔧 Initializing NVML (NVIDIA Management Library)...");

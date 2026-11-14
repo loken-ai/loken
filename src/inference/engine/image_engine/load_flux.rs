@@ -55,6 +55,7 @@ impl ImageEngine {
         } = req;
         let free_before_load = crate::inference::place::vram_manager::free_total();
         let model_state = self.model_state.clone();
+        let narrows = self.fidelity.narrows();
 
         let result = tokio::task::spawn_blocking(move || -> AnyResult<()> {
             let stage = LoadStage::new("Flux", progress_tx);
@@ -322,15 +323,17 @@ impl ImageEngine {
             // while this render's own need stays free there. The host otherwise: slower for
             // one encode, and correct. The cards are read after the transformer is resident,
             // so what they report is the truth.
-            let t5_bytes = t5_encoder_bytes(&t5_config, 2 /* bf16 */) + t5_encode_scratch_bytes(&t5_config);
+            // A card is asked for the encoder in the form the level holds it in there.
+            let t5_card_bytes = t5_held_dtype(true, narrows).size_in_bytes() as u64;
+            let t5_bytes = t5_encoder_bytes(&t5_config, t5_card_bytes)
+                + t5_encode_scratch_bytes(&t5_config);
             let aux_cards = crate::inference::place::ladder::aside(
                 &crate::inference::place::ladder::cards(0),
                 &hot_cards,
                 runtime_demand,
             );
             send_progress("Loading T5 encoder...");
-            // T5 runs on the NATIVE substrate: bf16 on a card (bf16 required - T5's FF
-            // activations overflow f16), F32 on the host.
+            // T5 runs on the NATIVE substrate, in the form `t5_held_dtype` gives its device.
             let (t5_model, t5_device) = crate::inference::place::ladder::load_whole_on(
                 "Flux T5 encoder",
                 t5_bytes,
@@ -338,14 +341,22 @@ impl ImageEngine {
                 &aux_cards,
                 cancel.as_ref(),
                 |dev| {
-                    let dtype = if dev.is_cuda() { DType::BF16 } else { DType::F32 };
+                    let dtype = t5_held_dtype(dev.is_cuda(), narrows);
                     let vb = unsafe { crate::tensor::VarBuilder::from_files(&[&t5_model_file], dtype, dev) }
                         .map_err(|e| anyhow!("T5 native weights: {e}"))?;
                     crate::inference::model::t5::encoder::T5EncoderModel::load(vb, &t5_config)
                         .map_err(|e| anyhow!("T5 native load: {e}"))
                 },
             )?;
-            info!("Flux T5 encoder device: {:?} (wanted {:.1} GB)", t5_device, t5_bytes as f64 / 1e9);
+            let t5_dtype = t5_held_dtype(t5_device.is_cuda(), narrows);
+            declare_t5_narrowing(&t5_model_file, &t5_config, t5_dtype)
+                .map_err(|e| anyhow!("T5 stored format: {e}"))?;
+            info!(
+                "Flux T5 encoder device: {:?}, held in {} (wanted {:.1} GB)",
+                t5_device,
+                t5_dtype.as_str(),
+                t5_bytes as f64 / 1e9
+            );
             let t5_tokenizer_file = api
                 .model("lmz/mt5-tokenizers".to_string())
                 .get("t5-v1_1-xxl.tokenizer.json")?;
@@ -556,6 +567,7 @@ impl ImageEngine {
                     t5_model: Some(t5_model),
                     t5_source: Some((t5_model_file.clone(), t5_config.clone())),
                     t5_device,
+                    t5_dtype,
                     t5_tokenizer,
                     clip_model,
                     clip_device,

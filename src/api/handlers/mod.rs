@@ -1562,7 +1562,7 @@ impl APIServer {
             #[cfg(feature = "image")]
             image_engine: Arc::new(ImageEngine::new(fidelity)),
             #[cfg(feature = "audio")]
-            audio_engine: Arc::new(AudioEngine::new()),
+            audio_engine: Arc::new(AudioEngine::new(fidelity)),
             #[cfg(feature = "audio")]
             tts_engine: Arc::new(crate::inference::engine::TtsEngine::new(fidelity)),
             forecast_engine: Arc::new(

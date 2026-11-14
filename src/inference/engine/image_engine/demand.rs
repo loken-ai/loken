@@ -704,3 +704,48 @@ pub(super) fn t5_encoder_bytes(
         + (cfg.relative_attention_num_buckets * cfg.num_heads) as u64;
     params * dtype_bytes
 }
+
+/// The form the Flux text encoder holds its weights in, on a card when `on_card` is set and
+/// on the host otherwise.
+///
+/// A card holds them in BF16 where the level narrows.
+/// T5's feed-forward activations overflow F16, so BF16 is its half form.
+/// Everywhere else they are held in F32, which keeps every value a float checkpoint stores.
+pub(super) fn t5_held_dtype(on_card: bool, narrows: bool) -> DType {
+    if narrows && on_card {
+        DType::BF16
+    } else {
+        DType::F32
+    }
+}
+
+/// Write in the conversion ledger the encoder of `cfg` held in `held` when that form is not
+/// the one `path` stores.
+///
+/// The bytes come from the config and the header of the file.
+pub(super) fn declare_t5_narrowing(
+    path: &std::path::Path,
+    cfg: &crate::inference::model::t5::encoder::Config,
+    held: DType,
+) -> Result<(), crate::tensor::Error> {
+    let loader = unsafe { crate::tensor::safetensors_io::SafeTensorsLoader::multi(&[path]) }?;
+    let stored = loader
+        .names()
+        .first()
+        .and_then(|name| loader.stored_format(name));
+    let Some((format, width)) = stored else {
+        return Ok(());
+    };
+    if format == held.as_str() {
+        return Ok(());
+    }
+    crate::tensor::conversion::record_kept(
+        "text_encoder",
+        format,
+        held.as_str(),
+        t5_encoder_bytes(cfg, width as u64),
+        t5_encoder_bytes(cfg, held.size_in_bytes() as u64),
+        "the T5 encoder is held in the form the level gives its device",
+    );
+    Ok(())
+}

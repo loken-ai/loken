@@ -692,6 +692,8 @@ pub(crate) async fn audio_generations(
     // What the request names, and what that checkpoint's files declare it to be. A request
     // naming nothing renders with the default sound model.
     let hf = _state.huggingface_models_dir.clone();
+    // Whether the fidelity level lets a card hold the music decoder in half precision.
+    let narrows = _state.default_inference_config.fidelity.narrows();
     let entry = match crate::api::handlers::catalogue::sound_entry(&body.0) {
         e if e.is_empty() => DEFAULT_SOUND_MODEL.to_string(),
         e => e,
@@ -994,8 +996,12 @@ pub(crate) async fn audio_generations(
                 let _ = tx.blocking_send((phase.to_string(), step, total));
                 cancel_m.bail()
             };
-            crate::inference::model::acestep::music::render_with_progress(&mcfg, Some(&cb))
-                .map_err(|e| e.to_string())?;
+            crate::inference::model::acestep::music::render_with_progress(
+                &mcfg,
+                narrows,
+                Some(&cb),
+            )
+            .map_err(|e| e.to_string())?;
             std::fs::read(&out_read).map_err(|e| format!("read rendered wav: {e}"))
         });
         let node_s = _state.node_name();
@@ -1252,8 +1258,12 @@ pub(crate) async fn audio_generations(
                 record.note(phase, step, total);
                 Ok(())
             };
-            crate::inference::model::acestep::music::render_with_progress(&mcfg, Some(&cb))
-                .map_err(|e| e.to_string())?;
+            crate::inference::model::acestep::music::render_with_progress(
+                &mcfg,
+                narrows,
+                Some(&cb),
+            )
+            .map_err(|e| e.to_string())?;
             std::fs::read(&out_read).map_err(|e| format!("read rendered wav: {e}"))
         })
         .await;

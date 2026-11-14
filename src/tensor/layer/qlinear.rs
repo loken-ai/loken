@@ -30,7 +30,8 @@ pub enum Weight {
     /// arithmetic around it stays F32. Casting the weight up instead would double what it
     /// occupies, on the path chosen precisely because memory was the constraint.
     ///
-    /// On the host the activation keeps its dtype and the product widens the weight.
+    /// On the host the activation reaches the `Linear` in its own dtype.
+    /// The `Linear` reads it at the precision the host's level gives.
     ///
     /// The `Linear` is a bare weight here: the bias and the adapters belong to the `QLinear`
     /// around it, so there is one place each lives rather than two that must agree.
@@ -46,7 +47,8 @@ impl Weight {
         match self {
             Weight::Quant(w) => w.forward(x),
             Weight::Dense(l, wdtype) => {
-                // On the host the rows stay as they come: the product widens a half weight.
+                // On the host the rows stay as they come.
+                // The `Linear` reads them at the precision the host's level gives.
                 let xw = if x.dtype() == *wdtype || l.device().is_cpu() {
                     x.clone()
                 } else {

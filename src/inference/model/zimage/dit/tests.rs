@@ -1365,9 +1365,10 @@ fn first_output(p: &QLinear, value: f32) -> f32 {
 
 /// A projection built on the host is held in the narrowest form exact for its stored values.
 ///
-/// Its product reads the rows in F32.
+/// At `reference` its product reads the rows in F32.
 #[test]
 fn a_projection_on_the_host_keeps_every_stored_value() {
+    let _reference = crate::tensor::layer::HostNarrows::enter(false);
     let cfg = tiny_config();
     let dir = std::env::temp_dir().join(format!("zimage_held_host_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();

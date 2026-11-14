@@ -40,6 +40,8 @@ pub struct FluxModelState {
     /// Device the T5 encoder lives on (a second CUDA device when available so it
     /// doesn't compete with the Flux transformer's VRAM, else CPU).
     pub t5_device: Device,
+    /// The form the T5 encoder holds its weights in, for a rebuild too.
+    pub t5_dtype: DType,
     pub t5_tokenizer: Tokenizer,
     pub clip_model: crate::inference::model::clip::text::Transformer,
     /// Device the CLIP text encoder lives on.

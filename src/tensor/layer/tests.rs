@@ -65,10 +65,12 @@ mod tests {
         }
     }
 
-    /// A half weight on the host gives F32 rows the product of the weight widened to F32.
+    /// At `reference` a half weight on the host gives F32 rows the product of the weight
+    /// widened to F32.
     #[test]
     fn a_half_weight_on_the_host_reads_f32_rows() {
         use crate::tensor::DType;
+        let _reference = HostNarrows::enter(false);
         let (s, i, o) = (3usize, 8usize, 5usize);
         let w = Tensor::from_vec_f32(data(o * i, 7), vec![o, i]).unwrap();
         let x = Tensor::from_vec_f32(data(s * i, 8), vec![s, i]).unwrap();
@@ -83,11 +85,13 @@ mod tests {
         }
     }
 
-    /// A half weight on the host, transposed or as published, gives F32 rows the product of
-    /// the weight widened whole, bit for bit, at shapes past the product's tile edges.
+    /// At `reference` a half weight on the host, transposed or as published, gives F32 rows the
+    /// product of the weight widened whole, bit for bit, at shapes past the product's tile
+    /// edges.
     #[test]
     fn a_half_weight_on_the_host_widens_by_blocks_exactly() {
         use crate::tensor::DType;
+        let _reference = HostNarrows::enter(false);
         for (s, i, o) in [(1usize, 300usize, 600usize), (5, 257, 513), (6, 64, 40)] {
             let w = Tensor::from_vec_f32(data(o * i, 3), vec![o, i]).unwrap();
             let x = Tensor::from_vec_f32(data(s * i, 4), vec![s, i]).unwrap();
@@ -111,6 +115,117 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Where the host narrows, an F16 weight on the host reads F32 rows in F16.
+    ///
+    /// The product is the one of the F16 kernels called on the rows rounded to F16, bit for bit,
+    /// transposed or as published.
+    /// It stays within the rounding of F16 of the product of the weight widened whole.
+    /// The bound is the rounding of each row value and of each output, both at the unit roundoff
+    /// of F16, plus the F32 sums of both products, plus the smallest F16 value for each rounding
+    /// that falls under its normal range.
+    #[test]
+    fn an_f16_weight_on_the_host_reads_the_rows_in_f16_where_the_host_narrows() {
+        use crate::tensor::DType;
+        let _narrows = HostNarrows::enter(true);
+        let u = half::f16::EPSILON.to_f32() / 2.0;
+        let tiny = half::f16::from_bits(1).to_f32();
+        for (s, i, o) in [(1usize, 300usize, 600usize), (5, 257, 513), (6, 64, 40)] {
+            let w = Tensor::from_vec_f32(data(o * i, 5), vec![o, i]).unwrap();
+            let x = Tensor::from_vec_f32(data(s * i, 6), vec![s, i]).unwrap();
+            let stored = w.to_dtype(DType::F16).unwrap();
+            let rows = x.to_dtype(DType::F16).unwrap();
+            let published = rows.matmul_t(&stored).unwrap();
+            let transposed = rows
+                .reshape(vec![1, s, i])
+                .unwrap()
+                .matmul(
+                    &stored
+                        .transpose(0, 1)
+                        .unwrap()
+                        .reshape(vec![1, i, o])
+                        .unwrap(),
+                )
+                .unwrap();
+            let exact = Linear::new(stored.to_dtype(DType::F32).unwrap(), None)
+                .unwrap()
+                .forward(&x)
+                .unwrap()
+                .to_vec_f32();
+            let wide = stored.to_dtype(DType::F32).unwrap().to_vec_f32();
+            let xs = x.to_vec_f32();
+            let bound = 3.0 * u + 2.0 * i as f32 * f32::EPSILON;
+            for (held, kernel) in [
+                (Linear::new(stored.clone(), None).unwrap(), transposed),
+                (
+                    Linear::from_published(stored.clone(), None).unwrap(),
+                    published,
+                ),
+            ] {
+                let got = held.forward(&x).unwrap();
+                assert_eq!(got.dtype(), DType::F32);
+                let got = got.to_vec_f32();
+                let kernel = kernel.to_dtype(DType::F32).unwrap().to_vec_f32();
+                assert_eq!(got, kernel, "{s}x{i}x{o}");
+                for (n, (g, e)) in got.iter().zip(&exact).enumerate() {
+                    let (r, c) = (n / o, n % o);
+                    let magnitude: f32 = (0..i)
+                        .map(|j| (xs[r * i + j] * wide[c * i + j]).abs())
+                        .sum();
+                    let allowed = bound * magnitude + (i + 1) as f32 * tiny;
+                    assert!(
+                        (g - e).abs() <= allowed,
+                        "{s}x{i}x{o} [{r},{c}]: {g} against {e}, allowed {allowed}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Where the host narrows, a BF16 weight on the host still gives F32 rows the product of
+    /// the weight widened whole, bit for bit, transposed or as published.
+    #[test]
+    fn a_bf16_weight_on_the_host_reads_f32_rows_where_the_host_narrows() {
+        use crate::tensor::DType;
+        let _narrows = HostNarrows::enter(true);
+        let (s, i, o) = (5usize, 257usize, 513usize);
+        let w = Tensor::from_vec_f32(data(o * i, 7), vec![o, i]).unwrap();
+        let x = Tensor::from_vec_f32(data(s * i, 8), vec![s, i]).unwrap();
+        let stored = w.to_dtype(DType::BF16).unwrap();
+        let wide = stored.to_dtype(DType::F32).unwrap();
+        let pairs = [
+            (
+                Linear::new(stored.clone(), None).unwrap(),
+                Linear::new(wide.clone(), None).unwrap(),
+            ),
+            (
+                Linear::from_published(stored, None).unwrap(),
+                Linear::from_published(wide, None).unwrap(),
+            ),
+        ];
+        for (held, widened) in pairs {
+            let want = widened.forward(&x).unwrap().to_vec_f32();
+            assert_eq!(held.forward(&x).unwrap().to_vec_f32(), want);
+        }
+    }
+
+    /// With no server to set it, the host narrows, as the default level does.
+    /// A scope sets the choice of its own thread only and gives the previous one back.
+    #[test]
+    fn the_host_narrows_until_a_level_says_otherwise() {
+        assert!(std::thread::spawn(host_narrows).join().unwrap());
+        {
+            let _reference = HostNarrows::enter(false);
+            assert!(!host_narrows());
+            assert!(std::thread::spawn(host_narrows).join().unwrap());
+            {
+                let _narrows = HostNarrows::enter(true);
+                assert!(host_narrows());
+            }
+            assert!(!host_narrows());
+        }
+        assert!(host_narrows());
     }
 
     /// A half precision table widens only the rows a lookup returns, to the values the

@@ -88,6 +88,8 @@ impl Fidelity {
     /// At `reference` the host keeps the cache of a sink or gemma4 layer at the model's width.
     /// At `reference` a half matrix over several rows on a card reads the rows in F32.
     /// At `reference` a card keeps a float output head in its stored format.
+    /// At `reference` an F16 weight on the host reads the rows in F32.
+    /// At `reference` the host keeps the block projections of a float video checkpoint as stored.
     pub fn narrows(self) -> bool {
         self != Fidelity::Reference
     }

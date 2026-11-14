@@ -6,10 +6,12 @@
 //! projects the last hidden state back through the embedding table to score the next token. The
 //! audio front-end, the config and the tokenizer constants live alongside, in the module above.
 //!
-//! On a card the projections a decode step runs, the head included, are held in half precision
-//! and the stream between them runs F32; the projections over the whole audio window are held
-//! in half precision when the card multiplies them faster that way ([`half_matmul_pays`]), and
-//! in F32 otherwise. The convolutions, norms and biases stay F32. Both embedding tables
+//! On a card, at a fidelity level that narrows, the projections a decode step runs, the head
+//! included, are held in half precision and the stream between them runs F32; the projections
+//! over the whole audio window are held in half precision when the card multiplies them faster
+//! that way ([`half_matmul_pays`]), and in F32 otherwise.
+//! At a level that does not narrow, every projection and every cache is held in F32.
+//! The convolutions, norms and biases stay F32. Both embedding tables
 //! stay on HOST: a decode step looks up its token and position there and uploads the one row
 //! it built. The decoder's self attention writes into buffers reserved for its whole context.
 
@@ -36,6 +38,7 @@ use crate::tensor::{DType, Device, Result, Tensor};
 ///
 /// `half` says, for the query and output projections and then for the key and value ones,
 /// whether they are held in half precision.
+/// A kept cache is held in half precision on a card when one of them is.
 fn attention(
     n_state: usize,
     n_head: usize,
@@ -43,7 +46,7 @@ fn attention(
     [half_q, half_kv]: [bool; 2],
     vb: VarBuilder,
 ) -> Result<MultiHeadAttention> {
-    MultiHeadAttention::new(
+    let attention = MultiHeadAttention::new(
         projection(n_state, n_state, true, half_q, &vb.pp("q_proj"))?,
         projection(n_state, n_state, false, half_kv, &vb.pp("k_proj"))?,
         projection(n_state, n_state, true, half_kv, &vb.pp("v_proj"))?,
@@ -52,8 +55,12 @@ fn attention(
         n_head,
         n_head,
         kv,
-    )
-    .map(MultiHeadAttention::with_half_cache)
+    )?;
+    Ok(if half_q || half_kv {
+        attention.with_half_cache()
+    } else {
+        attention
+    })
 }
 
 /// One block of either stack, read off the names whisper's checkpoint uses.
@@ -65,12 +72,13 @@ fn attention(
 ///
 /// `window_half` says whether the projections that read the whole audio window - all of the
 /// tower's, and the keys and values the decoder projects from it - are held in half precision.
-/// The decoder's other projections read one step at a time and always are.
+/// `step_half` says whether the decoder's other projections, which read one step at a time,
+/// are.
 fn block(
     n_state: usize,
     n_head: usize,
     context: Option<usize>,
-    window_half: bool,
+    [window_half, step_half]: [bool; 2],
     vb: VarBuilder,
 ) -> Result<CrossAttentionBlock> {
     let (self_kv, cross_attn, step_half) = match context {
@@ -80,10 +88,10 @@ fn block(
                 n_state,
                 n_head,
                 Kv::Fixed(None),
-                [true, window_half],
+                [step_half, window_half],
                 vb.pp("encoder_attn"),
             )?),
-            true,
+            step_half,
         ),
         None => (Kv::None, None, window_half),
     };
@@ -107,9 +115,9 @@ fn block(
 }
 
 /// Whether the projections over the whole audio window are held in half precision on the
-/// device `vb` loads to.
-fn window_half(vb: &VarBuilder, cfg: &Config) -> Result<bool> {
-    half_matmul_pays(vb.device(), cfg.max_source_positions, cfg.d_model)
+/// device `vb` loads to, at a level that lets a card narrow them when `narrows` is set.
+fn window_half(vb: &VarBuilder, cfg: &Config, narrows: bool) -> Result<bool> {
+    Ok(narrows && half_matmul_pays(vb.device(), cfg.max_source_positions, cfg.d_model)?)
 }
 
 /// `[length, channels]` sin/cos table, built host-side.
@@ -142,9 +150,12 @@ pub struct AudioEncoder {
 impl AudioEncoder {
     /// Public so Ultravox can load its Whisper-large-v3-turbo audio tower (the
     /// `audio_tower.*` tensors use the same names) without the text decoder.
-    pub fn load(vb: VarBuilder, cfg: &Config) -> Result<Self> {
+    ///
+    /// `narrows` says whether the fidelity level lets a card hold projections in half
+    /// precision.
+    pub fn load(vb: VarBuilder, cfg: &Config, narrows: bool) -> Result<Self> {
         let (width, heads) = (cfg.d_model, cfg.encoder_attention_heads);
-        let window_half = window_half(&vb, cfg)?;
+        let window_half = window_half(&vb, cfg, narrows)?;
         // The mel front-end: a three-tap convolution that keeps the length, then the same
         // one striding by two, which is where the sequence halves.
         let taps = same_length_1d(3, 1);
@@ -160,7 +171,7 @@ impl AudioEncoder {
                         width,
                         heads,
                         None,
-                        window_half,
+                        [window_half, window_half],
                         vb.pp(format!("layers.{i}")),
                     )
                 })
@@ -218,23 +229,25 @@ pub struct TextDecoder {
 }
 
 impl TextDecoder {
-    fn load(vb: VarBuilder, cfg: &Config) -> Result<Self> {
+    /// `narrows` says whether the fidelity level lets a card hold projections in half
+    /// precision.
+    fn load(vb: VarBuilder, cfg: &Config, narrows: bool) -> Result<Self> {
         let (width, heads) = (cfg.d_model, cfg.decoder_attention_heads);
         let span = cfg.max_target_positions;
         let host = vb.to(DType::F32, &Device::Cpu);
         let token_embedding = embedding(cfg.vocab_size, width, &host.pp("embed_tokens"))?;
         // Text positions were learned rather than computed, so the table is read.
         let positional_embedding = host.get((span, width), "embed_positions.weight")?;
-        let head = if vb.device().is_cuda() {
+        let head = if narrows && vb.device().is_cuda() {
             crate::inference::model::half::linear(token_embedding.table(), None, vb.device())?
         } else {
             Linear::new(token_embedding.table().to_device(vb.device())?, None)?
         };
-        let window_half = window_half(&vb, cfg)?;
+        let window_half = window_half(&vb, cfg, narrows)?;
         let blocks = (0..cfg.decoder_layers)
             .map(|i| {
                 let vb = vb.pp(format!("layers.{i}"));
-                block(width, heads, Some(span), window_half, vb)
+                block(width, heads, Some(span), [window_half, narrows], vb)
             })
             .collect::<Result<Vec<_>>>()?;
         let ln = layer_norm(width, 1e-5, &vb.pp("layer_norm"))?;
@@ -309,10 +322,13 @@ pub struct Whisper {
 
 impl Whisper {
     /// Both stacks hang off `model.*` in the checkpoint, one prefix each.
-    pub fn load(vb: &VarBuilder, config: Config) -> Result<Self> {
+    ///
+    /// `narrows` says whether the fidelity level lets a card hold projections in half
+    /// precision.
+    pub fn load(vb: &VarBuilder, config: Config, narrows: bool) -> Result<Self> {
         Ok(Self {
-            encoder: AudioEncoder::load(vb.pp("model.encoder"), &config)?,
-            decoder: TextDecoder::load(vb.pp("model.decoder"), &config)?,
+            encoder: AudioEncoder::load(vb.pp("model.encoder"), &config, narrows)?,
+            decoder: TextDecoder::load(vb.pp("model.decoder"), &config, narrows)?,
             config,
         })
     }
@@ -420,7 +436,7 @@ mod tests {
         weights.insert("layer_norm.weight".into(), filled(5, &[n_state]));
         weights.insert("layer_norm.bias".into(), filled(6, &[n_state]));
         let vb = VarBuilder::from_tensors(weights, DType::F32, &Device::Cpu);
-        let mut tower = AudioEncoder::load(vb, &cfg).unwrap();
+        let mut tower = AudioEncoder::load(vb, &cfg, true).unwrap();
 
         let (a, b) = (
             filled(7, &[1, n_mels, frames]),
@@ -477,11 +493,11 @@ mod tests {
             .collect();
         let xa = Tensor::from_vec(audio, (1, src, n_state), &Device::Cpu).unwrap();
 
-        let mut whole = block(n_state, n_head, Some(n), true, vb.clone()).unwrap();
+        let mut whole = block(n_state, n_head, Some(n), [true, true], vb.clone()).unwrap();
         whole.clear();
         let at_once = whole.forward(&xs, Some(&xa), Mask::Causal).unwrap();
 
-        let mut stepped = block(n_state, n_head, Some(n), true, vb).unwrap();
+        let mut stepped = block(n_state, n_head, Some(n), [true, true], vb).unwrap();
         let mut rows = Vec::new();
         for t in 0..n {
             let step = xs.narrow(1, t, 1).unwrap();
@@ -507,6 +523,29 @@ mod tests {
             gap < 1e-4,
             "stepped and whole-prefix decoding differ by {gap}"
         );
+    }
+
+    /// On a card a decoder block holds its projections in F32 at a level that does not
+    /// narrow, and its step projections in half precision at one that does.
+    #[test]
+    fn a_decoder_block_on_a_card_narrows_only_when_the_level_does() {
+        let Ok(card) = Device::new_cuda(0) else {
+            eprintln!("no card 0: skipped");
+            return;
+        };
+        let n_state = 16usize;
+        for (narrows, want) in [(false, "f32"), (true, "f16")] {
+            let vb = VarBuilder::from_tensors(block_weights(n_state, true), DType::F32, &card);
+            let held = crate::tensor::layer::held::collect();
+            block(n_state, 4, Some(5), [false, narrows], vb).unwrap();
+            let formats = held.formats().unwrap_or_default();
+            assert_eq!(
+                formats.contains("f16"),
+                want == "f16",
+                "narrows {narrows}: {formats}"
+            );
+            assert!(formats.contains("f32"), "narrows {narrows}: {formats}");
+        }
     }
 }
 

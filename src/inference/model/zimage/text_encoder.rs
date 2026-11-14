@@ -163,7 +163,7 @@ struct Attention {
 /// The `[out, inp]` weight of the projection under `vb`.
 ///
 /// On the host it is held in the narrowest form exact for its stored values.
-/// The host product reads that form with F32 rows.
+/// At `reference` the host product reads that form with F32 rows.
 /// Elsewhere it is held at the builder's dtype.
 fn held_weight(inp: usize, out: usize, vb: &VarBuilder) -> tensor::Result<Tensor> {
     if !vb.device().is_cpu() {

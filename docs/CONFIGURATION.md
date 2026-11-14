@@ -94,7 +94,12 @@ What each level chooses:
 | Float GEMMs of an image render on a CUDA card | IEEE F32 reduction | TF32 and fast BF16 for FLUX, IEEE F32 reduction for the other families | TF32 and fast BF16 for FLUX, IEEE F32 reduction for the other families |
 | Float GEMMs of a music, sound or video render on a CUDA card | IEEE F32 reduction | IEEE F32 reduction | IEEE F32 reduction |
 | Rows of a product over an F16 or BF16 matrix on a card | Read in F32, as a single row is | Rounded to the matrix's format above 1 row for F16, above a few for BF16 | Rounded to the matrix's format above 1 row for F16, above a few for BF16 |
+| Rows of a product over an F16 or BF16 weight on the host | Read in F32, the weight widened exactly to F32 | Rounded to F16 over an F16 weight. Read in F32 over a BF16 weight, the weight widened exactly | Rounded to F16 over an F16 weight. Read in F32 over a BF16 weight, the weight widened exactly |
+| Block projections of a video checkpoint stored in F32, on the host | As stored, in the narrowest form exact for every value | F16 | F16 |
+| Flux T5 text encoder on a CUDA card | F32 | BF16 | BF16 |
 | Parler-TTS decoder on a CUDA card | F32, as stored | F16 | F16 |
+| ACE-Step audio decoder kernels on a card | F32, as fused | F16 | F16 |
+| Whisper projections and decoder cache on a CUDA card | F32 | Half precision for the decoder steps and the head. Half precision for the audio window when the card multiplies it faster | Half precision for the decoder steps and the head. Half precision for the audio window when the card multiplies it faster |
 | Context shift | Off | On | On |
 | Drafts verified in recorded windows | No | No | Yes |
 | Exactness the experts streamed from disk may give up | `exact` | `exact` | `fast` |

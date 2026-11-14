@@ -348,6 +348,7 @@ A narrower form than the stored one goes in the conversion ledger.
 The load log and `/api/ps` name the formats the blocks run in.
 
 The Wan 1.3B video DiT holds each block projection in the narrowest form exact for its stored values, on a card and on the host.
+Outside the `reference` level the host holds the block projections of an F32 checkpoint in F16.
 A narrower form than the stored one goes in the conversion ledger.
 A projection merged with an adapter is held in the form of its stored values, rounded once, and the ledger says so.
 The load log names the formats the blocks run in.
@@ -355,7 +356,11 @@ The load log names the formats the blocks run in.
 An audio decoder with weight-normed convolutions fuses each kernel in `F32` at load.
 On a CUDA or ROCm card the fused kernel is held in `F16`, the form the convolution products read.
 That rounding goes in the conversion ledger.
+At the `reference` level the ACE-Step decoder holds its fused kernels in `F32` on a card.
 The ACE-Step load log names the format its decoder runs in.
+
+The T5 text encoder of Flux is held in `BF16` on a card outside the `reference` level, and in `F32` on the host and at `reference`.
+A form other than the stored one goes in the conversion ledger, and the load log names the form.
 
 A safetensors checkpoint of Flux, FLUX.2, Qwen-Image or Boogu is rebuilt in a block format at every load.
 Each rebuilt matrix goes in the conversion ledger, and the load log names the stored and the running formats.

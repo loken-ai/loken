@@ -377,13 +377,19 @@ type DynErr = Box<dyn std::error::Error>;
 /// - and re-runs the unit (which reloads its models so the new placement takes effect).
 use crate::inference::place::ladder::rerun_under_pressure;
 
+/// The decoder is held as the default fidelity level holds it.
 pub fn render(cfg: &MusicConfig) -> Result<(), DynErr> {
-    render_with_progress(cfg, None)
+    let level = crate::inference::engine::llm_engine::Fidelity::default();
+    render_with_progress(cfg, level.narrows(), None)
 }
 
 /// Like [`render`], plus a per-DiT-step progress callback `progress(step, total)` for streaming UIs.
+///
+/// `narrows` says whether the fidelity level lets a card hold the decoder's kernels in half
+/// precision.
 pub fn render_with_progress(
     cfg: &MusicConfig,
+    narrows: bool,
     progress: Option<&crate::inference::serve::progress::ProgressTryFn<'_>>,
 ) -> Result<(), DynErr> {
     use crate::inference::serve::progress as ph;
@@ -964,7 +970,7 @@ pub fn render_with_progress(
             v
         };
         ph::try_note(progress, ph::phase::DECODE, 0, t)?;
-        let vae = OobleckDecoder::from_gguf(&vae_g, 1e-12)?;
+        let vae = OobleckDecoder::from_gguf(&vae_g, 1e-12, narrows)?;
         let vae_part = ph::placement::part("vae", &vae.placement());
         let t2 = std::time::Instant::now();
         // The decode walks the latent in chunks and says where it is at each one; a
