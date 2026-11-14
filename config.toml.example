@@ -54,7 +54,7 @@ model_id = "qwen3:0.6b"
 # fidelity = "balanced"             # reference, balanced or fast
 
 # Files, moderation and the URLs handed out.
-# files_dir = "/var/lib/loken/files"   # uploads and batch outputs, default: files/ beside the model store
+# files_dir = "/var/lib/loken/files"   # uploads and batch outputs, default: files/ under the first Ollama store
 # moderation_model = "llama-guard3:1b" # Llama Guard, Shieldstral, ShieldGemma, Granite Guardian or gpt-oss Safeguard
 # public_url = "https://loken.example.org" # the origin clients reach this server at, default: the request's Host
 

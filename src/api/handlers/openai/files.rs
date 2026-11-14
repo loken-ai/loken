@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
-/// Where the files go: the configured directory, else `files/` beside the model store.
+/// Where the files go: the configured directory, else `files/` under the Ollama model store.
 fn files_dir(state: &APIServer) -> PathBuf {
     state
         .default_inference_config

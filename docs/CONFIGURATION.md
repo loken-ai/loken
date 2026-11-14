@@ -52,6 +52,7 @@ A Hugging Face repository stays whole in 1 directory.
 A single string reads as a list of 1.  
 Some media families read checkpoints from fixed paths under the store: `boogu/`, `wan/`, `flux-kontext-q4km.gguf` and `qwen-image-edit/`.
 These are looked up in the first Hugging Face directory only.
+The stored voices and their consents are kept beside the first Hugging Face directory too, see [Stored voices](API.md#stored-voices).
 
 ## `[server]`
 
@@ -86,7 +87,7 @@ What each level chooses:
 <!-- site: widget table id=config-fidelity-levels -->
 | Choice | `reference` | `balanced` | `fast` |
 |---|---|---|---|
-| Float projections of an F32, F16 or BF16 checkpoint | As stored | Q8_0 when the stack sits on one kind of memory, Q4_K (Q6_K for the feed-forward output) when it is split between cards and host | Q4_K (Q6_K for the feed-forward output) |
+| Float projections of an F32, F16 or BF16 checkpoint | As stored | As stored when the plan fits with them. Otherwise Q8_0, or Q4_K (Q6_K for the feed-forward output) when Q8_0 does not fit. The float matrices of a checkpoint that also holds block-format projections take Q8_0 when its stack sits on 1 kind of memory and fits, Q4_K otherwise | Q4_K (Q6_K for the feed-forward output) |
 | KV cache format | Full width, on the cards and on the host, attention sinks and gemma4 included | Q8 for a model the quantised kernels serve. F16 on a card and on the host for attention sinks and gemma4 | Q8 for a model the quantised kernels serve. F16 on a card and on the host for attention sinks and gemma4 |
 | Float output head on a card | As stored | F16 | F16 |
 | Float GEMMs on a CUDA card | IEEE F32 reduction | TF32 and fast BF16 | TF32 and fast BF16 |
@@ -133,10 +134,12 @@ A key of that name in an older `config.toml` loads and is reported as no longer 
 | Card a model loads on | The fastest card that holds it, from the probe. |
 | Memory each card offers | The measured free memory. The load keeps its own runtime reserve and backs off after an out-of-memory. |
 | Layers on cards, host threads | The placement plan, and the physical (or performance) cores. |
+| Experts of a mixture over several cards | A mixture that 1 card holds is weighed against spreading its experts over the cards. The plan compares both from the measured link and read speeds. It counts that the busiest card reads more than its share of the experts that a few rows route to. The faster placement is taken. |
 | KV cache format | Q8 for every model whose head shape the quantised kernels serve, at `balanced` and `fast`. Full width at `reference`, for a head shape they do not cover, and for capped attention scores (Gemma2), attention sinks and gemma4. At `balanced` and `fast` the cache of attention sinks and gemma4 is F16 on a card and on the host. |
 | Conversation snapshots | Each finished sequence is copied aside, a quantised cache in its packed form, so a later request on it resumes from its own KV. The count kept is bounded by the free device memory, leaving the cache its working window and the next prefill the memory it sizes its chunk from. A handed-over cache is kept in the same packed form. Before a kept snapshot is dropped for room, the work queued on the cards runs and the pools hand back their free blocks, and the room counts the blocks a pool still holds free. A copy that would not fit is not taken. |
-| Batched serving | Requests that overlap on a model on cards share its paged worker. The worker takes a mixture whose experts the card holds, attention sinks, layers that read a sliding window, and a rotation stretched or over part of each head. It decodes those models without its captured decode graph. The worker runs every layer whole on one card. It reads a prompt longer than a prefill chunk alone, a chunk at a time. Its chunk is the one the serial prefill sizes from the card before the pool takes its room, and the pool leaves that chunk's memory free. A model whose layers sit on several cards, or are split across them, decodes serially. A lone request takes the path that serves it sooner: serial decode, which drafts and takes a prompt from a prefill peer, or the worker, which does neither. The time counts the prompt of the latest lone request at the path's prompt rate, then its answer at the path's decode rate. Each path is measured on the lone requests it serves, and a path not yet measured takes the next one, the worker first. A prompt rate comes from a request that read at least a prefill chunk. A request that arrives while a lone request decodes serially moves that request into the worker at its next token. The model keeps the worker's paged pool while it serves serially, so the worker starts again at its first size. A serial prefill or a hand-over that needs more than its card has free gives that pool back, and the next worker sizes a new one. A hand-over then takes the room of the kept snapshots too. The time the arriving requests wait for that move counts against the serial path. A grammar, token rules or prompt embeddings take the model back to serial decode until the next overlap. |
+| Batched serving | Requests that overlap on a model on cards share its batch worker. The worker takes a mixture whose experts the card holds, attention sinks, layers that read a sliding window, and a rotation stretched or over part of each head. It decodes those models without its captured decode graph. The worker runs every layer whole on one card. It reads a prompt longer than a prefill chunk alone, a chunk at a time. Its chunk is the one the serial prefill sizes from the card before the pool takes its room, and the pool leaves that chunk's memory free. A model whose layers sit on several cards, or are split across them, decodes serially. A lone request takes the path that serves it sooner: serial decode, which drafts and takes a prompt from a prefill peer, or the worker, which does neither. The time counts the prompt of the latest lone request at the path's prompt rate, then its answer at the path's decode rate. Each path is measured on the lone requests it serves, and a path not yet measured takes the next one, the worker first. A prompt rate comes from a request that read at least a prefill chunk. A request that arrives while a lone request decodes serially moves that request into the worker at its next token. The model keeps the worker's paged pool while it serves serially, so the worker starts again at its first size. A serial prefill or a hand-over that needs more than its card has free gives that pool back, and the next worker sizes a new one. A hand-over then takes the room of the kept snapshots too. The time the arriving requests wait for that move counts against the serial path. A grammar, token rules or prompt embeddings take the model back to serial decode until the next overlap. |
 | Speculative decoding | A model that spills layers to the host is drafted for by the smallest model in the store with the same ordinary vocabulary, loaded on the fastest card before the target. The draft length is learned from measured acceptance and cycle time. On a model whose experts stream, it also counts the experts a longer draft adds that no card holds, from the routing and the measured copy and host pace. A cycle that recorded a verify window, or the drafter's step, counts its acceptance alone. The drafter's decode step is recorded where the model allows it and kept between requests while nothing it reads has moved. A drafter with a recurrent state keeps the state before each draft and returns to it, then takes in only the tokens the target kept. A model held on the cards gets no drafter. `POST /api/draft/attach` attaches one by hand. |
+| Prompt lookup | The serial path drafts without a second model. When the last 2 to 4 tokens already occur in the prompt or the answer, the tokens that followed them are the draft. The target verifies every draft. The lookup runs while its rounds write tokens faster than plain steps. Both rates are measured while decoding, and the next request starts from them. A lookup that loses waits for a run of plain steps, longer after each lost trial, then is tried again. The wait ends early once the drafts that the plain steps match would have saved more than a losing round costs. It also runs on a model whose experts stream. The batch worker does not draft. |
 | Resident models | As many language models stay loaded as the cards hold. The least recently used is unloaded only when an incoming model would otherwise be pushed off the cards. |
 | Sleeping models | When a keep-alive ends, a language model whose files fit the host memory budget (the available memory less a quarter of the machine) keeps them read into host memory, locked when the system allows, and its card memory is released. The files are every part of a GGUF set with its draft head, vision projector and tokenizer files, or the shards and JSON files of a checkpoint directory. The next request loads it without reading the disk. Otherwise it is unloaded. |
 | Context shift | At `balanced` and `fast`, once a conversation outgrows the window, the resident tail is kept and re-phased instead of prefilling the whole window, wherever the cache supports it (not Q4 caches, sliding-window layers or recurrent hybrids). |
@@ -192,9 +195,13 @@ A peer that reads fast makes the serial path's prompt rate high, and a long prom
 The prompt is read here when:
 
 - the prompt adds less than 1 prefill chunk to what the cache holds
-- the request carries an image
+- the request carries an image or audio
+- the answer is streamed and the request names a session
 - the model has recurrent or windowed layers and a layer split across the cards
 - the peer cannot answer
+
+The request to the peer carries the prompt as text and no API key.
+A peer with `require_auth` on refuses it, and the prompt is read here.
 
 A layer split across the cards gives its rows whole and takes them back share by share.
 A cache cut over the cards gives its rows in the order of their positions and cuts them again over its own cards.
@@ -335,7 +342,7 @@ For a recurrent hybrid, a stored state is a manifest and blocks:
 - Blocks hold the global layers' rows for 1 block size of tokens (derived, see above), once per shared prefix.
   A block is stored as f16 where every value is exactly an f16, and as f32 otherwise, so a restore returns the stored bits.
 - States are kept at the derived spacing of kept states, and at the end of every prompt of at least 1 block.
-- A state is keyed by the file, `kv_quant`, the layer kinds, the row geometry and which layers run on a card, so another placement or KV format starts from nothing.
+- A state is keyed by the file, the KV cache format, the layer kinds, the row geometry and which layers run on a card, so another placement or KV format starts from nothing.
 
 A restore removes the prefill of the covered tokens: the recurrent state and the global KV are read from disk instead of recomputed.
 The gain grows with the covered length and with how slow a prefill is on the machine and placement in use.
@@ -462,7 +469,8 @@ The caps follow the decoder's allocation budget: a request past 1 is answered 40
 
 ## `[cluster]`
 
-Without this table, the node runs alone and every cluster path is skipped.  
+Without this table, the node runs alone and routes no request to a peer.  
+`prefill_peer`, under `[inference]`, works without it.  
 See [CLUSTER.md](CLUSTER.md) for the model.
 
 <!-- site: widget table id=config-cluster -->
@@ -484,6 +492,9 @@ See [CLUSTER.md](CLUSTER.md) for the model.
 | `OLLAMA_KEEP_ALIVE` | unset | The keep-alive of a loaded model, 5 minutes when unset. A bare number is minutes. |
 | `HF_TOKEN` | unset | Sent when a pull fetches from Hugging Face. |
 
+The options of `lokend serve` are in [Building](BUILDING.md#daemon-options).
+`--backends` names the backends to compute on: `cuda`, `rocm`, `vulkan`, `opencl` and `cpu`.
+
 ## Build features
 
 <!-- site: widget table id=config-build-features -->
@@ -492,7 +503,7 @@ See [CLUSTER.md](CLUSTER.md) for the model.
 | `cuda`, `opencl` | on | The device backends. |
 | `rocm` | off | AMD cards through HIP. Alone with `--no-default-features --features rocm,cpu`, or beside `cuda` with `--features cuda,rocm`, where 1 binary drives both vendors' cards. |
 | `image`, `audio`, `video`, `midi`, or `media` for all | on | The generative-media families and their routes. |
-| `vulkan` | off | Dense decoder layers on Vulkan GPUs that no other runtime of the build drives. A build with `vulkan` alone drives every GPU. |
+| `vulkan` | off | Decoder layers on Vulkan GPUs that no other runtime of the build drives, a mixture's experts included. A build with `vulkan` and without `cuda` and `rocm` drives every GPU. See [Building](BUILDING.md#vulkan-cards). |
 | `metrics` | off | `GET /metrics` in OpenMetrics, behind the same authentication as every other route. |
 | `cpu` | off | Language models on the host only. |
 <!-- site: end -->

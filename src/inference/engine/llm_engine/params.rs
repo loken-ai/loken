@@ -61,7 +61,7 @@ impl Fidelity {
                 "float weights as stored, full-width cache, IEEE F32 GEMM, no context shift"
             }
             Fidelity::Balanced => {
-                "float weights in 8 bits on one kind of memory and 4 when split, Q8 cache where \
+                "float weights as stored when they fit, else in 8 or 4 bits, Q8 cache where \
                  served, TF32 GEMM, context shift"
             }
             Fidelity::Fast => {
@@ -102,12 +102,12 @@ impl Fidelity {
         self != Fidelity::Reference
     }
 
-    /// `recorded_drafts` when the configuration leaves it unset.
+    /// Whether the drafts are recorded at this level.
     pub fn recorded_drafts(self) -> bool {
         self == Fidelity::Fast
     }
 
-    /// `quality` when the configuration leaves it unset.
+    /// The quality of the weights and of the cache at this level.
     pub fn quality(self) -> QualityLevel {
         match self {
             Fidelity::Fast => QualityLevel::Fast,
@@ -115,7 +115,7 @@ impl Fidelity {
         }
     }
 
-    /// `expert_variants` when the configuration leaves it unset.
+    /// The expert variants the placement takes at this level.
     pub fn expert_variants(self) -> crate::inference::place::expert_variants::VariantChoice {
         use crate::inference::place::expert_variants::VariantChoice;
         match self {

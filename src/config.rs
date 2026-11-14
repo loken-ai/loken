@@ -109,8 +109,8 @@ pub struct InferenceConfigToml {
     pub context_parallel: bool,
     /// How closely the output follows the published model, against speed and memory:
     /// `reference`, `balanced` (the default) or `fast`. It chooses the weight format of float
-    /// checkpoints, the cache format, the shifted context, and the value of
-    /// `recorded_drafts`, `quality` and `expert_variants` where those are left unset.
+    /// checkpoints, the cache format, the shifted context, whether drafts are recorded, the
+    /// quality and the expert variants.
     #[serde(default)]
     pub fidelity: crate::inference::engine::llm_engine::Fidelity,
     /// Directory of the on-disk cache of DeepSeek V4.1 decode states, which lets a prompt that

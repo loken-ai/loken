@@ -1,7 +1,7 @@
 # Cluster internals
 
 To set up 2 machines, read [Run 2 machines](https://loken-ai.github.io/loken/cluster/).  
-[Status](https://github.com/loken-ai/loken/blob/main/docs/STATUS.md#the-cluster) says what has been measured.  
+[Status](STATUS.md#the-cluster) says what has been measured.  
 [Across machines](https://loken-ai.github.io/loken/nodes/) follows a request and a cut step by step.
 
 ## Principle
@@ -149,6 +149,14 @@ notes = ["A verdict that keeps the request logs `cluster: serving locally: <reas
 
 When a peer stops mid-stream, the relay appends the closing chunk of the API format so the client sees an end.
 
+## A prompt read by another instance
+
+An instance with `prefill_peer` set, under `[inference]`, asks that peer to read its long prompts on `/api/cluster/prefill`.
+It imports the KV cache or the decode state the peer answers, and decodes from it.
+The key needs no `[cluster]` table.
+The routing above plays no part.
+[Configuration](CONFIGURATION.md#prompts-read-by-another-instance) says when a prompt is handed over and when it is read here.
+
 ## Planning a cut
 
 At load, a clustered node measures itself and plans the split.
@@ -220,8 +228,8 @@ A frame is little endian:
 
 A frame whose shape and length disagree, or whose length passes the cap, is refused before any allocation.
 
-A multiplexed link carries many requests on 1 connection.
-A reply is routed by its request id, and a bound on requests in flight makes a fast sender wait.
+A pipeline link carries 1 request at a time: a caller sends, then reads its reply.
+The multiplexed link, which would route replies by request id, is written and reached by no code path, see [Status](STATUS.md#sharding-for-dense-transformers).
 
 Pipeline frames:
 

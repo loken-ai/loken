@@ -1,9 +1,9 @@
 # Status
 
 What is measured, what is slower, what has never run.  
-Revised 2026-11-01.
+Revised 2026-11-14.
 
-Every figure comes from 1 machine: RTX 5070 Ti + RTX 5060 Ti (16 GB each), Linux, CUDA 13.3, models on a USB disk reading at 460 MB/s.
+A figure comes from 1 machine unless its section names another: RTX 5070 Ti + RTX 5060 Ti (16 GB each), Linux, CUDA 13.3, models on a USB disk reading at 460 MB/s.
 
 ## Decode rate
 
@@ -136,7 +136,7 @@ vLLM could not run it.
 | Prefill | A prompt's token mixers run on the card that keeps them. Its routed experts run on the card that keeps them, and on the host from the file's mapping otherwise. The host tier admits the experts the prompt routes to |
 | Read-ahead, reader threads, expert tier | Derived from measurement at load and while decoding, see [Configuration](CONFIGURATION.md#streamed-mixtures-deepseek-v41) |
 | Decode-state cache | In host memory, or on disk when `state_cache_dir` is set. A stored state is restored only when reading it costs less than prefilling its tokens. A short remainder still reads nearly every expert, which bounds how little it costs |
-| Exactness of streamed experts | `exact` unless `fidelity = "fast"`. The other levels change the output. The budget is derived from the model's own noise and chosen against a teacher-forced run of a bundled text, not against a task score |
+| Exactness of streamed experts | Exact at `reference` and `balanced`. `fast` changes the output within a budget. The budget is derived from the model's own noise and chosen against a teacher-forced run of a bundled text, not against a task score |
 | Sharding across nodes | Unmeasured at 2 nodes, see [The cluster](#the-cluster) |
 <!-- site: end -->
 
@@ -210,11 +210,15 @@ It is most of loken's time per clip.
 
 ## OpenCL
 
+The figures of this section come from a laptop.
+Its integrated Intel Arc GPU shares the host's memory.
+The laptop also holds an RTX 4060 with 8 GB.
+
 The layers of a language model run on an Intel GPU through Intel's OpenCL runtime, and give the host's text (qwen3 0.6b, greedy).
 A model whose RoPE has frequency factors runs there too (llama3.2 1b).
 On the laptop's processor llama3.2 1b runs faster there than on the host.
-A prompt of about 1100 tokens reads at 309 tokens per second against 192, and a decode runs at 29 against 28.
-qwen3 0.6b reads a prompt of about 1100 tokens slower there: 332 tokens per second against 356.
+A prompt of about 1100 tokens reads at 309 tok/s against 192, and a decode runs at 29 tok/s against 28.
+qwen3 0.6b reads a prompt of about 1100 tokens slower there: 332 tok/s against 356.
 
 Devices of Mesa's OpenCL platform are not offered for layers, because the layers measured wrong on them.
 A card that CUDA or ROCm drives is told by its PCI address and is not offered for OpenCL layers.
@@ -351,7 +355,9 @@ No figure here measures the peak after the changes.
 
 ## The cluster
 
-2 halves live in [Cluster](CLUSTER.md), and only 1 of them runs.
+2 halves live in [Cluster](CLUSTER.md): replicated serving and sharding.
+Both run.
+Sharding is measured for a dense model on 2 loopback servers, and unmeasured between 2 machines.
 
 ### Replicated serving
 
@@ -364,7 +370,8 @@ That node forwards the whole HTTP request to the best holder and relays the stre
 Membership is SWIM gossip with a phi-accrual detector.
 Multicast announcement or a `join` list seeds it.
 
-`/api/cluster/state`, `/api/cluster/peers` and `/api/cluster/prefix` report the membership.  
+`/api/cluster/state` and `/api/cluster/peers` report the membership.  
+`/api/cluster/prefix` reports how much of a prompt a node already holds.  
 There is no consensus protocol: routing to a dead node costs a retry, not a corruption.
 
 A hand-over is priced on rates that each node measures from its own completed generations.
@@ -448,7 +455,7 @@ A loopback test of the toy model through the engine is bit-identical to 1 node.
 
 A verify batch crosses the pipeline: the last segment answers with the logits of every position.
 
-The link-cost matrix, the tiered KV, the resume path and the layer scheduler are reached by no code path.
+These are reached by no code path: the link-cost matrix, the tiered KV, the resume path, the layer scheduler, the multiplexed link, the request evidence, the `CutPlan` planner and the `NetworkClient`.
 
 ### Capacity defect
 
