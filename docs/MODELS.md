@@ -433,6 +433,7 @@ The hash depends on the placement, see [Status](https://github.com/loken-ai/loke
 | Speech | Parler-TTS | `tts-1`, `tts-1-hd`, `parler-tts/parler-tts-mini-v1`, `parler-tts/parler-tts-large-v1` |
 | Speech | Piper | `piper/<voice>`, as in `piper/fr_FR-tom-medium` |
 | Speech | Pocket-TTS, Kyutai | `pocket-tts`, `kyutai` |
+| Speech | Qwen3-TTS | `Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice`, `Qwen/Qwen3-TTS-12Hz-1.7B-Base`, `Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign`, by their repository |
 | Music | ACE-Step, Stable Audio | `acestep`, `stable-audio` |
 | Sound effects | EzAudio | `ezaudio` |
 | Separation | Mel-Band RoFormer | `/v1/audio/separate` |
@@ -440,6 +441,23 @@ The hash depends on the placement, see [Status](https://github.com/loken-ai/loke
 
 The OpenAI voice names (`alloy`, `echo`, `fable`, `onyx` and the rest) are accepted and mapped.
 `GET /v1/audio/voices` lists what the resident model offers.
+
+### A Qwen3-TTS voice that stays the same
+
+A Qwen3-TTS request names its checkpoint as `model`, or a stored voice as `voice`.
+`language` takes a BCP 47 code or a name the checkpoint lists.
+Without `model`, `language` alone picks Kyutai.
+
+| Voice | Request | Same voice from 1 text to the next |
+|---|---|---|
+| A speaker the CustomVoice checkpoint names | `model` the CustomVoice checkpoint, `voice` a name `GET /v1/audio/voices` lists | Yes |
+| A stored voice | `voice` its id | Yes |
+| A voice described in words | `model` the VoiceDesign checkpoint, `voice_description` | No |
+
+`POST /v1/audio/voices` makes a stored voice once, with the speaker encoder of the Base checkpoint.
+It takes a clip under a consent, or a description that the VoiceDesign checkpoint speaks first.
+A stored voice keeps the speaker embedding of its clip, not the clip.
+The same request without `seed` gives the same audio.
 
 ## Time series
 

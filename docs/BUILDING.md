@@ -46,6 +46,9 @@ A toolkit that does not know `sm_120a` fails the build.
 cargo build --release --no-default-features --features rocm,cpu
 ```
 
+This build serves language models only.
+`--features rocm,cpu,media` adds the speech, image and video routes.
+
 The build needs ROCm's `hipcc` on the `PATH` or under `ROCM_PATH`.  
 The kernels are compiled for the AMD targets from CDNA (gfx908) to RDNA4 (gfx1201).
 `LOKEN_ROCM_ARCHS` narrows the list.
