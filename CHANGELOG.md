@@ -151,6 +151,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 - Speech: serve the Piper voices in a build without the image and video families.
 - Cluster: read here a streamed prompt that carries a Qwen image or video.
 - API: report the prompt time of an answer the batch worker writes.
+- Serving: end a batched answer that a failed step cuts with an error.
 - Kernels: refuse the inputs and launches that failed without an error.
 - State cache: load when the disk probe measures no rate.
 - MoE: drop and read ahead the expert pages of a model loaded from 1 file.

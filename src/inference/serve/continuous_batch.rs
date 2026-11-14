@@ -144,6 +144,8 @@ struct ReqState {
     sampling: SamplingParams,
     /// Whether a step has started this request's prompt.
     admitted: bool,
+    /// The tokens the request may generate.
+    max_new: usize,
 }
 
 pub struct ContinuousBatchEngine<M: BatchedModel> {
@@ -197,6 +199,7 @@ impl<M: BatchedModel> ContinuousBatchEngine<M> {
                 last_was_prefill: false,
                 sampling: req.sampling,
                 admitted: false,
+                max_new: req.max_new,
             },
         );
     }
@@ -225,17 +228,32 @@ impl<M: BatchedModel> ContinuousBatchEngine<M> {
         self.model
     }
 
-    /// Abort all in-flight sequences (free their KV, clear per-seq state) after a
-    /// model step error, returning their ids so the caller can close their channels.
-    /// Lets the worker recover and keep serving instead of dying on one bad step.
-    pub fn abort_all(&mut self) -> Vec<SeqId> {
-        let ids: Vec<SeqId> = self.reqs.keys().copied().collect();
+    /// Aborts the sequences a step has started, after a model step error: frees their KV and
+    /// what the model keeps for them, and returns their ids for the caller to close their
+    /// channels.
+    ///
+    /// A request no step has started stays queued, in the order of its submission.
+    pub fn abort_started(&mut self) -> Vec<SeqId> {
+        let mut started = Vec::new();
+        let mut queued = Vec::new();
+        for (id, r) in self.reqs.drain() {
+            if r.admitted {
+                started.push(id);
+            } else {
+                queued.push((id, r));
+            }
+        }
         self.sched.reset();
-        self.reqs.clear();
-        for &id in &ids {
+        self.admitted.clear();
+        for &id in &started {
             self.model.release(id);
         }
-        ids
+        queued.sort_by_key(|(id, _)| *id);
+        for (id, r) in queued {
+            self.sched.add_request(id, r.prompt.clone(), r.max_new);
+            self.reqs.insert(id, r);
+        }
+        started
     }
 
     /// Run one batched step. Returns sequences that finished this step.
@@ -483,7 +501,7 @@ mod tests {
     }
 
     #[test]
-    fn abort_all_clears_state_and_frees_blocks() {
+    fn abort_started_clears_state_and_frees_blocks() {
         let mut e = engine(64, HashMap::new());
         let free0 = e.sched.free_blocks();
         for id in 1..=4 {
@@ -496,7 +514,7 @@ mod tests {
         }
         let _ = e.step().unwrap(); // prefill: allocate blocks for the 4 seqs
         assert!(e.sched.free_blocks() < free0, "blocks in use after prefill");
-        let aborted = e.abort_all();
+        let aborted = e.abort_started();
         assert_eq!(aborted.len(), 4, "all in-flight seqs reported");
         assert!(e.is_idle(), "engine idle after abort");
         assert_eq!(
@@ -619,10 +637,41 @@ mod tests {
             submit(&mut e, id, 10);
         }
         e.step().unwrap();
-        e.abort_all();
+        e.abort_started();
         let mut aborted = e.model.released[3..].to_vec();
         aborted.sort();
         assert_eq!(aborted, vec![4, 5]);
+    }
+
+    /// An abort ends the requests a step started.
+    /// The requests no step started stay queued and get their whole answers.
+    #[test]
+    fn a_request_no_step_started_outlives_an_abort() {
+        let m = MockModel {
+            eos: 0,
+            stop_after: HashMap::new(),
+            seen_prefill: Default::default(),
+        };
+        // A step admits the prompt rows of 1 request.
+        let mut e = ContinuousBatchEngine::new(m, vec![0], 64, 16, 8, 4).unwrap();
+        let free0 = e.sched.free_blocks();
+        for id in 1..=3 {
+            e.submit(GenReq {
+                id,
+                prompt: vec![5, 6, 7],
+                max_new: 3,
+                sampling: SamplingParams::greedy(),
+            });
+        }
+        e.step().unwrap();
+        assert_eq!(e.abort_started(), vec![1]);
+        let done = e.run_to_idle().unwrap();
+        let mut ids: Vec<SeqId> = done.iter().map(|d| d.id).collect();
+        ids.sort();
+        assert_eq!(ids, vec![2, 3]);
+        assert!(done.iter().all(|d| d.tokens.len() == 3));
+        assert!(e.is_idle());
+        assert_eq!(e.sched.free_blocks(), free0, "every block came back");
     }
 
     #[test]

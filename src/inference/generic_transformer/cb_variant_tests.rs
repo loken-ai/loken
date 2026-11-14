@@ -302,6 +302,7 @@ fn served_alone_and_beside_agree_on(load: &dyn Fn() -> GenericHeteroTransformer)
                     match token {
                         CbToken::Tok(t) => tokens.push(t),
                         CbToken::Done(_) => break,
+                        CbToken::Failed(why) => panic!("the request failed: {why}"),
                         CbToken::Admitted { .. } => {}
                     }
                 }
@@ -357,6 +358,7 @@ fn a_long_prompt_reads_in_chunks_on(load: &dyn Fn() -> GenericHeteroTransformer,
             match token {
                 CbToken::Tok(t) => tokens.push(t),
                 CbToken::Done(_) => break,
+                CbToken::Failed(why) => panic!("the request failed: {why}"),
                 CbToken::Admitted { .. } => {}
             }
         }

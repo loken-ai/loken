@@ -39,6 +39,13 @@ use rayon::prelude::*;
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
+#[cfg(test)]
+thread_local! {
+    /// Whether the next decode step of a batch of sequences on this thread runs out of card
+    /// memory after its first layer, for a test.
+    pub(crate) static FORCED_DECODE_OOM: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// The pre mix of a row that collapses onto stream 0 of `streams`.
 pub(super) fn onto_first(streams: usize) -> Vec<f32> {
     let mut row = vec![0f32; streams];
@@ -1593,6 +1600,13 @@ impl GenericHeteroTransformer {
         }
 
         for il in 0..self.layers.len() {
+            #[cfg(test)]
+            if il == 1 && FORCED_DECODE_OOM.with(|c| c.replace(false)) {
+                // A card with no room for the second layer: the first one took the tokens.
+                return Err(crate::tensor::Error::msg(
+                    "alloc: DriverError(CUDA_ERROR_OUT_OF_MEMORY, \"out of memory\")".to_string(),
+                ));
+            }
             let layer = &mut self.layers[il];
             let mut mids = Vec::with_capacity(rows_in);
             let mut attn_pres = Vec::with_capacity(rows_in);

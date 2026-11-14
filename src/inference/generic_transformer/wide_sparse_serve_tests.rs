@@ -13,7 +13,8 @@ use super::wide_sparse_oracle_tests::{generic, LAYOUTS};
 use super::*;
 use crate::inference::cache::state_disk::StateStore;
 use crate::inference::generic_transformer::wide_sparse_toy::VOCAB;
-use crate::inference::serve::continuous_serve::{CbToken, ContinuousServer};
+use crate::inference::serve::continuous_batch::BatchedModel;
+use crate::inference::serve::continuous_serve::{CbToken, ContinuousServer, Served};
 
 /// Sequences that decode together in the tests.
 const MAX_RUNNING: usize = 8;
@@ -79,12 +80,14 @@ fn alone(model: &mut GenericHeteroTransformer, prompt: &[u32], max_new: usize) -
     out
 }
 
-/// What a stream gave: its tokens, the prompt tokens served from a cache, and whether it ended.
+/// What a stream gave: its tokens, the prompt tokens served from a cache, whether it ended, and
+/// the error it ended with.
 #[derive(Default)]
 struct Stream {
     tokens: Vec<u32>,
     cached: usize,
     ended: bool,
+    failed: Option<String>,
 }
 
 /// Reads `rx` into `got` until it holds `until` tokens or the stream ends.
@@ -97,6 +100,10 @@ fn read(rx: &Receiver<CbToken>, got: &mut Stream, until: usize) {
                 ..
             }) => got.cached = cached_prompt_tokens,
             Ok(CbToken::Done(_)) | Err(_) => got.ended = true,
+            Ok(CbToken::Failed(why)) => {
+                got.failed = Some(why);
+                got.ended = true;
+            }
         }
     }
 }
@@ -298,6 +305,7 @@ fn served_watched(
             Ok(CbToken::Tok(t)) => got.tokens.push(t),
             Ok(CbToken::Admitted { .. }) | Err(RecvTimeoutError::Timeout) => {}
             Ok(CbToken::Done(_)) | Err(RecvTimeoutError::Disconnected) => got.ended = true,
+            Ok(CbToken::Failed(why)) => panic!("the request failed: {why}"),
         }
         let reading = probe.prefill();
         if seen.last() != Some(&reading) {
@@ -428,6 +436,178 @@ fn a_slowed_serial_forward_reports_its_layers() {
 
 /// Tokens per block of the stored states, as the V4.1 batch worker test cuts them.
 const BLOCK: usize = 8;
+
+/// The sequence adapter of a worker whose forwards run out of card memory where a test says.
+///
+/// The faults are set on the worker's thread before each step.
+struct Starved {
+    inner: crate::inference::serve::continuous_serve::SequenceBatched,
+    /// Whether the next step with a prefill finds room for no prompt row.
+    prefill_fails: Arc<std::sync::atomic::AtomicBool>,
+    /// Whether the next decode step runs out of memory after its first layer.
+    decode_fails: Arc<std::sync::atomic::AtomicBool>,
+    /// The sequences whose state the adapter holds after its last step or release.
+    held: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl BatchedModel for Starved {
+    fn step(
+        &mut self,
+        items: &[crate::inference::serve::continuous_batch::StepItem],
+    ) -> crate::tensor::Result<Vec<u32>> {
+        use crate::inference::engine::model_backend::FORCED_CHUNK_ROWS;
+        use std::sync::atomic::Ordering;
+        let prefills = items.iter().any(|it| it.is_prefill);
+        if prefills && self.prefill_fails.swap(false, Ordering::SeqCst) {
+            FORCED_CHUNK_ROWS.with(|c| c.set(0));
+        }
+        let decodes = items.iter().any(|it| !it.is_prefill);
+        let fail = decodes && self.decode_fails.swap(false, Ordering::SeqCst);
+        super::wide_sparse_layer::FORCED_DECODE_OOM.with(|c| c.set(fail));
+        let out = self.inner.step(items);
+        FORCED_CHUNK_ROWS.with(|c| c.set(usize::MAX));
+        super::wide_sparse_layer::FORCED_DECODE_OOM.with(|c| c.set(false));
+        self.held
+            .store(self.inner.sequences_held(), Ordering::SeqCst);
+        out
+    }
+
+    fn cached_prompt(&self, seq: crate::inference::cache::paged_kv::SeqId) -> Option<usize> {
+        self.inner.cached_prompt(seq)
+    }
+
+    fn release(&mut self, seq: crate::inference::cache::paged_kv::SeqId) {
+        self.inner.release(seq);
+        self.held.store(
+            self.inner.sequences_held(),
+            std::sync::atomic::Ordering::SeqCst,
+        );
+    }
+
+    fn watch(
+        &mut self,
+        seq: crate::inference::cache::paged_kv::SeqId,
+        probe: Arc<crate::request_metrics::RequestProbe>,
+    ) {
+        self.inner.watch(seq, probe);
+    }
+}
+
+impl Served for Starved {
+    fn into_parts(
+        self,
+    ) -> (
+        Option<GenericHeteroTransformer>,
+        Option<Vec<crate::inference::cache::paged_kv::PagedKvStore>>,
+    ) {
+        self.inner.into_parts()
+    }
+}
+
+/// Reads `rx` to its end, waiting at most a minute for each message.
+fn read_bounded(rx: &Receiver<CbToken>) -> Stream {
+    let mut got = Stream::default();
+    while !got.ended {
+        match rx.recv_timeout(std::time::Duration::from_secs(60)) {
+            Ok(CbToken::Tok(t)) => got.tokens.push(t),
+            Ok(CbToken::Admitted { .. }) => {}
+            Ok(CbToken::Done(_)) => got.ended = true,
+            Ok(CbToken::Failed(why)) => {
+                got.failed = Some(why);
+                got.ended = true;
+            }
+            Err(e) => panic!("the stream did not end: {e}"),
+        }
+    }
+    got
+}
+
+/// For both layouts on the host with a state cache, a prefill and a decode step of the batch
+/// worker that run out of card memory end their request with an error.
+///
+/// The decode step fails after its first layer took the token.
+/// A request queued behind the failed prefill gets its whole answer.
+/// The same prompts served again, and the prompt continued by the token streamed before the
+/// failure, get the tokens they get alone.
+/// No sequence state stays in the worker.
+#[test]
+fn a_batch_forward_that_does_not_fit_ends_its_request_with_an_error() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    const PROMPT: usize = 2 * BLOCK + 1;
+    const NEW: usize = 4;
+    let prompt = |seed: u32| -> Vec<u32> {
+        (0..PROMPT as u32)
+            .map(|i| (i * (2 * seed + 1) + seed) % VOCAB as u32)
+            .collect()
+    };
+    for layout in 0..LAYOUTS.len() {
+        let what = format!("layout {layout}");
+        let (first, second) = (prompt(1), prompt(2));
+        let mut lone = cut_model(layout, false);
+        let want_first = alone(&mut lone, &first, NEW);
+        let want_second = alone(&mut lone, &second, NEW);
+        let mut continued = second.clone();
+        continued.push(want_second[0]);
+        let want_continued = alone(&mut lone, &continued, NEW);
+        let prefill_fails = Arc::new(AtomicBool::new(true));
+        let decode_fails = Arc::new(AtomicBool::new(false));
+        let held = Arc::new(AtomicUsize::new(0));
+        let server = ContinuousServer::spawn_sequences_wrapped(
+            cut_model(layout, true),
+            PROMPT + 1 + NEW,
+            2,
+            PROMPT + 1,
+            |inner| Starved {
+                inner,
+                prefill_fails: Arc::clone(&prefill_fails),
+                decode_fails: Arc::clone(&decode_fails),
+                held: Arc::clone(&held),
+            },
+        );
+
+        // The prefill of the first prompt does not fit; the second is queued behind it.
+        let failed = server.submit(first.clone(), NEW);
+        let queued = server.submit(second.clone(), NEW);
+        let failed = read_bounded(&failed);
+        assert!(
+            failed.failed.is_some(),
+            "{what}: the failed prefill ended as an answer"
+        );
+        assert!(failed.tokens.is_empty(), "{what}: {:?}", failed.tokens);
+        let queued = read_bounded(&queued);
+        assert_eq!(queued.failed, None, "{what}: the queued request failed");
+        assert_eq!(queued.tokens, want_second, "{what}: the queued request");
+
+        // The first decode step of the second prompt does not fit.
+        decode_fails.store(true, Ordering::SeqCst);
+        let cut = read_bounded(&server.submit(second.clone(), NEW));
+        assert!(
+            cut.failed.is_some(),
+            "{what}: the failed decode ended as an answer"
+        );
+        assert_eq!(
+            cut.tokens,
+            want_second[..1],
+            "{what}: before the failed decode"
+        );
+
+        for (p, want, name) in [
+            (&first, &want_first, "the first prompt"),
+            (&second, &want_second, "the second prompt"),
+            (&continued, &want_continued, "the continued prompt"),
+        ] {
+            let got = read_bounded(&server.submit(p.clone(), NEW));
+            assert_eq!(got.failed, None, "{what}: {name} failed");
+            assert_eq!(&got.tokens, want, "{what}: {name} served again");
+        }
+        assert_eq!(
+            held.load(Ordering::SeqCst),
+            0,
+            "{what}: a state stayed held"
+        );
+        server.stop().expect("the worker hands the model back");
+    }
+}
 
 /// Polls `store` until it holds a state of `len` tokens.
 fn wait_for_len(store: &StateStore, len: usize) {

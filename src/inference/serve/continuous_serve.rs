@@ -38,6 +38,8 @@ pub enum CbToken {
     },
     Tok(u32),
     Done(FinishReason),
+    /// The request ends without the rest of its answer, for the reason given.
+    Failed(String),
 }
 
 /// A submitted generation request the worker should serve.
@@ -740,6 +742,14 @@ impl SequenceBatched {
     }
 }
 
+#[cfg(test)]
+impl SequenceBatched {
+    /// The sequences whose state the adapter holds.
+    pub(crate) fn sequences_held(&self) -> usize {
+        self.seqs.len()
+    }
+}
+
 impl BatchedModel for SequenceBatched {
     fn step(&mut self, items: &[StepItem]) -> crate::tensor::Result<Vec<u32>> {
         let mut out = vec![0u32; items.len()];
@@ -849,7 +859,7 @@ impl BatchedModel for SequenceBatched {
 }
 
 /// What the adapter of a worker hands back once the worker ends.
-trait Served: BatchedModel {
+pub(crate) trait Served: BatchedModel {
     /// The model the adapter owned, `None` when it shared it, and its paged stores, `None`
     /// when it keeps none.
     fn into_parts(self) -> (Option<GenericHeteroTransformer>, Option<Vec<PagedKvStore>>);
@@ -1335,6 +1345,37 @@ impl ContinuousServer {
         }
     }
 
+    /// [`Self::spawn_sequences`] over the adapter `wrap` makes of the sequence adapter, for a
+    /// test.
+    #[cfg(test)]
+    pub(crate) fn spawn_sequences_wrapped<M: Served + 'static>(
+        model: GenericHeteroTransformer,
+        context_length: usize,
+        max_running: usize,
+        max_prefill_tokens: usize,
+        wrap: impl FnOnce(SequenceBatched) -> M,
+    ) -> Self {
+        let adapter = wrap(SequenceBatched::new(model).expect("a model with sequence state"));
+        let num_blocks = max_running.max(1) * context_length.max(1).div_ceil(CB_BLOCK_SIZE);
+        let (submit_tx, worker) = launch(
+            adapter,
+            Vec::new(),
+            num_blocks,
+            CB_BLOCK_SIZE,
+            max_running,
+            max_prefill_tokens,
+            max_prefill_tokens,
+        )
+        .map_err(|(_, e)| e)
+        .expect("the worker starts");
+        Self {
+            submit_tx,
+            worker,
+            model: None,
+            cache_tokens: num_blocks * CB_BLOCK_SIZE,
+        }
+    }
+
     /// Stops the worker once its sequences finish and hands the model back for serial
     /// serving. `Err` says why: another holder still shares the model, or the worker ended
     /// without it.
@@ -1548,26 +1589,27 @@ fn worker_loop<M: BatchedModel>(
                 v
             }
             Err(e) => {
-                // A step failed (e.g. a transient CUDA OOM on a too-wide batch).
-                // RECOVER instead of dying: abort the in-flight sequences (free
-                // their KV, notify their clients with Done so nobody hangs), then
-                // keep serving. Bail only after several CONSECUTIVE failures (a
-                // genuinely poisoned context) so we don't spin failing forever.
+                // A failed step ends the requests it started with the error.
+                // Their KV and their state in the model are freed.
+                // The requests it did not start stay queued.
+                // The worker stops after 3 failed steps in a row.
                 fails += 1;
-                eprintln!(
-                    "cb-worker step error #{fails} (recovering, aborting {} in-flight): {e}",
-                    chans.len()
-                );
+                let why = format!("the batch worker's step failed: {e}");
                 let mut batch = Vec::new();
-                for id in engine.abort_all() {
+                let started = engine.abort_started();
+                eprintln!(
+                    "cb-worker step error #{fails}: {} started requests end with it: {e}",
+                    started.len()
+                );
+                for id in started {
                     if let Some(tx) = chans.remove(&id) {
-                        batch.push((tx, CbToken::Done(FinishReason::Stop)));
+                        batch.push((tx, CbToken::Failed(why.clone())));
                     }
                 }
                 if fails >= 3 {
                     eprintln!("cb-worker: 3 consecutive step errors - stopping worker");
                     for (_, tx) in chans.drain() {
-                        batch.push((tx, CbToken::Done(FinishReason::Stop)));
+                        batch.push((tx, CbToken::Failed(why.clone())));
                     }
                     emit(batch);
                     return Some(engine.into_model());

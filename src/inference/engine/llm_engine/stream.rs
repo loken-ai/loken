@@ -400,7 +400,19 @@ impl LlmEngine {
                         }
                         continue;
                     }
-                    _ => break,
+                    Ok(CbToken::Done(_)) => break,
+                    // An answer the worker cannot finish ends with an error, not as a
+                    // finished answer.
+                    Ok(CbToken::Failed(why)) => {
+                        let _ = tx.blocking_send(Err(why));
+                        return;
+                    }
+                    Err(_) => {
+                        let _ = tx.blocking_send(Err(
+                            "the batch worker ended before the answer did".to_string(),
+                        ));
+                        return;
+                    }
                 };
                 first_token.get_or_insert_with(std::time::Instant::now);
                 if eos_set.contains(&t) {
