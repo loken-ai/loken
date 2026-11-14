@@ -29,7 +29,8 @@ cargo bench --features microbench --bench microbench -- schedule-host --batch 64
 ```
 
 A ROCm build takes `rocm` in place of `cuda`.  
-A build without a GPU runtime omits `crossing`, `expert-ahead`, `expert-upload`, `prefill-layer`, `marlin-rows`, `decode-inputs`, `decode-layer`, `media-overlap` and `parler-step`.
+A build without a GPU runtime omits `crossing`, `decode-inputs`, `decode-layer`, `dequant-gemm`, `expert-ahead`, `expert-upload`, `marlin-rows`, `media-overlap`, `prefill-layer` and `parler-step`.
+`parler-step` also needs the `audio` feature, which `media` brings.
 
 Arguments after `--`:
 
@@ -64,6 +65,7 @@ Arguments after `--`:
 | `--block-size` | Tokens per block of the paged cache (`schedule-host`, `decode-inputs`, `decode-layer`). | 16 |
 | `--layers` | Layers of the stack a step runs (`decode-layer`, `expert-ahead`). | 36 |
 | `--vocab` | Entries of the vocabulary the head matmul and the argmax run over (`decode-layer`). | 131072 |
+| `--codebooks` | The codebooks of the audio decoder (`parler-step`). | 9 |
 | `--blocks-per-row` | The width of a block table (`decode-inputs`). | `--context` over `--block-size`, rounded up: 32 |
 | `--rope-base` | The rope base of the rope rows (`schedule-host`, `decode-inputs`). | 10000 |
 | `--json` | Where the JSON record is written. | none |
@@ -312,6 +314,21 @@ Its variants:
 
 Each new variant carries in its note its speed against the old variant of the same inputs, by the median.  
 A new variant that does not fit the card or the widths says so in place of its figures.
+
+2 more groups time the rest of the layer on the same tensors.
+
+The activation group runs the feed-forward activation of a fused gate and up projection:
+
+- Old, 2 narrow copies and `silu_mul_f16`: 3 launches.
+- New, 1 kernel that reads the fused buffer: 1 launch.
+
+The attention group runs the stage from the fused input launch to the attention output, over 1 sequence of all the rows:
+
+- Old, the fused stage, the cast of q, the copy of q to heads first, the flash kernel and the cast of its output: 5 launches.
+- New, the fused stage writes q in the flash kernel's layout and the flash kernel stores f16: 2 launches.
+
+Each new variant carries its speed against the old one by the median.
+It says so when the fused launch or the flash kernel does not fit the card or the widths.
 
 The rotation base only sets the angles and does not change the time.  
 Without a file it is 1.

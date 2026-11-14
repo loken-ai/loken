@@ -24,17 +24,24 @@ curl -s localhost:11435/v1/chat/completions -H 'Content-Type: application/json' 
 ```
 
 Inference stays on the machine. loken needs no account and no API key, and has no hosted fallback.
-It reaches the network to fetch a model you asked for, to announce a cluster node you configured, and to forward a request to a peer you configured.
+It reaches the network for 4 things, each configured or asked for:
+
+- to fetch a model you asked for
+- to fetch an image a request gives by URL, from a host you listed in `image_fetch_hosts`
+- to announce a cluster node you configured
+- to send a request or a long prompt to a peer you configured
 
 ## What it does
 
 - Chat, completion, embeddings and reranking, with tools, JSON schema and grammar-constrained output.
-- Images, video, transcription, speech, music and sound effects.
+- Images, video, transcription, speech with named, described or cloned voices, music and sound effects.
+- Time-series forecasting.
 - Placement of a model across cards and the host, with experts streamed from disk when a mixture does not fit.
+- 1 setting, `fidelity`, that trades fidelity to the published model for speed.
 - Continuous batching, speculative decoding and KV reuse across conversations.
 - Coding agents served by the daemon: `loken launch claude`, `loken launch cline`.
-- Replicated serving and sharding across machines.
-- Energy reported per request.
+- Replicated serving, sharding across machines, and a prompt read by another instance.
+- Energy, times and cache place reported per request.
 
 [The overview](https://loken-ai.github.io/loken/overview/) holds the full table: each capability, its route, its configuration key and its state.
 
@@ -48,8 +55,8 @@ Set `require_auth`, `api_keys` and `rate_limit_per_minute` under `[server]` in `
 | Page | Read it to |
 |---|---|
 | [Install](https://loken-ai.github.io/loken/install/) | Build and install loken |
-| [Guides](https://loken-ai.github.io/loken/) | Do one task, with the smallest configuration and one request |
-| [Learn](https://loken-ai.github.io/loken/) | Learn the fundamentals of inference in 10 lessons |
+| [Guides](https://loken-ai.github.io/loken/) | Do 1 task, with the smallest configuration and 1 request |
+| [Learn](https://loken-ai.github.io/loken/course/) | Learn the fundamentals of inference in 10 lessons |
 | [`docs/API.md`](docs/API.md) | Look up a route on the 3 surfaces |
 | [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md) | Look up a key of `config.toml` and its default |
 | [`docs/STATUS.md`](docs/STATUS.md) | See what is measured, what is slower, and what has never run |

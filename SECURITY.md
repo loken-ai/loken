@@ -12,6 +12,8 @@ Inside it there is none.
 
 Prompts leave the machine only for a peer you configured, in `[cluster]` or as `prefill_peer`.  
 The network is reached to fetch a model you asked for, and by cluster nodes announcing themselves when configured.  
+It is reached to fetch an image given by URL only from a host listed in `image_fetch_hosts` under `[inference]`.
+The list is empty by default and fetches nothing.  
 Logs carry lengths and counts, never a prompt or a generated text.
 
 ## Reporting

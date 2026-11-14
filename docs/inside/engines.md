@@ -12,30 +12,6 @@ soundtheme = "soft"
 legendLabel = "Key:"
 legend = [["eg-card", "on a card"], ["eg-host", "in host memory"], ["eg-remote", "on another machine"], ["eg-stop", "stopped"]]
 
-[sounds]
-room1 = "narration/engines-room1.mp3"
-room2 = "narration/engines-room2.mp3"
-room3 = "narration/engines-room3.mp3"
-room4 = "narration/engines-room4.mp3"
-room5 = "narration/engines-room5.mp3"
-room6 = "narration/engines-room6.mp3"
-room7 = "narration/engines-room7.mp3"
-cards1 = "narration/engines-cards1.mp3"
-cards2 = "narration/engines-cards2.mp3"
-cards3 = "narration/engines-cards3.mp3"
-cards4 = "narration/engines-cards4.mp3"
-cards5 = "narration/engines-cards5.mp3"
-cards6 = "narration/engines-cards6.mp3"
-machines1 = "narration/engines-machines1.mp3"
-machines2 = "narration/engines-machines2.mp3"
-machines3 = "narration/engines-machines3.mp3"
-machines4 = "narration/engines-machines4.mp3"
-machines5 = "narration/engines-machines5.mp3"
-parallel1 = "narration/engines-parallel1.mp3"
-parallel2 = "narration/engines-parallel2.mp3"
-parallel3 = "narration/engines-parallel3.mp3"
-parallel4 = "narration/engines-parallel4.mp3"
-
 [camera]
 below = 640
 over = 600
@@ -65,9 +41,7 @@ steps = [
   "Loken fills the card with the layers it holds, and the host takes only the layers that no card holds.",
   "Only if that placement fails with an out-of-memory error does loken try the next rung of a ladder. The rungs go from an even split, to the cards at a smaller share with the host, to the host alone.",
 ]
-narration = ["room1", "room2", "room3", "room4", "room5", "room6", "room7"]
 done = "Each engine has answered"
-deeper = [{ text = "The placement ladder", href = "layers.md#ladder" }, { text = "When layers spill to the host", href = "layers.md#spill" }]
 now = ["The model and the server", "vLLM, on the card", "vLLM, with the host", "vLLM, the KV check", "Ollama, decided at load", "Loken, card first, host for the rest", "Loken, after a failure"]
 
 [[scene]]
@@ -85,9 +59,7 @@ steps = [
   "Loken ranks the cards by compute rate and fills them in that order until every layer has a card. The layers are then shared out by rate, so the faster card holds more.",
   "When the model fits no card and every layer can be split, loken splits every layer across the cards if that is predicted faster.",
 ]
-narration = ["cards1", "cards2", "cards3", "cards4", "cards5", "cards6"]
 done = "Each engine has answered"
-deeper = [{ text = "Layers spread over cards", href = "layers.md#runs" }, { text = "Every layer split across cards", href = "layers.md#split" }]
 now = ["2 cards, a model that fits neither", "vLLM, sizes of 1", "vLLM, tensor parallel", "Ollama, spread", "Loken, ranked by rate", "Loken, split when faster"]
 
 [[scene]]
@@ -104,9 +76,7 @@ steps = [
   "In loken, any machine of the cluster can receive a request. It predicts the completion time here and on its peer, and sends the whole request to the peer when the peer wins by a margin.",
   "A model larger than a machine can be cut across 2 machines. Each machine runs 1 run of layers, on its cards first, and the cut is the one with the shortest predicted time for 1 token.",
 ]
-narration = ["machines1", "machines2", "machines3", "machines4", "machines5"]
 done = "Each engine has answered"
-deeper = [{ text = "Forwarding a request whole", href = "nodes.md#forward" }, { text = "Cutting a model across machines", href = "nodes.md#pipeline" }]
 now = ["2 machines on a network", "vLLM, nodes by hand", "Ollama, its own machine", "Loken, forwarding the request", "Loken, cutting the model"]
 
 [[scene]]
@@ -120,11 +90,9 @@ steps = [
   "3 requests reach the same model together.",
   "vLLM batches the running requests in its scheduler, step by step, up to `max_num_seqs` sequences, 128 by default.",
   "Ollama serves `OLLAMA_NUM_PARALLEL` requests per model at a time, 1 by default, and queues the others. The memory for the context grows with each parallel request.",
-  "Loken serves 1 request at a time until 1 arrives while another runs. Then the model batches its requests in its worker, and a run of lone requests brings it back to serial.",
+  "Loken batches the requests that overlap in its worker. A lone request takes the path, serial or worker, that serves a request like the latest lone one sooner. The serial path drafts. When another request arrives during a serial decode, the decode moves into the worker at its next step.",
 ]
-narration = ["parallel1", "parallel2", "parallel3", "parallel4"]
 done = "Each engine has answered"
-deeper = [{ text = "The gate and its lanes", href = "../site/03-operate/lanes.md" }]
 now = ["3 requests together", "vLLM, continuous batching", "Ollama, parallel slots", "Loken, serial or batch"]
 ```
 

@@ -12,6 +12,9 @@ The bench is `benches/layerbench.rs`, behind the `microbench` feature.
 No release build carries it.  
 It starts no server and loads no other model.
 
+The bench takes a Sinkhorn wide-residual mixture, the architecture of DeepSeek V4.1.
+A file of another architecture is refused by name.
+
 ## Run
 
 ```sh
@@ -85,10 +88,11 @@ The generic route has no such seam, so the section is empty.
 
 The counters, over the timed steps:
 
+- the steps a card took, with the waits they cost (empty on the generic route)
 - the expert uploads to the cards (a stage the generic route does not record)
-- the host tier's hits, misses and experts let go
+- the host tier's hits, misses and evictions
 - the major page faults
-- the bytes the process read from disk
+- the megabytes the process read from disk
 
 The JSON record carries the build (version and commit), the machine (host, processor, memory, cards), the controls, the model as held and placed, the time of every token, the stages and the counters.
 2 records with the same controls compare 2 commits.

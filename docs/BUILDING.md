@@ -12,10 +12,11 @@ cargo build --release   # target/release/{lokend,loken}
 
 | Target | Command | Needs |
 |---|---|---|
-| NVIDIA, default | `cargo build --release` | CUDA toolkit, OpenCL headers |
+| NVIDIA, default | `cargo build --release` | CUDA toolkit |
 | AMD (ROCm) | `cargo build --release --no-default-features --features rocm,cpu` | ROCm `hipcc` |
 | NVIDIA and AMD in 1 binary | `cargo build --release --features cuda,rocm` | Both toolkits |
-| Vulkan | `cargo build --release --features vulkan` | The crates only |
+| Vulkan beside CUDA and OpenCL | `cargo build --release --features vulkan` | CUDA toolkit |
+| Vulkan alone | `cargo build --release --no-default-features --features vulkan,cpu` | Nothing |
 | Host only, language models | `cargo build --release --no-default-features --features cpu` | Nothing |
 | Host only, with every media family | `cargo build --release --no-default-features --features cpu,media` | Nothing |
 
@@ -27,9 +28,12 @@ The feature table is in [Configuration](CONFIGURATION.md#build-features).
 
 The default features are `cuda`, `opencl` and `media`.
 
-The build needs a **CUDA toolkit** and **OpenCL headers**.  
+The build needs a **CUDA toolkit**.  
 It is built and tested against **CUDA 13.3**.
 No older toolkit has been tried.
+
+OpenCL needs nothing at build time.
+The server opens the OpenCL loader when it starts.
 
 The kernels are compiled for a fixed list of architectures from Turing to Blackwell, not probed against the toolkit.
 A toolkit that does not know `sm_120a` fails the build.
@@ -39,6 +43,29 @@ A toolkit that does not know `sm_120a` fails the build.
 | `CUDA_PATH`, `CUDA_HOME` | Locates the toolkit when it is not where the build looks |
 | `LOKEN_CUDA_ARCHS` | Narrows the list of NVIDIA architectures the kernels are built for |
 | `LOKEN_STATIC_CXX` | Links the C++ runtime statically |
+
+## Release archive
+
+`scripts/build-portable.sh` builds the Linux x86-64 archives in a container and packages them in `dist/`.
+`scripts/build-portable.sh --host` builds with the toolchain of this machine instead.
+
+It produces 2 archives:
+
+| Archive | Holds |
+|---|---|
+| Light | The binaries. Starts on any machine |
+| CUDA libraries | `lib/` with NVRTC, cuBLAS and cuBLASLt, and NCCL when the build machine has it |
+
+Unpacked over the light archive, the second one runs on a machine that has only the NVIDIA driver.
+
+| Variable | Effect |
+|---|---|
+| `FEATURES` | The cargo features. Default: the crate's defaults, plus `rocm` when `hipcc` is found |
+| `CPU_BASELINE` | The `-C target-cpu` of the CPU kernels. Default `x86-64-v3` |
+| `MAX_GLIBC` | The highest glibc symbol version the binaries may need. Default 2.34 |
+| `DIST` | The output directory. Default `dist` |
+
+The script header lists the other variables.
 
 ## AMD cards (ROCm)
 
@@ -84,19 +111,37 @@ The placement plan, the ladder and the probes see every card, so a model can be 
 | Replayed decode step | Stays on cards of 1 vendor |
 | Layer on an AMD card | Takes the kernels the ROCm build runs |
 
+## OpenCL GPUs
+
+`opencl` is a default feature, so `cargo build --release` already carries it.
+The build needs no OpenCL package.
+The server opens the OpenCL loader when it starts.
+A machine without a loader lists no OpenCL device.
+A driver that does not answer when asked what it has counts as no device.
+
+A card that CUDA or ROCm drives is told by its PCI address and is not offered for OpenCL layers.
+Devices of Mesa's OpenCL platform are not offered for layers.
+The layers of a language model and the blocks of Z-Image run through Intel's OpenCL runtime on an Intel GPU, see [Status](STATUS.md#opencl).
+A GPU that shares the host's memory offers what the host can spare at load.
+`/api/distributed/devices` reports that figure as the device's free memory.
+
+`lokend serve --backends opencl,cpu` serves on OpenCL and the host only.
+
 ## Vulkan cards
 
 ```sh
-cargo build --release --features vulkan
+cargo build --release --no-default-features --features vulkan,cpu
 ```
 
 The server opens the Vulkan loader when it starts, and compiles the kernels for the device when it opens.
 
 Placement offers the Vulkan GPUs that no other runtime of the build drives.  
 They come after the CUDA or HIP cards and before the host.  
-A build with `vulkan` alone has no other runtime, so every GPU is offered.
+The build above has no other runtime, so every GPU is offered.
+`--features vulkan` on the default build adds Vulkan beside CUDA and OpenCL, and needs the CUDA toolkit.
 
 The layers of a decoder in `Q4_K`, `Q6_K`, `Q8_0`, `Q5_0`, `MXFP4`, `BF16`, `F16` or `F32` run on Vulkan, with the output head when the last layer does.
+The routed experts of a mixture run there when the router is a softmax over experts held as 1 stack each of gate, up and down.
 A recurrent layer of a hybrid model runs on the host between them.
 Their weights count in the `size_vram` that `/api/ps` reports.
 A model of another shape stays off Vulkan and loads on the host.
@@ -163,6 +208,6 @@ The daemon finds it in the working directory, beside the executable, or in the u
 | `Model not found` | Neither store holds the name. Run `loken pull <name> --source ollama` or `--source huggingface`. A Hugging Face id needs its owner |
 | `Model '...' not found in remote registry` | The registry chosen by `--source` does not know the name. Check the tag on the registry, or try the other source |
 | `alloc failed: out of memory` | A card ran out while the placement had already spread the model. Lower the request's `num_ctx`, or pick a smaller quantisation |
-| `401` on every request but `/health` | `require_auth` is on. Send `Authorization: Bearer <key>` or `X-API-Key` with a key from `api_keys` |
+| `401` on every request but the health paths | `require_auth` is on. Send `Authorization: Bearer <key>` or `X-API-Key` with a key from `api_keys`. `/health`, `/healthz`, `/api/health` and `/ping` need no key |
 | `Address already in use` | Another daemon holds the port. Run `lokend serve --port <other>`, or stop it |
 | The first answer after a load is slow | The load is paid once, and so is the background repack of a mixture. The second request runs at the model's rate |

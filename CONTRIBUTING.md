@@ -21,7 +21,7 @@ A kernel without such a test has shipped wrong answers for 2 days.
 
 | Setup | Command |
 |---|---|
-| CUDA toolkit and OpenCL headers | `cargo build --release` |
+| CUDA toolkit | `cargo build --release` |
 | Neither | `cargo build --release --no-default-features --features cpu` |
 
 Copy `config.toml.example` to `config.toml` before running the daemon.  
@@ -58,3 +58,8 @@ The hooks of this repository chain to the conventions hooks.
 After a clone, run `git config core.hooksPath scripts/hooks`.
 The pre-commit refuses a model backend, a model family or a streaming client outside the hetero route.
 `scripts/hetero_route.txt` lists them, and the debt there only shrinks.
+The commit-msg hook checks the staged diff against the subject.
+Only a commit with the scope `hetero` may add lines to a path of the debt list.
+
+The CI also runs `cargo fmt --all --check`, clippy with warnings as errors, `cargo doc` with warnings as errors, `python3 scripts/check_docs.py` and `python3 scripts/check_hetero.py`.
+Run the last 2 before committing a page or a model.
