@@ -144,6 +144,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 - Placement: plan no card when the driver sees none, though the machine has some.
 - Speculation: try a waiting prompt lookup again when the answer copies the prompt.
 - Speculation: cut a hybrid model's recurrent state back to the drafted tokens it kept.
+- ROCm: give a drafted token the logits of its decode step.
 - Kernels: refuse the inputs and launches that failed without an error.
 - State cache: load when the disk probe measures no rate.
 - MoE: drop and read ahead the expert pages of a model loaded from 1 file.

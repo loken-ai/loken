@@ -690,7 +690,8 @@ static __device__ __forceinline__ void flash_splitk_quantize_slice(
     const float * __restrict__ out, void * __restrict__ q81,
     const int block_index, const int value_index, const int lane, const int warp) {
     if (warp != 0) return;
-    const float xi = out[value_index + lane];
+    // The value as stored, so the block's sum adds the stored values.
+    const float xi = *(const volatile float *)&out[value_index + lane];
     float amax = fabsf(xi);
     float sum = xi;
     #pragma unroll
@@ -702,8 +703,10 @@ static __device__ __forceinline__ void flash_splitk_quantize_slice(
         sum += __shfl_xor_sync(0xffffffff, sum, mask, 32);
     }
     const float d = amax / 127;
+    // Each value is scaled by the reciprocal of `d`, as `quantize_row_to_q8_1` scales it.
+    const float id = amax == 0.0f ? 0.0f : 1.0f / d;
     unsigned char * blk = (unsigned char *) q81 + (size_t) block_index * 36;
-    ((signed char *) (blk + 4))[lane] = amax == 0.0f ? 0 : (signed char) roundf(xi / d);
+    ((signed char *) (blk + 4))[lane] = (signed char) roundf(xi * id);
     if (lane == 0) {
         *((half2 *) blk) = __floats2half2_rn(d, sum);
     }

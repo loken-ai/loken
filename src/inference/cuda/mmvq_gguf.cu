@@ -784,11 +784,17 @@ MMVQ_QUANTIZE_ENTRY(f32, float)
 // quantised row has no padding, and a warp holds 32 consecutive values of the row.
 
 /// One lane's value of a 32-value block to its q8_1 code, and the block's pair from lane 0.
-static __device__ __forceinline__ void quantize_lane_to_q8_1(block_q8_1 * y, const int i, const float xi) {
+/// The value is read back from `stored`, where the kernel wrote it.
+/// The block's sum then adds the stored values, as `quantize_row_to_q8_1` adds them.
+static __device__ __forceinline__ void quantize_lane_to_q8_1(
+    block_q8_1 * y, const int i, const float * stored) {
+    const float xi = *(const volatile float *)stored;
     const float amax = warp_max(fabsf(xi));
     const float sum = warp_sum(xi);
     const float d = amax / 127;
-    y[i / QK8_1].qs[i % QK8_1] = amax == 0.0f ? 0 : roundf(xi / d);
+    // Each value is scaled by the reciprocal of `d`, as `quantize_row_to_q8_1` scales it.
+    const float id = amax == 0.0f ? 0.0f : 1.0f / d;
+    y[i / QK8_1].qs[i % QK8_1] = roundf(xi * id);
     if (i % QK8_1 == 0) {
         y[i / QK8_1].ds = __floats2half2_rn(d, sum);
     }
@@ -825,7 +831,7 @@ extern "C" __global__ void rmsnorm_wide_q8_1_f32(
   for (int i = threadIdx.x; i < cols; i += blockDim.x) {
     const float v = srow_rq[i] * rms * weight[i];
     out[offset + i] = v;
-    quantize_lane_to_q8_1(y, i, v);
+    quantize_lane_to_q8_1(y, i, &out[offset + i]);
   }
 }
 
@@ -862,7 +868,7 @@ extern "C" __global__ void add_rmsnorm_dual_wide_q8_1_f32(
   for (int i = threadIdx.x; i < cols; i += blockDim.x) {
     const float v = ssum_aq[i] * rms * weight[i];
     norm_out[offset + i] = v;
-    quantize_lane_to_q8_1(y, i, v);
+    quantize_lane_to_q8_1(y, i, &norm_out[offset + i]);
   }
 }
 
@@ -923,7 +929,7 @@ extern "C" __global__ void post_norm_add_norm_wide_q8_1_f32(
   for (int i = threadIdx.x; i < cols; i += blockDim.x) {
     const float v = srow_pn[i] * rms_ffn * w_ffn[i];
     norm_out[offset + i] = v;
-    quantize_lane_to_q8_1(y8, i, v);
+    quantize_lane_to_q8_1(y8, i, &norm_out[offset + i]);
   }
 }
 
@@ -971,7 +977,7 @@ extern "C" __global__ void split_silu_mul_q8_1_f32(
   const float silu_g = g / (1.0f + expf(-g));
   const float v = silu_g * u;
   out[idx] = v;
-  quantize_lane_to_q8_1((block_q8_1 *)vy, idx, v);
+  quantize_lane_to_q8_1((block_q8_1 *)vy, idx, &out[idx]);
 }
 
 extern "C" __global__ void split_gelu_mul_q8_1_f32(
@@ -985,7 +991,7 @@ extern "C" __global__ void split_gelu_mul_q8_1_f32(
   const float gelu_g = 0.5f * g * (1.0f + tanhf(k0 * (g + k1 * g * g * g)));
   const float v = gelu_g * u;
   out[idx] = v;
-  quantize_lane_to_q8_1((block_q8_1 *)vy, idx, v);
+  quantize_lane_to_q8_1((block_q8_1 *)vy, idx, &out[idx]);
 }
 
 // Host-side launchers, called through the kernel FFI boundary.

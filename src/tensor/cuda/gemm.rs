@@ -661,3 +661,62 @@ pub fn softmax_lastdim_f32(
 }
 
 // --- Quantized GEMV: the mmvq kernels on native storage ----
+
+#[cfg(test)]
+mod prequant_tests {
+    use super::*;
+
+    /// The q8_1 rows a norm kernel leaves for the mat-vec carry the codes and pairs the quantise
+    /// kernel writes from the same normed rows, value for value.
+    #[test]
+    fn a_norm_kernel_quantises_its_rows_as_the_quantise_kernel() {
+        let Ok(device) = crate::tensor::Device::new_cuda(0) else {
+            eprintln!("no card: the kernels run on a card only");
+            return;
+        };
+        let dev = device.as_cuda_device().unwrap().native().clone();
+        let stream = dev.stream().clone();
+        let (rows, cols) = (512usize, 4096usize);
+        let x: Vec<f32> = (0..rows * cols)
+            .map(|i| (i as f32 * 0.618_034).sin() * 3.0 + ((i / cols) as f32 * 0.37).cos())
+            .collect();
+        let w: Vec<f32> = (0..cols)
+            .map(|i| 0.5 + (i as f32 * 0.11).sin().abs())
+            .collect();
+        let x_dev = stream.clone_htod(&x).unwrap();
+        let w_dev = stream.clone_htod(&w).unwrap();
+        let out = unsafe { stream.alloc::<f32>(rows * cols) }.unwrap();
+        let q81 = unsafe { stream.alloc::<u8>(rows * cols / 32 * 36) }.unwrap();
+        let func = dev.mmvq_fn("rmsnorm_wide_q8_1_f32").unwrap();
+        let (eps, cols_i32) = (1e-6f32, cols as i32);
+        let mut b = stream.launch_builder(&func);
+        b.arg(&x_dev);
+        b.arg(&w_dev);
+        b.arg(&out);
+        b.arg(&q81);
+        b.arg(&eps);
+        b.arg(&cols_i32);
+        unsafe { b.launch(row_norm_cfg(rows, cols, true)) }.unwrap();
+        let plain = crate::tensor::cuda::quantize_q8_1_rows(&dev, &out, cols, rows).unwrap();
+        let (fused, plain) = (
+            stream.clone_dtoh(&q81).unwrap(),
+            stream.clone_dtoh(&plain).unwrap(),
+        );
+        dev.synchronize().unwrap();
+        // A block is 36 bytes: the pair of the scale and the sum, then the 32 codes.
+        let differing: Vec<String> = fused
+            .iter()
+            .zip(&plain)
+            .enumerate()
+            .filter(|(_, (a, b))| a != b)
+            .map(|(at, (a, b))| format!("block {} byte {}: {a} for {b}", at / 36, at % 36))
+            .collect();
+        assert!(
+            differing.is_empty(),
+            "{} of {} bytes differ from the quantise kernel's: {}",
+            differing.len(),
+            fused.len(),
+            differing.join(", ")
+        );
+    }
+}
