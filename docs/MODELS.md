@@ -8,6 +8,7 @@
 | Ollama | `manifests/` and `blobs/` under `ollama_models_dir` | GGUF, with the template, system prompt and parameters of the manifest | `name:tag`, as in `qwen3:0.6b` |
 | Hugging Face | The cache layout under `huggingface_models_dir`, or its `hub/` subdirectory | safetensors, and the `.pth` archives some media families ship | `owner/repo`, as in `Qwen/Qwen3-0.6B` |
 | Bare file | A GGUF at the root of the Hugging Face store | GGUF | Its file name, with or without a tag |
+| Piper voice | `piper/<voice>/` beside the Hugging Face store, outside its `hub/` | `<voice>.onnx` and its `<voice>.onnx.json` | `piper/<voice>` |
 <!-- site: end -->
 
 | Command | Effect |
@@ -19,7 +20,8 @@
 A `.pth` archive that a media family needs is placed in the store by hand.  
 A request that names a model not yet loaded loads it.
 A model stays resident for the keep-alive the daemon was started with.
-When the keep-alive ends, a language model sleeps if its files fit the host memory budget: the files stay read into host memory and the card memory is released.
+When the keep-alive ends, a language model whose files fit the host memory budget sleeps.
+A sleeping model keeps its files read into host memory and releases the card memory.
 A model in GGUF keeps every part of its set, the draft head beside it, its vision projector and its tokenizer files.
 A checkpoint directory keeps its safetensors shards and its JSON files.
 The next request loads it from that memory, without reading the disk.
@@ -28,7 +30,7 @@ An unload by name also frees a sleeping model.
 
 Quantisations are read as the file carries them.  
 On a card, the block formats run through their own kernels.  
-On the host, they need AVX2 (see [Building](https://github.com/loken-ai/loken/blob/main/docs/BUILDING.md)).
+On the host, they need AVX2 (see [Building](BUILDING.md)).
 
 <!-- site: widget table id=models-tensor-formats -->
 | Tensor formats a GGUF may carry | |
@@ -37,7 +39,7 @@ On the host, they need AVX2 (see [Building](https://github.com/loken-ai/loken/bl
 | Legacy blocks | `Q4_0`, `Q4_1`, `Q5_0`, `Q5_1`, `Q8_0`, `Q8_1` |
 | K-quants | `Q2_K`, `Q3_K`, `Q4_K`, `Q5_K`, `Q6_K`, `Q8_K` |
 | Codebook | `IQ2_XXS`, `IQ2_S`, `IQ3_XXS`, `IQ3_S`, `IQ4_NL`, `IQ4_XS`, `Q2_0` |
-| Others | `MXFP4` |
+| Others | `MXFP4`, `I8` (raw bytes, the fp8 engram rows and their scales) |
 <!-- site: end -->
 
 The codebook formats run on a card for the experts, in decode and prefill.  
@@ -158,14 +160,15 @@ Another model's further files are left unread, and the log says so.
 
 ### Convert DeepSeek V4.1
 
-`loken convert` writes a DeepSeek V4.1 file in llama.cpp's `deepseek41` layout. llama.cpp and the engines that vendor it load that file.
+`loken convert` writes a DeepSeek V4.1 file in llama.cpp's `deepseek41` layout.
+llama.cpp and the engines that vendor it load that file.
 
 | Element | Content |
 |---|---|
 | Keys and tensor names | llama.cpp's |
 | Model name | The last segment of the checkpoint's Hugging Face id |
 | Vocabulary | llama.cpp's arrays, beside the checkpoint's own `tokenizer.json` |
-| Engram tables | 1 `per_layer_token_embd` table in `Q8_0`. ggml has no fp8 type, and `Q8_0` holds the released values in about the same bytes |
+| Engram tables | 1 `per_layer_token_embd` table in `Q8_0` |
 | Engram layer weights | Each layer's query and key weights, stored as their product |
 | Routed experts | The formats asked for |
 | DSpark draft | Stored apart as `<name>:<tag>-dspark`, the companion the loader reads for `<name>:<tag>` |
@@ -185,6 +188,7 @@ The loader reads it from a companion file, `<stem>.mtp.gguf`, beside the model.
 
 The stem is that of a split's parts.
 A model without the companion decodes without a head.
+The model and its companion load as 1 split set, so the placement never splits them tensor-parallel.
 
 `loken draft-head <repo> <out.gguf>` writes the companion from the checkpoint's `mtp.*` tensors.
 It fetches them by range requests and keeps them as released: the checkpoint's names, shapes and bytes.
@@ -213,12 +217,19 @@ At load, the loader:
 | Granite | `granite`, `granite3`, `granitemoe` |
 | OLMo | `olmo2`, `olmoe` |
 | Others | `gptoss`, `lfm2`, `lfm2moe`, `nemotron_h_moe`, `smollm3`, `starcoder`, `starcoder2`, `glm4`, `chatglm`, `ernie4_5`, `dbrx`, `glm_moe_dsa`, `mpt`, `orion` |
+| DeepSeek V4.1 | `deepseek41`, and `deepseek_v41` for the files loken wrote before |
 <!-- site: end -->
 
 Mixtures route their experts on the card.
 When the model does not fit, only the experts spill.
 
-The recurrent hybrids (`lfm2moe`, `nemotron_h_moe`, `qwen3next`) carry their state-space blocks beside attention.
+The recurrent hybrids carry recurrent blocks beside attention:
+
+| Block | Architectures |
+|---|---|
+| Short convolution | `lfm2`, `lfm2moe` |
+| Delta rule | `qwen35`, `qwen35moe`, `qwen3next`, `qwen4exp` |
+| Mamba2 | `nemotron_h_moe` |
 
 Reasoning models return their thinking apart from the answer on every surface.  
 `gptoss` speaks Harmony and is read as such.
@@ -261,6 +272,7 @@ Across machines, the model splits into runs of layers as a dense stack does, see
 | Input | Families | Transport |
 |---|---|---|
 | Vision | `moondream`, `pixtral`, the Qwen vision lines (`qwen25` vision, `qwen3vl`, `qwen35`) | Base64 in the request, on all 3 surfaces |
+| Video clip | The Qwen vision lines | A base64 `data:` URL in a `video_url` part of `/v1/chat/completions`, or `videos` of an `/api/chat` message. A remote clip and an `input_video` part of `/v1/responses` are refused |
 | Speech | `voxtral`, `ultravox` | Base64 clip in a chat turn |
 
 A Qwen vision prompt gives the tokens of an image or of a frame of a clip the positions of their grid.
@@ -268,11 +280,12 @@ The position of the next token then runs behind the cache length.
 Such a request decodes one step at a time, streamed or not, without the recorded step and without drafts.
 
 A model whose files carry a speech tower lists `audio` among its capabilities.
-The tower comes from one of 2 sources:
+The tower comes from one of 3 sources:
 
 - The `mmproj*.gguf` beside a text GGUF.
   `clip.projector_type` names the family.
 - A checkpoint directory whose `config.json` declares an `audio_config`.
+- A native layout whose `params.json` declares the tower under `multimodal`, as `whisper_model_args` for Voxtral.
 
 Ultravox ships only the tower and the projector.
 
@@ -296,7 +309,10 @@ A request that carries a clip is not served from the prompt cache and takes no g
 
 ### Dense checkpoints
 
-A directory of `config.json`, a tokenizer and F32, F16 or BF16 safetensors shards of a Llama, Mistral or Qwen text model is served through the generic route, as a GGUF file is.
+A directory of `config.json`, a tokenizer and safetensors shards is served through the generic route, as a GGUF file is, when its `architectures[0]` is a text class of the [architecture table](ARCHITECTURES.md#architecture-table).
+A class that another route serves, such as a speech talker, is refused with the route that serves it.
+The shards hold `F32`, `F16` or `BF16` tensors.
+They may also hold the experts of `gptoss` in MXFP4 blocks, or fp8 weights with a scale per square tile.
 
 Shapes come from the configuration.  
 Tensors are read in their stored width.  
@@ -323,7 +339,7 @@ A GGUF file with block projections rebuilds its stray float matrices in `Q8_0`, 
 | Vulkan | A `BF16` or `F32` matrix runs the mat-vec kernel at every token count. Only `F16` has a mat-mat kernel |
 | OpenCL | The kernels do not read `BF16`. A `BF16` matrix kept as stored runs there widened to `F32`, and the load log says so |
 
-Z-Image holds each projection on a CUDA or ROCm card in the narrowest form exact for its stored values: `BF16`, then `F16`, else `F32`.
+Z-Image holds each projection on a CUDA, ROCm or OpenCL device in the narrowest form exact for its stored values: `BF16`, then `F16`, else `F32`.
 Its blocks on the host hold each projection in the same form, and the host products read it with `F32` rows.
 Its caption encoder on the host holds each projection in its narrowest exact form too.
 On the host the caption encoder is built for a prompt the cache lacks, and dropped once it has read it.
@@ -349,7 +365,8 @@ A layer on Vulkan or OpenCL runs its projections in the format the rung and the 
 The expert stacks of a mixture-of-experts checkpoint follow the kernels instead.
 A stack runs as stored where a kernel of its device reads that format.
 
-On the host that includes `F32`, through the dense expert product, which copies the stack on each call and is slow for a large one.
+On the host that includes `F32`, through the dense expert product.
+That product copies the stack on each call, so a large stack runs slowly there.
 `F16` and `BF16` stacks are rebuilt in `Q8_0`.
 
 A rebuilt stack goes in the conversion ledger, and the load log sums the ledger.
@@ -359,8 +376,8 @@ A rebuilt stack goes in the conversion ledger, and the load log sums the ledger.
 
 | Model | Route |
 |---|---|
-| BERT-shaped encoders (`nomic`, `bge` and the like) | `/v1/embeddings`, `/api/embed` |
-| Qwen3-Reranker checkpoint | `/v1/rerank` |
+| BERT-shaped encoders (`nomic`, `bge` and the like) | `/v1/embeddings`, `/api/embed`, `/api/embeddings`, `/v2/embed` |
+| Qwen3-Reranker checkpoint | `/v1/rerank`, `/rerank`, `/v2/rerank`, `/score`, `/v1/score` |
 | CLIP or SigLIP checkpoint directory | `/v1/embeddings`, `/v2/embed`, texts and images in 1 space ([guide](https://loken-ai.github.io/loken/embeddings/)) |
 
 ## The qwen4exp family
@@ -394,30 +411,30 @@ A card holds a cache of the hot ones per layer, and the rest run on the host bes
 A wide prompt batch streams the layer's experts to the card through 2 buffers when that costs less than running its rows 1 by 1.
 Host memory is admitted against the bytes the process owns.
 
-Limits and measurements are in [Status](https://github.com/loken-ai/loken/blob/main/docs/STATUS.md#the-qwen4exp-family).
+Limits and measurements are in [Status](STATUS.md#the-qwen4exp-family).
 
 ## Image
 
-The `model` of an image request names the family by substring.
-The loader then reads that family's files from the Hugging Face store.  
+The `model` of an image request names a checkpoint: a repository id, its name without the owner, or a catalogue entry such as `flux-schnell` or `z-image-turbo`.
+The checkpoint's own files say which family it is: the diffusers `_class_name` of `model_index.json` or of its denoiser, else the names of its tensors.
 A loader that lacks a file says which one it looked for.
 
 <!-- site: widget table id=models-image -->
-| Family | `model` contains | Files |
+| Family | Declared by | Files |
 |---|---|---|
-| FLUX.1 | `flux` | `black-forest-labs/FLUX.1-schnell`, with the T5 and CLIP encoders it references |
-| FLUX.2 klein | `flux2` | The klein checkpoint and its Qwen text encoder |
-| Z-Image | `z-image` | `Tongyi-MAI/Z-Image-Turbo` |
-| Qwen-Image | `qwen-image` | The Qwen-Image checkpoint and its text encoder |
-| SDXL | `sdxl` | An SDXL checkpoint in safetensors, adapters through `/v1/loras` |
-| Boogu | `boogu` | The Boogu checkpoint |
+| FLUX.1 | `FluxPipeline`, `FluxTransformer2DModel` | `black-forest-labs/FLUX.1-schnell`, with the T5 and CLIP encoders it references |
+| FLUX.2 klein | `Flux2KleinPipeline`, `Flux2Transformer2DModel` | The klein checkpoint and its Qwen text encoder |
+| Z-Image | `ZImagePipeline`, `ZImageTransformer2DModel` | `Tongyi-MAI/Z-Image-Turbo` |
+| Qwen-Image | `QwenImagePipeline`, `QwenImageTransformer2DModel` | The Qwen-Image checkpoint and its text encoder |
+| SDXL | `StableDiffusionXLPipeline`, or the tensor names of a single file | An SDXL checkpoint in safetensors, adapters through `/v1/loras` |
+| Boogu | The tensor names of its file | The Boogu checkpoint |
 <!-- site: end -->
 
 An SDXL checkpoint's UNet and text towers are held in the float format it stores.
 Its VAE is held in F32.
 
 Image parity across machines is a hash of 1 render per family.
-The hash depends on the placement, see [Status](https://github.com/loken-ai/loken/blob/main/docs/STATUS.md).
+The hash depends on the placement, see [Status](STATUS.md).
 
 ## Video
 
@@ -429,7 +446,7 @@ The hash depends on the placement, see [Status](https://github.com/loken-ai/loke
 <!-- site: widget table id=models-audio -->
 | Task | Family | `model` |
 |---|---|---|
-| Transcription | Whisper | `whisper-1`, `whisper-small`, `whisper-medium`, `whisper-large-v3`, distil and faster-whisper checkpoints by their repository |
+| Transcription | Whisper | `whisper-1`, `whisper-small`, `whisper-medium`, `whisper-large-v3`, and distil checkpoints in safetensors by their repository. A CTranslate2 conversion is refused |
 | Speech | Parler-TTS | `tts-1`, `tts-1-hd`, `parler-tts/parler-tts-mini-v1`, `parler-tts/parler-tts-large-v1` |
 | Speech | Piper | `piper/<voice>`, as in `piper/fr_FR-tom-medium` |
 | Speech | Pocket-TTS, Kyutai | `pocket-tts`, `kyutai` |
@@ -446,11 +463,13 @@ The OpenAI voice names (`alloy`, `echo`, `fable`, `onyx` and the rest) are accep
 
 A Qwen3-TTS request names its checkpoint as `model`, or a stored voice as `voice`.
 `language` takes a BCP 47 code or a name the checkpoint lists.
-Without `model`, `language` alone picks Kyutai.
+Without `model`, a stored voice is spoken by the checkpoint that made it.
+Without `model` and without a stored voice, `language` `en` or `fr` picks Kyutai.
+Another language without `model` is refused.
 
 | Voice | Request | Same voice from 1 text to the next |
 |---|---|---|
-| A speaker the CustomVoice checkpoint names | `model` the CustomVoice checkpoint, `voice` a name `GET /v1/audio/voices` lists | Yes |
+| A speaker the CustomVoice checkpoint names | `model` the CustomVoice checkpoint, `voice` a name `GET /v1/audio/voices` lists, `instructions` an optional style | Yes |
 | A stored voice | `voice` its id | Yes |
 | A voice described in words | `model` the VoiceDesign checkpoint, `voice_description` | No |
 

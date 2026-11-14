@@ -2,7 +2,9 @@
 
 `loken` is licensed under **MIT OR Apache-2.0**. See [`LICENSE-MIT`](https://github.com/loken-ai/loken/blob/main/LICENSE-MIT) and [`LICENSE-APACHE`](https://github.com/loken-ai/loken/blob/main/LICENSE-APACHE).
 
-`loken` builds on, vendors or links against the third-party works listed here. Each keeps its own license, and this file collects the required notices. The authoritative license of a crate dependency is the one shipped in its source tree, resolved in `Cargo.lock`.
+`loken` builds on, vendors or links against the third-party works listed here.
+Each keeps its own license, and this file collects the required notices.
+The authoritative license of a crate dependency is the one shipped in its source tree, resolved in `Cargo.lock`.
 
 ## Dependency
 
@@ -14,10 +16,9 @@
 
 ## Redistributed binaries
 
-The `-cuda-libs` release archive carries NVIDIA's NVRTC, cuBLAS and cuBLASLt, redistributed under
-the CUDA Toolkit EULA (`LICENSE-CUDA.txt` in the archive, Attachment A lists them), and NCCL
-under its own licence (`LICENSE-NCCL.txt`) when the build machine provides it. The light archive
-carries none of them.
+The `-cuda-libs` release archive carries NVIDIA's NVRTC, cuBLAS and cuBLASLt under the CUDA Toolkit EULA (`LICENSE-CUDA.txt` in the archive, Attachment A lists them).
+It carries NCCL under its own licence (`LICENSE-NCCL.txt`) when the build machine provides it.
+The light archive carries none of them.
 
 ## Bench recordings
 
@@ -27,7 +28,7 @@ their credits, in the [benchmarks](https://github.com/loken-ai/benchmarks) repos
 ## Borrowed code, measured
 
 Each row states what a file still shares, verbatim, with the upstream it names.
-The figures come from `scripts/provenance/manifest.tsv`, measured against real checkouts.
+The figures come from `scripts/provenance/manifest.tsv`, measured against real checkouts, and from `scripts/provenance/externally_attested.tsv`, a snippet scanner's figures.
 `src/notice_gate.rs` holds the table to them:
 
 - At or above 30%, a file must have a row.
@@ -39,9 +40,9 @@ The goal is an empty table.
 2 caveats:
 
 - A snippet scanner sees reformatted copies that the line-for-line measure cannot, so the larger of the 2 figures is recorded.
-- The largest range left in `mmq_gguf.cuh` is the GGUF k-quant bit specification: masks, shifts and strides that any correct reader reproduces. 2 restructurings left the arithmetic identical and the share slightly higher. This is convergent design over a published format, not residual copying.
+- The largest range left in `mmq_gguf.cuh` is the GGUF k-quant bit specification: masks, shifts and strides that any correct reader reproduces. 2 restructurings left the arithmetic identical and the share slightly higher. The range is convergent design over a published format.
 
-The IQ2_XXS row is the same case in one file. Every matched line is the format's codebook, the point grid, the sign patterns and the mask that a reader of that format holds byte for byte. The dequantiser around them is ours.
+The IQ2_XXS row is the same case in one file. Every matched line is the format's codebook, the point grid, the sign patterns and the mask that a reader of that format holds byte for byte. The dequantiser around them is written for loken.
 
 **Chain of title.** The `cuda/mmq_gguf/` and `cuda/moe/` kernels reached this tree through candle, whose own copies are llama.cpp's. Candle matches `ggml/src/ggml-cuda` at 100%, 94%, 63% and 55% across those files. Those are candle's shares, not ours. They establish that llama.cpp (MIT) governs the kernels even where candle is the immediate upstream.
 `cuda/marlin/` descends from [IST-DASLab/marlin](https://github.com/IST-DASLab/marlin) via vLLM.
@@ -79,6 +80,8 @@ The named-voice prompt in `src/inference/model/qwen3_tts/prompt.rs` and `config.
 
 The codec decoder in `src/inference/model/qwen3_tts/decoder/` follows the layers of the decoder in `modeling_qwen3_tts_tokenizer_v2.py` in [QwenLM/Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS) (Apache-2.0). The code is written for loken.
 
+The log-mel front end in `src/inference/model/whisper/mod.rs` follows the audio code of [ggml-org/whisper.cpp](https://github.com/ggml-org/whisper.cpp) (MIT). The code is written for loken.
+
 ## Model weights
 
 Model *weights* are not distributed with this repository. Downloading and using a model is subject to that model's own license and terms of use.
@@ -90,6 +93,7 @@ Permissive (MIT, Apache-2.0, BSD), among others: `tokio`, `axum`, `serde`, `reqw
 
 Weak copyleft (file-level), used unmodified as a dependency:
 
-- **`symphonia`** (audio decoding: MP3, FLAC, OGG, AAC): **MPL-2.0**. Compatible with this project's license. It requires that modifications to the symphonia source files themselves remain under MPL-2.0. `loken` does not modify symphonia, so no additional obligation applies beyond this notice.
+- **`symphonia`** (audio decoding: MP3, FLAC, OGG, AAC): **MPL-2.0**. Its license is compatible with this project's. It requires that modifications to the symphonia source files themselves remain under MPL-2.0. `loken` does not modify symphonia, so no additional obligation applies beyond this notice.
+- **`option-ext`** (an extension of `Option`, through `dirs`): **MPL-2.0**. `loken` does not modify it, so no obligation applies beyond this notice.
 
 `cargo license` lists the complete, version-pinned dependency license set.

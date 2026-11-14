@@ -9,6 +9,9 @@ The loader decides from tensors and metadata:
 - `general.architecture` selects a row of `src/inference/model_facts.rs`.
 - A checkpoint's `architectures[0]` selects a GGUF tag through the class table in `src/inference/load/hf_config.rs`.
   AWQ checkpoints are read by `src/inference/load/awq_loader.rs`.
+- A GGUF file whose residual mixes through Sinkhorn projections loads as a wide-residual model, before any row is read.
+  `WideSparseMeta::claims` in `src/inference/generic_transformer/wide_sparse_config.rs` decides from the stream mix tensors and the `hyper_connection` keys.
+  A checkpoint directory of the same family is claimed by `WideSparseMeta::claims_checkpoint` and read by the block-scaled reader.
 
 ## Tests
 
@@ -118,6 +121,7 @@ The `Verified` column says how the safetensors layout is checked:
 | `lfm2moe` | `Lfm2MoeForCausalLM` | GGUF, HF safetensors | `lfm2moe_loads_from_gguf`, `lfm2moe_loads_from_safetensors` | reference, synthetic |
 | `nemotron_h_moe` | `NemotronHForCausalLM` | GGUF, HF safetensors | `nemotron_h_moe_loads_from_gguf`, `nemotron_h_moe_loads_from_safetensors` | reference, synthetic |
 | `glm_moe_dsa` | `GlmMoeDsaForCausalLM` (latent attention, sparse indexer shared across layers, sigmoid router with a selection bias, shared expert, dense first blocks, fp8 weights with 128 by 128 tile scales) | GGUF, HF safetensors | `glm_moe_dsa_loads_from_gguf`, `glm_moe_dsa_matches_reference`, `glm_moe_dsa_dense_matches_reference`, `glm_moe_dsa_sparse_matches_reference`, `glm_moe_dsa_fp8_matches_reference`, `glm_moe_dsa_layers_match_reference` | reference (`glm_moe_dsa`, `glm_moe_dsa_dense`, `glm_moe_dsa_sparse`, `glm_moe_dsa_fp8`), synthetic |
+| `deepseek41` | none: no transformers class, the block-scaled checkpoint directory is read by its own reader | GGUF (`deepseek41` and loken's `deepseek_v41`), block-scaled checkpoint directory | `the_generic_route_gives_the_bits_of_the_v41_path`, `the_generic_route_reproduces_the_frozen_oracle`, `a_model_read_from_the_block_scaled_checkpoint_gives_the_bits_of_the_v41_path` | records of the replaced V4.1 path (`deepseek_v41_oracle`, `deepseek_v41_frozen`) |
 | `qwen3` talker and code predictor of a speech release | `Qwen3TTSForConditionalGeneration` with its fields under `talker_config`, `Qwen3TTSTalkerCodePredictorModelForConditionalGeneration` for the code predictor nested in the same checkpoint with its fields under `talker_config.code_predictor_config` | HF safetensors composite | `a_class_reads_its_text_model_under_its_own_key`, `the_published_configuration_gives_both_transformers_geometry`, `a_speech_checkpoint_reads_as_a_talker_and_a_code_predictor`, `the_published_speech_header_reads_as_a_talker_and_a_code_predictor`, `a_nested_class_loads_and_a_layout_without_a_head_gives_none` | synthetic, real checkpoint configuration and header |
 | `llama` transformer of a speech codec's decoder | `Qwen3TTSTokenizerV2DecoderTransformerModel` nested in the codec's own configuration with its fields under `decoder_config`, every layer windowed, a scale per channel on both residual branches | HF safetensors, the codec's file | `a_windowed_scaled_class_matches_a_plain_host_run`, `a_window_wider_than_the_rows_is_the_causal_run`, `the_card_windowed_scaled_class_matches_a_plain_host_run` | synthetic |
 | `llama` transformer of Mimi's decoder | `ProjectedTransformer`, its configuration made from the codec's tensors, no token table, no final norm, layer norms with a bias, one Q, K and V projection, adjacent rotary lanes, the error-function GELU of an ungated feed-forward, every layer windowed, a scale per channel on both residual branches | the codec's own file | `a_tableless_layer_normed_class_matches_a_plain_host_run`, `a_prefill_longer_than_the_cache_is_the_windowed_run`, `the_card_tableless_layer_normed_class_matches_a_plain_host_run` | synthetic |
@@ -133,7 +137,8 @@ The loader reads:
 
 - GGUF, 1 file.
   A split set reads through the same tensor path, covered once in `loader.rs`.
-- Dense safetensors in the framework's layout: F32, F16, BF16, and MXFP4 blocks for the experts of `gptoss`.
+- Dense safetensors in the framework's layout: F32, F16, BF16, MXFP4 blocks for the experts of `gptoss`, and fp8 with a scale per square tile.
+- A block-scaled checkpoint directory of DeepSeek V4.1: fp8 matrices with tile scales, fp4 routed experts with row scales, bf16 and f32 tensors, read in place by `src/tensor/blockscaled/`.
 - AWQ safetensors.
 - The vendor's native layout (`params.json` and `consolidated*.safetensors`), dense or with routed experts.
 
@@ -221,7 +226,8 @@ The recipes write the tensor set each architecture's GGUF carries:
 Every recipe is written in F32.
 `tiny_model::write_quant` exercises K-quant weights for 1 architecture.
 
-`qwen4exp` loads the seeded toy file `tests/vectors/qwen4exp/toy.gguf`, because its wide residual, indexer and n-gram features are not part of a recipe.
+`qwen4exp` loads the seeded toy file `tests/vectors/qwen4exp/toy.gguf`.
+No recipe writes its wide residual, indexer or n-gram table.
 `wide_tests.rs` checks that model against the reference.
 
 ### What the tests check
@@ -260,9 +266,17 @@ The loader does not read these, as from a GGUF file:
 The reference vectors hold none of these.
 
 The loader does not map the 2 input norms of the grouped `falcon` decoder, so it refuses such a checkpoint for a missing tensor.  
-It refuses a quantised checkpoint other than AWQ of the llama, mistral and qwen families.
+It reads 3 kinds of quantised checkpoint:
 
-Architectures with their own model code (image, speech, video, forecasting) are outside this table, and the generic transformer does not read them.
+- AWQ, for the classes of the llama, mistral and qwen families that the class table marks.
+- MXFP4 blocks and their scales.
+- fp8 weights with a scale per square tile of `quantization_config.weight_block_size`.
+
+It refuses any other quantised checkpoint.
+
+Architectures with their own model code (image, video, forecasting) are outside this table.
+The parts of a speech model that are not a transformer are outside it too.
+The generic transformer reads only the speech transformers the table lists.
 DeepSeek V4.1 is read by the generic transformer as a wide-residual model.
 
 ## Embeddings towers
@@ -398,7 +412,8 @@ The clone prompt has 2 modes (`prompt::clone_rows`):
 A reference frame row sums the frame's code rows and the pad text row, as the row after a drawn frame does.
 The decoder takes the reference frames before the frames drawn, and their samples are cut from the waveform.
 The engine entries `qwen3_speaker_embedding`, `qwen3_clone_blocking` and `qwen3_clone_streamed` in `tts_engine.rs` take a clone prompt.
-No request field carries one yet.
+A request carries a clone prompt through a stored voice: `voice` names it, and the prompt holds its speaker embedding only.
+No request carries the in-context mode.
 
 ### The CustomVoice variant
 
@@ -603,7 +618,7 @@ Each lesson in `learn/` describes a behaviour, and the tables below list the sou
 
 | File | Role |
 |---|---|
-| `src/tensor/quant_cpu/format/q4_0.rs`, `q4_k.rs`, `iq2_xxs.rs` | 1 file per format, with layout, dequantiser and quantiser together. A sub-block count changed in only 1 of them is a silent defect. Read `q4_0.rs` first. |
+| `src/tensor/quant_cpu/format/q4_0.rs`, `q4_k.rs`, `iq2_xxs.rs` | 1 file per format, with layout, dequantiser and quantiser together. Read `q4_0.rs` first. |
 | `src/tensor/quant_cpu/scale.rs` | Scale searches: signed, with offset, and the second stage that quantises the scales. |
 | `src/tensor/quant_cpu/avx/mod.rs` | AVX2 dot products: the 4-step shape of every kernel and the unsigned-by-signed constraint of the multiply-add. |
 | `src/tensor/quantized/kernel_matmul.rs` | Picks the matmul for a call: mat-vec for decode, tiled for prefill, a repack when the format has one. Each can decline. The dequantised matmul at the end never does. |
@@ -668,7 +683,7 @@ The assertion names the measured difference.
 | `src/inference/serve/continuous_serve.rs` | Worker thread that owns the model and the paged cache. The only caller of the forward. |
 | `src/inference/serve/batched_forward.rs` | The batched forward as an f32 specification, and the batch-invariance contract a backend meets. |
 | `src/inference/kernel/cpu_decode_exec.rs` | Host decode path with a preallocated arena. A token on the host allocates nothing. |
-| `src/inference/place/layer_perf.rs`, `src/api/handlers/system.rs` | Per-layer and per-stage timers behind `/api/layer_perf` and `/api/stage_perf`. Off by default, because each stage costs a device synchronisation. |
+| `src/inference/place/layer_perf.rs`, `src/api/handlers/system.rs` | Per-layer and per-stage timers behind `/api/layer_perf` and `/api/stage_perf`. Off by default. Each stage costs a device synchronisation. |
 
 The 70B host-placement figure comes from [`STATUS.md`](STATUS.md#placement-measured-separately).
 
@@ -682,7 +697,7 @@ The 70B host-placement figure comes from [`STATUS.md`](STATUS.md#placement-measu
 | `src/inference/cache/paged_kv.rs`, `paged_attention.rs` | Block allocator and block tables, tested without a card. The attention that reads through them. |
 | `src/inference/cache/q4_kv.rs`, `q8_kv.rs` | Quantised caches. A per-token 4-bit key failed and a per-channel scheme replaced it. The 8-bit layout appends 1 row per step with 1 copy. |
 | `src/inference/cache/kv_disk.rs` | Disk tier: blocks, chained hash, 1 manifest per sequence, writes off the request path. |
-| `src/inference/cache/turboquant/mod.rs` | 3-bit cache as a host reference. The measurement that decides whether to write the kernel comes first: read `measure.rs` before the rest. |
+| `src/inference/cache/turboquant/mod.rs` | 3-bit cache as a host reference. Read `measure.rs` before the rest. |
 | `src/inference/engine/llm_engine/load.rs` (`kv_reuse_start`) | What a new prompt reuses: the resident prefix, a snapshot that covers more, a disk sequence that covers more still. Each is rounded down to a prefill chunk. |
 | `src/inference/engine/llm_engine/params.rs` | Keys `kv_disk_dir` (and its budget) and `fidelity`. Snapshots need no key. `fidelity = reference` turns the shift past the window off. |
 
@@ -719,7 +734,8 @@ The comment above `kv_reuse_start` in `src/inference/engine/llm_engine/load.rs` 
 | `src/inference/serve/speculative_config.rs` | Decides from measured device timings whether drafting pays. |
 | `src/inference/serve/spec_kv_cache.rs` | Cache that drops the rejected tail. |
 
-The EAGLE speedup of 1.71 to 1.82 times comes from the `eagle.rs` module comment, dated there.
+The EAGLE speedup of 1.71 to 1.82 times comes from the `eagle.rs` module comment.
+It was measured before the head moved to the native tensor substrate.
 
 ### Lesson 9: Fitting a model on the machine you have
 
@@ -736,9 +752,20 @@ The EAGLE speedup of 1.71 to 1.82 times comes from the `eagle.rs` module comment
 | `src/inference/generic_transformer/wide_sparse_card_tier.rs`, `wide_expert_card.rs` | The card tier of a model larger than the cards and host together. Keeps the hottest routed experts on the cards when a card measures faster than the host. Every card the load was offered has a room, a card outside the plan for routed experts only. Each card runs its experts on a thread of its own. |
 | `src/inference/generic_transformer/wide_sparse_host_tier.rs` | The host tier of the same experts. Keeps the routed experts of each layer that rank highest in the page cache, ranked by the decoded rows that routed to them or by recency, whichever a shadow of each layer measures to miss less, within what the host has left beside a burst, a layer's experts in flight and a sequence's state. Drops every other expert's pages once computed, so a prompt never pushes the decode's experts out, and reads ahead the next layer's guessed experts. |
 | `src/inference/generic_transformer/wide_always_read.rs` | The weights every token of a wide-residual model reads. Splits each card's room between them and the routed experts by the host time a byte saves, measured at load. |
-| `src/inference/generic_transformer/wide_sparse_card_stream.rs` | The residual of a single decoded row of a wide-residual model on a card. The Sinkhorn mixes, the collapse with its norm and the post of a layer whose mixers the load keeps on the card run there. A token mixer that runs its output projection on the same card reads its input there and leaves its output there. Only its key row and the rows its host state keeps come down. A router on the same card reads the feed-forward's input there. Its logits come down with that input and with the rows the token mixer's host state keeps. The feed-forward's output goes up. A residual that ends on the card that keeps the head is collapsed and normed there, and only the logits come down. A layer is admitted at its first decoded row when each card product is no farther from the exact one than the host's. |
+| `src/inference/generic_transformer/wide_sparse_card_stream.rs` | The residual of a single decoded row of a wide-residual model on a card, see [Card residual of a decoded row](#card-residual-of-a-decoded-row). |
 | `src/inference/generic_transformer/expert_tier.rs`, `expert_readahead.rs` | Expert tiers over streamed experts: views into the mapping, a cache on the cards by use, reads ahead of the layer. Drops used experts from the page cache while the host's memory is short. |
 | `src/distributed/routing.rs` | Picks the node that answers by predicted completion. [`CLUSTER.md`](CLUSTER.md) describes the routing. |
+
+#### Card residual of a decoded row
+
+- The Sinkhorn mixes, the collapse with its norm and the post of a layer whose mixers the load keeps on the card run there.
+- A token mixer that runs its output projection on the same card reads its input there and leaves its output there.
+- Only its key row and the rows its host state keeps come down.
+- A router on the same card reads the feed-forward's input there.
+- Its logits come down with that input and with the rows the token mixer's host state keeps.
+- The feed-forward's output goes up.
+- A residual that ends on the card that keeps the head is collapsed and normed there, and only the logits come down.
+- A layer is admitted at its first decoded row when each card product is no farther from the exact one than the host's.
 
 ### Lesson 10: Measuring an engine without fooling yourself
 
