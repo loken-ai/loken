@@ -96,18 +96,46 @@ fn handover_of(
     }))
 }
 
+/// A prompt a peer handed over and this instance imported.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct Landed {
+    /// The prompt tokens the cache here held before the hand-over.
+    pub held: usize,
+    /// When the peer was asked.
+    pub asked: std::time::Instant,
+}
+
+impl Landed {
+    /// Records the hand-over in `rates` once the local read after it ended.
+    /// Its time runs from the ask to now, so the restore and the rest of the read count.
+    pub(super) fn note(
+        &self,
+        rates: &super::handover_rate::HandoverRates,
+        peer: &str,
+        prompt_len: usize,
+    ) {
+        rates.note_handover(
+            peer,
+            prompt_len.saturating_sub(self.held),
+            self.asked.elapsed().as_secs_f64(),
+        );
+    }
+}
+
 /// Has the instance at `peer` read `prompt` when the cache here is at least a prefill chunk short
-/// of the whole and handing the prompt over is measured to take no longer than reading the rest here.
-/// Imports what it hands back as a snapshot that the prefix reuse then restores. Anything that goes wrong leaves the prompt to be read here.
-/// Returns the prompt tokens the cache here held before the hand-over, when the peer's prompt
-/// was imported.
+/// of the whole and `rates` say a hand-over takes no longer than reading the rest here.
+/// Imports what it hands back as a snapshot that the prefix reuse then restores.
+/// Anything that goes wrong leaves the prompt to be read here.
+/// Returns the hand-over when the peer's prompt was imported.
+/// The caller records it with [`Landed::note`] after its local read.
 pub(super) fn pull_prompt_from_peer(
     model: &mut dyn crate::inference::engine::model_backend::ModelBackend,
+    rates: &super::handover_rate::HandoverRates,
     model_name: &str,
     prompt: &str,
     prompt_tokens: &[u32],
     peer: &str,
-) -> Option<usize> {
+) -> Option<Landed> {
     use crate::distributed::kv_handover::decode;
     use crate::distributed::prefill_stream;
     let carries_state = model.handover_carries_state();
@@ -125,7 +153,7 @@ pub(super) fn pull_prompt_from_peer(
     if prompt_tokens.len() < held + chunk {
         return None;
     }
-    if !super::handover_rate::peer_reads(peer, prompt_tokens.len(), prompt_tokens.len() - held) {
+    if !rates.peer_reads(peer, prompt_tokens.len(), prompt_tokens.len() - held) {
         return None;
     }
     // The request's probe hears that its prompt is being read while the peer reads it.
@@ -208,13 +236,15 @@ pub(super) fn pull_prompt_from_peer(
     };
     match imported {
         Ok(()) => {
-            super::handover_rate::note_handover(peer, n, started.elapsed().as_secs_f64());
             info!(
                 "prompt read by {peer}: {n} tokens, {:.1} MB handed over in {:.0} ms",
                 bytes.len() as f64 / 1e6,
                 started.elapsed().as_secs_f64() * 1e3
             );
-            Some(held)
+            Some(Landed {
+                held,
+                asked: started,
+            })
         }
         Err(e) => {
             warn!("prefill peer {peer}: import: {e}; the prompt is read here");

@@ -7,6 +7,7 @@
 //! The peer's reading is relayed to the request as it goes.
 //! A peer that answers the handover alone still serves.
 //! A peer whose model sits in its batch worker reads the prompt on its serial path.
+//! An instance measures the hand-over and its own read before it decides between them.
 
 use super::model_manager::LoadedModelEntry;
 use super::*;
@@ -222,6 +223,34 @@ async fn a_peer_whose_worker_is_busy_still_hands_a_prompt_over() {
     );
     assert!(cached > 0, "the peer did not hand the prompt over");
     assert_eq!(text, want, "the handed prompt gave another answer");
+}
+
+/// The first long prompt measures the peer and the next one the local read.
+/// Every answer is the one an instance without a peer gives.
+#[tokio::test(flavor = "multi_thread")]
+async fn each_way_is_measured_before_the_measures_decide() {
+    let _paused = crate::request_metrics::PREFILL_PAUSE_LOCK.lock().await;
+    let (root, vocab) = models_dir();
+    let peer_port = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", peer_port.local_addr().unwrap());
+    let a = instance(&root, Some(url)).await;
+    let peer = instance(&root, None).await;
+    let alone = instance(&root, None).await;
+    let app = peer.create_router();
+    tokio::spawn(async move { axum::serve(peer_port, app).await.unwrap() });
+
+    let mut cached = Vec::new();
+    for first in [30, 31, 32] {
+        ask(&a, &peer, vocab).await;
+        let long = prompt(LONG_PROMPT_WORDS, vocab, first);
+        let (text, held) = answer(&a, long.clone()).await;
+        let (want, _) = answer(&alone, long).await;
+        assert_eq!(text, want, "a long prompt gave another answer");
+        cached.push(held);
+    }
+    let _ = std::fs::remove_dir_all(&root);
+    assert!(cached[0] > 0, "the unmeasured peer was not asked");
+    assert_eq!(cached[1], 0, "the unmeasured local read was not taken");
 }
 
 /// An instance whose cache is cut over 2 cards takes a long prompt that an instance with a whole

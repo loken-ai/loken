@@ -37,7 +37,7 @@ Smaller, by state then by priority:
 | Checkpoints served as stored | Models | A float checkpoint is served in its stored format whenever it fits, on the host and on every card family, it is requantised only to fit, and the log, `/api/ps` and the bench records say which format runs. | Partial |
 | Records that carry their recipe | Bench | A record holds the command, the binary hash, the model file hash and the configuration digest, and a seal that shows any change. | Done |
 | Sleep mode | Serving | An idle model moves to host memory and comes back on the next request. | Done |
-| Reuse or recompute | Serving | A prompt hand-over takes the KV when moving it is faster than reading the prompt again, judged on the link speed and the prompt speed loken measured, and it works in both directions. | Partial |
+| Reuse or recompute | Serving | A prompt hand-over takes the KV when moving it is faster than reading the prompt again, judged on the link speed and the prompt speed loken measured, and it works in both directions. | Done |
 | Batched expert reads in a prompt | Performance | Reading a prompt loads each streamed expert once for all the tokens that route to it, and prompt speed rises accordingly | Done |
 | Prompt lookup while experts stream | Speculation | Prompt-lookup drafting runs on models whose experts stream from disk, faster than plain decode on code that repeats its context | Done |
 | Routing toward resident experts | Performance | At the fast level the router favours experts already in memory, and the answers stay inside the bounds of the quality harness. | Done |

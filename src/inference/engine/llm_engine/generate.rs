@@ -343,6 +343,8 @@ impl LlmEngine {
             // Same proven trim_kv logic as generate_stream -> greedy-identical. Vision
             // requests fall back to a full reset.
             state.exact_prefill = None;
+            // A prompt a peer handed over, recorded once the local read after it ends.
+            let mut landed = None;
             let cache_session_start: usize = {
                 let is_vision_req = (state.model.is_vision_model() && state.image_embeds.is_some())
                     || !state.qwen35_vision.is_empty()
@@ -351,8 +353,9 @@ impl LlmEngine {
                     || false;
                 state.model.set_cache_scope(cache_scope);
                 if let (Some(peer), false) = (prefill_peer.as_deref(), disabled) {
-                    super::handover::pull_prompt_from_peer(
+                    landed = super::handover::pull_prompt_from_peer(
                         state.model.as_mut(),
+                        &spec_engine.handover_rates,
                         &state.name,
                         prompt.as_str(),
                         &prompt_tokens,
@@ -564,8 +567,10 @@ impl LlmEngine {
             };
             // The prefill ends when its logits are on the host: the card's queue is drained by then.
             let prompt_eval_duration = prefill_start.elapsed().as_nanos() as u64;
-            if vision_prefix_len.is_none() && audio_split.is_none() {
-                super::handover_rate::note_local_prefill(
+            if let (Some(landed), Some(peer)) = (landed, prefill_peer.as_deref()) {
+                landed.note(&spec_engine.handover_rates, peer, prompt_tokens.len());
+            } else if vision_prefix_len.is_none() && audio_split.is_none() {
+                spec_engine.handover_rates.note_local_prefill(
                     super::handover_rate::tokens_read(
                         prompt_tokens.len(),
                         cached_tokens,
@@ -575,6 +580,7 @@ impl LlmEngine {
                         state.model.prefill_shape(),
                     ),
                     prompt_eval_duration as f64 / 1e9,
+                    !for_peer,
                 );
             }
             // Diagnostic: fingerprint prefill logits + KV cache state.

@@ -255,6 +255,8 @@ pub struct LlmEngine {
     active: Arc<std::sync::atomic::AtomicUsize>,
     /// What the requests so far say about serial or batched serving.
     batching: Arc<batching::Batching>,
+    /// What this engine measured of its own prompt reads and of hand-overs from peers.
+    handover_rates: Arc<handover_rate::HandoverRates>,
     /// The drafter chosen for the loaded target (`None` = not decided yet).
     drafter_choice: Arc<std::sync::Mutex<Option<Option<String>>>>,
     /// What the cycles with the current drafter taught about the best draft length.
@@ -281,6 +283,7 @@ impl InferenceEngine for LlmEngine {
             dual_encoder: Arc::default(),
             active: Arc::default(),
             batching: Arc::default(),
+            handover_rates: Arc::default(),
             drafter_choice: Arc::default(),
             load_report: Arc::default(),
             draft_length: Arc::default(),
@@ -338,6 +341,7 @@ impl LlmEngine {
             dual_encoder: Arc::default(),
             active: Arc::default(),
             batching: Arc::default(),
+            handover_rates: Arc::default(),
             drafter_choice: Arc::default(),
             load_report: Arc::default(),
             draft_length: Arc::default(),

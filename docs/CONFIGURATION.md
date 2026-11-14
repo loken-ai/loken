@@ -167,9 +167,12 @@ The peer answers with its KV cache over `/api/cluster/prefill`, and this instanc
 [Across machines](https://loken-ai.github.io/loken/nodes/) draws the steps.
 
 The instance asks the peer only while handing the whole prompt over is expected to take no longer than reading the tokens its cache lacks.
-Both speeds are measured by the instance itself, the first from its hand-overs and the second from its prefills.
-A peer never measured is asked once.
-A peer measured slow is asked again after the local prefill has run as long as its last hand-over took.
+Both costs are measured by the instance itself for the model it serves.
+A hand-over is timed from the ask to the end of the local read after it: the peer's read, the transfer, the import and the restore.
+A local read is timed from its prefills, those it reads for the peer included.
+A peer never measured is asked once, then the next long prompt is read here to measure the local read.
+The way that loses is measured again once the other way has run as long as the losing way's measures took since it last won.
+A way that keeps losing is measured again less and less often.
 
 2 instances may each be the prefill peer of the other.
 A prompt read for a peer is read there and never handed over again.

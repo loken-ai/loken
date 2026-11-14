@@ -24,6 +24,7 @@ impl LlmEngine {
             dual_encoder: self.dual_encoder.clone(),
             active: self.active.clone(),
             batching: self.batching.clone(),
+            handover_rates: self.handover_rates.clone(),
             drafter_choice: self.drafter_choice.clone(),
             draft_length: self.draft_length.clone(),
             pld_cost: self.pld_cost.clone(),

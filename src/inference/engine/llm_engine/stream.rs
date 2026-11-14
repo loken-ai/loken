@@ -697,8 +697,8 @@ impl LlmEngine {
             // Entries moved to the request's queue.
             let mut logprobs_handed: usize = 0;
             let mut reused_prompt_tokens: usize;
-            // The prompt tokens the cache held before a prefill peer handed the prompt over.
-            let mut held_before_handover: Option<usize> = None;
+            // A prompt a prefill peer handed over, recorded once the local read after it ends.
+            let mut landed: Option<super::handover::Landed> = None;
             // The prompt tokens the request had to read when it arrived, and the model's
             // prefill chunk.
             let mut arrival_read = (0usize, usize::MAX);
@@ -986,8 +986,9 @@ impl LlmEngine {
                     // The resident KV serves only the caller that wrote it.
                     state.model.set_cache_scope(cache_scope);
                     if let Some(peer) = config.prefill_peer.as_deref() {
-                        held_before_handover = super::handover::pull_prompt_from_peer(
+                        landed = super::handover::pull_prompt_from_peer(
                             state.model.as_mut(),
+                            &spec_engine.handover_rates,
                             &state.name,
                             prompt.as_str(),
                             &prompt_tokens,
@@ -1379,13 +1380,19 @@ impl LlmEngine {
                         reused_prompt_tokens,
                         prefill_skipped,
                     );
-                    super::handover_rate::note_local_prefill(
-                        read,
-                        chunk,
-                        prefill_began.elapsed().as_secs_f64(),
-                    );
-                    let at_arrival = held_before_handover
-                        .map_or(read, |held| prompt_tokens.len().saturating_sub(held));
+                    match (landed, config.prefill_peer.as_deref()) {
+                        (Some(landed), Some(peer)) => {
+                            landed.note(&spec_engine.handover_rates, peer, prompt_tokens.len())
+                        }
+                        _ => spec_engine.handover_rates.note_local_prefill(
+                            read,
+                            chunk,
+                            prefill_began.elapsed().as_secs_f64(),
+                            true,
+                        ),
+                    }
+                    let at_arrival =
+                        landed.map_or(read, |l| prompt_tokens.len().saturating_sub(l.held));
                     arrival_read = (at_arrival, chunk);
                 }
                 // The first compute window is NOT opened here. Sampling the first token and
