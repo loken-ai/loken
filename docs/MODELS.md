@@ -458,6 +458,7 @@ Without `model`, `language` alone picks Kyutai.
 It takes a clip under a consent, or a description that the VoiceDesign checkpoint speaks first.
 A stored voice keeps the speaker embedding of its clip, not the clip.
 The same request without `seed` gives the same audio.
+[API](API.md#speech-requests) lists the fields each kind of checkpoint takes.
 
 ## Time series
 

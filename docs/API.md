@@ -26,7 +26,7 @@ With `[server] require_auth` on, every route needs a key, as `Authorization: Bea
 | `POST /api/copy` | Copy a manifest under a new name. Blobs are shared. |
 | `DELETE /api/delete` | Remove a manifest and every blob no manifest names. |
 | `POST /api/chat` | Chat. Takes `tools`, `tool_choice`, `think`, `format`, `logprobs`, `top_logprobs`, images, and `audios` (base64 clips) on a user message for a model with the `audio` capability. Returns `thinking` apart from `content`, `done_reason` and the engine's timings. |
-| `POST /api/generate` | Completion. Renders `system` and `template`, takes `suffix` and `images`, returns `context`. The images go before the prompt, as on `/api/chat`. A package with no template layer gets the prompt as given, as in Ollama. |
+| `POST /api/generate` | Completion. Renders `system` and `template`, takes `suffix`, `images`, `logprobs` and `top_logprobs`, returns `context`. The images go before the prompt, as on `/api/chat`. A package with no template layer gets the prompt as given, as in Ollama. |
 | `POST /api/embed` | Embeddings. Honours `dimensions` and `truncate`. |
 | `POST /api/embeddings` | The legacy 1-prompt shape. |
 <!-- site: end -->
@@ -38,9 +38,9 @@ With `[server] require_auth` on, every route needs a key, as `Authorization: Bea
 <!-- site: widget table id=api-openai-language -->
 | Route | What it does |
 |---|---|
-| `POST /v1/chat/completions`, `POST /api/chat/completions` | Chat. Takes content parts, images, `input_audio` parts, `tools`, `tool_choice`, `parallel_tool_calls`, `response_format`, `reasoning_effort`, `n`, `logprobs`, `logit_bias`, `max_completion_tokens` and [vLLM's extensions](#vllms-extensions). An `input_audio` part is `{"type": "input_audio", "input_audio": {"data": "<base64>", "format": "wav"}}`, in any container the server decodes, for a model with the `audio` capability. A `video_url` part is `{"type": "video_url", "video_url": {"url": "data:video/mp4;base64,..."}}`, in any container `ffmpeg` reads, for a vision model that reads video. `ffmpeg` and `ffprobe` must be on the PATH. A remote URL answers 400. Returns `reasoning_content` apart from `content`, and `finish_reason`. `usage` carries the reasoning tokens, `accepted_prediction_tokens`, `rejected_prediction_tokens` and the [`loken` object](#per-request-figures). A stop sequence is not part of the text. |
+| `POST /v1/chat/completions`, `POST /api/chat/completions` | Chat. Takes content parts, images, `input_audio` parts, `tools`, `tool_choice`, `parallel_tool_calls`, `response_format`, `reasoning_effort`, `n`, `logprobs`, `top_logprobs`, `logit_bias`, `max_completion_tokens` and [vLLM's extensions](#vllms-extensions). An `input_audio` part is `{"type": "input_audio", "input_audio": {"data": "<base64>", "format": "wav"}}`, in any container the server decodes, for a model with the `audio` capability. A `video_url` part is `{"type": "video_url", "video_url": {"url": "data:video/mp4;base64,..."}}`, in any container `ffmpeg` reads, for a vision model that reads video. `ffmpeg` and `ffprobe` must be on the PATH. A remote URL answers 400. Returns `reasoning_content` apart from `content`, and `finish_reason`. `usage` carries the reasoning tokens, `accepted_prediction_tokens`, `rejected_prediction_tokens` and the [`loken` object](#per-request-figures). A stop sequence is not part of the text. |
 | `POST /v1/chat/completions/batch` | vLLM's batch of conversations. `messages` is a list of conversations, each answered as its own chat completion, 1 choice per conversation. No `stream`, no `tools`, no `n` above 1. |
-| `POST /v1/completions` | Text completion. Takes `suffix` (fill-in-the-middle), `echo`, an array of prompts, `logit_bias`, `response_format` and [vLLM's extensions](#vllms-extensions). `prompt_embeds` sends the prompt as embedding rows of the model's width, in a form listed under [Prompt embeddings](#prompt-embeddings). It is refused while the model batches concurrent requests. |
+| `POST /v1/completions` | Text completion. Takes `suffix` (fill-in-the-middle), `echo`, an array of prompts, `logprobs`, `logit_bias`, `response_format` and [vLLM's extensions](#vllms-extensions). `prompt_embeds` sends the prompt as embedding rows of the model's width, in a form listed under [Prompt embeddings](#prompt-embeddings). It is refused while the model batches concurrent requests. |
 | `POST /v1/responses` | The Responses API, lowered to a chat completion and lifted back into output items. `GET` and `DELETE /v1/responses/{id}` read and drop a stored response. `previous_response_id` continues one. `input_image` (`image_url` as a base64 data URL, or the `file_id` of an upload) and `input_audio` (`data`, `format`) parts become the `image_url` and `input_audio` parts of a chat completion. Another part type answers 400 naming it. |
 | `POST /v1/embeddings` | Embeddings, loading the model on demand. `encoding_format` is `float` or `base64`, `dimensions` cuts the vector. `input` is a string, strings or 1 conversation. `messages` is 1 conversation or a list, as vLLM takes them. A conversation is 1 vector: its text parts joined by newlines, or its single `image_url` part for a CLIP or SigLIP model. The image is a base64 data URL or an http(s) URL from a host in `image_fetch_hosts`. Text beside an image is refused. A CLIP or SigLIP checkpoint is named by its Hugging Face id, such as `openai/clip-vit-large-patch14`. See [the embeddings guide](https://loken-ai.github.io/loken/embeddings/). |
 | `POST /v1/rerank`, `POST /rerank` | Score documents against a query with a cross-encoder. |
@@ -211,7 +211,7 @@ A route in the Feature column exists when its Cargo feature is compiled.
 | Route | Feature | What it does |
 |---|---|---|
 | `POST /v1/audio/transcriptions`, `POST /v1/audio/translations` | `audio` | Speech to text. |
-| `POST /v1/audio/speech` | `audio` | Text to speech. `response_format` is `wav` (default), `pcm`, `mp3`, `flac`, `opus` (Ogg) or `aac` (ADTS), another name answers 400 with the list. Every speech engine answers every format, at the rate and channel count it produces. `opus` takes 8, 12, 16, 24 and 48 kHz, and another rate is resampled to 48 kHz. `aac` takes the ADTS rates, and another rate is resampled to 48 kHz. The bit rate is the encoder's own default for speech. `stream` sends each sentence as it is spoken: `wav` as a header then samples, `pcm` as samples, `mp3`, `opus` and `aac` as 1 complete stream per sentence, one after the other. `flac` cannot be streamed and answers 400. `stream_format` `sse` answers every format as a base64 clip in its `done` event. `GET /v1/audio/voices` lists the voices. pocket-tts speaks a long text in the chunks its reference generates apart: its sentences grouped up to the reference's chunk of tokens, a longer sentence cut at its clauses. Its `stream` sends each chunk as it is spoken. A checkpoint whose voice is described in words takes the timbre from `voice_description`, else from the description of the `voice` preset, and the style from `instructions`. Both given, the timbre comes first. Its `language` is a BCP-47 code or a name its configuration lists. Absent or `auto`, the model picks the language. Another language answers 400 with the list the checkpoint speaks. Without `seed` the draw derives from a hash of the timbre, so the same request gives the same audio. `temperature`, `top_p` and `max_steps` replace the values of its `generation_config.json`. It speaks a whole text in one call, and splits it at paragraphs then sentences only when one call cannot hold the speech. With `stream`, its audio leaves while it draws the frames: each piece the decoder gives leaves at once, `wav` and `pcm` as 1 continuous stream, `mp3`, `opus` and `aac` as 1 complete stream per piece. A streamed text is spoken in one call when the talker's cache holds its prompt and the checkpoint's frame limit, else a part per call, its paragraphs else its sentences, each with the same seed. A streamed call that reaches the checkpoint's frame limit ends the stream there. A whole clip whose frames per text token exceed both a fixed pace and a multiple of the median the loaded checkpoint measured for texts of its language from half to twice its length is drawn again once with the next seed, and the shorter draw is kept when both run long. The 2 bounds are `TOKEN_PACE` and `MEDIAN_FACTOR` in `src/inference/model/qwen3_tts/overrun.rs`. A request with `seed` is drawn again the same way. A streamed clip is never drawn again. A speech talker that clones speaks a stored voice only: `voice` names its id, as a string or as an object with an `id`. Without `model` the voice is spoken by the checkpoint that made it. A checkpoint whose speaker embedding has another width answers 400. A stored voice with `voice_description` or `instructions` answers 400. An id the store does not hold answers 404. Such a talker without a stored voice answers 400 with how to create one. Without `seed` the draw derives from a hash of the voice id. A speech talker that names its voices speaks the one `voice` names, matched without case, in the style `instructions` gives. No `voice`, or a name its configuration does not list, answers 400 with the names it lists. A `voice` that a checkpoint of the store names, sent without that checkpoint as `model`, answers 400 with the checkpoint to name. A `model` that adds a voice after the id of a speech talker answers 400 with the field its checkpoint takes the voice from. `voice_description` answers 400: a voice described in words is spoken by the VoiceDesign variant. A stored voice answers 400 with the checkpoint that made it. A dialect speaker speaks its dialect when `language` is absent, `auto` or Chinese, and another language when `language` names it. Without `seed` the draw derives from a hash of the voice name and the style. |
+| `POST /v1/audio/speech` | `audio` | Text to speech. `response_format` is `wav` (default), `pcm`, `mp3`, `flac`, `opus` (Ogg) or `aac` (ADTS). Another name answers 400 with the list. `GET /v1/audio/voices` lists the voices. See [Speech requests](#speech-requests) for the formats, the stream and the fields each kind of checkpoint takes. |
 | `POST /v1/audio/separate` | `audio` | Split a mix into stems. |
 | `GET /v1/audio/voices` | `audio` | The `voice` presets in `data`, and the stored voices as Voice objects in `custom_voices`, oldest first. `data` also lists the speakers of each checkpoint of the store that names its voices. Such an entry has the speaker's name as `voice`, the checkpoint's id as `family` and `model`, its dialect as `accent` or `null`, `gender` `null` and `is_default` false. |
 | `POST /v1/audio/voices` | `audio` | Create a voice and keep it. The answer is a Voice object: `id`, `created_at`, `name`, `object` `audio.voice`, `type` and `prompt` for a voice from a description. `type` `prompt` takes a JSON body or a multipart form with `name` (1 to 256 characters), `prompt` (1 to 2000) and `script_hint` (1 to 2000). The voice design checkpoint speaks `script_hint` once in the voice `prompt` describes. `script_hint` is a sentence in the language the voice will speak. A request without it answers 400. The speaker encoder of a checkpoint that clones then turns that speech into the stored voice. `type` `audio_sample`, the default, takes a multipart form with `name`, `audio_sample` (an audio file of at most 10 MiB and 60 s) and `consent`, the id of a consent recording. An unknown consent answers 404. `model` names either checkpoint. Absent or `auto`, each comes from the store. |
@@ -226,10 +226,93 @@ A route in the Feature column exists when its Cargo feature is compiled.
 | `POST /v1/video/generations` | `video` | Text- and image-conditioned clips. |
 | `POST /api/video/plan` | `video` | What a clip of a given length will cost, before rendering it. |
 | `GET /v1/renders`, `POST /v1/renders/{id}/cancel` | none | Renders in flight of the calling key, and cancelling 1. See [Naming a render](#naming-a-render). |
+<!-- site: end -->
+
+### Speech requests
+
+Every speech engine answers every format, at the rate and channel count it produces.
+
+| `response_format` | With `stream` |
+|---|---|
+| `wav` (default) | A header, then the samples |
+| `pcm` | The samples |
+| `mp3` | 1 complete stream per sentence, in order |
+| `opus` (Ogg) | 1 complete stream per sentence, in order |
+| `aac` (ADTS) | 1 complete stream per sentence, in order |
+| `flac` | Not streamed. The request answers 400 |
+
+- `opus` takes 8, 12, 16, 24 and 48 kHz. Another rate is resampled to 48 kHz.
+- `aac` takes the ADTS rates. Another rate is resampled to 48 kHz.
+- The bit rate is the encoder's own default for speech.
+- `stream` sends each sentence as it is spoken.
+- `stream_format` `sse` answers every format as a base64 clip in its `done` event.
+
+#### pocket-tts
+
+- It speaks a long text in the chunks its reference generates apart: its sentences grouped up to the reference's chunk of tokens, a longer sentence cut at its clauses.
+- Its `stream` sends each chunk as it is spoken.
+
+#### A checkpoint whose voice is described in words
+
+| Field | Effect |
+|---|---|
+| `voice_description` | The timbre. Absent, the timbre is the description of the `voice` preset |
+| `instructions` | The style. With `voice_description`, the timbre comes first |
+| `language` | A BCP-47 code or a name its configuration lists. Absent or `auto`, the model picks the language. Another language answers 400 with the list the checkpoint speaks |
+| `seed` | Absent, the draw derives from a hash of the timbre, so the same request gives the same audio |
+| `temperature`, `top_p`, `max_steps` | Replace the values of its `generation_config.json` |
+
+A whole answer:
+
+- It speaks a whole text in 1 call.
+- It splits the text at paragraphs then sentences only when 1 call cannot hold the speech.
+- A clip is drawn again once with the next seed when its frames per text token exceed both of 2 bounds: a fixed pace, and a multiple of the median the loaded checkpoint measured for texts of its language from half to twice its length.
+- The shorter draw is kept when both run long.
+- The 2 bounds are `TOKEN_PACE` and `MEDIAN_FACTOR` in `src/inference/model/qwen3_tts/overrun.rs`.
+- A request with `seed` is drawn again the same way.
+
+A streamed answer:
+
+- Its audio leaves while it draws the frames: each piece the decoder gives leaves at once.
+- `wav` and `pcm` leave as 1 continuous stream. `mp3`, `opus` and `aac` leave as 1 complete stream per piece.
+- The text is spoken in 1 call when the talker's cache holds its prompt and the checkpoint's frame limit.
+- Otherwise it is spoken a part per call, its paragraphs else its sentences, each with the same seed.
+- A call that reaches the checkpoint's frame limit ends the stream there.
+- A streamed clip is never drawn again.
+
+#### A speech talker that clones
+
+It speaks a stored voice only.
+
+| Request | Answer |
+|---|---|
+| `voice` names the id of a stored voice, as a string or as an object with an `id` | The voice is spoken. Without `model`, the checkpoint that made it speaks it |
+| A checkpoint whose speaker embedding has another width | 400 |
+| A stored voice with `voice_description` or `instructions` | 400 |
+| An id the store does not hold | 404 |
+| No stored voice | 400 with how to create one |
+
+Without `seed` the draw derives from a hash of the voice id.
+
+#### A speech talker that names its voices
+
+It speaks the voice `voice` names, matched without case, in the style `instructions` gives.
+
+| Request | Answer |
+|---|---|
+| No `voice`, or a name its configuration does not list | 400 with the names it lists |
+| A `voice` that a checkpoint of the store names, sent without that checkpoint as `model` | 400 with the checkpoint to name |
+| A `model` that adds a voice after the id of a speech talker | 400 with the field its checkpoint takes the voice from |
+| `voice_description` | 400: a voice described in words is spoken by the VoiceDesign variant |
+| A stored voice | 400 with the checkpoint that made it |
+
+- A dialect speaker speaks its dialect when `language` is absent, `auto` or Chinese, and another language when `language` names it.
+- Without `seed` the draw derives from a hash of the voice name and the style.
 
 ### Stored voices
 
 The voices and the consents live in a `voices` directory beside the Hugging Face store: the parent of `huggingface_models_dir` when it names a `hub` directory, else that directory.
+When the key lists several directories, the first one holds them.
 
 | Entry | Directory | Files |
 |---|---|---|
@@ -249,8 +332,6 @@ A valid identifier has letters, digits, dot, underscore and dash, 64 characters 
 - Reusing an identifier of the same key while its render runs cancels that render.
 - 2 keys can use the same identifier. Each reaches its own render.
 - These renders register: image generation, image edit and variation, music, sound effect, MIDI, transcription, separation, video and speech.
-
-<!-- site: end -->
 
 ### Requests that share a pass
 
@@ -433,7 +514,7 @@ The serial path and the paged batch worker read a long prompt a prefill chunk at
 The batch worker of a model that keeps a state per sequence reads a prompt in the forwards its model cuts it into, and `done` moves at each forward.
 Inside a forward over prompt rows, `done` moves with each layer of the model: it adds the share of the forward's rows that the layers done stand for.
 A prompt the prefill peer reads reports the peer's reading of the whole prompt until the peer hands it over, then the rest read here.
-A peer of an earlier version reports nothing while it reads, and `done` stays at 0 until its handover.
+A peer of an earlier version reports nothing while it reads, and `done` stays at 0 until its hand-over.
 
 A prompt read in under 250 ms sends no comment line.
 
