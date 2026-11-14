@@ -59,6 +59,22 @@ impl LlmEngine {
         }
     }
 
+    /// Takes the model out of its batch worker when no request runs on it.
+    pub async fn leave_idle_worker(&self) {
+        if self.active.load(std::sync::atomic::Ordering::Acquire) > 0 {
+            return;
+        }
+        let mut guard = self.model_state.lock().await;
+        if let Some(state) = guard.as_mut() {
+            if state.model.batched_server().is_some() && super::load::demote_to_serial(state) {
+                info!(
+                    "{}: a request reads its log-probabilities: serving serially",
+                    state.name
+                );
+            }
+        }
+    }
+
     /// Returns once the model serves from its batch worker.
     pub async fn until_continuous(&self) {
         self.batching.until(|| self.is_continuous()).await
@@ -549,6 +565,7 @@ impl LlmEngine {
         // A lone request that finds another admitted before it starts moves the model into its
         // worker and is served there.
         if self.active.load(std::sync::atomic::Ordering::Acquire) > 1
+            && params.top_logprobs.is_none()
             && !self.is_continuous().await
             && self.hands_over_to_worker().await
         {
@@ -580,7 +597,7 @@ impl LlmEngine {
         }
 
         let model_state = self.model_state.clone();
-        let logprob_queue = self.logprob_queue.clone();
+        let drawn_logprobs = params.drawn_logprobs.clone();
         let sessions = self.sessions.clone();
         let session_id = params.session_id.clone();
         let cache_scope = params.cache_scope;
@@ -612,7 +629,8 @@ impl LlmEngine {
         let spec_rt = tokio::runtime::Handle::current();
         let probe = params.probe.clone();
         // A lone request moves into the batch worker when another request arrives.
-        let mut hand_over = self.hands_over_to_worker().await;
+        // A request that reads log-probabilities stays where they are drawn.
+        let mut hand_over = params.top_logprobs.is_none() && self.hands_over_to_worker().await;
         let hand_over_params = params.clone();
 
         std::thread::spawn(move || {
@@ -653,6 +671,8 @@ impl LlmEngine {
             // Log-probabilities gathered between two chunks, and the prompt tokens the
             // session cache already held: both outlive the prefill block.
             let mut logprob_buf: Vec<TokenLogprob> = Vec::new();
+            // Entries moved to the request's queue.
+            let mut logprobs_handed: usize = 0;
             let mut reused_prompt_tokens: usize;
             // The prompt tokens the cache held before a prefill peer handed the prompt over.
             let mut held_before_handover: Option<usize> = None;
@@ -1802,11 +1822,9 @@ impl LlmEngine {
                 if let Some(t) = cycle_end.take() {
                     loop_after_ns += t.elapsed().as_nanos() as u64;
                 }
-                if !logprob_buf.is_empty() {
-                    if let Ok(mut q) = logprob_queue.lock() {
-                        q.append(&mut logprob_buf);
-                    }
-                }
+                // The buffer holds the entries of the tokens streamed and of the one streamed next.
+                logprobs_handed += logprob_buf.len();
+                drawn_logprobs.append(&mut logprob_buf);
                 // Prefill ends where its token exists, not where its forward pass returned.
                 if prefill_end.is_none() {
                     prefill_end = Some(std::time::Instant::now());
@@ -1989,6 +2007,12 @@ impl LlmEngine {
                                     break 'stream_loop;
                                 }
                             };
+                            // Each verify draw is a token written: its log probability is kept.
+                            record_logprobs(
+                                &stream_tokenizer,
+                                &mut logits_processor,
+                                &mut logprob_buf,
+                            );
 
                             if verify_token == draft_tokens_buf[k] {
                                 accepted += 1;
@@ -2040,6 +2064,7 @@ impl LlmEngine {
                                 break;
                             }
                         };
+                        record_logprobs(&stream_tokenizer, &mut logits_processor, &mut logprob_buf);
 
                         let spec_ms = t_spec.elapsed().as_secs_f64() * 1000.0;
                         let tokens_produced = accepted + 1;
@@ -2953,41 +2978,35 @@ impl LlmEngine {
                                     /* committed_base */ token_count,
                                     max_tokens,
                                     &mut |row, recent| {
-                                        if temperature == 0.0 {
-                                            #[cfg(feature = "gpu")]
-                                            {
-                                                gpu_sample_returning_tensor(
-                                                    row,
-                                                    recent,
-                                                    repeat_penalty,
-                                                    repeat_last_n,
-                                                )
-                                            }
-                                            #[cfg(not(feature = "gpu"))]
-                                            {
-                                                let penalized = apply_repeat_penalty(
-                                                    row,
-                                                    recent,
-                                                    repeat_penalty,
-                                                    repeat_last_n,
-                                                )?;
-                                                logits_processor
-                                                    .sample(&penalized)
-                                                    .map(|t| (t, None))
-                                            }
-                                        } else {
-                                            let row_cpu = match row.device() {
-                                                Device::Cpu => row.clone(),
-                                                _ => row.to_device(&Device::Cpu)?,
-                                            };
-                                            let penalized = apply_repeat_penalty(
-                                                &row_cpu,
+                                        // The card's argmax draws no log probability and adds no bias.
+                                        #[cfg(feature = "gpu")]
+                                        if temperature == 0.0 && !logits_processor.needs_host() {
+                                            return gpu_sample_returning_tensor(
+                                                row,
                                                 recent,
                                                 repeat_penalty,
                                                 repeat_last_n,
-                                            )?;
-                                            logits_processor.sample(&penalized).map(|t| (t, None))
+                                            );
                                         }
+                                        let row_cpu = match row.device() {
+                                            Device::Cpu => row.clone(),
+                                            _ => row.to_device(&Device::Cpu)?,
+                                        };
+                                        let penalized = apply_repeat_penalty(
+                                            &row_cpu,
+                                            recent,
+                                            repeat_penalty,
+                                            repeat_last_n,
+                                        )?;
+                                        let drawn = logits_processor.sample(&penalized)?;
+                                        // Each draw of the verify is a token written.
+                                        // Its log probability is kept with it.
+                                        record_logprobs(
+                                            &stream_tokenizer,
+                                            &mut logits_processor,
+                                            &mut logprob_buf,
+                                        );
+                                        Ok((drawn, None))
                                     },
                                 );
                                 if recorded_window {
@@ -3225,7 +3244,9 @@ impl LlmEngine {
                             // the U32 [1,1] device tensor for the next
                             // iter's forward (Path B step 3) - bit-exact
                             // equivalent to Tensor::new(&[tok], dev).
-                            let (tok, dev_next) = if temperature == 0.0 {
+                            let (tok, dev_next) = if temperature == 0.0
+                                && !logits_processor.needs_host()
+                            {
                                 let logits_1d = match logits.squeeze(0) {
                                     Ok(s) => s,
                                     Err(e) => {
@@ -3526,11 +3547,9 @@ impl LlmEngine {
             let mut serial_part: Option<crate::request_metrics::RequestOutcome> = None;
             let mut return_stats = true;
             if let Ok(mut slot) = stream_stats_slot.lock() {
-                if !logprob_buf.is_empty() {
-                    if let Ok(mut q) = logprob_queue.lock() {
-                        q.append(&mut logprob_buf);
-                    }
-                }
+                // The draws past the last token streamed are not tokens written.
+                logprob_buf.truncate(token_count.saturating_sub(logprobs_handed));
+                drawn_logprobs.append(&mut logprob_buf);
                 let finish_reason = if let Some(hit) = stop_tracker.matched() {
                     FinishReason::StopSequence(hit.to_string())
                 } else if ends(next_token) {

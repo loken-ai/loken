@@ -374,12 +374,13 @@ pub(crate) async fn ollama_chat(
         .await?;
     // The gate, the in-flight count and the last user turn's images.
     let admission = state
-        .admit(
+        .admit_reading(
             engine.clone(),
             &model_name,
             crate::api::gate::Priority::of_request(&headers, false),
             "/api/chat",
             &crate::api::handlers::chat_prompt::last_user_images(&request.messages),
+            params.top_logprobs.is_some(),
         )
         .await?;
     state
@@ -402,6 +403,7 @@ pub(crate) async fn ollama_chat(
         let probe = std::sync::Arc::new(crate::request_metrics::RequestProbe::default());
         params.probe = Some(probe.clone());
         // Use streaming generation (NDJSON format, matching Ollama's API)
+        let drawn_logprobs = params.drawn_logprobs.clone();
         match engine.generate_stream(&prompt, params.clone()).await {
             Ok(mut rx) => {
                 let model_name_clone = model_name.clone();
@@ -458,7 +460,7 @@ pub(crate) async fn ollama_chat(
                                         "done": false
                                     });
                                     if wants_logprobs {
-                                        let drawn = engine_for_stats.take_logprobs();
+                                        let drawn = drawn_logprobs.take();
                                         if !drawn.is_empty() {
                                             response_chunk["logprobs"] = ollama_logprobs(&drawn);
                                         }
@@ -594,7 +596,7 @@ pub(crate) async fn ollama_chat(
                             message["tool_calls"] =
                                 crate::api::types::ollama_tool_calls(&tool_calls);
                         }
-                        let final_chunk = serde_json::json!({
+                        let mut final_chunk = serde_json::json!({
                             "model": model_name_clone,
                             "created_at": chrono::Utc::now().to_rfc3339(),
                             "message": message,
@@ -609,6 +611,13 @@ pub(crate) async fn ollama_chat(
                             "eval_count": eval_count,
                             "eval_duration": eval_duration
                         });
+                        // The entries of the last tokens go with the final chunk.
+                        if wants_logprobs {
+                            let drawn = drawn_logprobs.take();
+                            if !drawn.is_empty() {
+                                final_chunk["logprobs"] = ollama_logprobs(&drawn);
+                            }
+                        }
                         let mut line = final_chunk.to_string();
                         line.push('\n');
                         yield Ok::<_, std::io::Error>(axum::body::Bytes::from(line));
@@ -1170,12 +1179,13 @@ pub(crate) async fn ollama_generate(
         .await?;
     // The gate (FIM auto-promotes its priority), the in-flight count and the images.
     let admission = state
-        .admit(
+        .admit_reading(
             engine.clone(),
             &model_name,
             crate::api::gate::Priority::of_request(&headers, is_fim),
             "/api/generate",
             request.images.as_deref().unwrap_or_default(),
+            params.top_logprobs.is_some(),
         )
         .await?;
     drop(inflight_guard);
@@ -1186,6 +1196,7 @@ pub(crate) async fn ollama_generate(
         // The request's own counts come back through its probe.
         let probe = std::sync::Arc::new(crate::request_metrics::RequestProbe::default());
         params.probe = Some(probe.clone());
+        let drawn_logprobs = params.drawn_logprobs.clone();
         // Use streaming generation (NDJSON format, matching Ollama's API)
         match engine
             .generate_stream(&effective_prompt, params.clone())
@@ -1236,7 +1247,7 @@ pub(crate) async fn ollama_generate(
                                         "done": false
                                     });
                                     if wants_logprobs {
-                                        let drawn = engine_for_stats.take_logprobs();
+                                        let drawn = drawn_logprobs.take();
                                         if !drawn.is_empty() {
                                             response_chunk["logprobs"] = ollama_logprobs(&drawn);
                                         }
@@ -1336,7 +1347,7 @@ pub(crate) async fn ollama_generate(
                                 wall_total_ns,
                             ),
                         };
-                        let final_chunk = serde_json::json!({
+                        let mut final_chunk = serde_json::json!({
                             "model": model_name_clone,
                             "created_at": chrono::Utc::now().to_rfc3339(),
                             "response": "",
@@ -1351,6 +1362,13 @@ pub(crate) async fn ollama_generate(
                             "eval_count": eval_count,
                             "eval_duration": eval_duration
                         });
+                        // The entries of the last tokens go with the final chunk.
+                        if wants_logprobs {
+                            let drawn = drawn_logprobs.take();
+                            if !drawn.is_empty() {
+                                final_chunk["logprobs"] = ollama_logprobs(&drawn);
+                            }
+                        }
                         let mut line = final_chunk.to_string();
                         line.push('\n');
                         yield Ok::<_, std::io::Error>(axum::body::Bytes::from(line));

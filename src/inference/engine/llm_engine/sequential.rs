@@ -174,9 +174,6 @@ fn decode_sequential(
             .map_err(|e| anyhow!(e))?;
         let next_token = logits_processor.sample_logits(row)?;
         record_logprobs(&state.tokenizer, &mut logits_processor, &mut logprob_acc);
-        for lp in logprob_acc.drain(..) {
-            (out.logprob)(lp);
-        }
         let grammar_done = match constraint.as_mut() {
             Some(c) => {
                 c.commit_token(Some(next_token))
@@ -192,6 +189,10 @@ fn decode_sequential(
         }
         generated.push(next_token);
         recent_tokens.push(next_token);
+        // The draw of an end token is not a token written: only a written token's entry goes out.
+        for lp in logprob_acc.drain(..) {
+            (out.logprob)(lp);
+        }
 
         let piece = detok.step(&state.tokenizer, &generated, skip_special);
         let stopped = stop_tracker.is_active()
@@ -331,7 +332,7 @@ impl LlmEngine {
         let model_state = self.model_state.clone();
         let sessions = self.sessions.clone();
         let config = self.config.clone();
-        let logprob_queue = self.logprob_queue.clone();
+        let drawn_logprobs = params.drawn_logprobs.clone();
         let stats_slot = self.stream_stats_slot();
         let cancel = params.cancel.clone().unwrap_or_default();
         let probe = params.probe.clone();
@@ -354,11 +355,7 @@ impl LlmEngine {
                 &cancel,
                 Outlet {
                     text: &mut |piece| tx.blocking_send(Ok(piece)).is_ok(),
-                    logprob: &mut |lp| {
-                        if let Ok(mut q) = logprob_queue.lock() {
-                            q.push(lp);
-                        }
-                    },
+                    logprob: &mut |lp| drawn_logprobs.append(&mut vec![lp]),
                 },
             );
             match run {

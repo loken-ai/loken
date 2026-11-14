@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::api::tool_calls::ToolFormat;
-use crate::inference::engine::llm_engine::{LlmEngine, StreamStats, TokenLogprob};
+use crate::inference::engine::llm_engine::{DrawnLogprobs, LlmEngine, StreamStats};
 use axum::response::sse::Event;
 use std::sync::Arc;
 use tokio::sync::mpsc::Receiver;
@@ -10,8 +10,6 @@ use tokio::sync::mpsc::Receiver;
 /// What the stream reads from the engine besides its tokens.
 #[async_trait::async_trait]
 pub(super) trait StreamSource: Send + Sync {
-    /// The log-probabilities drawn since the last call.
-    fn take_logprobs(&self) -> Vec<TokenLogprob>;
     /// The compute-only stats of the stream that just ended.
     fn take_last_stream_stats(&self) -> Option<StreamStats>;
     /// Tokens the loaded model makes of `text`.
@@ -20,10 +18,6 @@ pub(super) trait StreamSource: Send + Sync {
 
 #[async_trait::async_trait]
 impl StreamSource for LlmEngine {
-    fn take_logprobs(&self) -> Vec<TokenLogprob> {
-        LlmEngine::take_logprobs(self)
-    }
-
     fn take_last_stream_stats(&self) -> Option<StreamStats> {
         LlmEngine::take_last_stream_stats(self)
     }
@@ -40,6 +34,8 @@ pub(super) struct ChatRun {
     pub created_at: i64,
     pub service_tier: String,
     pub wants_logprobs: bool,
+    /// The log-probabilities the request's stream draws.
+    pub drawn_logprobs: DrawnLogprobs,
     pub ids_as_tokens: bool,
     pub include_reasoning: bool,
     pub tools_active: bool,
@@ -55,6 +51,22 @@ pub(super) struct ChatRun {
     pub probe: Arc<crate::request_metrics::RequestProbe>,
     pub energy: Option<crate::energy_report::RequestEnergy>,
     pub stream_started: std::time::Instant,
+}
+
+/// Puts the entries drawn since the last chunk into `chunk`.
+fn attach_logprobs(chunk: &mut ChatCompletionChunk, drawn: &DrawnLogprobs, ids_as_tokens: bool) {
+    let mut entries = drawn.take();
+    if ids_as_tokens {
+        vllm::tokens_as_ids(&mut entries);
+    }
+    if entries.is_empty() {
+        return;
+    }
+    if let Some(c) = chunk.choices.first_mut() {
+        c.logprobs = Some(serde_json::json!({
+            "content": openai_logprobs_content(&entries)
+        }));
+    }
 }
 
 /// The SSE events of an engine's token channel.
@@ -74,6 +86,7 @@ where
         created_at,
         service_tier,
         wants_logprobs,
+        drawn_logprobs,
         ids_as_tokens,
         include_reasoning,
         tools_active,
@@ -148,17 +161,7 @@ where
                         );
                         chunk.service_tier = service_tier.clone();
                         if wants_logprobs {
-                            let mut drawn = engine_for_stats.take_logprobs();
-                            if ids_as_tokens {
-                                vllm::tokens_as_ids(&mut drawn);
-                            }
-                            if !drawn.is_empty() {
-                                if let Some(c) = chunk.choices.first_mut() {
-                                    c.logprobs = Some(serde_json::json!({
-                                        "content": openai_logprobs_content(&drawn)
-                                    }));
-                                }
-                            }
+                            attach_logprobs(&mut chunk, &drawn_logprobs, ids_as_tokens);
                         }
                         yield Ok(Event::default().data(to_json_string!(&chunk)));
                     }
@@ -289,6 +292,10 @@ where
             Some(finish_reason.to_string()),
         );
         stop_chunk.service_tier = service_tier.clone();
+        // The entries of the last tokens go with the finish chunk.
+        if wants_logprobs {
+            attach_logprobs(&mut stop_chunk, &drawn_logprobs, ids_as_tokens);
+        }
         yield Ok(Event::default().data(to_json_string!(&stop_chunk)));
 
         // OpenAI spec: the trailing usage-only chunk

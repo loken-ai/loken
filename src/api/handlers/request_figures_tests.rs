@@ -11,7 +11,7 @@ use std::sync::atomic::Ordering;
 /// The tiny checkpoint the routes serve.
 const CHECKPOINT: &str = "tests/vectors/hf/llama";
 /// The name the server knows it by.
-const MODEL: &str = "test/request-figures";
+pub(super) const MODEL: &str = "test/request-figures";
 /// Tokens each answer may write.
 const MAX_TOKENS: u64 = 4;
 /// Words of a short prompt, read well within a report period.
@@ -24,11 +24,11 @@ const SLOW_PREFILL_PERIODS: u32 = 3;
 const PREFILL_COMMENT: &str = ": loken-prefill ";
 
 /// The route tests run one at a time: the slowed prefill is process-wide.
-use crate::request_metrics::PREFILL_PAUSE_LOCK as ROUTES;
+pub(super) use crate::request_metrics::PREFILL_PAUSE_LOCK as ROUTES;
 
 /// A server serving the tiny checkpoint as [`MODEL`], with a word-level vocabulary of its
 /// size, and the scratch directory it was copied to.
-async fn server_with_tiny_model() -> (APIServer, std::path::PathBuf, usize) {
+pub(super) async fn server_with_tiny_model() -> (APIServer, std::path::PathBuf, usize) {
     use tokenizers::models::wordlevel::WordLevel;
     use tokenizers::pre_tokenizers::whitespace::Whitespace;
     static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -82,14 +82,14 @@ async fn server_with_tiny_model() -> (APIServer, std::path::PathBuf, usize) {
 
 /// A prompt of `words` words of the vocabulary, starting at word `first`: two routes given
 /// different starts share no prefix, so neither finds the other's prompt in the cache.
-fn prompt(words: usize, vocab_size: usize, first: usize) -> String {
+pub(super) fn prompt(words: usize, vocab_size: usize, first: usize) -> String {
     (0..words)
         .map(|i| format!("t{}", (i + first) % vocab_size))
         .collect::<Vec<_>>()
         .join(" ")
 }
 
-async fn body_text(response: Response) -> String {
+pub(super) async fn body_text(response: Response) -> String {
     let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
         .unwrap();
@@ -97,7 +97,7 @@ async fn body_text(response: Response) -> String {
 }
 
 /// The JSON of each `data:` line of a stream.
-fn data_lines(sse: &str) -> Vec<Value> {
+pub(super) fn data_lines(sse: &str) -> Vec<Value> {
     sse.lines()
         .filter_map(|l| l.strip_prefix("data: "))
         .filter_map(|d| serde_json::from_str(d).ok())

@@ -3656,6 +3656,8 @@ mod handover_route_tests;
 #[cfg(all(test, feature = "gpu"))]
 mod level_tests;
 #[cfg(test)]
+mod logprob_route_tests;
+#[cfg(test)]
 mod request_figures_tests;
 #[cfg(test)]
 mod tests;

@@ -233,9 +233,6 @@ pub struct LlmEngine {
     /// The on-disk cache of decode states for a model that keeps one, when the configuration
     /// names a directory.
     state_cache: Option<Arc<crate::inference::cache::state_disk::StateStore>>,
-    /// Log-probabilities of the tokens a stream has drawn and not yet handed out; the
-    /// handler drains it after each chunk.
-    logprob_queue: Arc<std::sync::Mutex<Vec<TokenLogprob>>>,
     last_error: Arc<Mutex<Option<String>>>,
     cached_model_size: Arc<Mutex<u64>>,
     /// Session-persistent KV cache tracking. A single model has a single live
@@ -276,7 +273,6 @@ impl InferenceEngine for LlmEngine {
             draft_engine: Arc::new(Mutex::new(None)),
             kv_disk: None,
             state_cache: None,
-            logprob_queue: Arc::new(std::sync::Mutex::new(Vec::new())),
             last_error: Arc::new(Mutex::new(None)),
             cached_model_size: Arc::new(Mutex::new(0)),
             sessions: Arc::new(Mutex::new(HashMap::new())),
@@ -334,7 +330,6 @@ impl LlmEngine {
             config,
             model_state: Arc::new(Mutex::new(None)),
             draft_engine: Arc::new(Mutex::new(None)),
-            logprob_queue: Arc::new(std::sync::Mutex::new(Vec::new())),
             last_error: Arc::new(Mutex::new(None)),
             cached_model_size: Arc::new(Mutex::new(0)),
             sessions: Arc::new(Mutex::new(HashMap::new())),
@@ -982,14 +977,6 @@ impl LlmEngine {
         state.exact_prefill = None;
         state.model.reset_kv_from(0);
         true
-    }
-
-    /// The log-probabilities a stream has drawn since the last call.
-    pub fn take_logprobs(&self) -> Vec<TokenLogprob> {
-        self.logprob_queue
-            .lock()
-            .map(|mut q| std::mem::take(&mut *q))
-            .unwrap_or_default()
     }
 
     /// A guard for one request: dropping it, as the handler does when the client goes away or the

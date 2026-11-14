@@ -64,7 +64,7 @@ Smaller, by state then by priority:
 | Lower precision on a miss | Performance | An expert that is not in memory and weighs little in the routing is read from a smaller copy, and the answers stay inside the bounds of the quality harness. | Planned |
 | Expert deferral | Performance | At the fast level the host's expert work overlaps the next layer's attention, decode is faster than without, and the answers stay inside the bounds of the quality harness. | Planned |
 | Replay of agent sessions | Bench | The bench replays a recorded session with its shared prefixes and its timing, and the record names the trace by its digest. | Partial |
-| Quality next to speed | Bench | A text record also holds how far each answer departs from a reference run, on the engines that expose the data. | Partial |
+| Quality next to speed | Bench | A text record also holds how far each answer departs from a reference run, on the engines that expose the data. | Done |
 | DeepSeek V4.1 through the hetero route | Models | DeepSeek V4.1 loads and is placed through HeteroPlan and the ladder, with no loader, backend, batch server or expert streamer of its own, and its tokens equal those of the frozen oracle. | Done |
 | Documents checked against the hetero route | Documentation | Every page, scene and exercise that names DeepSeek V4.1, in `docs/` and on the site, matches the hetero route, with no dedicated loader, engine or port left in the text. | Done |
 | Continuous batching for mixture models | Serving | A mixture model, a model with attention sinks and a model with partial rotary embedding run in the continuous batch worker, and a sequence batched gives the tokens of the same sequence alone. | Done |

@@ -324,6 +324,9 @@ A part the server cannot take, such as a document block, is refused with the rea
   `include_stop_str_in_output` keeps it on the OpenAI routes.
 - `logprobs` carry 1 entry per token written, in a streamed answer and in a whole one.
   The token that ended the answer is not 1.
+  A stream's last entries may come with its final chunk.
+  A request that asks for them is served by the serial path, which draws them.
+  One that arrives while the batch worker serves other requests waits for them to end.
 - A generation that fails while streaming ends an OpenAI stream with a `{"error": ...}` frame and no finish chunk.
   The Responses route turns that frame into a `response.failed` event.
 - A Responses stream whose source ends without its final marker ends as `response.incomplete`.

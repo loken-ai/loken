@@ -147,7 +147,9 @@ impl LlmEngine {
         // delegation, collecting the streamed chunks into one result.
         // An admitted request of a model that can batch takes the streamed path too, which
         // moves it into the worker when another request is admitted.
-        let admitted = self.active.load(std::sync::atomic::Ordering::Acquire) > 0;
+        // A request that reads log-probabilities stays where they are drawn.
+        let admitted = self.active.load(std::sync::atomic::Ordering::Acquire) > 0
+            && params.top_logprobs.is_none();
         if self.is_continuous().await || (admitted && self.hands_over_to_worker().await) {
             let t0 = std::time::Instant::now();
             // The request's own probe receives its counts from the path that serves it.
@@ -938,6 +940,8 @@ impl LlmEngine {
                             let penalty_tokens = &recent_tokens[..recent_tokens.len() - (spec_k - k)];
                             let vl = apply_repeat_penalty(&vl.squeeze(0)?, penalty_tokens, repeat_penalty, repeat_last_n)?;
                             let verify_token = logits_processor.sample(&vl)?;
+                            // Each verify draw is a token written: its log probability is kept.
+                            record_logprobs(&state.tokenizer, &mut logits_processor, &mut logprob_acc);
 
                             if verify_token == draft_tokens[k] {
                                 accepted += 1;
@@ -1896,10 +1900,14 @@ impl LlmEngine {
                             &ends,
                             /* committed_base */ 0, max_tokens,
                             &mut |row, recent| {
-                                sample_row_sync(
+                                let drawn = sample_row_sync(
                                     row, recent, repeat_penalty, repeat_last_n,
                                     &mut logits_processor,
-                                ).map(|t| (t, None))
+                                )?;
+                                // Each draw of the verify is a token written.
+                                // Its log probability is kept with it.
+                                record_logprobs(&state.tokenizer, &mut logits_processor, &mut logprob_acc);
+                                Ok((drawn, None))
                             },
                         )?;
                         let accepted_drafts = outcome.accepted_drafts;

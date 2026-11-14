@@ -538,12 +538,13 @@ pub(crate) async fn chat_completion_at(
         .await?;
     // The gate, the in-flight count and the last user turn's images.
     let admission = state
-        .admit(
+        .admit_reading(
             engine.clone(),
             &model_name,
             priority,
             "/v1/chat/completions",
             &super::chat_prompt::last_user_images(&request.messages),
+            params.top_logprobs.is_some(),
         )
         .await?;
     state
@@ -688,6 +689,7 @@ pub(crate) async fn chat_completion_at(
                         created_at,
                         service_tier,
                         wants_logprobs,
+                        drawn_logprobs: params.drawn_logprobs.clone(),
                         ids_as_tokens,
                         include_reasoning,
                         tools_active,
@@ -1310,12 +1312,13 @@ pub(crate) async fn text_completions_at(
     // worker), the in-flight count, and no images: a completion carries none, and what an
     // earlier request encoded must not answer this one.
     let admission = state
-        .admit(
+        .admit_reading(
             engine.clone(),
             &model_name,
             priority,
             "/v1/completions",
             &[],
+            params.top_logprobs.is_some(),
         )
         .await?;
     if let Some(embeds) = prompt_embeds {
@@ -1338,6 +1341,7 @@ pub(crate) async fn text_completions_at(
             probe: Some(probe.clone()),
             ..params
         };
+        let drawn_logprobs = params.drawn_logprobs.clone();
         let rx = engine
             .generate_stream(&prompt, params.clone())
             .await
@@ -1364,7 +1368,7 @@ pub(crate) async fn text_completions_at(
                         let piece = format!("{echo_pending}{text}");
                         echo_pending.clear();
                         let mut drawn = if completion_logprobs.is_some() {
-                            engine_for_stats.take_logprobs()
+                            drawn_logprobs.take()
                         } else {
                             Vec::new()
                         };
@@ -1438,6 +1442,20 @@ pub(crate) async fn text_completions_at(
                         _ => "stop",
                     },
                 };
+                // The entries of the last tokens go with the stop chunk.
+                let mut drawn = if completion_logprobs.is_some() {
+                    drawn_logprobs.take()
+                } else {
+                    Vec::new()
+                };
+                if ids_as_tokens {
+                    vllm::tokens_as_ids(&mut drawn);
+                }
+                let logprobs_value = if drawn.is_empty() {
+                    serde_json::Value::Null
+                } else {
+                    completions_logprobs(&drawn, text_offset)
+                };
                 let stop = serde_json::json!({
                     "id": cid,
                     "object": "text_completion",
@@ -1446,7 +1464,7 @@ pub(crate) async fn text_completions_at(
                     "choices": [{
                         "text": "",
                         "index": 0,
-                        "logprobs": serde_json::Value::Null,
+                        "logprobs": logprobs_value,
                         "finish_reason": finish_reason,
                     }],
                 });

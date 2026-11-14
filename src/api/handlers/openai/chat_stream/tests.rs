@@ -6,10 +6,6 @@ struct Silent;
 
 #[async_trait::async_trait]
 impl StreamSource for Silent {
-    fn take_logprobs(&self) -> Vec<TokenLogprob> {
-        Vec::new()
-    }
-
     fn take_last_stream_stats(&self) -> Option<StreamStats> {
         None
     }
@@ -26,6 +22,7 @@ fn run() -> ChatRun {
         created_at: 0,
         service_tier: "default".into(),
         wants_logprobs: false,
+        drawn_logprobs: Default::default(),
         ids_as_tokens: false,
         include_reasoning: true,
         tools_active: false,

@@ -498,6 +498,30 @@ pub struct TokenLogprob {
     pub top: Vec<(u32, String, f32)>,
 }
 
+/// The log-probabilities a streamed request has drawn and its handler has not sent yet.
+///
+/// Each request carries its own queue.
+/// The entries of one request never reach another.
+#[derive(Debug, Clone, Default)]
+pub struct DrawnLogprobs(std::sync::Arc<std::sync::Mutex<Vec<TokenLogprob>>>);
+
+impl DrawnLogprobs {
+    /// Moves `drawn` to the end of the queue, leaving it empty.
+    pub fn append(&self, drawn: &mut Vec<TokenLogprob>) {
+        if let Ok(mut q) = self.0.lock() {
+            q.append(drawn);
+        }
+    }
+
+    /// The entries drawn since the last call, oldest first.
+    pub fn take(&self) -> Vec<TokenLogprob> {
+        self.0
+            .lock()
+            .map(|mut q| std::mem::take(&mut *q))
+            .unwrap_or_default()
+    }
+}
+
 /// Result of a generation call, including timing and token count metrics.
 #[derive(Debug, Clone)]
 pub struct GenerationResult {
@@ -583,6 +607,8 @@ pub struct GenerationParams {
     /// Report each drawn token's log-probability with this many alternatives; `Some(0)`
     /// reports the drawn token alone. Costs a host copy of the logits per token.
     pub top_logprobs: Option<usize>,
+    /// Where a stream puts the log-probabilities of its tokens for its handler.
+    pub drawn_logprobs: DrawnLogprobs,
     /// Raised when the request's client goes away; the generation loops read it between tokens.
     /// Each request carries its own, so a request that ends never stops another.
     pub cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,

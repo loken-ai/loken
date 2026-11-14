@@ -143,19 +143,46 @@ impl APIServer {
         endpoint: &'static str,
         images: &[String],
     ) -> Result<Admission, ApiError> {
+        self.admit_reading(engine, model_name, priority, endpoint, images, false)
+            .await
+    }
+
+    /// [`Self::admit`] for a request that reads its log-probabilities when `logprobs` is set.
+    ///
+    /// The batch worker draws no log-probabilities.
+    /// Such a request waits for the requests the worker serves to end.
+    /// It then takes the model out of the idle worker and holds the serial gate.
+    /// It never moves the model into the worker.
+    pub(crate) async fn admit_reading(
+        &self,
+        engine: Arc<LlmEngine>,
+        model_name: &str,
+        priority: crate::api::gate::Priority,
+        endpoint: &'static str,
+        images: &[String],
+        logprobs: bool,
+    ) -> Result<Admission, ApiError> {
         self.default_inference_config
             .media_limits
             .check_images(images)
             .map_err(ApiError::Validation)?;
         let arrived = std::time::Instant::now();
         let in_flight = crate::distributed::rate_meter::InFlight::enter();
+        let serial = if logprobs {
+            self.serial_gate(&engine, priority, model_name, endpoint)
+                .await?
+        } else {
+            None
+        };
         let active = engine.admit_request().await;
         if active.wants_serial() {
             engine.serve_alone_serially().await;
         }
         // A request that waits at the gate stops waiting when the model enters its batch
         // worker: a lone request decoding serially moves there when another request arrives.
-        let mut gate = if engine.is_continuous().await {
+        let mut gate = if serial.is_some() {
+            serial
+        } else if engine.is_continuous().await {
             None
         } else {
             tokio::select! {
@@ -171,7 +198,7 @@ impl APIServer {
         // at the gate while the model moved into its batch worker gives the gate up too, and
         // the requests queued behind it reach the worker at once.
         if gate.is_some() {
-            if active.wants_batched() {
+            if active.wants_batched() && !logprobs {
                 engine.serve_batched().await;
             }
             if engine.is_continuous().await {
@@ -195,6 +222,30 @@ impl APIServer {
             _in_flight: in_flight,
             _active: active,
         })
+    }
+
+    /// The serial gate of `engine`, held with its model out of the batch worker.
+    ///
+    /// The request waits for the requests the worker serves to end.
+    /// New requests enter the worker meanwhile, and the request waits for them too.
+    /// `None` when the worker keeps the model with no request admitted.
+    async fn serial_gate(
+        &self,
+        engine: &LlmEngine,
+        priority: crate::api::gate::Priority,
+        model_name: &str,
+        endpoint: &'static str,
+    ) -> Result<Option<crate::api::gate::RequestGuard>, ApiError> {
+        loop {
+            engine.until_worker_idle().await;
+            let gate = acquire_gate(self, priority, model_name.to_string(), endpoint).await?;
+            if engine.leave_idle_worker().await {
+                return Ok(Some(gate));
+            }
+            if engine.in_flight() == 0 {
+                return Ok(None);
+            }
+        }
     }
 
     /// Hand the loaded model the video clip of a chat request, after [`Self::admit`] set its

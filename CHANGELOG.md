@@ -137,6 +137,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 - API: end a chat stream on an engine error with the error alone.
 - Serving: answer with a model split over several cards.
 - OpenCL: offer a GPU that shares the host's memory only what the host can spare.
+- API: give every token its log-probability, drafted or batched, to its own request only.
 - Kernels: refuse the inputs and launches that failed without an error.
 - State cache: load when the disk probe measures no rate.
 - MoE: drop and read ahead the expert pages of a model loaded from 1 file.
