@@ -64,6 +64,11 @@ pub(super) fn wan_lora_corrects(lora: &SafeTensorsLoader, stem: &str) -> bool {
     lora.contains(&key("diff")) || lora.contains(&key("lora_down.weight"))
 }
 
+/// The form the norms and the patch embedding of the 1.3B are held in.
+///
+/// F32 keeps every value a float checkpoint stores.
+pub(super) const WAN_VECTORS: DType = DType::F32;
+
 /// The dtype the dense projection weight `name` of `ld` is held in on `dv`.
 ///
 /// It is the narrowest form exact for every stored value of `name`.
@@ -407,7 +412,7 @@ impl WanDit {
         }
     }
 
-    /// Load the Wan 1.3B DiT from the resolved safetensors (weights -> F16), splitting the
+    /// Load the Wan 1.3B DiT from the resolved safetensors, splitting the
     /// 30 blocks across the available devices with the SAME unified HeteroPlan the 14B path
     /// uses. This is the hot per-step component: it must be able to spread, with CPU as a
     /// spill of last resort rather than an all-or-nothing destination. Placing it whole
@@ -519,9 +524,10 @@ impl WanDit {
                     .collect::<Vec<_>>()
                     .join(" ")
             );
-            let f16_on =
-                |name: &str, dv: &Device| -> Result<Tensor> { corrected(name, DType::F16, dv) };
-            let f16 = |name: &str| -> Result<Tensor> { f16_on(name, &device) };
+            // The norms and the patch embedding are held in the form that keeps every value.
+            let vector_on =
+                |name: &str, dv: &Device| -> Result<Tensor> { corrected(name, WAN_VECTORS, dv) };
+            let vector = |name: &str| -> Result<Tensor> { vector_on(name, &device) };
             // Each projection weight is held in the form `wan_held_dtype` gives, on a card and on
             // the host alike.
             // The bias is held in F32.
@@ -537,7 +543,8 @@ impl WanDit {
                 )?))
             };
             let lin = |prefix: &str| -> Result<WanLinear> { lin_on(prefix, &device) };
-            let patch_w = f16("patch_embedding.weight")?.reshape((dim, IN_CH, PATCH_H, PATCH_W))?;
+            let patch_w =
+                vector("patch_embedding.weight")?.reshape((dim, IN_CH, PATCH_H, PATCH_W))?;
             let ones = Tensor::from_vec_f32(vec![1.0f32; dim], (dim,))?.to_device(&device)?;
             let mut blocks = Vec::with_capacity(n_layers);
             for i in 0..n_layers {
@@ -551,20 +558,20 @@ impl WanDit {
                 let dv = layer_devices[i].clone();
                 blocks.push(WanBlock {
                     modulation: ld.load(&format!("{p}.modulation"))?.to_vec_f32(),
-                    norm3_w: f16_on(&format!("{p}.norm3.weight"), &dv)?,
-                    norm3_b: f16_on(&format!("{p}.norm3.bias"), &dv)?,
+                    norm3_w: vector_on(&format!("{p}.norm3.weight"), &dv)?,
+                    norm3_b: vector_on(&format!("{p}.norm3.bias"), &dv)?,
                     sa_q: lin_on(&format!("{p}.self_attn.q"), &dv)?,
                     sa_k: lin_on(&format!("{p}.self_attn.k"), &dv)?,
                     sa_v: lin_on(&format!("{p}.self_attn.v"), &dv)?,
                     sa_o: lin_on(&format!("{p}.self_attn.o"), &dv)?,
-                    sa_norm_q: f16_on(&format!("{p}.self_attn.norm_q.weight"), &dv)?,
-                    sa_norm_k: f16_on(&format!("{p}.self_attn.norm_k.weight"), &dv)?,
+                    sa_norm_q: vector_on(&format!("{p}.self_attn.norm_q.weight"), &dv)?,
+                    sa_norm_k: vector_on(&format!("{p}.self_attn.norm_k.weight"), &dv)?,
                     ca_q: lin_on(&format!("{p}.cross_attn.q"), &dv)?,
                     ca_k: lin_on(&format!("{p}.cross_attn.k"), &dv)?,
                     ca_v: lin_on(&format!("{p}.cross_attn.v"), &dv)?,
                     ca_o: lin_on(&format!("{p}.cross_attn.o"), &dv)?,
-                    ca_norm_q: f16_on(&format!("{p}.cross_attn.norm_q.weight"), &dv)?,
-                    ca_norm_k: f16_on(&format!("{p}.cross_attn.norm_k.weight"), &dv)?,
+                    ca_norm_q: vector_on(&format!("{p}.cross_attn.norm_q.weight"), &dv)?,
+                    ca_norm_k: vector_on(&format!("{p}.cross_attn.norm_k.weight"), &dv)?,
                     // The 1.3B is text-to-video: it has no frame to continue and no weights
                     // that would read one.
                     ca_k_img: None,
@@ -580,7 +587,7 @@ impl WanDit {
             }
             Ok::<_, crate::tensor::Error>(WanDit {
                 patch_w,
-                patch_b: f16("patch_embedding.bias")?,
+                patch_b: vector("patch_embedding.bias")?,
                 text0: lin("text_embedding.0")?,
                 text2: lin("text_embedding.2")?,
                 time0: lin("time_embedding.0")?,
@@ -2196,6 +2203,27 @@ mod held_form_tests {
             rounded,
             "the rounding of a merged weight is not in the conversion ledger"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A norm or the patch embedding keeps every stored value, on the host.
+    #[test]
+    fn a_norm_on_the_host_keeps_every_stored_value() {
+        let dir = std::env::temp_dir().join(format!("wan_vectors_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (path, _) = checkpoint(&dir);
+        let ld = unsafe { SafeTensorsLoader::multi(&[&path]) }.unwrap();
+        for (name, value) in [
+            ("blocks.0.plain.weight", PLAIN),
+            ("blocks.0.half.weight", ONLY_F16),
+            ("blocks.0.fine.weight", ONLY_F32),
+        ] {
+            assert_eq!(
+                first_value(&ld, name, WAN_VECTORS, &Device::Cpu),
+                value,
+                "{name}"
+            );
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
