@@ -83,8 +83,12 @@ __device__ __forceinline__ void quantize_to_q8_1_shared(
             amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFFu, amax, mask, WARP_SIZE));
             sum  = sum + __shfl_xor_sync(0xFFFFFFFFu, sum,  mask, WARP_SIZE);
         }
-        const float d = amax / 127.0f;
-        const int8_t q = (amax == 0.0f) ? (int8_t)0 : (int8_t)__float2int_rn(v / d);
+        // The scale and its reciprocal are rounded divisions, as `quantize_row_to_q8_1` takes
+        // them: this unit is built with fast math, which would approximate both.
+        const float d = __fdiv_rn(amax, 127.0f);
+        // Each value is scaled by the reciprocal of `d` and rounded as `quantize_row_to_q8_1` does.
+        const float id = (amax == 0.0f) ? 0.0f : __fdiv_rn(1.0f, d);
+        const int8_t q = (int8_t)roundf(v * id);
         if (lane == 0) {
             reinterpret_cast<__half&>(dst[b].ds.x) = __float2half(d);
             reinterpret_cast<__half&>(dst[b].ds.y) = __float2half(sum);
