@@ -325,6 +325,8 @@ A GGUF file with block projections rebuilds its stray float matrices in `Q8_0`, 
 
 Z-Image holds each projection on a CUDA or ROCm card in the narrowest form exact for its stored values: `BF16`, then `F16`, else `F32`.
 Its blocks on the host hold each projection in the same form, and the host products read it with `F32` rows.
+Its caption encoder on the host holds each projection in its narrowest exact form too.
+On the host the caption encoder is built for a prompt the cache lacks, and dropped once it has read it.
 The placement weighs each projection in the form it is held in.
 A narrower form than the stored one goes in the conversion ledger.
 The load log and `/api/ps` name the formats the blocks run in.

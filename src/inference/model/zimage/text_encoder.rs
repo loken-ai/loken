@@ -160,6 +160,31 @@ struct Attention {
     shape: HeadShape,
 }
 
+/// The `[out, inp]` weight of the projection under `vb`.
+///
+/// On the host it is held in the narrowest form exact for its stored values.
+/// The host product reads that form with F32 rows.
+/// Elsewhere it is held at the builder's dtype.
+fn held_weight(inp: usize, out: usize, vb: &VarBuilder) -> tensor::Result<Tensor> {
+    if !vb.device().is_cpu() {
+        return vb.get((out, inp), "weight");
+    }
+    let held = vb.narrowest_exact_dtype("weight")?;
+    let (stored, width) = vb.stored_format("weight")?;
+    if held.size_in_bytes() < width {
+        let elems = out * inp;
+        crate::tensor::conversion::record_kept(
+            "projection",
+            stored,
+            held.as_str(),
+            (elems * width) as u64,
+            (elems * held.size_in_bytes()) as u64,
+            "every value is exact in the narrower form the products read",
+        );
+    }
+    vb.to(held, &Device::Cpu).get((out, inp), "weight")
+}
+
 impl Attention {
     fn new(cfg: &TextEncoderConfig, vb: &VarBuilder) -> tensor::Result<Self> {
         // Everything the shape of this attention depends on, taken out of the config in one
@@ -181,11 +206,9 @@ impl Attention {
         // A checkpoint carries a bias on all four projections or on none of them; the per-head
         // norms never have one.
         let projection = |inp: usize, out: usize, name: &str| -> tensor::Result<Linear> {
-            if attention_bias {
-                nl::linear(inp, out, &vb.pp(name))
-            } else {
-                nl::linear_no_bias(inp, out, &vb.pp(name))
-            }
+            let vb = vb.pp(name);
+            let bias = attention_bias.then(|| vb.get(out, "bias")).transpose()?;
+            Linear::new(held_weight(inp, out, &vb)?, bias)
         };
         // A per-head norm is over one head's width, not the stream's.
         let head_norm = |name: &str| -> tensor::Result<RmsNorm> {
@@ -267,16 +290,17 @@ impl DecoderLayer {
                 // `gate_proj` / `up_proj` / `down_proj` - the names this checkpoint gives the
                 // three weights of the gated feed-forward.
                 inner: SwiGlu::new(
-                    nl::linear_no_bias(
-                        cfg.hidden_size,
-                        cfg.intermediate_size,
-                        &ff.pp("gate_proj"),
+                    Linear::new(
+                        held_weight(cfg.hidden_size, cfg.intermediate_size, &ff.pp("gate_proj"))?,
+                        None,
                     )?,
-                    nl::linear_no_bias(cfg.hidden_size, cfg.intermediate_size, &ff.pp("up_proj"))?,
-                    nl::linear_no_bias(
-                        cfg.intermediate_size,
-                        cfg.hidden_size,
-                        &ff.pp("down_proj"),
+                    Linear::new(
+                        held_weight(cfg.hidden_size, cfg.intermediate_size, &ff.pp("up_proj"))?,
+                        None,
+                    )?,
+                    Linear::new(
+                        held_weight(cfg.intermediate_size, cfg.hidden_size, &ff.pp("down_proj"))?,
+                        None,
                     )?,
                 ),
             },

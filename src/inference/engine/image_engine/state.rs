@@ -101,7 +101,11 @@ pub enum ZImageVariant {
 /// State for a loaded Z-Image model
 pub struct ZImageModelState {
     pub transformer: ZImageVariant,
-    pub text_encoder: crate::inference::model::zimage::text_encoder::ZImageTextEncoder,
+    /// The caption encoder on a card.
+    /// `None` on the host: a prompt the cache lacks builds it, and drops it once read.
+    pub text_encoder: Option<crate::inference::model::zimage::text_encoder::ZImageTextEncoder>,
+    /// The caption encoder's shards, in shard order.
+    pub te_files: Vec<std::path::PathBuf>,
     pub tokenizer: Tokenizer,
     pub vae: crate::inference::model::zimage::vae::AutoEncoderKL,
     /// CPU-resident VAE for large images (>=768^2) whose GPU decode OOMs - the

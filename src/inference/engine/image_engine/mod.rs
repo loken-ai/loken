@@ -1489,6 +1489,34 @@ fn zimage_euler_step(
     Ok(scheduler.step(&step_pred, &frameless)?.unsqueeze(2)?)
 }
 
+/// The Z-Image caption encoder built on the host from its shards `files`.
+///
+/// Refused when the host cannot give its measured footprint without swapping.
+/// Its projections are held as stored and its embedding table in F32.
+fn zimage_text_encoder_on_host(
+    files: &[std::path::PathBuf],
+) -> AnyResult<crate::inference::model::zimage::text_encoder::ZImageTextEncoder> {
+    let need = zimage_text_encoder_bytes();
+    let budget = crate::inference::place::layer_executor::host_spill_budget_bytes();
+    if need > budget {
+        return Err(anyhow!(
+            "Z-Image text encoder needs {:.1} GB of host memory on the CPU path and {:.1} GB \
+             can be given without swapping; a node with a card that holds it, or more free \
+             host memory, is needed",
+            need as f64 / 1e9,
+            budget as f64 / 1e9
+        ));
+    }
+    info!("Z-Image: building the caption encoder on the host");
+    let names: Vec<&str> = files.iter().filter_map(|p| p.to_str()).collect();
+    // SAFETY: the same mmap contract every load of these files takes.
+    let vb = unsafe { crate::tensor::VarBuilder::from_files(&names, DType::F32, &Device::Cpu) }
+        .map_err(|e| anyhow!("z-image TE native weights: {e}"))?;
+    let config = crate::inference::model::zimage::text_encoder::TextEncoderConfig::z_image();
+    crate::inference::model::zimage::text_encoder::ZImageTextEncoder::new(&config, vb)
+        .map_err(|e| anyhow!("z-image TE native load: {e}"))
+}
+
 fn generate_zimage(
     device: &Device,
     dtype: DType,
@@ -1527,11 +1555,25 @@ fn generate_zimage(
         let tokens = encode_ids(&zimg.tokenizer, formatted.as_str(), "Z-Image")?;
         let count = tokens.len();
         let input_ids = Tensor::from_vec(tokens, (1, count), &zimg.te_device)?;
-        let feats = zimg
-            .text_encoder
-            .forward(&input_ids)?
-            .to_device(device)?
-            .to_dtype(dtype)?;
+        // On the host the encoder lives for this prompt only.
+        let feats = {
+            let built;
+            let encoder = match &zimg.text_encoder {
+                Some(encoder) => encoder,
+                None => {
+                    built = zimage_text_encoder_on_host(&zimg.te_files)?;
+                    &built
+                }
+            };
+            encoder
+                .forward(&input_ids)?
+                .to_device(device)?
+                .to_dtype(dtype)?
+        };
+        // The allocator gives the memory of an encoder dropped here back to the kernel.
+        if zimg.text_encoder.is_none() {
+            crate::inference::place::heap::release_retained();
+        }
         // All tokens attended: a (1, count) U8 ones mask. Built once per
         // unique prompt and re-served from cache on subsequent calls.
         let mask = Tensor::ones((1, count), DType::U8, device)?;

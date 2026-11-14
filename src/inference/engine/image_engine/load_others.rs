@@ -772,11 +772,6 @@ impl ImageEngine {
                 &hot_cards,
                 u64::MAX,
             );
-            // The host path holds the encoder in F32, twice its measured BF16 footprint,
-            // and is admitted against what the host can give without swapping. Refused
-            // here, the request fails in a second; admitted, it ran for an hour in swap.
-            let host_need = te_est_bytes.saturating_mul(2);
-            let host_budget = crate::inference::place::layer_executor::host_spill_budget_bytes();
             send_progress("Loading text encoder...");
             let te_config = crate::inference::model::zimage::text_encoder::TextEncoderConfig::z_image();
             let te_files_str: Vec<&str> = te_files.iter().map(|p| p.to_str().unwrap()).collect();
@@ -787,20 +782,14 @@ impl ImageEngine {
                 &te_cards,
                 cancel.as_ref(),
                 |dev| {
-                    if !dev.is_cuda() && host_need > host_budget {
-                        return Err(anyhow!(
-                            "Z-Image text encoder needs {:.1} GB of host memory on the CPU path and \
-                             {:.1} GB can be given without swapping; a node with a card that holds \
-                             it, or more free host memory, is needed",
-                            host_need as f64 / 1e9,
-                            host_budget as f64 / 1e9
-                        ));
+                    // On the host the encoder is built when a prompt needs it.
+                    if !dev.is_cuda() {
+                        return Ok(None);
                     }
-                    // bf16 stack on a card, F32 on the host.
-                    let dtype = if dev.is_cuda() { DType::BF16 } else { DType::F32 };
-                    let vb = unsafe { crate::tensor::VarBuilder::from_files(&te_files_str, dtype, dev) }
+                    let vb = unsafe { crate::tensor::VarBuilder::from_files(&te_files_str, DType::BF16, dev) }
                         .map_err(|e| anyhow!("z-image TE native weights: {e}"))?;
                     crate::inference::model::zimage::text_encoder::ZImageTextEncoder::new(&te_config, vb)
+                        .map(Some)
                         .map_err(|e| anyhow!("z-image TE native load: {e}"))
                 },
             )?;
@@ -870,6 +859,7 @@ impl ImageEngine {
                 model: LoadedImageModel::ZImage(ZImageModelState {
                     transformer,
                     text_encoder,
+                    te_files,
                     tokenizer,
                     vae,
                     vae_cpu,
