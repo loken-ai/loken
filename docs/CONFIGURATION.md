@@ -316,7 +316,7 @@ The cache works out these quantities from what the model, the disk and the engin
 | Block size | The bytes a token adds to the blocks, the model's granule, and the directory's per-file cost and write throughput. These are measured once on the directory with synced probe files and kept, so a restart finds the chain it wrote. |
 | Spacing of kept states | The measured write throughput, the size of a manifest and the measured prefill time per token. A state is kept no closer than the disk can finish writing it within the prefill of the tokens in between. Until both are measured, the spacing is the prefill's own chunk. It is a multiple of the block size and of the chunk. |
 | Whether to restore | A stored state is read only while its measured read-and-decode cost per byte, times its bytes, is below the measured prefill time of the tokens it covers. It is tried while either is unmeasured. |
-| Writes | 1 at a time. A write queues behind earlier ones only while the disk drains the queue within the prefill time of the prompt that produced the state. Otherwise it is skipped with a log line. |
+| Writes | 1 at a time. A write to the directory queues behind earlier ones only while the disk drains the queue within the prefill time of the prompt that produced the state. Otherwise it is skipped with a log line. A cache in host memory keeps every state. |
 
 A DeepSeek V4.1 state is a manifest and blocks, as a hybrid's is:
 

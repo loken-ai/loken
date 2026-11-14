@@ -74,6 +74,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 ### Fixed
 
 - Speech: speak a long text with pocket-tts in its reference's chunks, the voice held across them.
+- Conversations: keep the state of a short answer in a state cache in host memory.
 - OpenCL: give each block of 32 activations of a product its own scale.
 - OpenCL: read the subnormal half scales of a model on every device.
 - OpenCL: offer no card that CUDA or ROCm already drives.

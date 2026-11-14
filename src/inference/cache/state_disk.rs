@@ -607,10 +607,12 @@ impl StateStore {
 
     /// Admits a write of `bytes` to the queue when the disk drains what waits within
     /// `window_s`, the compute time of the prompt the state belongs to.
+    /// A store in host memory has no disk to wait for: it admits every write.
     pub fn admit(&self, bytes: u64, window_s: Option<f64>) -> Option<WriteTicket> {
         let pending = self.pending.load(Ordering::Relaxed);
         let w = self.tuning.get().write.per_sec();
-        if !super::state_tune::write_may_queue(pending, bytes, w, window_s) {
+        if self.memory.is_none() && !super::state_tune::write_may_queue(pending, bytes, w, window_s)
+        {
             return None;
         }
         self.pending.fetch_add(bytes, Ordering::Relaxed);
@@ -1159,6 +1161,26 @@ mod tests {
         assert_eq!(store.stats().0, 1);
         assert_eq!(store.block_count(), 3);
         assert!(!store.dir().exists(), "a store in memory has no directory");
+    }
+
+    /// A store in host memory admits a write while another waits.
+    /// A store in a directory refuses one it cannot weigh against the disk.
+    #[test]
+    fn a_store_in_memory_admits_a_write_while_another_waits() {
+        let store = StateStore::in_memory(1 << 20, 8);
+        let first = store.admit(100, Some(1.0)).expect("an idle store admits");
+        assert!(
+            store.admit(100, None).is_some(),
+            "the finished state was refused"
+        );
+        drop(first);
+        let d = dir("admit");
+        let on_disk = StateStore::open(d.clone(), 0, 8).unwrap();
+        let first = on_disk.admit(100, Some(1.0)).expect("an idle disk admits");
+        assert!(on_disk.admit(100, None).is_none());
+        drop(first);
+        assert!(on_disk.admit(100, None).is_some());
+        let _ = std::fs::remove_dir_all(d);
     }
 
     /// A consumer short of host memory empties a store in memory through the registry's hook.
