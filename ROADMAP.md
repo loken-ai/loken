@@ -91,6 +91,7 @@ Major, by state then by priority:
 | More weight formats | Models | GPTQ, AWQ and BitsAndBytes checkpoints load and answer as the reference implementation does. | Planned |
 | Mistral 4 Large | Models | The published Mistral 4 Large checkpoint loads and answers as the reference implementation does. | Planned |
 | OpenCL faster than the CPU for every model | Performance | qwen3 0.6b reads a long prompt through OpenCL on an Intel GPU faster than on its CPU, as llama3.2 1b does, and a whole Z-Image picture renders there faster than on its CPU. | Planned |
+| Media checkpoints served as stored | Models | The float checkpoints of FLUX.2, Qwen-Image, Boogu and Flux are held as stored at the reference level when they fit. The projections and decoder kernels of Stable Audio and EzAudio follow the level and the conversion ledger declares them. A music or video render reports the format it runs in, and the bench records hold it for image, music, speech and transcription cells. Each is verified on CUDA, ROCm and Vulkan. | Planned |
 
 Smaller, by state then by priority:
 
