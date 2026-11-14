@@ -114,10 +114,14 @@ fn reference_layers(
             })
             .collect()
     };
+    // The file's frequency factors divide each pair's frequency.
+    let factors = has("rope_freqs.weight").then(|| w("rope_freqs.weight"));
     let rope = |v: &mut [f32], pos: usize| {
         let half = hd / 2;
         for i in 0..half {
-            let theta = pos as f32 * cfg.rope_freq_base.powf(-((2 * i) as f32) / hd as f32);
+            let factor = factors.as_ref().map_or(1.0, |f| f[i]);
+            let theta =
+                pos as f32 * cfg.rope_freq_base.powf(-((2 * i) as f32) / hd as f32) / factor;
             let (sn, cs) = theta.sin_cos();
             let (a, b) = if cfg.flags.use_rope_i {
                 (2 * i, 2 * i + 1)
@@ -392,14 +396,25 @@ const TEXT: &str =
 #[test]
 #[ignore = "needs the model in the store and an OpenCL device"]
 fn opencl_greedy_text_matches_the_host() {
-    let fx = Fixture::open_tag(TAG);
+    greedy_text_against_host(TAG);
+}
+
+/// The greedy text test on a model whose RoPE has frequency factors.
+#[test]
+#[ignore = "needs the model in the store and an OpenCL device"]
+fn opencl_greedy_text_matches_the_host_llama32() {
+    greedy_text_against_host("llama3.2:1b");
+}
+
+fn greedy_text_against_host(tag: &str) {
+    let fx = Fixture::open_tag(tag);
     let tokenizer =
         crate::inference::engine::llm_engine::build_tokenizer_from_gguf(&self_content(&fx.mmap))
             .unwrap();
     let prompt = tokenizer.encode(TEXT, false).unwrap().get_ids().to_vec();
     let decode = |t: &[u32]| tokenizer.decode(t, false).unwrap_or_default();
     let (want, host_rate) = greedy(&mut fx.build(&fx.host()), &prompt);
-    println!("{TAG}: host {host_rate:.1} tok/s {:?}", decode(&want));
+    println!("{tag}: host {host_rate:.1} tok/s {:?}", decode(&want));
     let host = fx.host_rows(&prompt, STEPS);
     let mut picks = Vec::new();
     for d in devices() {
@@ -407,11 +422,11 @@ fn opencl_greedy_text_matches_the_host() {
         // One copy serves both runs.
         // The teacher-forced run comes first, on the fresh copy, fed the host's tokens.
         picks.push((
-            format!("{TAG} opencl {}", d.1),
+            format!("{tag} opencl {}", d.1),
             forced_picks(&mut whole, &prompt, &host),
         ));
         let (got, rate) = greedy(&mut whole, &prompt);
-        println!("{TAG}: opencl {}: {rate:.1} tok/s {:?}", d.1, decode(&got));
+        println!("{tag}: opencl {}: {rate:.1} tok/s {:?}", d.1, decode(&got));
     }
     // The native copy loads once every OpenCL copy is freed.
     let native = native_or_card(&fx, &prompt, &host);

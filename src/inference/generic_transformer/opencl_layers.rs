@@ -307,7 +307,10 @@ fn refusal(
             (!l.attends(), "a recurrent layer"),
             (l.moe.is_some(), "routed experts"),
             (l.ffn_norm.is_none(), "a layer without an FFN norm"),
-            (l.rope_freq_factors.is_some(), "RoPE frequency factors"),
+            (
+                l.rope_freq_factors.is_some() != layers[0].rope_freq_factors.is_some(),
+                "RoPE frequency factors on some layers only",
+            ),
             (l.attn_v_norm_ones.is_some(), "normalised values"),
             (
                 l.attn_layer_scale.is_some() || l.ffn_layer_scale.is_some(),
@@ -421,13 +424,20 @@ fn build_stack(
             down: raw(format!("{p}.ffn_down.weight"))?,
         });
     }
+    // Every layer rotates by the first layer's phases, its frequency factors applied.
+    let (cos, sin) = match layers.first() {
+        Some(l) if l.rope_freq_factors.is_some() => {
+            l.rope_table().rows(0, cos.dim(0)?, &Device::Cpu)?
+        }
+        _ => (cos.clone(), sin.clone()),
+    };
     let half = cos.dim(1)?;
     let mut stack = crate::inference::kernel::opencl_stack::OpenClStack::new(
         device,
         spec,
         tensors,
-        &host(cos)?,
-        &host(sin)?,
+        &host(&cos)?,
+        &host(&sin)?,
         half,
     )?;
     // The head goes with the last layer when the file's projection is in a format the

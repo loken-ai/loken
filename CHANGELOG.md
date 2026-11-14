@@ -42,6 +42,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 - Speech: speak with Qwen3-TTS in a voice described in words or named by the checkpoint.
 - Speech: create a voice from a clip or a description and reuse it.
 - Vulkan: run layers with residual scales, no pre-norm, softcap, sinks, biases, Q5_0 or MXFP4 weights, and hybrid models.
+- OpenCL: run the layers of a model whose RoPE has frequency factors.
 
 ### Changed
 

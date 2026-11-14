@@ -211,6 +211,7 @@ It is most of loken's time per clip.
 ## OpenCL
 
 The layers of a language model run on an Intel GPU through Intel's OpenCL runtime, and give the host's text (qwen3 0.6b, greedy).
+A model whose RoPE has frequency factors runs there too (llama3.2 1b).
 On the laptop's processor they are slower than the host: 51 tokens per second against 74.
 
 Devices of Mesa's OpenCL platform are not offered for layers, because the layers measured wrong on them.
