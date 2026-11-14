@@ -1958,10 +1958,7 @@ pub(crate) async fn audio_speech(
             if !KNOWN_VOICES.contains(&lower.as_str()) {
                 return err_resp(
                     axum::http::StatusCode::BAD_REQUEST,
-                    format!(
-                        "voice '{v}' is unknown; valid presets: {} (or pass `voice_description` to override)",
-                        KNOWN_VOICES.join(", ")
-                    ),
+                    unknown_preset(state.huggingface_models_dir.as_str(), v),
                 );
             }
         }
@@ -2037,11 +2034,7 @@ pub(crate) async fn audio_speech(
     if let Some(s) = talker.as_ref().filter(|s| s.voice.is_some()) {
         return err_resp(
             axum::http::StatusCode::BAD_REQUEST,
-            format!(
-                "'{}': this checkpoint's voice is described in words; name the checkpoint \
-                 alone and send the description as `voice_description` or `instructions`",
-                s.canonical()
-            ),
+            talker_voice_in_model(&s.canonical(), &s.path),
         );
     }
     let language = match &talker {
@@ -2394,11 +2387,10 @@ pub(super) async fn ensure_tts_model_loaded_reporting(
             .load_parler_reporting(Some(&speech.id), watch)
             .await
             .map_err(|e| format!("tts load: {e:#}")),
-        // A voice described in words: nothing follows the checkpoint's name.
-        SpeechModel::Qwen3Tts if speech.voice.is_some() => Err(format!(
-            "'{requested}': this checkpoint's voice is described in words; send the \
-             description as `voice_description` or `instructions`"
-        )),
+        // A speech talker takes its voice in the request: nothing follows the checkpoint's name.
+        SpeechModel::Qwen3Tts if speech.voice.is_some() => {
+            Err(talker_voice_in_model(requested, &speech.path))
+        }
         SpeechModel::Qwen3Tts => state
             .tts_engine
             .load_qwen3_tts_reporting(speech.path.clone(), canonical, watch)
@@ -2408,6 +2400,22 @@ pub(super) async fn ensure_tts_model_loaded_reporting(
             "'{requested}' is a speech model this build runs no engine for"
         )),
     }
+}
+
+/// The refusal of `model` when it names a voice after the speech talker checkpoint at `dir`.
+///
+/// It says which field carries the voice the checkpoint takes.
+/// A checkpoint that names its voices takes a speaker in `voice`.
+/// A checkpoint that clones takes the id of a stored voice in `voice`.
+/// A checkpoint whose voice is described in words takes `voice_description` or `instructions`.
+pub(super) fn talker_voice_in_model(model: &str, dir: &std::path::Path) -> String {
+    let voice = crate::inference::engine::tts_engine::speech_talker_voice(dir).ok();
+    let takes = match voice {
+        Some(v) if v.names => "the speaker its checkpoint names as `voice`",
+        Some(v) if v.clones => "the id of a stored voice as `voice`",
+        _ => "the description as `voice_description` or `instructions`",
+    };
+    format!("'{model}': name the checkpoint alone as `model` and send {takes}")
 }
 
 /// The design text of a voice described in words, and the timbre it opens with.
@@ -2941,6 +2949,30 @@ pub(super) fn tts_events_response(
     Sse::new(stream)
         .keep_alive(KeepAlive::default())
         .into_response()
+}
+
+/// The refusal of `voice` when it is not a preset.
+///
+/// A speaker that a checkpoint of the store `hf` names is refused with that checkpoint, to
+/// name as `model`.
+/// Any other name is refused with the presets.
+pub(super) fn unknown_preset(hf: &str, voice: &str) -> String {
+    let wanted = voice.trim().to_lowercase();
+    let naming = named_voices(hf).into_iter().find(|v| {
+        v["voice"]
+            .as_str()
+            .is_some_and(|n| n.to_lowercase() == wanted)
+    });
+    match naming.as_ref().and_then(|v| v["model"].as_str()) {
+        Some(model) => format!(
+            "voice '{voice}' is a speaker the checkpoint '{model}' names: pass \
+             \"model\": \"{model}\" with it"
+        ),
+        None => format!(
+            "voice '{voice}' is unknown; valid presets: {} (or pass `voice_description` to override)",
+            KNOWN_VOICES.join(", ")
+        ),
+    }
 }
 
 /// The speakers each speech talker checkpoint of the store `hf` names, as entries of the

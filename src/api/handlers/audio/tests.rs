@@ -1566,6 +1566,39 @@ fn a_named_voice_is_listed_and_found_without_case() {
     assert!(described.contains("VoiceDesign"), "{described}");
 }
 
+/// A voice that is no preset but a speaker of a checkpoint of the store is refused with that
+/// checkpoint.
+/// Any other voice is refused with the presets.
+#[test]
+fn an_unknown_preset_names_the_checkpoint_of_its_speaker() {
+    let s = named_store();
+    let hf = s.0.to_string_lossy().to_string();
+    let named = unknown_preset(&hf, "BOB");
+    assert!(named.contains("\"model\": \"org/named\""), "{named}");
+    let unknown = unknown_preset(&hf, "carol");
+    assert!(
+        unknown.contains("carol") && unknown.contains("alloy"),
+        "{unknown}"
+    );
+}
+
+/// A voice named after the id of a speech talker is refused with the field its checkpoint
+/// takes the voice from.
+#[test]
+fn a_voice_after_a_talker_id_is_refused_with_its_field() {
+    let s = named_store();
+    let hf = s.0.to_string_lossy().to_string();
+    let named = speech_request(&hf, "org/named").unwrap().path;
+    let refused = talker_voice_in_model("org/named-bob", &named);
+    assert!(
+        refused.contains("org/named-bob") && refused.contains("speaker its checkpoint names"),
+        "{refused}"
+    );
+    let design = speech_request(&hf, "org/design").unwrap().path;
+    let refused = talker_voice_in_model("org/design-x", &design);
+    assert!(refused.contains("`voice_description`"), "{refused}");
+}
+
 /// A named voice without a seed draws from its name, and from its style when given.
 #[test]
 fn a_named_voice_seed_derives_from_its_name_and_its_style() {
