@@ -99,7 +99,8 @@ typedef struct {
 
 // Weights meet activations in groups of 256 values, eight sub-blocks of 32. The eight lanes
 // of a row share a group: lane i takes values 4i..4i+3 of every sub-block, so the loads of a
-// sub-block are one contiguous run across the lanes (a word of codes per lane). A format's
+// sub-block are one contiguous run across the lanes (a word of codes per lane). In a prompt
+// chunk lane i takes sub-block i whole instead (see BLOCK_LANES). A format's
 // `grp_<fmt>` adds the group's dot products with each of the nr activation rows to accA[r],
 // and those of a second weight, when use_b, to accB[r].
 //
@@ -135,7 +136,39 @@ typedef struct {
 #define KS(r, C) ((float)xq.sk[(ulong)(r) * nb + 8 * g + (C)])
 #endif
 
+// A prompt chunk: lane c of a group takes the whole of sub-block c, so that the eight integer
+// dot products of a block add up before its scales meet them.
+#if !defined(MEGA) && R > 1
+#define BLOCK_LANES 1
+#define DP8(DP, a, x)                                                                            \
+    DP(a.s7, x.s7, DP(a.s6, x.s6, DP(a.s5, x.s5, DP(a.s4, x.s4,                                   \
+        DP(a.s3, x.s3, DP(a.s2, x.s2, DP(a.s1, x.s1, DP(a.s0, x.s0, 0))))))))
+// The 32 codes of sub-block c of activation row r.
+#define LW8(r, c) vload8(0, (__global const uint*)(xq.qz + (ulong)(r) * cols + 256 * g + 32 * (c)))
+#endif
+
 // ---- Q8_0: 32 quants per block, then the half scales.
+#ifdef BLOCK_LANES
+inline void grp_q8_0(GRP_ARGS) {
+    if (lane >= nsub) return;
+    ulong blk = blk0 + lane;
+    float da = h2f(((__global const ushort*)(wa + total * 32))[blk]);
+    uint8 wqa = vload8(0, (__global const uint*)(wa + blk * 32));
+    float db = 0;
+    uint8 wqb = (uint8)(0);
+    if (use_b) {
+        db = h2f(((__global const ushort*)(wb + total * 32))[blk]);
+        wqb = vload8(0, (__global const uint*)(wb + blk * 32));
+    }
+    UNROLL for (uint r = 0; r < R; r++) {
+        if (r >= nr) break;
+        uint8 xv = LW8(r, lane);
+        float sc = LD(r, lane);
+        accA[r] += da * sc * (float)DP8(DP_SS, wqa, xv);
+        if (use_b) accB[r] += db * sc * (float)DP8(DP_SS, wqb, xv);
+    }
+}
+#else
 inline void grp_q8_0(GRP_ARGS) {
 #define STEP(cc)                                                                                 \
     if (cc < nsub) {                                                                             \
@@ -159,6 +192,7 @@ inline void grp_q8_0(GRP_ARGS) {
     EIGHT(STEP)
 #undef STEP
 }
+#endif
 
 // ---- Q4_0: 16 bytes of nibbles per block (low = values 0..15, high = 16..31), then the scales.
 inline uint q4_0_nibbles(__global const uchar* w, ulong blk, uint lane) {
@@ -283,6 +317,36 @@ inline void scale_min_k4(int j, uint s0, uint s1, uint s2, float* sc, float* mn)
         *mn = (float)((lo >> 4) | (((s1 >> sh) >> 6 & 3) << 4));
     }
 }
+#ifdef BLOCK_LANES
+inline void grp_q4_k(GRP_ARGS) {
+    ulong sb = blk0 >> 3;
+    uint c = lane;
+    uint4 ha = ((__global const uint4*)(wa + sb * 144))[0];
+    uint8 qa = vload8(0, (__global const uint*)(wa + sb * 144 + 16 + 32 * (c >> 1)));
+    uint4 hb = (uint4)(0);
+    uint8 qb = (uint8)(0);
+    if (use_b) {
+        hb = ((__global const uint4*)(wb + sb * 144))[0];
+        qb = vload8(0, (__global const uint*)(wb + sb * 144 + 16 + 32 * (c >> 1)));
+    }
+    // Sub-block c reads the low nibbles of its bytes when c is even, the high ones when odd.
+    uint shift = 4 * (c & 1);
+    qa = (qa >> shift) & 0x0f0f0f0fu;
+    qb = (qb >> shift) & 0x0f0f0f0fu;
+    float sca, mna, scb = 0, mnb = 0;
+    scale_min_k4(c, ha.y, ha.z, ha.w, &sca, &mna);
+    if (use_b) scale_min_k4(c, hb.y, hb.z, hb.w, &scb, &mnb);
+    float ka = h2f(ha.x & 0xffffu) * sca, ma = h2f(ha.x >> 16) * mna;
+    float kb = h2f(hb.x & 0xffffu) * scb, mb = h2f(hb.x >> 16) * mnb;
+    UNROLL for (uint r = 0; r < R; r++) {
+        if (r >= nr) break;
+        uint8 xv = LW8(r, c);
+        float2 ys = LDS(r, c);
+        accA[r] += ys.x * ka * (float)DP8(DP_US, qa, xv) - ma * ys.y;
+        if (use_b) accB[r] += ys.x * kb * (float)DP8(DP_US, qb, xv) - mb * ys.y;
+    }
+}
+#else
 inline void grp_q4_k(GRP_ARGS) {
     ulong sb = blk0 >> 3;
     uint4 ha = ((__global const uint4*)(wa + sb * 144))[0];
@@ -316,6 +380,7 @@ inline void grp_q4_k(GRP_ARGS) {
     EIGHT(STEP)
 #undef STEP
 }
+#endif
 
 // ---- Q6_K, stored as four arrays over the superblocks: 128 bytes of low nibbles, 64 of high
 // bit pairs, 16 signed scales, one half scale. Sub-block c is quarter c & 3 of half c >> 2: its
@@ -326,6 +391,46 @@ inline uint six_codes(uint a, uint e, uint shift, uint high) {
     uint top = (e >> shift) & 0x03030303u;
     return lowbits | (top << 4);
 }
+#ifdef BLOCK_LANES
+// Each half of a sub-block of 32 values has its own scale.
+#define DP4(DP, a, x) DP(a.s3, x.s3, DP(a.s2, x.s2, DP(a.s1, x.s1, DP(a.s0, x.s0, 0))))
+inline uint8 six_codes8(__global const uchar* w, ulong total, ulong sb, uint c) {
+    uint h = c >> 2, q = c & 3;
+    uint8 low = vload8(0, (__global const uint*)(w + sb * 128 + 64 * h + 32 * (c & 1)));
+    uint8 top = vload8(0, (__global const uint*)(w + total * 128 + sb * 64 + 32 * h));
+    return ((low >> (4 * (q >> 1))) & 0x0f0f0f0fu) | (((top >> (2 * q)) & 0x03030303u) << 4);
+}
+inline void grp_q6_k(GRP_ARGS) {
+    ulong sb = blk0 >> 3;
+    uint c = lane, h = c >> 2, so = 16 * (c & 3);
+    float da = h2f(((__global const ushort*)(wa + total * 208))[sb]);
+    ulong sca = ((__global const ulong*)(wa + total * 192 + sb * 16))[h];
+    uint8 qa = six_codes8(wa, total, sb, c);
+    float a0 = da * (float)(char)(sca >> so), a1 = da * (float)(char)(sca >> (so + 8));
+    float b0 = 0, b1 = 0;
+    uint8 qb = (uint8)(0);
+    if (use_b) {
+        float db = h2f(((__global const ushort*)(wb + total * 208))[sb]);
+        ulong scb = ((__global const ulong*)(wb + total * 192 + sb * 16))[h];
+        qb = six_codes8(wb, total, sb, c);
+        b0 = db * (float)(char)(scb >> so);
+        b1 = db * (float)(char)(scb >> (so + 8));
+    }
+    UNROLL for (uint r = 0; r < R; r++) {
+        if (r >= nr) break;
+        uint8 xv = LW8(r, c);
+        float y = LD(r, c);
+        // The codes are stored 32 above their values: the sums of the activation codes take it back.
+        int s0 = 32 * DP4(DP_SS, ((uint4)(0x01010101u)), xv.lo);
+        int s1 = 32 * DP4(DP_SS, ((uint4)(0x01010101u)), xv.hi);
+        accA[r] += y * (a0 * (float)(DP4(DP_US, qa.lo, xv.lo) - s0) +
+                        a1 * (float)(DP4(DP_US, qa.hi, xv.hi) - s1));
+        if (use_b)
+            accB[r] += y * (b0 * (float)(DP4(DP_US, qb.lo, xv.lo) - s0) +
+                            b1 * (float)(DP4(DP_US, qb.hi, xv.hi) - s1));
+    }
+}
+#else
 inline void grp_q6_k(GRP_ARGS) {
     ulong sb = blk0 >> 3;
     float da = h2f(((__global const ushort*)(wa + total * 208))[sb]);
@@ -370,6 +475,7 @@ inline void grp_q6_k(GRP_ARGS) {
     EIGHT(STEP)
 #undef STEP
 }
+#endif
 
 #ifndef MEGA
 // Per-class preloads for a decode step: the group's eight activation words and scales.
