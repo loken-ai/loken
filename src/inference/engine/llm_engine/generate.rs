@@ -185,14 +185,23 @@ impl LlmEngine {
             // The serial path leaves its counts for the request that streamed: taken here, no
             // later request reads them.
             let _ = self.take_last_stream_stats();
-            let counts = WorkerCounts::of(probe.outcome().as_ref(), chunks);
+            let outcome = probe.outcome();
+            let counts = WorkerCounts::of(outcome.as_ref(), chunks);
+            // The request's own times, else the times its client saw.
+            let (prompt_eval_duration, eval_duration) = match outcome {
+                Some(o) => (o.figures.prefill_ns(), o.figures.decode_ns()),
+                None => (
+                    ttft.as_nanos() as u64,
+                    t0.elapsed().saturating_sub(ttft).as_nanos() as u64,
+                ),
+            };
             return Ok(GenerationResult {
                 text,
                 tokens: Vec::new(),
                 prompt_eval_count: counts.prompt_eval_count,
-                prompt_eval_duration: ttft.as_nanos() as u64,
+                prompt_eval_duration,
                 eval_count: counts.eval_count,
-                eval_duration: t0.elapsed().saturating_sub(ttft).as_nanos() as u64,
+                eval_duration,
                 cached_prompt_tokens: counts.cached_prompt_tokens,
                 finish_reason: FinishReason::Eos,
                 logprobs: Vec::new(),

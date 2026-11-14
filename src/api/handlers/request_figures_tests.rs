@@ -348,6 +348,7 @@ const REPEATED_PROMPT_WORDS: usize = 8;
 
 /// The prompt figures of an Ollama generate answer: every prompt position, then the cached
 /// ones.
+/// The answer states a time reading its prompt, within its whole time.
 async fn ollama_counts(state: &APIServer, vocab_size: usize, stream: bool) -> (u64, u64) {
     let mut request = OllamaGenerateRequest::new(
         MODEL.to_string(),
@@ -373,6 +374,11 @@ async fn ollama_counts(state: &APIServer, vocab_size: usize, stream: bool) -> (u
             .as_u64()
             .unwrap_or_else(|| panic!("{name} in {last}"))
     };
+    assert!(field("prompt_eval_duration") > 0, "stream {stream}: {last}");
+    assert!(
+        field("prompt_eval_duration") + field("eval_duration") <= field("total_duration"),
+        "stream {stream}: {last}"
+    );
     (
         field("prompt_eval_count"),
         field("prompt_eval_cached_count"),

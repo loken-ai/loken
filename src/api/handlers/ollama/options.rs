@@ -540,16 +540,16 @@ pub(crate) async fn ollama_chat(
                                 Some(s.finish_reason.ollama()),
                             ),
                             // A path that writes no stats recorded the request's own
-                            // counts in its probe.
-                            None => (
-                                probe
-                                    .outcome()
-                                    .map_or(chunk_count as u64, |o| o.figures.generated_tokens),
-                                wall_total_ns,
-                                0u64,
-                                wall_total_ns,
-                                None,
-                            ),
+                            // counts and times in its probe.
+                            None => {
+                                let (eval_count, eval_duration, prompt_eval_duration, total) =
+                                    unstated_figures(
+                                        probe.outcome().as_ref(),
+                                        chunk_count as u64,
+                                        wall_total_ns,
+                                    );
+                                (eval_count, eval_duration, prompt_eval_duration, total, None)
+                            }
                         };
                         let load_duration =
                             total_duration.saturating_sub(prompt_eval_duration + eval_duration);
@@ -849,6 +849,31 @@ fn streamed_prompt_counts(
         }
         (None, Some(s)) => ollama_prompt_counts(s.prompt_eval_count, s.cached_prompt_tokens),
         (None, None) => ollama_prompt_counts(estimate, 0),
+    }
+}
+
+/// The answer's tokens, the nanoseconds writing them, the nanoseconds reading its prompt and
+/// the whole nanoseconds, for a streamed answer whose path writes no stats.
+/// They come from the request's own `outcome`.
+/// The whole is at least the wait, the reading and the writing, and at least `wall_ns`.
+/// Without an outcome the answer counts its `chunks`, written over `wall_ns`, and no reading.
+fn unstated_figures(
+    outcome: Option<&crate::request_metrics::RequestOutcome>,
+    chunks: u64,
+    wall_ns: u64,
+) -> (u64, u64, u64, u64) {
+    match outcome {
+        Some(o) => {
+            let f = &o.figures;
+            let spent = f.queue_ns() + f.prefill_ns() + f.decode_ns();
+            (
+                f.generated_tokens,
+                f.decode_ns(),
+                f.prefill_ns(),
+                spent.max(wall_ns),
+            )
+        }
+        None => (chunks, wall_ns, 0, wall_ns),
     }
 }
 
@@ -1337,15 +1362,14 @@ pub(crate) async fn ollama_generate(
                                 s.total_duration_ns,
                             ),
                             // A path that writes no stats recorded the request's own
-                            // counts in its probe.
-                            None => (
-                                probe
-                                    .outcome()
-                                    .map_or(chunk_count as u64, |o| o.figures.generated_tokens),
-                                wall_total_ns,
-                                0u64,
-                                wall_total_ns,
-                            ),
+                            // counts and times in its probe.
+                            None => {
+                                unstated_figures(
+                                    probe.outcome().as_ref(),
+                                    chunk_count as u64,
+                                    wall_total_ns,
+                                )
+                            }
                         };
                         let mut final_chunk = serde_json::json!({
                             "model": model_name_clone,

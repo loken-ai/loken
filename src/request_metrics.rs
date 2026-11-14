@@ -57,6 +57,21 @@ impl RequestFigures {
         self.prompt_tokens.saturating_sub(self.cached_prompt_tokens)
     }
 
+    /// Nanoseconds from its arrival at the model to the start of its prompt.
+    pub fn queue_ns(&self) -> u64 {
+        Duration::try_from_secs_f64(self.queue_s).map_or(0, |d| d.as_nanos() as u64)
+    }
+
+    /// Nanoseconds reading its prompt, to its first token.
+    pub fn prefill_ns(&self) -> u64 {
+        Duration::try_from_secs_f64(self.prefill_s).map_or(0, |d| d.as_nanos() as u64)
+    }
+
+    /// Nanoseconds writing its answer after the first token.
+    pub fn decode_ns(&self) -> u64 {
+        Duration::try_from_secs_f64(self.decode_s).map_or(0, |d| d.as_nanos() as u64)
+    }
+
     /// The figures of a request served by the batch worker: the wait from submission to
     /// admission, the prompt from admission to the first token, the answer from the first
     /// token to its end. An answer with no token reads its prompt until it ends.
