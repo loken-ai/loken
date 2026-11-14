@@ -188,24 +188,6 @@ fn registered_entries(hf_dir: &str) -> Vec<MediaEntry> {
             p,
         );
     }
-    // Piper voices, each its own checkpoint: `<models>/piper/<voice>/<voice>.onnx`, with the
-    // phoneme table beside it. The directory steps out of a `hub/` cache as the voices do.
-    let root = if hf.file_name().is_some_and(|n| n == "hub") {
-        hf.parent().unwrap_or(hf)
-    } else {
-        hf
-    };
-    for dir in std::fs::read_dir(root.join(PIPER_DIR))
-        .into_iter()
-        .flatten()
-        .flatten()
-    {
-        let voice = dir.file_name().to_string_lossy().to_string();
-        push(
-            &format!("{PIPER_DIR}/{voice}"),
-            dir.path().join(format!("{voice}.onnx")),
-        );
-    }
     #[cfg(feature = "midi")]
     push(
         "midi",
@@ -226,10 +208,42 @@ fn registered_entries(_hf_dir: &str) -> Vec<MediaEntry> {
     Vec::new()
 }
 
+/// The Piper voices, each its own checkpoint: `<models>/piper/<voice>/<voice>.onnx`, with
+/// the phoneme table beside it.
+/// The directory steps out of a `hub/` cache as the voices do.
+#[cfg(feature = "audio")]
+fn piper_entries(hf_dir: &str) -> Vec<MediaEntry> {
+    let hf = Path::new(hf_dir);
+    let root = if hf.file_name().is_some_and(|n| n == "hub") {
+        hf.parent().unwrap_or(hf)
+    } else {
+        hf
+    };
+    std::fs::read_dir(root.join(PIPER_DIR))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|dir| {
+            let voice = dir.file_name().to_string_lossy().to_string();
+            let path = dir.path().join(format!("{voice}.onnx"));
+            path.exists().then(|| MediaEntry {
+                id: format!("{PIPER_DIR}/{voice}"),
+                path,
+            })
+        })
+        .collect()
+}
+
+#[cfg(not(feature = "audio"))]
+fn piper_entries(_hf_dir: &str) -> Vec<MediaEntry> {
+    Vec::new()
+}
+
 /// Every media checkpoint of the local stores that the Hugging Face cache listing does not
 /// name, registered entries first.
 pub(crate) fn local_media_entries(hf_dir: &str) -> Vec<MediaEntry> {
     let mut out = registered_entries(hf_dir);
+    out.extend(piper_entries(hf_dir));
     for e in drop_in_entries(hf_dir) {
         if !out.iter().any(|o| o.id == e.id) {
             out.push(e);
