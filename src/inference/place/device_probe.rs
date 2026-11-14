@@ -185,7 +185,19 @@ pub fn visible_cards(nvml: &nvml_wrapper::Nvml) -> Vec<(usize, u32)> {
             return out;
         }
     }
-    (0..all).map(|i| (i as usize, i)).collect()
+    cards_without_driver_count(cfg!(feature = "gpu"), all)
+}
+
+/// The cards listed when the driver gives no count, from `nvml_count` NVML cards.
+///
+/// A build with the driver lists none: the driver fails to count when no card is visible to
+/// the process, and NVML lists every card of the machine whatever the process sees.
+/// A build without it numbers the NVML cards in their own order.
+fn cards_without_driver_count(with_driver: bool, nvml_count: u32) -> Vec<(usize, u32)> {
+    match with_driver {
+        true => Vec::new(),
+        false => (0..nvml_count).map(|i| (i as usize, i)).collect(),
+    }
 }
 
 /// The bytes card `ordinal`'s default memory pool hands out to live buffers and the bytes it
@@ -845,6 +857,24 @@ mod primary_ctx_tests {
             release();
             assert!(!primary_ctx_active(ord), "released again");
         }
+    }
+}
+
+#[cfg(test)]
+mod uncounted_tests {
+    use super::cards_without_driver_count;
+
+    /// A build with the driver lists no card when the driver cannot count any, though NVML
+    /// lists the machine's cards.
+    #[test]
+    fn a_driver_that_counts_no_card_lists_none() {
+        assert!(cards_without_driver_count(true, 2).is_empty());
+    }
+
+    /// A build without the driver numbers the NVML cards in their order.
+    #[test]
+    fn a_build_without_the_driver_lists_the_nvml_cards() {
+        assert_eq!(cards_without_driver_count(false, 2), vec![(0, 0), (1, 1)]);
     }
 }
 
