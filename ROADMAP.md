@@ -19,20 +19,10 @@ Major, by state then by priority:
 
 | Feature | Category | Done when | State |
 |---|---|---|---|
-| Experts chosen across quantised files | Performance | One model served from 2 GGUF files of one checkpoint picks each expert's file by memory budget and routing heat: DeepSeek V4.1 from its IQ2 and IQ3 files decodes within 10% of IQ2 alone and stays closer to the official model than IQ2 alone. | Partial |
 | Expert parallelism | Parallelism | A MoE model's experts are spread across cards when that is faster. | Done |
 | Prefill and decode on different instances | Serving | One instance reads the prompt and another one writes the answer. | Done |
-| Qwen3.8 at full speed | Performance | Qwen3.8 IQ1_M and UD-Q4_K_XL run at least as fast as the reference engine, on 1 and 2 cards. | Partial |
-| Throughput serving | Serving | Many requests at once run at the reference server's throughput on the same card. | Started |
 | Video input | Multimodal input | A vision model answers about a video as the reference implementation does. | Done |
-| Speculation for every model | Speculation | Every model family decodes faster with a draft than without. | Started |
-| DeepSeek V4.1 for coding agents | Performance | DeepSeek V4.1 reads a 10k-token agent prompt in under a minute and writes 500 tokens in under a minute, on 2 16 GB cards and the host | Started |
-| Qwen3.8 IQ1_M on 1 card at the reference | Performance | Qwen3.8 IQ1_M on 1 card is at least as fast as the reference engine, with 3k and 13k prompts. | Planned |
-| Context parallelism inside the recorded step | Parallelism | A context split across cards decodes with recorded graphs, within 10% of an unsplit cache. | Planned |
-| Vulkan at the speed of CUDA and ROCm | Performance | Vulkan decodes and reads a prompt at the speed of CUDA on the NVIDIA card and of ROCm on the AMD card, for 1 model of each family. | Partial |
-| Vulkan for every layer kind | Backends | A model whose layers the Vulkan backend refuses today (recurrent mixers, shared experts, other expert routing) runs through Vulkan and answers as the host does. | Partial |
 | OpenCL faster than the CPU | Performance | A language model and an image model run through OpenCL on an Intel GPU faster than on its CPU. | Started |
-| Backends at the reference speed | Performance | Each backend is at least as fast as the reference engine on the same card. | Planned |
 | Qwen3-TTS | Audio | Qwen3-TTS speaks English and French through the speech route from its published checkpoint, within the bounds of the acceptance table, and a voice named, described in words or cloned from a clip stays the same from one request to the next. | Started |
 
 Smaller, by state then by priority:
@@ -43,27 +33,15 @@ Smaller, by state then by priority:
 | Server-side thinking budget | API | A request's reasoning budget ends the reasoning with the closing marker of the chat template once it is spent. | Done |
 | Batch invariance measured | Tests | A test compares a sequence's logits alone and inside a batch, and reports the largest difference. | Done |
 | Load profiles in the bench | Bench | The bench sends requests at a constant or a random rate, and finds the rate at which the queue of the engine starts to grow without bound. | Done |
-| Embeddings measured by the bench | Bench | The bench measures every embedding model against the other servers that run it. | Partial |
 | Per-request figures in the answer | Operations | A chat answer on the OpenAI and Anthropic routes carries its own queue, prefill and decode times, its energy with how it was shared, its place in the cache and its accepted drafts, and a long prompt reports its reading as it goes. | Done |
 | Checkpoints served as stored | Models | A float checkpoint is served in its stored format whenever it fits, on the host and on every card family, it is requantised only to fit, and the log, `/api/ps` and the bench records say which format runs. | Partial |
 | Records that carry their recipe | Bench | A record holds the command, the binary hash, the model file hash and the configuration digest, and a seal that shows any change. | Done |
-| Concurrent media requests | Serving | 2 image or speech requests on 1 card finish sooner together than one after the other. | Started |
-| One setting from fidelity to speed | Serving | One configuration setting, with a few named levels, chooses every trade between fidelity to the published model and speed: the weight format, the cache format, the drafts that are not bit for bit, the shifted context. | Started |
-| ACE-Step at the reference speed | Performance | Each ACE-Step 1.5 variant renders a full song at most 1.2x slower than the original code. | Planned |
 | Sleep mode | Serving | An idle model moves to host memory and comes back on the next request. | Done |
-| Expert parallelism for resident experts | Parallelism | A MoE model whose experts fit on the cards runs faster spread across them than on 1 card. | Started |
-| Prefill hand-over for split layers and cut caches | Serving | Prompt hand-over also works when the model or its cache is split across cards. | Partial |
 | Reuse or recompute | Serving | A prompt hand-over takes the KV when moving it is faster than reading the prompt again, judged on the link speed and the prompt speed loken measured, and it works in both directions. | Partial |
 | Batched expert reads in a prompt | Performance | Reading a prompt loads each streamed expert once for all the tokens that route to it, and prompt speed rises accordingly | Done |
 | Prompt lookup while experts stream | Speculation | Prompt-lookup drafting runs on models whose experts stream from disk, faster than plain decode on code that repeats its context | Done |
-| DeepSeek V4.1 native draft | Speculation | DeepSeek V4.1 drafts with its own draft head and decodes faster than without it, with the same greedy text | Started |
-| Experts fetched one layer ahead | Performance | The experts of the next layer load while the current layer runs, and decode gets faster with the same text | Started |
-| Speculation sized by expert cost | Speculation | The draft length accounts for the experts a draft adds that are not in memory, and a streamed model decodes faster with it than with the length chosen by acceptance alone. | Started |
 | Routing toward resident experts | Performance | At the fast level the router favours experts already in memory, and the answers stay inside the bounds of the quality harness. | Done |
-| Expert skipping | Performance | At the fast level a token skips the routed experts that add little, which removes their reads, and the answers stay inside the bounds of the quality harness. | Planned |
-| Lower precision on a miss | Performance | An expert that is not in memory and weighs little in the routing is read from a smaller copy, and the answers stay inside the bounds of the quality harness. | Planned |
-| Expert deferral | Performance | At the fast level the host's expert work overlaps the next layer's attention, decode is faster than without, and the answers stay inside the bounds of the quality harness. | Planned |
-| Replay of agent sessions | Bench | The bench replays a recorded session with its shared prefixes and its timing, and the record names the trace by its digest. | Partial |
+| Replay of agent sessions | Bench | The bench replays a recorded session with its shared prefixes and its timing, and the record names the trace by its digest. | Done |
 | Quality next to speed | Bench | A text record also holds how far each answer departs from a reference run, on the engines that expose the data. | Done |
 | DeepSeek V4.1 through the hetero route | Models | DeepSeek V4.1 loads and is placed through HeteroPlan and the ladder, with no loader, backend, batch server or expert streamer of its own, and its tokens equal those of the frozen oracle. | Done |
 | Documents checked against the hetero route | Documentation | Every page, scene and exercise that names DeepSeek V4.1, in `docs/` and on the site, matches the hetero route, with no dedicated loader, engine or port left in the text. | Done |
@@ -93,6 +71,16 @@ Major, by state then by priority:
 
 | Feature | Category | Done when | State |
 |---|---|---|---|
+| Experts chosen across quantised files | Performance | One model served from 2 GGUF files of one checkpoint picks each expert's file by memory budget and routing heat: DeepSeek V4.1 from its IQ2 and IQ3 files decodes within 10% of IQ2 alone and stays closer to the official model than IQ2 alone. | Partial |
+| Qwen3.8 at full speed | Performance | Qwen3.8 IQ1_M and UD-Q4_K_XL run at least as fast as the reference engine, on 1 and 2 cards. | Partial |
+| Throughput serving | Serving | Many requests at once run at the reference server's throughput on the same card. | Started |
+| Speculation for every model | Speculation | Every model family decodes faster with a draft than without. | Started |
+| DeepSeek V4.1 for coding agents | Performance | DeepSeek V4.1 reads a 10k-token agent prompt in under a minute and writes 500 tokens in under a minute, on 2 16 GB cards and the host | Started |
+| Qwen3.8 IQ1_M on 1 card at the reference | Performance | Qwen3.8 IQ1_M on 1 card is at least as fast as the reference engine, with 3k and 13k prompts. | Planned |
+| Context parallelism inside the recorded step | Parallelism | A context split across cards decodes with recorded graphs, within 10% of an unsplit cache. | Planned |
+| Vulkan at the speed of CUDA and ROCm | Performance | Vulkan decodes and reads a prompt at the speed of CUDA on the NVIDIA card and of ROCm on the AMD card, for 1 model of each family. | Partial |
+| Vulkan for every layer kind | Backends | A model whose layers the Vulkan backend refuses today (recurrent mixers, shared experts, other expert routing) runs through Vulkan and answers as the host does. | Partial |
+| Backends at the reference speed | Performance | Each backend is at least as fast as the reference engine on the same card. | Planned |
 | GLM-5.3 on the host and the cards | Models | GLM-5.3 loads from its published checkpoint and answers as the reference implementation does, its experts read from disk when they do not fit, and it drafts with its own draft head. | Planned |
 | Text prepared for speech | Audio | Every speech model reads acronyms letter by letter and takes a pronunciation written inline in the text, through one text preparation step with an English pronunciation lexicon, and a sentence holding VRAM, KV, MoE, OOM and TP is transcribed back with the same words. | Planned |
 | Speech from a style vector | Audio | A speech model whose voice is a style tensor and whose decoder is an inverse STFT speaks English, French, Spanish, Hindi, Italian and Portuguese through the speech route, its voice the same from one request to the next and its output within the bounds of the acceptance table. | Planned |
@@ -107,6 +95,18 @@ Smaller, by state then by priority:
 
 | Feature | Category | Done when | State |
 |---|---|---|---|
+| Embeddings measured by the bench | Bench | The bench measures every embedding model against the other servers that run it. | Partial |
+| Concurrent media requests | Serving | 2 image or speech requests on 1 card finish sooner together than one after the other. | Started |
+| One setting from fidelity to speed | Serving | One configuration setting, with a few named levels, chooses every trade between fidelity to the published model and speed: the weight format, the cache format, the drafts that are not bit for bit, the shifted context. | Started |
+| ACE-Step at the reference speed | Performance | Each ACE-Step 1.5 variant renders a full song at most 1.2x slower than the original code. | Planned |
+| Expert parallelism for resident experts | Parallelism | A MoE model whose experts fit on the cards runs faster spread across them than on 1 card. | Started |
+| Prefill hand-over for split layers and cut caches | Serving | Prompt hand-over also works when the model or its cache is split across cards. | Partial |
+| DeepSeek V4.1 native draft | Speculation | DeepSeek V4.1 drafts with its own draft head and decodes faster than without it, with the same greedy text | Started |
+| Experts fetched one layer ahead | Performance | The experts of the next layer load while the current layer runs, and decode gets faster with the same text | Started |
+| Speculation sized by expert cost | Speculation | The draft length accounts for the experts a draft adds that are not in memory, and a streamed model decodes faster with it than with the length chosen by acceptance alone. | Started |
+| Expert skipping | Performance | At the fast level a token skips the routed experts that add little, which removes their reads, and the answers stay inside the bounds of the quality harness. | Planned |
+| Lower precision on a miss | Performance | An expert that is not in memory and weighs little in the routing is read from a smaller copy, and the answers stay inside the bounds of the quality harness. | Planned |
+| Expert deferral | Performance | At the fast level the host's expert work overlaps the next layer's attention, decode is faster than without, and the answers stay inside the bounds of the quality harness. | Planned |
 | Decision route | Models | A decision route takes a block of state and typed questions (choice, score, yes or no) and returns one calibrated probability per option in one pass, and several questions on one state cost one reading. Strands Decider 2B matches its reference on a fixed set, on the host and on a card. | Planned |
 | Adapters per request | Models | Several text adapters share one base model, and each request picks its own. | Planned |
 | Pooling and classification | API | The classify, score and pooling routes work on the loaded models. | Planned |
@@ -188,6 +188,10 @@ Smaller, by state then by priority:
 | 4-bit weights and activations | Quantisation | A diffusion model runs with 4-bit weights and activations plus a low-rank branch in 16 bits, inside the quality score of the 8-bit model. | Planned |
 | Lossless compressed BF16 weights | Quantisation | A BF16 checkpoint is stored entropy-coded, decoded on the card as it is read, and gives the same bits in less memory. | Planned |
 | Video diffusion with a wider VAE | Models | A video model whose VAE compresses 16 by 16 in space and 4 in time loads and renders as its reference does. | Planned |
+| Learned draft control | Speculation | A small network trained by loken on its own measurements chooses when to draft and how long, and every model family decodes at least as fast as with the measured averages, with the same greedy text. | Planned |
+| Learned expert prediction | Speculation | A small network predicts the experts the next layer routes, the predicted ones are read ahead, and a streamed model decodes faster than with the previous layer's routing as the guess. | Planned |
+| Learned cluster placement | Cluster | A small network trained on the cluster's measured runs chooses the nodes, the layer cut and the tensor parallelism of a model, and the placement it picks is at least as fast as the one the measured cost model picks. | Planned |
+| Learned serving choices | Serving | The choice of path, chunk and product route for a request comes from a model trained on loken's measurements, and no request is slower than with the rules it replaces. | Planned |
 
 Fixes, by state then by priority:
 
