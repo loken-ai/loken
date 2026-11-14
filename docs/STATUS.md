@@ -372,7 +372,8 @@ Hardware nameplates play no part, because what a card could do is not what this 
 
 A hand-over carries the rows of whole layers.
 A layer split across cards gives its rows whole and takes them back share by share, so the 2 instances may place the stack differently.
-A cache cut over cards has no snapshot form, so a model that cuts its cache is still read again.
+A cache cut over cards gives its rows in the order of their positions and cuts them again over the cards of the instance that takes them.
+A model with recurrent or windowed layers and a layer split across cards still reads its prompt itself.
 
 ### Sharding for DeepSeek V4.1
 

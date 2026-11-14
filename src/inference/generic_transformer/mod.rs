@@ -67,6 +67,8 @@ pub use loader::{set_float_weights, set_narrows};
 mod context_parallel;
 #[cfg(test)]
 mod conversation_tests;
+#[cfg(all(test, feature = "gpu"))]
+mod cut_cache_tests;
 #[cfg_attr(not(feature = "gpu"), allow(dead_code))]
 mod expert_admission;
 #[cfg_attr(not(feature = "gpu"), allow(dead_code))]

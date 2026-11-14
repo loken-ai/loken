@@ -417,6 +417,26 @@ impl CpuF16Kv {
         Ok(())
     }
 
+    /// Append the F16 rows `k`, `v` of whole tokens, token-major `[n, n_kv_head, head_dim]`.
+    pub fn append_f16_rows(&mut self, k: &[f16], v: &[f16]) -> Result<()> {
+        let (hd, row) = (self.head_dim, self.n_kv_head * self.head_dim);
+        if k.len() != v.len() || row == 0 || !k.len().is_multiple_of(row) {
+            return Err(crate::tensor::Error::msg(
+                "CpuF16Kv::append_f16_rows: the rows do not fit the heads".to_string(),
+            ));
+        }
+        let n = k.len() / row;
+        for t in 0..n {
+            for h in 0..self.n_kv_head {
+                let at = t * row + h * hd;
+                self.k[h].extend_from_slice(&k[at..at + hd]);
+                self.v[h].extend_from_slice(&v[at..at + hd]);
+            }
+        }
+        self.seq += n;
+        Ok(())
+    }
+
     /// Tokens `[from, to)` as f32 rows, token-major `[n, n_kv, head_dim]`, K then V.
     pub fn host_rows(&self, from: usize, to: usize) -> (Vec<f32>, Vec<f32>) {
         let hd = self.head_dim;

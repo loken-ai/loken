@@ -74,11 +74,21 @@ pub(super) fn models_dir() -> (std::path::PathBuf, usize) {
 /// An instance serving [`MODEL`] from `root`, with `peer` as its prefill peer.
 /// Lone requests stay on the serial path, the one that asks a peer.
 async fn instance(root: &std::path::Path, peer: Option<String>) -> APIServer {
+    instance_with(root, peer, false).await
+}
+
+/// [`instance`], its attention layers' caches cut over every card when `context_parallel`.
+async fn instance_with(
+    root: &std::path::Path,
+    peer: Option<String>,
+    context_parallel: bool,
+) -> APIServer {
     let engine = Arc::new(LlmEngine::with_config(InferenceConfig {
         model_id: MODEL.to_string(),
         models_dir: Some(root.to_path_buf()),
         context_length: CONTEXT,
         prefill_peer: peer,
+        context_parallel,
         ..InferenceConfig::default()
     }));
     engine
@@ -156,6 +166,52 @@ async fn a_prompt_is_handed_over_between_2_instances_both_ways() {
     }
     let (_, cached) = answer(&a, prompt(SHORT_PROMPT_WORDS, vocab, 3)).await;
     assert_eq!(cached, 0, "a short prompt was handed over");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// An instance whose cache is cut over 2 cards takes a long prompt that an instance with a whole
+/// cache read, and reads one for it.
+/// Each answers with the tokens it gives reading the prompt itself.
+/// The instance with the cut cache reads the second turn of a conversation from its cache in
+/// place: no copy of the first turn left the cards.
+#[cfg(feature = "gpu")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs 2 CUDA cards"]
+async fn a_prompt_is_handed_over_to_and_from_a_cache_cut_over_cards() {
+    // The load and the hand-over are logged with the result.
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .with_test_writer()
+        .try_init();
+    let _paused = crate::request_metrics::PREFILL_PAUSE_LOCK.lock().await;
+    let (root, vocab) = models_dir();
+    let a_port = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let b_port = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = |l: &tokio::net::TcpListener| format!("http://{}", l.local_addr().unwrap());
+    let a = instance_with(&root, Some(url(&b_port)), false).await;
+    let b = instance_with(&root, Some(url(&a_port)), true).await;
+    let a_alone = instance_with(&root, None, false).await;
+    let b_alone = instance_with(&root, None, true).await;
+    for (listener, state) in [(a_port, &a), (b_port, &b)] {
+        let app = state.create_router();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    }
+
+    // The cut cache takes a prompt first, then gives one.
+    for (to, alone, first) in [(&b, &b_alone, 11), (&a, &a_alone, 12)] {
+        let long = prompt(LONG_PROMPT_WORDS, vocab, first);
+        let (text, cached) = answer(to, long.clone()).await;
+        let (want, read_alone) = answer(alone, long).await;
+        assert_eq!(read_alone, 0, "the instance without a peer read the prompt");
+        assert!(cached > 0, "the peer did not hand the prompt over");
+        assert_eq!(text, want, "the handed prompt gave another answer");
+    }
+
+    let turn = prompt(LONG_PROMPT_WORDS, vocab, 13);
+    let (said, _) = answer(&b_alone, turn.clone()).await;
+    let next = format!("{turn} {said} {}", prompt(SHORT_PROMPT_WORDS, vocab, 15));
+    let (_, cached) = answer(&b_alone, next).await;
+    assert!(cached > 0, "the second turn was read again");
     let _ = std::fs::remove_dir_all(&root);
 }
 

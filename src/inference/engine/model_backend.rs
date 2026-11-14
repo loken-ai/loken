@@ -663,6 +663,12 @@ pub(crate) trait ModelBackend: Send {
     fn snapshot_kv(&mut self, _tokens: Vec<u32>, _kv_len: usize) -> crate::tensor::Result<()> {
         Ok(())
     }
+    /// Whether a snapshot of the resident KV is a copy off the cards.
+    /// Such a snapshot is taken only for a peer that asked for the prompt: the resident KV
+    /// serves the next turn of the conversation in place.
+    fn snapshot_leaves_the_cards(&self) -> bool {
+        false
+    }
     fn kv_snapshot_dtype(&self, _index: usize) -> Option<u8> {
         None
     }
@@ -2037,6 +2043,9 @@ impl ModelBackend for GenericBackend {
     fn snapshot_kv(&mut self, tokens: Vec<u32>, kv_len: usize) -> crate::tensor::Result<()> {
         self.0.snapshot_kv(tokens, kv_len)
     }
+    fn snapshot_leaves_the_cards(&self) -> bool {
+        self.0.has_context_shards()
+    }
     fn snapshot_prefix(&mut self, prompt: &[u32], logits: &Tensor) -> crate::tensor::Result<()> {
         self.0.snapshot_prefix(prompt, logits)
     }
@@ -2080,10 +2089,11 @@ impl ModelBackend for GenericBackend {
     }
 
     fn kv_layout(&self) -> Option<(usize, usize, usize)> {
-        // A recurrent state is not rows of KV, and a cache cut over cards has no snapshot form:
-        // the disk tier and the hand-over have nothing to store for either. A layer split across
-        // cards gives its rows whole.
-        (!self.0.is_recurrent() && !self.0.has_context_shards()).then(|| self.0.kv_layout())
+        // A recurrent state is not rows of KV: the disk tier and the hand-over have no rows to
+        // store for it.
+        // A layer split across cards gives its rows whole.
+        // A cache cut over cards gives its rows in the order of their positions.
+        (!self.0.is_recurrent()).then(|| self.0.kv_layout())
     }
     fn kv_snapshot_ref(&self, index: usize) -> Option<(&[u32], usize)> {
         self.0.kv_snapshot_ref(index)

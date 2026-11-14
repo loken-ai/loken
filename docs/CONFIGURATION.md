@@ -186,9 +186,11 @@ The prompt is read here when:
 
 - the prompt adds less than 1 prefill chunk to what the cache holds
 - the request carries an image
-- the model has a split layer
-- the cache is cut over the cards
+- the model has recurrent or windowed layers and a layer split across the cards
 - the peer cannot answer
+
+A layer split across the cards gives its rows whole and takes them back share by share.
+A cache cut over the cards gives its rows in the order of their positions and cuts them again over its own cards.
 
 The rows travel as f32, about 4 times the cache's own size.
 
@@ -205,7 +207,9 @@ With `context_parallel` set, the cache of each attention layer is cut into range
 - A query attends to every range on the range's card, and the parts are combined on the layer's card, so a context no single card holds is served whole.
 
 The ranges hold F16 rows.
-The layers so cut run outside the recorded decode step, and their prefixes are not kept as snapshots.
+The layers so cut run outside the recorded decode step.
+The next turn of a conversation reads their cache in place.
+A snapshot of them is taken only for a prefill peer, with their rows in host memory, and not when the host cannot spare them.
 
 These layers keep their own cache: layers with a sliding window, attention sinks or indexed attention, layers sharing a cache with others, and layers split across cards.
 

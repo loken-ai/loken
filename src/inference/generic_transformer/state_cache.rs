@@ -891,6 +891,9 @@ fn decode_block(bytes: &[u8], layout: &Layout) -> AnyResult<Vec<(Vec<f32>, Vec<f
 
 /// Rows resident in a layer's KV, whichever store holds them.
 fn resident_len(l: &GenericTransformerLayer) -> usize {
+    if let Some(c) = l.context.as_ref() {
+        return c.len();
+    }
     let spec = l.kv_cache.current_seq_len();
     let host = l.cpu_f16_kv.as_ref().map_or(0, |c| c.len());
     #[cfg(feature = "gpu")]
@@ -902,6 +905,9 @@ fn resident_len(l: &GenericTransformerLayer) -> usize {
 
 /// The element type a layer's resident KV rows are read back in.
 fn cache_dtype(l: &GenericTransformerLayer) -> Result<u8> {
+    if l.context.is_some() {
+        return dtype_code(super::graph::cut_rows_dtype(l));
+    }
     if l.cpu_f16_kv.as_ref().is_some_and(|c| !c.is_empty()) {
         return Ok(0);
     }
@@ -929,7 +935,12 @@ fn live_rows(l: &GenericTransformerLayer, from: usize, to: usize) -> Result<Rows
             v: Vec::new(),
         });
     }
-    let (dtype, (k, v)) = if let Some(c) = l
+    let (dtype, (k, v)) = if let Some(c) = l.context.as_ref() {
+        // A cache cut over cards holds F16 rows in its ranges.
+        let (k, v) = c.host_rows(from, to)?;
+        let wide = |x: Vec<half::f16>| x.into_iter().map(half::f16::to_f32).collect::<Vec<f32>>();
+        (cache_dtype(l)?, (wide(k), wide(v)))
+    } else if let Some(c) = l
         .cpu_f16_kv
         .as_ref()
         .filter(|c| c.len() >= to && !c.is_empty())
@@ -1359,6 +1370,7 @@ impl GenericHeteroTransformer {
             );
         }
         let snaps = self.point_snapshots(point, blocks)?;
+        self.reserve_context(point.pos);
         super::graph::restore_layers(&mut self.layers, &snaps)?;
         for l in &mut self.layers {
             rebuild_host_rows(l);
@@ -1398,13 +1410,13 @@ impl GenericHeteroTransformer {
 
     /// Whether this model's decode state is more than rows of KV (a recurrent mixer, a windowed
     /// layer) and can still travel in a state handover: no wide-residual layer, no host q8 cache,
-    /// no layer split over cards or cut over cards.
+    /// no layer split over cards.
+    /// A cache cut over cards travels as its rows in the order of their positions.
     pub(crate) fn carries_handover_state(&self) -> bool {
         let stateful = self.is_recurrent() || self.layers.iter().any(|l| l.kv_cache.is_windowed());
         stateful
             && !self.is_wide()
             && !self.has_split_layers()
-            && !self.has_context_shards()
             && self.layers.iter().all(|l| l.cpu_q8_kv.is_none())
     }
 
@@ -1643,6 +1655,12 @@ fn snapshot_rows(l: &GenericTransformerLayer, s: &super::LayerKvSnapshot) -> Res
             q.len(),
             q.host_rows(0, q.len())
                 .map_err(|e| crate::tensor::Error::msg(e.to_string()))?,
+        ),
+        // The rows of a cache cut over cards are labelled as the layer's whole cache holds them.
+        (None, None, Some(c)) if l.context.is_some() => (
+            dtype_code(super::graph::cut_rows_dtype(l))?,
+            c.len(),
+            c.host_rows(0, c.len()),
         ),
         (None, None, Some(c)) => (0, c.len(), c.host_rows(0, c.len())),
         (None, None, None) => (0, 0, (Vec::new(), Vec::new())),

@@ -382,6 +382,45 @@ impl ContextShards {
         Ok(())
     }
 
+    /// Positions `from..to` of every range as host F16 rows, K then V.
+    /// The rows are token-major, `[to - from, h_kv, d]`, in the order of their positions.
+    pub fn host_rows(&self, from: usize, to: usize) -> Result<(Vec<half::f16>, Vec<half::f16>)> {
+        let to = to.min(self.len());
+        let n = to.saturating_sub(from);
+        let mut k = Vec::with_capacity(n * self.h_kv * self.d);
+        let mut v = Vec::with_capacity(n * self.h_kv * self.d);
+        let mut ranges: Vec<&Shard> = self.shards.iter().filter(|s| s.len > 0).collect();
+        ranges.sort_by_key(|s| s.start);
+        for s in ranges {
+            // The position the next block of the range starts at.
+            let mut at = s.start;
+            for seg in &s.segs {
+                let in_seg = (s.start + s.len).saturating_sub(at).min(seg.cap);
+                if in_seg == 0 {
+                    break;
+                }
+                let (lo, hi) = (from.max(at), to.min(at + in_seg));
+                if lo < hi {
+                    let rows = |t: &Tensor| -> Result<Vec<half::f16>> {
+                        t.narrow(1, lo - at, hi - lo)?
+                            .to_device(&Device::Cpu)?
+                            .flatten_all()?
+                            .to_vec1::<half::f16>()
+                    };
+                    k.extend(rows(&seg.k)?);
+                    v.extend(rows(&seg.v)?);
+                }
+                at += seg.cap;
+            }
+        }
+        if k.len() != n * self.h_kv * self.d {
+            crate::tensor::bail!(
+                "context parallel: the ranges do not hold positions {from} to {to}"
+            );
+        }
+        Ok((k, v))
+    }
+
     /// Keep the first `len` positions; the blocks stay for the positions written next.
     pub fn trim_to(&mut self, len: usize) -> Result<()> {
         for s in &mut self.shards {
@@ -667,6 +706,97 @@ mod tests {
         assert!(shards
             .append(&t4([1, h_kv, 30, d], 14), &t4([1, h_kv, 30, d], 15))
             .is_err());
+    }
+
+    /// A layer whose cache is cut over ranges is captured as its rows on the host, in the order of
+    /// their positions.
+    /// Restored over another sequence into the same ranges, it attends bit for bit as before.
+    /// Restored into ranges of other sizes, it attends as before.
+    #[test]
+    fn a_cut_cache_captured_and_restored_attends_as_before() {
+        use super::super::graph::{capture_layer, restore_layer};
+        let path = super::super::tiny_model::write("cut-capture", 1);
+        let mut model = super::super::tiny_model::load(&path, 1);
+        let l = &mut model.layers[0];
+        let (h, h_kv, d) = (l.n_head, l.n_kv_head, l.head_dim);
+        let dev = Device::Cpu;
+        let cut = |caps: &[usize]| {
+            ContextShards::new(
+                caps.iter().map(|&c| (dev.clone(), c)).collect(),
+                h_kv,
+                d,
+                4,
+                0,
+                3 * bytes_per_key(h, h_kv, d, 1),
+            )
+        };
+        let (t, scale) = (17usize, 0.3);
+        let k = t4([1, h_kv, t, d], 31);
+        let v = t4([1, h_kv, t, d], 32);
+        let q = t4([1, h, 1, d], 33);
+        l.context = Some(cut(&[5, 6, 30]));
+        let ranges = l.context.as_mut().unwrap();
+        ranges
+            .append(&k.narrow(2, 0, 9).unwrap(), &v.narrow(2, 0, 9).unwrap())
+            .unwrap();
+        ranges
+            .append(&k.narrow(2, 9, 8).unwrap(), &v.narrow(2, 9, 8).unwrap())
+            .unwrap();
+        let before = flat(&ranges.attend(&q, scale, t - 1).unwrap());
+
+        let snap = capture_layer(l).unwrap();
+        assert_eq!(snap.kv_len(), Some(t));
+        // The rows come out token-major, as the F16 cache holds them.
+        let token_major = |x: &Tensor| {
+            flat(
+                &x.to_dtype(DType::F16)
+                    .unwrap()
+                    .to_dtype(DType::F32)
+                    .unwrap()
+                    .transpose(1, 2)
+                    .unwrap()
+                    .contiguous()
+                    .unwrap(),
+            )
+        };
+        let (rk, rv) = snap.host_rows(0, t).unwrap().unwrap();
+        assert!(rk == token_major(&k) && rv == token_major(&v));
+
+        // Another sequence takes the ranges, then the snapshot comes back.
+        let ranges = l.context.as_mut().unwrap();
+        ranges.trim_to(0).unwrap();
+        ranges
+            .append(&t4([1, h_kv, 11, d], 34), &t4([1, h_kv, 11, d], 35))
+            .unwrap();
+        restore_layer(l, &snap).unwrap();
+        let ranges = l.context.as_ref().unwrap();
+        assert_eq!(ranges.len(), t);
+        let after = flat(&ranges.attend(&q, scale, t - 1).unwrap());
+        assert!(
+            before
+                .iter()
+                .map(|x| x.to_bits())
+                .eq(after.iter().map(|x| x.to_bits())),
+            "the restored ranges attend otherwise"
+        );
+
+        // Ranges of other sizes take the same rows.
+        l.context = Some(cut(&[3, 8, 30]));
+        restore_layer(l, &snap).unwrap();
+        let other = flat(
+            &l.context
+                .as_ref()
+                .unwrap()
+                .attend(&q, scale, t - 1)
+                .unwrap(),
+        );
+        let worst = before
+            .iter()
+            .zip(&other)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        assert!(worst < 1e-5, "other ranges: max diff {worst}");
+        super::super::tiny_model::remove(&path);
     }
 
     /// A range every key of which is past the rows gives nothing, and the others are exact.

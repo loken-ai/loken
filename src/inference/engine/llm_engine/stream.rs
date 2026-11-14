@@ -3717,7 +3717,13 @@ impl LlmEngine {
                         let mut g = model_state.blocking_lock();
                         if let Some(s) = g.as_mut() {
                             s.model.set_cache_scope(cache_scope);
-                            match s.model.snapshot_kv(full.clone(), pos) {
+                            // A copy off the cards serves a peer, which asks without a stream.
+                            let copy = !s.model.snapshot_leaves_the_cards();
+                            match if copy {
+                                s.model.snapshot_kv(full.clone(), pos)
+                            } else {
+                                Ok(())
+                            } {
                                 Err(e) => tracing::warn!("kv snapshot skipped: {e}"),
                                 Ok(()) => {
                                     if let Some(store) = kv_disk.clone() {

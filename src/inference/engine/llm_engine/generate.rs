@@ -218,6 +218,7 @@ impl LlmEngine {
             .clone()
             .filter(|_| !params.for_peer);
         let cache_scope = params.cache_scope;
+        let for_peer = params.for_peer;
         let probe = params.probe.clone();
 
         let arrived = std::time::Instant::now();
@@ -2127,7 +2128,9 @@ impl LlmEngine {
                 });
                 drop(g);
                 state.model.set_cache_scope(cache_scope);
-                match state.model.snapshot_kv(full.clone(), pos) {
+                // A copy off the cards is taken only for the peer that asked for the prompt.
+                let copy = for_peer || !state.model.snapshot_leaves_the_cards();
+                match if copy { state.model.snapshot_kv(full.clone(), pos) } else { Ok(()) } {
                     Err(e) => tracing::warn!("kv snapshot skipped: {e}"),
                     Ok(()) => {
                         if let Some(store) = kv_disk.clone() {

@@ -1828,11 +1828,9 @@ impl GenericHeteroTransformer {
         // restored by re-appending, which stays on the same quant grid. The host q8 cache
         // has no such round-trip and still bars snapshots. A recurrent state cannot be cut
         // to the prefix a KV snapshot is reused at; it is kept by `snapshot_prefix`.
-        // A cache cut over cards has no snapshot form either: its prefix is read again. Nor
-        // has the cache of a layer on a Vulkan device.
-        self.layers
-            .iter()
-            .all(|l| l.cpu_q8_kv.is_none() && l.context.is_none())
+        // A cache cut over cards is kept as its rows on the host.
+        // The cache of a layer on a Vulkan device has no snapshot form.
+        self.layers.iter().all(|l| l.cpu_q8_kv.is_none())
             && !self.is_recurrent()
             && self.vulkan.is_empty()
             && self.opencl.is_empty()
@@ -1874,12 +1872,26 @@ impl GenericHeteroTransformer {
     /// copied: while the copy does not fit in the free memory less what the snapshot budget
     /// keeps aside, drops the snapshot `tokens` would replace, then the least recently used.
     /// False, with nothing copied, when it still does not fit once none is left.
+    /// The rows of a cache cut over cards are copied to the host: they must fit in what the
+    /// host can spare.
     fn room_for_snapshot(&mut self, tokens: &[u32]) -> bool {
         let need: u64 = self.layers.iter().map(layer_snapshot_bytes).sum();
+        let host_need: u64 = self
+            .layers
+            .iter()
+            .filter_map(|l| l.context.as_ref())
+            .map(|c| c.len() as u64 * c.position_bytes())
+            .sum();
         let reserve = self.snapshot_reserve();
         loop {
             let free = self.free_device_memory();
-            if snapshot_fits(need, free, reserve) {
+            let host_fits = host_need == 0
+                || snapshot_fits(
+                    host_need,
+                    Some(crate::inference::place::layer_executor::host_spill_budget_bytes()),
+                    0,
+                );
+            if snapshot_fits(need, free, reserve) && host_fits {
                 return true;
             }
             let existing: Vec<(&[u32], u64)> = self
@@ -1889,7 +1901,7 @@ impl GenericHeteroTransformer {
                 .collect();
             let Some(victim) = snapshot_slot(&existing, tokens, existing.len()) else {
                 tracing::debug!(
-                    "kv snapshot skipped: {need} bytes do not fit in {} free bytes less {reserve} kept aside",
+                    "kv snapshot skipped: {need} bytes do not fit in {} free bytes less {reserve} kept aside, or {host_need} host bytes do not fit",
                     free.unwrap_or(0)
                 );
                 return false;
@@ -2124,6 +2136,7 @@ impl GenericHeteroTransformer {
         else {
             return Ok(None);
         };
+        self.reserve_context(self.kv_snapshots[index].kv_len);
         let Self {
             layers,
             kv_snapshots,
@@ -2301,6 +2314,8 @@ impl GenericHeteroTransformer {
         &mut self,
         index: usize,
     ) -> crate::tensor::Result<(Vec<u32>, usize)> {
+        // A cache cut over cards takes its blocks for the positions before the rows come back.
+        self.reserve_context(self.kv_snapshots[index].kv_len);
         let Self {
             layers,
             kv_snapshots,
@@ -2374,6 +2389,12 @@ impl GenericHeteroTransformer {
                     .iter()
                     .any(|l| l.quant.is_some())
                     .then_some(crate::tensor::DType::F32)
+            })
+            .or_else(|| {
+                self.layers
+                    .iter()
+                    .find(|l| l.context.is_some())
+                    .map(cut_rows_dtype)
             })?;
         Some(match dt {
             crate::tensor::DType::F16 => 0,
@@ -3081,6 +3102,21 @@ pub(super) fn layer_snapshot_from_rows(
 ) -> crate::tensor::Result<super::LayerKvSnapshot> {
     let (n_kv, hd) = (l.n_kv_head, l.head_dim);
     let n = k.len() / (n_kv * hd);
+    // A cache cut over cards keeps its snapshot's rows on the host, as its own snapshots do.
+    if l.context.is_some() {
+        let mut rows = crate::inference::cache::cpu_f16_kv::CpuF16Kv::new(l.n_head, n_kv, hd, None);
+        let row = n_kv * hd;
+        for t in 0..n {
+            rows.append(&k[t * row..(t + 1) * row], &v[t * row..(t + 1) * row])?;
+        }
+        return Ok(super::LayerKvSnapshot {
+            spec: None,
+            quant: None,
+            cpu_f16: Some(rows),
+            mixer: None,
+            shards: Vec::new(),
+        });
+    }
     // A quantised cache's rows are kept in its own packed form, as its own snapshots are.
     #[cfg(feature = "gpu")]
     if let Some(q) = l.quant_kv.as_ref() {
@@ -3155,15 +3191,43 @@ pub(super) fn restore_layers(
     Ok(())
 }
 
+/// The element type the rows of a cache cut over cards are handed over in: the one the layer's
+/// whole cache holds, so an instance whose cache is whole takes them in its own.
+/// The F16 rows of the ranges are exact in it.
+pub(super) fn cut_rows_dtype(l: &GenericTransformerLayer) -> crate::tensor::DType {
+    match l.kv_f16 {
+        true => crate::tensor::DType::F16,
+        false => crate::tensor::DType::F32,
+    }
+}
+
+/// A cache cut over cards as 1 host F16 cache of its rows, in the order of their positions.
+fn cut_cache_rows(
+    l: &GenericTransformerLayer,
+    c: &super::context_parallel::ContextShards,
+) -> crate::tensor::Result<crate::inference::cache::cpu_f16_kv::CpuF16Kv> {
+    let (k, v) = c.host_rows(0, c.len())?;
+    let mut rows =
+        crate::inference::cache::cpu_f16_kv::CpuF16Kv::new(l.n_head, l.n_kv_head, l.head_dim, None);
+    rows.append_f16_rows(&k, &v)?;
+    Ok(rows)
+}
+
 /// A layer's caches and state, and its shares', as `l` holds them now.
-fn capture_layer(l: &GenericTransformerLayer) -> crate::tensor::Result<super::LayerKvSnapshot> {
+/// The snapshot of a cache cut over cards holds its rows on the host.
+pub(super) fn capture_layer(
+    l: &GenericTransformerLayer,
+) -> crate::tensor::Result<super::LayerKvSnapshot> {
     let mixer = l.state_snapshot()?;
     let mut snap = match quantised_layer_snapshot(l)? {
         Some(snap) => snap,
         None => super::LayerKvSnapshot {
             spec: l.kv_cache.snapshot()?,
             quant: None,
-            cpu_f16: l.cpu_f16_kv.clone(),
+            cpu_f16: match l.context.as_ref() {
+                Some(c) => Some(cut_cache_rows(l, c)?),
+                None => l.cpu_f16_kv.clone(),
+            },
             mixer: None,
             shards: Vec::new(),
         },
@@ -3178,7 +3242,7 @@ fn capture_layer(l: &GenericTransformerLayer) -> crate::tensor::Result<super::La
 }
 
 /// [`capture_layer`]'s snapshot `s` made the layer's and its shares' caches and state again.
-fn restore_layer(
+pub(super) fn restore_layer(
     l: &mut GenericTransformerLayer,
     s: &super::LayerKvSnapshot,
 ) -> crate::tensor::Result<()> {
@@ -3189,6 +3253,9 @@ fn restore_layer(
         Some(state) => l.state_restore(state)?,
         None => l.state_reset(),
     }
+    if restore_cut_layer(l, s)? {
+        return Ok(());
+    }
     if restore_quantised_layer(l, s)? {
         return Ok(());
     }
@@ -3198,6 +3265,30 @@ fn restore_layer(
     }
     l.cpu_f16_kv = s.cpu_f16.clone();
     Ok(())
+}
+
+/// Restore a snapshot layer into a cache cut over cards: the ranges emptied, then the snapshot's
+/// host rows appended, each to the range of this instance's cards it falls in.
+/// Returns `false` for a layer whose cache is not cut.
+fn restore_cut_layer(
+    l: &mut GenericTransformerLayer,
+    s: &super::LayerKvSnapshot,
+) -> crate::tensor::Result<bool> {
+    let (n_kv, hd) = (l.n_kv_head, l.head_dim);
+    let Some(c) = l.context.as_mut() else {
+        return Ok(false);
+    };
+    c.trim_to(0)?;
+    if let Some(rows) = s.cpu_f16.as_ref().filter(|r| !r.is_empty()) {
+        // The host cache keeps each head's rows together: `[1, n_kv, n, head_dim]`.
+        let n = rows.len();
+        let (k, v) = rows.export_kv();
+        let heads = |x: Vec<half::f16>| {
+            crate::tensor::Tensor::from_vec(x, (1, n_kv, n, hd), &crate::tensor::Device::Cpu)
+        };
+        c.append(&heads(k)?, &heads(v)?)?;
+    }
+    Ok(true)
 }
 
 /// Restore a snapshot layer into a quantised cache: its raw codes and scales copied back, or,
