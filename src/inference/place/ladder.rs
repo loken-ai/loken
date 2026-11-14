@@ -461,10 +461,13 @@ pub fn cards_for(owner: &str, reserve: u64) -> Vec<(usize, u64)> {
 }
 
 /// The host-side accelerators, with the bytes each offers once `reserve` is kept free on
-/// it. Empty in a build without them.
+/// it. Empty in a build without them, and when the allowed backends leave OpenCL out.
 pub fn accelerators(reserve: u64) -> Vec<(DeviceKind, u64)> {
     #[cfg(feature = "opencl")]
     {
+        if !crate::gpu::backends::allows(crate::gpu::backends::Backend::OpenCl) {
+            return Vec::new();
+        }
         crate::inference::kernel::opencl::layer_devices()
             .into_iter()
             .enumerate()
