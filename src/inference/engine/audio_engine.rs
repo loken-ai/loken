@@ -7,10 +7,11 @@
 //!      (we accept 16 kHz only here; callers convert), runs the encoder
 //!      followed by a greedy decoder loop, returns the final text.
 //!
-//! Implementation mirrors the reference whisper example but simplified for
-//! greedy / single-language / no-timestamps. Multi-language, beam search,
-//! and timestamp segmentation can be layered on later without changing
-//! the public API.
+//! The decode is greedy and keeps 1 language per clip.
+//!
+//! A clip longer than 1 encoder window is read as the reference transcription reads it.
+//! Each window decodes with timestamps.
+//! The next window starts where the last segment the model left unfinished starts.
 
 use crate::inference::model::whisper::{self as m, audio, Config};
 use crate::tensor::VarBuilder;
@@ -558,9 +559,12 @@ fn token_id(t: &Tokenizer, name: &str) -> AnyResult<u32> {
 
 /// Several transcriptions on the resident model, one answer per job in job order.
 ///
-/// Every clip is cut into its audio windows first, and the windows of all of them run
-/// through the encoder together, in passes of as many as the roomiest card takes. Each
-/// clip is then decoded on its own windows' features, as it would be alone.
+/// The window of every clip that fits in 1 window runs through the encoder with the
+/// others, in passes of as many as the roomiest card takes.
+/// Each clip is then decoded on its own window's features, as it would be alone.
+///
+/// A longer clip brings no window to the shared passes.
+/// It encodes each of its windows when its decode reaches the window's start.
 fn transcribe_group_blocking(
     s: &mut WhisperModelState,
     jobs: &[(Vec<f32>, AudioTranscribeParams)],
@@ -654,23 +658,56 @@ fn pass_features<F>(n: usize, answer: AnyResult<Vec<F>>) -> Vec<AnyResult<F>> {
     (0..n).map(|_| Err(anyhow!("{msg}"))).collect()
 }
 
-/// One clip's mel spectrogram cut into encoder windows.
+/// One clip's mel spectrogram, as the encoder reads it.
 struct MelWindows {
-    /// `[1, n_mels, N_FRAMES]` on the host, in time order; the last is zero-padded at its
-    /// end so the encoder's positions line up.
+    /// The window of a clip that fits in 1 window: `[1, n_mels, N_FRAMES]` on the host.
+    /// Empty for a longer clip and for a clip without audio.
     mels: Vec<Tensor>,
-    /// The mel frame each window starts at.
+    /// The mel frame each window of `mels` starts at.
     starts: Vec<usize>,
+    /// The whole spectrogram of a clip longer than 1 window, read by its seek.
+    long: Option<LongMel>,
     /// Wall time of the spectrogram, in milliseconds.
     mel_ms: f64,
 }
 
-/// Cut a clip into encoder windows. Empty or sub-frame audio has none: the mel filter
-/// window is ~25 ms (400 samples at 16 kHz), and shorter input yields a 0-frame mel.
+/// The spectrogram of a clip longer than 1 encoder window.
+struct LongMel {
+    /// `[1, n_mels, frames]` on the host, the audio's frames followed by padding.
+    mel: Tensor,
+    /// The frames that hold audio.
+    content: usize,
+}
+
+/// The frames of `samples` that hold audio: a frame per hop, the last one partial.
+fn content_frames(samples: usize) -> usize {
+    samples.div_ceil(m::HOP_LENGTH)
+}
+
+/// The encoder window of `mel` (`[1, n_mels, frames]`) that starts at mel frame `seek`.
+/// A window that runs past the last frame is zero-padded at its end.
+fn window_at(mel: &Tensor, seek: usize) -> AnyResult<Tensor> {
+    let (_, n_mels, n_frames) = mel.shape().dims3()?;
+    let size = n_frames.saturating_sub(seek).min(m::N_FRAMES);
+    let segment = mel.narrow(2, seek, size)?;
+    Ok(if size < m::N_FRAMES {
+        let pad = Tensor::zeros(vec![1, n_mels, m::N_FRAMES - size], DType::F32)?;
+        Tensor::cat(&[&segment, &pad], 2)?
+    } else {
+        segment.contiguous()?
+    })
+}
+
+/// Cut a clip into encoder windows.
+/// Empty audio has none.
+///
+/// A clip whose audio fits in 1 window gives that window, which starts at frame 0.
+/// A longer clip gives its whole spectrogram, and its decode picks each window's start.
 fn mel_windows(s: &WhisperModelState, samples: &[f32]) -> AnyResult<MelWindows> {
     let mut windows = MelWindows {
         mels: Vec::new(),
         starts: Vec::new(),
+        long: None,
         mel_ms: 0.0,
     };
     if samples.is_empty() {
@@ -684,22 +721,111 @@ fn mel_windows(s: &WhisperModelState, samples: &[f32]) -> AnyResult<MelWindows> 
     if n_frames == 0 {
         return Ok(windows);
     }
-    let mel_tensor = Tensor::from_vec_f32(mel, vec![1, n_mels, n_frames])?;
-    let mut seek = 0usize;
-    while seek < n_frames {
-        let segment_size = (n_frames - seek).min(m::N_FRAMES);
-        let segment = mel_tensor.narrow(2, seek, segment_size)?;
-        let window = if segment_size < m::N_FRAMES {
-            let pad = Tensor::zeros(vec![1, n_mels, m::N_FRAMES - segment_size], DType::F32)?;
-            Tensor::cat(&[&segment, &pad], 2)?
-        } else {
-            segment.contiguous()?
-        };
-        windows.mels.push(window);
-        windows.starts.push(seek);
-        seek += segment_size;
+    let mel = Tensor::from_vec_f32(mel, vec![1, n_mels, n_frames])?;
+    let content = content_frames(samples.len());
+    if content > m::N_FRAMES {
+        windows.long = Some(LongMel { mel, content });
+    } else {
+        windows.mels.push(window_at(&mel, 0)?);
+        windows.starts.push(0);
     }
     Ok(windows)
+}
+
+/// Where the decode of a long clip goes on after 1 window.
+#[derive(Debug, PartialEq, Eq)]
+struct SeekStep {
+    /// The tokens of the window's output that are kept: its complete segments.
+    kept: usize,
+    /// The mel frames from the window's start to the next window's start.
+    advance: usize,
+}
+
+/// The next window of a long clip after a window of `segment_frames` audio frames whose
+/// output is `body`.
+///
+/// A timestamp token is at least `timestamp_begin`.
+/// Each timestamp step covers `frames_per_timestamp` mel frames.
+///
+/// 2 timestamps in a row close a segment and open the next one.
+/// An output that ends inside a segment keeps its segments up to the last 2 timestamps in a row.
+/// The next window then starts at the first of those 2, where the unfinished segment starts.
+///
+/// An output that ends on a closing timestamp keeps every token and moves by the whole window.
+/// An output without 2 timestamps in a row does the same.
+/// A last segment that closes at the window's start does the same, so the decode always moves.
+fn seek_step(
+    body: &[u32],
+    timestamp_begin: u32,
+    segment_frames: usize,
+    frames_per_timestamp: usize,
+) -> SeekStep {
+    let whole = SeekStep {
+        kept: body.len(),
+        advance: segment_frames,
+    };
+    let is_timestamp = |t: u32| t >= timestamp_begin;
+    let ends_closed = body.len() >= 2
+        && !is_timestamp(body[body.len() - 2])
+        && is_timestamp(body[body.len() - 1]);
+    let last_pair = (1..body.len())
+        .rev()
+        .find(|&i| is_timestamp(body[i - 1]) && is_timestamp(body[i]));
+    match last_pair {
+        Some(i) if !ends_closed => {
+            let advance = (body[i - 1] - timestamp_begin) as usize * frames_per_timestamp;
+            match advance {
+                0 => whole,
+                advance => SeekStep { kept: i, advance },
+            }
+        }
+        _ => whole,
+    }
+}
+
+/// The rules of the model's reference decoding on timestamp tokens, applied to `logits`, the
+/// next token's logits after the tokens `sampled` since the prompt.
+///
+/// The output opens with a timestamp.
+/// A timestamp after text is followed by a second timestamp or by `eot`.
+/// 2 timestamps in a row are followed by text.
+/// A timestamp is never earlier than the last one.
+/// A timestamp is taken whenever all timestamps together are likelier than the likeliest text
+/// token.
+fn apply_timestamp_rules(logits: &mut [f32], sampled: &[u32], timestamp_begin: u32, eot: u32) {
+    let tb = (timestamp_begin as usize).min(logits.len());
+    let is_timestamp = |t: u32| t >= timestamp_begin;
+    let last = sampled.last().copied().filter(|&t| is_timestamp(t));
+    let penultimate_is_timestamp = sampled.len() < 2 || is_timestamp(sampled[sampled.len() - 2]);
+    if last.is_some() {
+        match penultimate_is_timestamp {
+            true => logits[tb..].fill(f32::NEG_INFINITY),
+            false => logits[..(eot as usize).min(tb)].fill(f32::NEG_INFINITY),
+        }
+    }
+    if let Some(&latest) = sampled.iter().rev().find(|&&t| is_timestamp(t)) {
+        let floor = match last.is_some() && !penultimate_is_timestamp {
+            true => latest,
+            false => latest + 1,
+        };
+        let floor = (floor as usize).min(logits.len());
+        logits[tb..floor.max(tb)].fill(f32::NEG_INFINITY);
+    }
+    if sampled.is_empty() {
+        logits[..tb].fill(f32::NEG_INFINITY);
+    }
+    let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    if !max.is_finite() {
+        return;
+    }
+    let timestamps = logits[tb..].iter().map(|&l| (l - max).exp()).sum::<f32>();
+    let best_text = logits[..tb]
+        .iter()
+        .copied()
+        .fold(f32::NEG_INFINITY, f32::max);
+    if timestamps > 0.0 && timestamps.ln() + max > best_text {
+        logits[..tb].fill(f32::NEG_INFINITY);
+    }
 }
 
 /// One encoder pass over `pass` windows stacked along the batch axis: one
@@ -738,7 +864,7 @@ fn transcribe_windows(
 ) -> AnyResult<TranscribeResult> {
     let duration_s = n_samples as f32 / m::SAMPLE_RATE as f32;
     let mel_ms = windows.mel_ms;
-    if windows.starts.is_empty() {
+    if windows.starts.is_empty() && windows.long.is_none() {
         return Ok(TranscribeResult {
             text: String::new(),
             language: params.language.clone().unwrap_or_else(|| "en".to_string()),
@@ -748,7 +874,6 @@ fn transcribe_windows(
         });
     }
 
-    // Iterate over 30-second chunks.
     // Whisper assumes a single language per file. Cache the detected
     // code after chunk 0 and pin params.language for the rest of the
     // file - skips a redundant per-chunk SOT decoder pass plus the
@@ -762,13 +887,36 @@ fn transcribe_windows(
     let mut total_lp_count: usize = 0;
     let mut first_chunk_no_speech: Option<f32> = None;
     let mut effective = params.clone();
-    for (seek, audio_features) in windows.starts.iter().zip(features) {
+    // A clip of 1 window decodes the features of the shared pass.
+    // A longer clip encodes the window at its seek, decodes it, and moves the seek to the
+    // start of the last segment the window left unfinished.
+    let mut shared = windows.starts.iter().zip(features);
+    let mut seek = 0usize;
+    loop {
         if let Some(cancel) = &params.cancel {
             cancel.bail().map_err(|e| anyhow!("{e}"))?;
         }
-        let chunk_offset_s = (*seek as f32) * 0.01; // 1 frame = 10 ms in whisper's mel
+        let (start, audio_features, segment_frames) = match &windows.long {
+            Some(long) if seek < long.content => {
+                let window = window_at(&long.mel, seek)?;
+                let encoded = encode_pass(s, &[&window])?.remove(0);
+                (seek, encoded, Some((long.content - seek).min(m::N_FRAMES)))
+            }
+            Some(_) => break,
+            None => match shared.next() {
+                Some((start, features)) => (*start, features.clone(), None),
+                None => break,
+            },
+        };
+        let chunk_offset_s = (start as f32) * 0.01; // 1 frame = 10 ms in whisper's mel
         let audio_features = audio_features.to_device(&s.device)?;
-        let dec = decode_segment(s, &audio_features, &effective, chunk_offset_s)?;
+        let dec = decode_segment(
+            s,
+            &audio_features,
+            &effective,
+            chunk_offset_s,
+            segment_frames,
+        )?;
         tracing::debug!(
             "whisper chunk at {chunk_offset_s:.1} s: mel {mel_ms:.1} ms, \
              prompt {:.1} ms, {} steps {:.1} ms",
@@ -776,6 +924,7 @@ fn transcribe_windows(
             dec.timing.steps,
             dec.timing.steps_ms,
         );
+        seek = start + dec.advance;
         if detected_lang.is_none() {
             detected_lang = Some(dec.lang_code.clone());
             if effective.language.is_none() {
@@ -857,6 +1006,8 @@ struct ChunkDecode {
     logprob_sum: f64,
     logprob_count: usize,
     chunk_no_speech_prob: f32,
+    /// The mel frames from this window's start to the next window's start.
+    advance: usize,
     timing: ChunkTiming,
 }
 
@@ -871,12 +1022,20 @@ struct ChunkTiming {
 }
 
 /// Decode one window from its encoded `audio_features`.
+///
+/// `segment_frames` is set for a window of a clip longer than 1 window: the audio frames the
+/// window holds.
+/// Such a window decodes with timestamps under the reference rules.
+/// Its output keeps its complete segments, and `advance` says where the next window starts.
 fn decode_segment(
     s: &mut WhisperModelState,
     audio_features: &Tensor,
     params: &AudioTranscribeParams,
     chunk_offset_s: f32,
+    segment_frames: Option<usize>,
 ) -> AnyResult<ChunkDecode> {
+    let timestamps = params.timestamps || segment_frames.is_some();
+    let timestamp_begin = s.control.no_timestamps + 1;
     let mut timing = ChunkTiming::default();
     let t_prompt = std::time::Instant::now();
     // New audio: the cross attentions project these features on their first call and keep
@@ -986,7 +1145,7 @@ fn decode_segment(
         tokens.push(lt);
     }
     tokens.push(task_token);
-    if !params.timestamps {
+    if !timestamps {
         tokens.push(s.control.no_timestamps);
     }
     // Track the prompt length so we know where to start stripping after
@@ -1056,6 +1215,10 @@ fn decode_segment(
         for (l, m) in logits.iter_mut().zip(&s.vocab.suppress) {
             *l += m;
         }
+        if segment_frames.is_some() {
+            let sampled = &tokens[prompt_len..];
+            apply_timestamp_rules(&mut logits, sampled, timestamp_begin, s.control.eot);
+        }
 
         let next_token = if temperature > 0.0 {
             let scaled: Vec<f32> = logits.iter().map(|&l| l / temperature as f32).collect();
@@ -1083,17 +1246,27 @@ fn decode_segment(
 
     // Strip the prompt prefix (and trailing EOT) before any further
     // processing. `prompt_len` was captured above before sampling.
-    let body: Vec<u32> = tokens
+    let mut body: Vec<u32> = tokens
         .into_iter()
         .skip(prompt_len)
         .take_while(|&t| t != s.control.eot)
         .collect();
+    // A window of a long clip keeps its complete segments.
+    // The unfinished one is decoded again from the next window, which starts where it starts.
+    let advance = match segment_frames {
+        Some(frames) => {
+            let per_step = m::N_FRAMES / s.config.max_source_positions.max(1);
+            let step = seek_step(&body, timestamp_begin, frames, per_step);
+            body.truncate(step.kept);
+            step.advance
+        }
+        None => m::N_FRAMES,
+    };
 
     // Parse segments when timestamps were requested AND the model
     // actually emitted timestamp tokens (`token >= timestamp_begin`).
     // Each pair of consecutive timestamp tokens bounds a segment whose
     // text is the tokens between them.
-    let timestamp_begin = s.control.no_timestamps + 1;
     // `logprobs` has one entry per appended token (parallel to body
     // plus a trailing EOT if the loop closed on it). Truncate to body
     // length so per-segment averaging uses only the text/timestamp
@@ -1144,6 +1317,10 @@ fn decode_segment(
     // mean across chunks instead of mean-of-means.
     let logprob_sum: f64 = logprobs.iter().map(|x| *x as f64).sum();
     let logprob_count = logprobs.len();
+    // A caller that asked for no timestamps gets none in the tokens.
+    if !params.timestamps {
+        body.retain(|&t| t < timestamp_begin);
+    }
     Ok(ChunkDecode {
         text,
         body,
@@ -1152,6 +1329,7 @@ fn decode_segment(
         logprob_sum,
         logprob_count,
         chunk_no_speech_prob: no_speech_prob,
+        advance,
         timing,
     })
 }
@@ -1691,5 +1869,185 @@ mod tests {
             "a pass that drops a window is refused for each of its windows"
         );
         assert!(short[4].is_ok(), "the lone last window keeps its feature");
+    }
+
+    /// The first timestamp token of the toy vocabularies below.
+    const TB: u32 = 1000;
+
+    /// A timestamp token at `frames` mel frames from its window's start.
+    fn ts(frames: usize) -> u32 {
+        TB + (frames / 2) as u32
+    }
+
+    #[test]
+    fn a_window_that_ends_inside_a_segment_hands_it_to_the_next_window() {
+        let body = [ts(0), 1, 2, ts(500), ts(500), 3, 4, ts(2400), ts(2400), 5];
+        assert_eq!(
+            seek_step(&body, TB, 3000, 2),
+            SeekStep {
+                kept: 8,
+                advance: 2400
+            }
+        );
+    }
+
+    #[test]
+    fn a_window_whose_segments_all_close_moves_by_the_whole_window() {
+        let whole = |body: &[u32], frames| SeekStep {
+            kept: body.len(),
+            advance: frames,
+        };
+        let closed = [ts(0), 1, ts(500), ts(500), 2, ts(900)];
+        assert_eq!(seek_step(&closed, TB, 3000, 2), whole(&closed, 3000));
+        let single = [ts(0), 1, 2, ts(700)];
+        assert_eq!(seek_step(&single, TB, 1200, 2), whole(&single, 1200));
+        let none = [1, 2, 3];
+        assert_eq!(seek_step(&none, TB, 3000, 2), whole(&none, 3000));
+        let at_start = [ts(0), ts(0), 1];
+        assert_eq!(seek_step(&at_start, TB, 3000, 2), whole(&at_start, 3000));
+        assert_eq!(seek_step(&[], TB, 3000, 2), whole(&[], 3000));
+    }
+
+    /// A toy recording: word `k` sounds from `k * 47 + 5` to `k * 47 + 45` mel frames, and
+    /// every 7 words make a sentence.
+    /// Word 63 straddles the end of the first window.
+    fn toy_words() -> Vec<(u32, usize, usize)> {
+        (0..160u32)
+            .map(|k| (k, k as usize * 47 + 5, k as usize * 47 + 45))
+            .collect()
+    }
+
+    /// The output of a toy model on the window of `frames` frames at `seek`: the sentences
+    /// that start in the window, each opened by a timestamp, then their words heard whole.
+    /// A sentence heard to its end is closed by a timestamp.
+    fn toy_decode(words: &[(u32, usize, usize)], seek: usize, frames: usize) -> Vec<u32> {
+        let end = seek + frames;
+        let mut body = Vec::new();
+        for sentence in words.chunks(7) {
+            let (start, stop) = (sentence[0].1, sentence[sentence.len() - 1].2);
+            if start < seek {
+                continue;
+            }
+            if start >= end {
+                break;
+            }
+            body.push(ts(start - seek));
+            body.extend(sentence.iter().filter(|w| w.2 <= end).map(|w| w.0));
+            if stop > end {
+                break;
+            }
+            body.push(ts(stop - seek));
+        }
+        body
+    }
+
+    #[test]
+    fn the_seek_keeps_every_word_of_a_recording_longer_than_a_window() {
+        let words = toy_words();
+        let content = words[words.len() - 1].2;
+        let said: Vec<u32> = words.iter().map(|w| w.0).collect();
+        let (mut seek, mut heard) = (0, Vec::<u32>::new());
+        while seek < content {
+            let frames = (content - seek).min(m::N_FRAMES);
+            let body = toy_decode(&words, seek, frames);
+            let step = seek_step(&body, TB, frames, 2);
+            heard.extend(body[..step.kept].iter().copied().filter(|&t| t < TB));
+            seek += step.advance;
+        }
+        assert_eq!(heard, said);
+        let mut fixed = Vec::new();
+        for seek in (0..content).step_by(m::N_FRAMES) {
+            let frames = (content - seek).min(m::N_FRAMES);
+            let heard_whole = words.iter().filter(|w| w.1 >= seek && w.2 <= seek + frames);
+            fixed.extend(heard_whole.map(|w| w.0));
+        }
+        assert!(
+            !fixed.contains(&63),
+            "fixed windows lose the word across their edge"
+        );
+    }
+
+    /// Logits of a toy vocabulary: text below `TB`, `eot` at 999, 1501 timestamps from `TB`.
+    fn toy_logits() -> Vec<f32> {
+        vec![0.0; TB as usize + 1501]
+    }
+
+    fn allowed(logits: &[f32]) -> (bool, bool, bool) {
+        let text = logits[..999].iter().any(|l| l.is_finite());
+        let eot = logits[999].is_finite();
+        let stamp = logits[TB as usize..].iter().any(|l| l.is_finite());
+        (text, eot, stamp)
+    }
+
+    #[test]
+    fn the_timestamp_rules_open_pair_and_order_the_timestamps() {
+        let mut l = toy_logits();
+        apply_timestamp_rules(&mut l, &[], TB, 999);
+        assert_eq!(
+            allowed(&l),
+            (false, false, true),
+            "the output opens with a timestamp"
+        );
+
+        let mut l = toy_logits();
+        apply_timestamp_rules(&mut l, &[TB + 5], TB, 999);
+        assert!(
+            !allowed(&l).2,
+            "a lone opening timestamp is followed by text"
+        );
+
+        let mut l = toy_logits();
+        apply_timestamp_rules(&mut l, &[TB, 7, TB + 40], TB, 999);
+        assert!(
+            !allowed(&l).0,
+            "a timestamp after text is not followed by text"
+        );
+        assert!(
+            l[TB as usize + 39].is_infinite(),
+            "a timestamp never goes back"
+        );
+        assert!(
+            l[TB as usize + 40].is_finite(),
+            "the next segment may open at once"
+        );
+
+        let mut l = toy_logits();
+        apply_timestamp_rules(&mut l, &[TB, 7, TB + 40, TB + 40], TB, 999);
+        assert!(!allowed(&l).2, "2 timestamps in a row are followed by text");
+
+        let mut l = toy_logits();
+        apply_timestamp_rules(&mut l, &[TB, 7], TB, 999);
+        assert!(
+            l[TB as usize].is_infinite(),
+            "a closing timestamp is later than the opening"
+        );
+        assert_eq!(
+            allowed(&l),
+            (false, false, true),
+            "all timestamps together outweigh any single text token"
+        );
+        let mut l = toy_logits();
+        l[7] = 10.0;
+        apply_timestamp_rules(&mut l, &[TB, 7], TB, 999);
+        assert!(
+            l[7].is_finite(),
+            "a text token likelier than every timestamp stays"
+        );
+    }
+
+    #[test]
+    fn a_clip_longer_than_a_window_is_read_by_its_seek() {
+        assert_eq!(content_frames(m::N_SAMPLES), m::N_FRAMES);
+        assert_eq!(content_frames(m::N_SAMPLES + 1), m::N_FRAMES + 1);
+        assert_eq!(content_frames(1), 1);
+        let mel = Tensor::from_vec_f32(vec![1.0; 2 * 4000], vec![1, 2, 4000]).unwrap();
+        let tail = window_at(&mel, 3000).unwrap();
+        assert_eq!(tail.shape().dims3().unwrap(), (1, 2, m::N_FRAMES));
+        let row = tail.narrow(1, 0, 1).unwrap().to_vec_f32();
+        assert!(row[..1000].iter().all(|&v| v == 1.0));
+        assert!(
+            row[1000..].iter().all(|&v| v == 0.0),
+            "past the last frame is zeros"
+        );
     }
 }

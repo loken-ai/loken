@@ -1615,3 +1615,152 @@ fn a_seed_derives_from_the_timbre_text() {
         seed_of_text("A bright voice.")
     );
 }
+
+/// The words of `text` in lower case, without punctuation.
+fn words_of(text: &str) -> Vec<String> {
+    text.to_lowercase()
+        .split(|c: char| !(c.is_alphanumeric() || c == '\''))
+        .filter(|w| !w.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// The word error of `heard` against `said`: the edits from one to the other over the words
+/// said.
+fn word_error(said: &[String], heard: &[String]) -> f64 {
+    let mut row: Vec<usize> = (0..=heard.len()).collect();
+    for (i, s) in said.iter().enumerate() {
+        let mut diagonal = row[0];
+        row[0] = i + 1;
+        for (j, h) in heard.iter().enumerate() {
+            let next = (row[j + 1] + 1)
+                .min(row[j] + 1)
+                .min(diagonal + usize::from(s != h));
+            diagonal = row[j + 1];
+            row[j + 1] = next;
+        }
+    }
+    row[heard.len()] as f64 / said.len().max(1) as f64
+}
+
+/// The transcript of the WAV `wav` by the transcription route.
+async fn transcribe_wav(state: &APIServer, model: &str, language: &str, wav: Vec<u8>) -> String {
+    let boundary = "transcription-test";
+    let mut body = Vec::new();
+    for (name, value) in [("model", model), ("language", language)] {
+        body.extend(
+            format!("--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n")
+                .as_bytes(),
+        );
+    }
+    body.extend(
+        format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"clip.wav\"\r\n\
+             Content-Type: audio/wav\r\n\r\n"
+        )
+        .as_bytes(),
+    );
+    body.extend(wav);
+    body.extend(format!("\r\n--{boundary}--\r\n").as_bytes());
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(
+        axum::http::header::CONTENT_TYPE,
+        format!("multipart/form-data; boundary={boundary}")
+            .parse()
+            .unwrap(),
+    );
+    let response = super::wav::audio_transcriptions(
+        axum::extract::State(state.clone()),
+        headers,
+        axum::http::Extensions::default(),
+        body.into(),
+    )
+    .await;
+    assert_eq!(response.status().as_u16(), 200);
+    let bytes = axum::body::to_bytes(response.into_body(), 1 << 24)
+        .await
+        .unwrap();
+    let answer: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    answer["text"].as_str().unwrap_or_default().to_string()
+}
+
+/// A spoken paragraph longer than 1 recognition window is transcribed whole with no more word
+/// error than its 2 halves cut at a pause and transcribed apart.
+#[tokio::test]
+#[ignore = "needs the CustomVoice and whisper-large-v3-turbo checkpoints in the test store"]
+async fn a_recording_longer_than_a_window_keeps_the_words_at_its_edges() {
+    const SPEECH: &str = "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice";
+    const ASR: &str = "openai/whisper-large-v3-turbo";
+    let source = crate::config::Config::load_test()
+        .get_hf_models_dir()
+        .join("hub");
+    let hf =
+        crate::inference::generic_transformer::class_load::tests::scratch("long-transcription");
+    std::fs::create_dir_all(hf.join("hub")).unwrap();
+    for repo in [SPEECH, ASR] {
+        let dir = format!("models--{}", repo.replace('/', "--"));
+        if !source.join(&dir).is_dir() {
+            eprintln!("{repo} is not in the test store");
+            return;
+        }
+        std::os::unix::fs::symlink(source.join(&dir), hf.join("hub").join(&dir)).unwrap();
+    }
+    let state = APIServer::new(
+        "/nonexistent-ollama-models".to_string(),
+        hf.to_string_lossy().to_string(),
+    );
+    let text = "Le 14 mars 2025, le petit musée de la rue du Port a ouvert ses portes à 9 heures. \
+        En une heure, 312 visiteurs avaient déjà parcouru la grande salle, dont beaucoup \
+        d'étudiants de l'université voisine. Le directeur, un homme patient nommé Thomas Leroy, \
+        a déclaré aux journalistes : « Nous avons attendu 7 ans pour ce jour. » Il a expliqué \
+        que le bâtiment abritait autrefois la première station de radio de la ville. Pourquoi \
+        avoir attendu si longtemps ? L'argent, les formalités, et un toit qui fuyait chaque hiver.";
+    let spoken = super::decode::audio_speech(
+        axum::extract::State(state.clone()),
+        axum::http::HeaderMap::new(),
+        Json(serde_json::json!({
+            "model": SPEECH, "voice": "ryan", "language": "fr", "input": text,
+        })),
+    )
+    .await;
+    assert_eq!(spoken.status().as_u16(), 200);
+    let wav = axum::body::to_bytes(spoken.into_body(), 1 << 28)
+        .await
+        .unwrap()
+        .to_vec();
+    let (pcm, _, rate) = super::decode::decode_audio_planar(&wav).unwrap();
+    let window = crate::inference::model::whisper::CHUNK_LENGTH * rate as usize;
+    assert!(
+        pcm.len() > window,
+        "the paragraph is spoken in more than 1 window"
+    );
+
+    // The 2 halves meet at the quietest hop of the middle third.
+    let hop = rate as usize / 100;
+    let third = pcm.len() / 3;
+    let cut = (third..2 * third - hop)
+        .step_by(hop)
+        .min_by(|&a, &b| {
+            let energy = |at: usize| pcm[at..at + hop].iter().map(|x| x * x).sum::<f32>();
+            energy(a).total_cmp(&energy(b))
+        })
+        .unwrap();
+    let mut halves = String::new();
+    for piece in [&pcm[..cut], &pcm[cut..]] {
+        let wav = super::wav::pcm_to_wav_ch(piece, rate, 1);
+        halves.push_str(&transcribe_wav(&state, ASR, "fr", wav).await);
+        halves.push(' ');
+    }
+    let whole = transcribe_wav(&state, ASR, "fr", wav).await;
+    let said = words_of(text);
+    let (whole_error, halves_error) = (
+        word_error(&said, &words_of(&whole)),
+        word_error(&said, &words_of(&halves)),
+    );
+    eprintln!("whole {whole_error:.3}: {whole}\nhalves {halves_error:.3}: {halves}");
+    assert!(
+        whole_error <= halves_error,
+        "whole {whole_error} against halves {halves_error}"
+    );
+    let _ = std::fs::remove_dir_all(&hf);
+}

@@ -256,7 +256,7 @@ A valid identifier has letters, digits, dot, underscore and dash, 64 characters 
 
 | Route | Grouped when | Shared pass |
 |---|---|---|
-| `POST /v1/audio/transcriptions`, `/translations` (Whisper) | the same resident model | The audio windows of every clip run through the encoder as 1 batch. Each clip decodes on its own windows. |
+| `POST /v1/audio/transcriptions`, `/translations` (Whisper) | the same resident model | The window of every clip of 30 s or less runs through the encoder as 1 batch. Each clip decodes on its own window. A longer clip is read as the model's reference transcription reads it. Each window decodes with timestamps, and the next window starts where the last segment the model left unfinished starts. That clip encodes each window when its decode reaches it. |
 | `POST /v1/images/generations` (an SDXL checkpoint) | not streamed, `n` 1, no `control_image`, no `regions`, and the same model, `size`, step count, `sampler`, `scheduler` and `loras` | The group takes the media gate once. Its renders denoise as 1 batch, with the prompt, `negative_prompt`, `guidance` and `seed` of each request. |
 
 A request starts at once when no group of its kind runs, and queues behind the group otherwise:
