@@ -20,6 +20,8 @@ pub(crate) async fn list_models(
         Ok(mut models) => {
             #[cfg(feature = "media")]
             inject_local_media(&state, &mut models);
+            // What the tags route lists: present weights a loader reads.
+            models.retain(|m| state.serves_weights(m));
             let count = models.len();
             info!("   Found {} model(s)", count);
             // Stable alphabetical order matching /api/tags and /v1/models
@@ -365,7 +367,7 @@ pub(crate) async fn ollama_embed(
     OllamaJson(request): OllamaJson<OllamaEmbedRequest>,
 ) -> Result<Json<OllamaEmbedResponse>, ApiError> {
     validate_model_id(&request.model)?;
-    let model_name = normalize_model_id(&request.model);
+    let model_name = state.served_model_id(&request.model).await;
     info!("Embed request for model: {}", model_name);
 
     // Parse input: can be a single string or array of strings
@@ -1090,7 +1092,7 @@ async fn embed_where_the_model_is<R: serde::Serialize>(
     request: &R,
 ) -> Option<axum::response::Response> {
     let body = serde_json::to_value(request).ok()?;
-    let model = normalize_model_id(model);
+    let model = state.served_model_id(model).await;
     let holds = |n: &crate::distributed::membership::NodeState| {
         crate::distributed::routing::can_serve(n, &model)
     };

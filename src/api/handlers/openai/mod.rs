@@ -403,7 +403,7 @@ pub(crate) async fn chat_completion_at(
 
     validate_model_id(&request.model)?;
     // Normalize model ID
-    let model_name = normalize_model_id(&request.model);
+    let model_name = state.served_model_id(&request.model).await;
     // The conversation goes where the model is. Peers are asked about the prompt this
     // node would prefill, which is the text their caches are keyed on.
     let clustered = state.cluster_handle().is_some();
@@ -1016,7 +1016,7 @@ pub(crate) async fn text_completions_at(
     let model = text_field(&body, "model");
     // The completion goes where the model is.
     {
-        let model_name = crate::api::handlers::normalize_model_id(&model);
+        let model_name = state.served_model_id(&model).await;
         let prompt_text = fim_wrapped(&body, completion_prompt_text(&body).unwrap_or_default());
         let max_tokens = body["max_tokens"].as_u64().map_or_else(
             || crate::distributed::rate_meter::expected_output_tokens(&model_name),
@@ -1253,7 +1253,7 @@ pub(crate) async fn text_completions_at(
     }
 
     validate_model_id(&model)?;
-    let model_name = normalize_model_id(&model);
+    let model_name = state.served_model_id(&model).await;
 
     // Reject non-decoder pipeline components (parity with the chat path).
     if let Some(hint) = non_chat_pipeline_component(&state.huggingface_models_dir, &model_name) {
@@ -1940,8 +1940,12 @@ pub(crate) async fn openai_retrieve_model(
     if let Err(e) = validate_model_id(&model_id) {
         return e.into_response();
     }
-    let normalized = normalize_model_id(&model_id);
+    let normalized = state.served_model_id(&model_id).await;
     let now = chrono::Utc::now().timestamp();
+    if let Some(refusal) = state.companion_refusal(&normalized).await {
+        let code = axum::http::StatusCode::NOT_FOUND;
+        return (code, Json(openai_error_body(code, refusal))).into_response();
+    }
 
     // Look up among locally-cached LLM checkpoints first.
     if let Ok(models) = state.model_manager.list_models().await {
@@ -2014,7 +2018,7 @@ pub(crate) async fn openai_rerank(
 ) -> axum::response::Response {
     // The request goes to a node whose catalogue holds the model when this one's does not.
     {
-        let model = normalize_model_id(&text_field(&body, "model"));
+        let model = state.served_model_id(&text_field(&body, "model")).await;
         let holds = |n: &crate::distributed::membership::NodeState| {
             crate::distributed::routing::can_serve(n, &model)
         };
@@ -2087,7 +2091,7 @@ pub(crate) async fn openai_rerank(
     if let Err(e) = validate_model_id(&model) {
         return e.into_response();
     }
-    let model_name = normalize_model_id(&model);
+    let model_name = state.served_model_id(&model).await;
     let engine = match state.get_engine(&model_name).await {
         Ok(e) => e,
         Err(_) => {
@@ -2158,7 +2162,7 @@ pub(crate) async fn openai_embeddings(
 ) -> axum::response::Response {
     // The request goes to a node whose catalogue holds the model when this one's does not.
     {
-        let model = normalize_model_id(&text_field(&body, "model"));
+        let model = state.served_model_id(&text_field(&body, "model")).await;
         let holds = |n: &crate::distributed::membership::NodeState| {
             crate::distributed::routing::can_serve(n, &model)
         };
@@ -2288,7 +2292,7 @@ pub(crate) async fn openai_embeddings(
     if let Err(e) = validate_model_id(&model) {
         return e.into_response();
     }
-    let model_name = normalize_model_id(&model);
+    let model_name = state.served_model_id(&model).await;
     // Loads on demand, as the chat and completion endpoints do.
     let keep_alive = state.get_effective_keep_alive(None);
     if let Err(e) = state.ensure_loaded(&model_name, keep_alive).await {

@@ -39,6 +39,7 @@ use crate::inference::engine::image_engine::{
 use crate::inference::engine::llm_engine::{GenerationParams, InferenceConfig, LlmEngine};
 #[cfg(feature = "audio")]
 use crate::inference::engine::tts_engine::{LoadWatch, TtsResult, TtsSynthParams};
+use crate::inference::generic_transformer::wide_sparse_sibling;
 use crate::inference::load::model_manager::ModelManager;
 use crate::stats::StatsMonitor;
 use serde::{Deserialize, Serialize};
@@ -1737,6 +1738,9 @@ impl APIServer {
         if self.engine_serves(model_id).await {
             return Ok(());
         }
+        if let Some(refusal) = self.companion_refusal(model_id).await {
+            return Err(refusal);
+        }
         // Announce the load so a client listing models sees it in flight rather than a gap; the
         // guard clears it whichever way this function returns, error included.
         let load_guard = self.loading.begin(model_id);
@@ -2025,12 +2029,103 @@ impl APIServer {
             return text_loader_can_open(&self.huggingface_models_dir, model);
         }
         match self.manifest_layer_path(&model.id, "model") {
-            Some(blob) => blob.exists(),
+            Some(blob) => blob.exists() && !wide_sparse_sibling::is_companion(&blob),
             None => true,
         }
     }
 
-    fn manifest_layer_path(&self, model_id: &str, kind: &str) -> Option<PathBuf> {
+    /// The model that takes `model_id` as its companion, when `model_id` names a companion
+    /// file and not a model.
+    ///
+    /// `Some(None)` for a companion no listed model takes.
+    /// `None` for anything else.
+    ///
+    /// Several models read one companion when their blobs, or their drafts, are the same.
+    /// The owner is the reader whose blob a further model layer of the companion's manifest names.
+    /// Among several such readers, or without one, it is the reader whose companion tag is
+    /// `model_id`.
+    /// Without either it is the first reader in catalogue order, and the log names it.
+    pub(crate) async fn companion_owner(&self, model_id: &str) -> Option<Option<String>> {
+        let layers = self.manifest_layer_paths(model_id, "model");
+        let companion = layers.first()?.clone();
+        if !wide_sparse_sibling::is_companion(&companion) {
+            return None;
+        }
+        let models = self.model_manager.list_models().await.unwrap_or_default();
+        let mut readers: Vec<&str> = models
+            .iter()
+            .filter(|m| m.source != "huggingface" && m.id != model_id)
+            .filter(|m| {
+                self.manifest_layer_path(&m.id, "model")
+                    .is_some_and(|blob| wide_sparse_sibling::takes_companion(&blob, &companion))
+            })
+            .map(|m| m.id.as_str())
+            .collect();
+        readers.sort_unstable();
+        readers.dedup();
+        // The further model layers of the companion's manifest name the model it was written for.
+        let declared: Vec<PathBuf> = layers[1..]
+            .iter()
+            .filter_map(|p| std::fs::canonicalize(p).ok())
+            .collect();
+        let holds_declared = |reader: &str| {
+            self.manifest_layer_path(reader, "model")
+                .and_then(|p| std::fs::canonicalize(p).ok())
+                .is_some_and(|blob| declared.contains(&blob))
+        };
+        let requested = self
+            .manifest_path(model_id)
+            .and_then(|p| std::fs::canonicalize(p).ok());
+        let tagged = |reader: &str| {
+            let tag = self
+                .manifest_path(reader)
+                .and_then(|m| wide_sparse_sibling::companion_manifest(&m))
+                .and_then(|p| std::fs::canonicalize(p).ok());
+            tag.is_some() && tag == requested
+        };
+        let pick = |rule: &dyn Fn(&str) -> bool| readers.iter().copied().find(|r| rule(r));
+        let named = pick(&|r| holds_declared(r) && tagged(r))
+            .or_else(|| pick(&holds_declared))
+            .or_else(|| pick(&tagged));
+        let owner = named.or_else(|| readers.first().copied());
+        if let (None, Some(first), true) = (named, owner, readers.len() > 1) {
+            info!(
+                "'{model_id}' is read by {}: '{first}' serves it, the first in the catalogue",
+                readers.join(", ")
+            );
+        }
+        Some(owner.map(str::to_string))
+    }
+
+    /// Why `model_id` cannot be served, when it names a companion file and not a model.
+    pub(crate) async fn companion_refusal(&self, model_id: &str) -> Option<String> {
+        let owner = self.companion_owner(model_id).await?;
+        Some(match owner {
+            Some(owner) => format!(
+                "'{model_id}' is a companion file of '{owner}', not a model: \
+                 request '{owner}', which reads it"
+            ),
+            None => format!(
+                "'{model_id}' is a companion file, not a model, and no model in the store reads it"
+            ),
+        })
+    }
+
+    /// The model a request that names `requested` is served by, under its own name.
+    ///
+    /// The name takes its tag, `latest` when it has none.
+    /// A companion file stands for the model that reads it.
+    /// A companion no listed model reads keeps its name, and its load is refused.
+    pub(crate) async fn served_model_id(&self, requested: &str) -> String {
+        let id = normalize_model_id(requested);
+        match self.companion_owner(&id).await {
+            Some(Some(owner)) => owner,
+            _ => id,
+        }
+    }
+
+    /// The manifest of `model_id` in the Ollama store, its tag `latest` when it has none.
+    fn manifest_path(&self, model_id: &str) -> Option<PathBuf> {
         let (name, tag) = match model_id.split_once(':') {
             Some((n, t)) => (n.to_lowercase(), t),
             None => (model_id.to_lowercase(), "latest"),
@@ -2038,23 +2133,42 @@ impl APIServer {
         let ollama = crate::inference::load::ollama_manager::OllamaManager::new(PathBuf::from(
             &self.ollama_models_dir,
         ));
-        let manifest_path = ollama.get_model_path(&name, tag)?;
-        let manifest: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&manifest_path).ok()?).ok()?;
-        for layer in manifest.get("layers")?.as_array()? {
-            let media = layer
-                .get("mediaType")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            if media.rsplit('.').next() == Some(kind) {
+        ollama.get_model_path(&name, tag)
+    }
+
+    /// The blob of the first layer of kind `kind` (`model`, `params`, `license`, `template`) in
+    /// the manifest of `model_id`.
+    fn manifest_layer_path(&self, model_id: &str, kind: &str) -> Option<PathBuf> {
+        self.manifest_layer_paths(model_id, kind).into_iter().next()
+    }
+
+    /// The blobs of every layer of kind `kind` in the manifest of `model_id`, in manifest order.
+    fn manifest_layer_paths(&self, model_id: &str, kind: &str) -> Vec<PathBuf> {
+        let Some(manifest_path) = self.manifest_path(model_id) else {
+            return Vec::new();
+        };
+        let Some(manifest) = std::fs::read_to_string(&manifest_path)
+            .ok()
+            .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+        else {
+            return Vec::new();
+        };
+        let layers = manifest.get("layers").and_then(|l| l.as_array());
+        layers
+            .into_iter()
+            .flatten()
+            .filter(|layer| {
+                let media = layer.get("mediaType").and_then(|v| v.as_str());
+                media.and_then(|m| m.rsplit('.').next()) == Some(kind)
+            })
+            .filter_map(|layer| {
                 let digest = layer.get("digest").and_then(|v| v.as_str())?;
-                return crate::inference::load::ollama_manager::OllamaManager::blob_for(
+                crate::inference::load::ollama_manager::OllamaManager::blob_for(
                     &manifest_path,
                     digest,
-                );
-            }
-        }
-        None
+                )
+            })
+            .collect()
     }
 
     fn read_manifest_layer(&self, model_id: &str, kind: &str) -> Option<String> {

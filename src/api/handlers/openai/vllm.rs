@@ -557,7 +557,7 @@ pub(crate) fn tokens_as_ids(lps: &mut [TokenLogprob]) {
 /// The loaded engine of `model`, loaded on first use as the generation routes do.
 async fn engine_for(state: &APIServer, model: &str) -> Result<Arc<LlmEngine>, ApiError> {
     validate_model_id(model)?;
-    let name = normalize_model_id(model);
+    let name = state.served_model_id(model).await;
     let load = super::super::admission::LoadRequest::new(state.get_effective_keep_alive(None));
     state.load_for_request(&name, load).await
 }
@@ -587,7 +587,7 @@ pub(crate) async fn tokenize(
             let thinking = super::super::chat_prompt::thinking_from_variables(&options.variables);
             let prompt = state
                 .prepare_prompt(
-                    &normalize_model_id(&model),
+                    &state.served_model_id(&model).await,
                     Some(&engine),
                     &super::super::chat_prompt::PromptSpec {
                         messages: &messages,

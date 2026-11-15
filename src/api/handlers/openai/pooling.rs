@@ -252,7 +252,7 @@ pub(crate) async fn score(
     if let Err(e) = validate_model_id(&model) {
         return e.into_response();
     }
-    let model_name = normalize_model_id(&model);
+    let model_name = state.served_model_id(&model).await;
     let keep_alive = state.get_effective_keep_alive(None);
     if let Err(e) = state.ensure_loaded(&model_name, keep_alive).await {
         return ApiError::NotFound(format!("model '{model_name}' could not be loaded: {e}"))

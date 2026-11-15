@@ -1145,6 +1145,10 @@ impl APIServer {
             }
         }
 
+        if let Some(refusal) = self.companion_refusal(new_model_id).await {
+            return Err(ApiError::NotFound(refusal));
+        }
+
         // 2. Load the new model
         let model_path = self
             .model_manager

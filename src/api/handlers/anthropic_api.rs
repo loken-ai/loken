@@ -89,7 +89,7 @@ pub(crate) async fn anthropic_messages_at(
     {
         return anthropic_error_response(StatusCode::BAD_REQUEST, "invalid_request_error", why);
     }
-    let model_name = normalize_model_id(&req.model);
+    let model_name = state.served_model_id(&req.model).await;
     // The conversation goes where the model is. Peers are asked about the prompt this
     // node would prefill, which is the text their caches are keyed on.
     let clustered = state.cluster_handle().is_some();
@@ -620,7 +620,7 @@ pub(crate) async fn anthropic_count_tokens(
     if let Err(e) = validate_model_id(&req.model) {
         return anthropic_api_error(e);
     }
-    let model_name = normalize_model_id(&req.model);
+    let model_name = state.served_model_id(&req.model).await;
     let tool_choice = req.tool_choice.clone();
     let thinking = req.thinking_preference();
     let (messages, tools) = req.into_internal();
@@ -662,6 +662,8 @@ pub(crate) async fn list_models_by_dialect(
     let listed = chrono::Utc::now().to_rfc3339();
     let mut local: Vec<String> = Vec::new();
     if let Ok(mut models) = state.model_manager.list_models().await {
+        // What the tags route lists: present weights a loader reads.
+        models.retain(|m| state.serves_weights(m));
         models.sort_by(|a, b| a.id.cmp(&b.id));
         for m in models {
             local.push(m.id.clone());

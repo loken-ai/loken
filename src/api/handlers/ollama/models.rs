@@ -1000,7 +1000,7 @@ pub(crate) async fn ollama_show_model(
     // (matches official Ollama API behavior). Use trim()-based emptiness
     // so whitespace-only `model: "  "` correctly falls through to `name`
     // rather than being treated as set and immediately failing validation.
-    let model_name = if !request.model.trim().is_empty() {
+    let mut model_name = if !request.model.trim().is_empty() {
         request.model.clone()
     } else if !request.name.trim().is_empty() {
         request.name.clone()
@@ -1016,6 +1016,17 @@ pub(crate) async fn ollama_show_model(
 
     info!("📝 POST /api/show - Model: {}", model_name);
     info!("   Models dir: {}", state.ollama_models_dir);
+
+    // A companion file is shown as the model that reads it.
+    if let Some(Some(owner)) = state
+        .companion_owner(&normalize_model_id(&model_name))
+        .await
+    {
+        model_name = owner;
+    }
+    if let Some(refusal) = state.companion_refusal(&model_name).await {
+        return Err(ApiError::NotFound(refusal));
+    }
 
     let manager = state.model_manager.clone();
 
@@ -1322,6 +1333,220 @@ mod catalogue_tests {
             .capabilities
             .unwrap()
             .contains(&"completion".to_string()));
+    }
+
+    /// An Ollama store holding `a:t` and its draft companion at `a:t-dspark`.
+    /// The model declares its vocabulary, the companion only the keys of its draft.
+    fn store_with_a_companion(tag: &str) -> std::path::PathBuf {
+        use crate::inference::generic_transformer::wide_sparse_names::ARCH;
+        let dir = scratch(tag);
+        let blobs = dir.join("blobs");
+        std::fs::create_dir_all(&blobs).unwrap();
+        let arch = (
+            "general.architecture".to_string(),
+            Value::String(ARCH.into()),
+        );
+        let vocabulary = (
+            "tokenizer.ggml.tokens".to_string(),
+            Value::Array(vec![Value::String("a".into())]),
+        );
+        let draft = (format!("{ARCH}.dspark.block_size"), Value::U32(4));
+        write_gguf_with_metadata(&blobs.join("sha256-aa"), &[arch.clone(), vocabulary], &[])
+            .unwrap();
+        write_gguf_with_metadata(&blobs.join("sha256-dd"), &[arch, draft], &[]).unwrap();
+        let library = dir.join("manifests/registry.ollama.ai/library/a");
+        std::fs::create_dir_all(&library).unwrap();
+        for (tag, hex) in [("t", "aa"), ("t-dspark", "dd")] {
+            let manifest = serde_json::json!({
+                "config": {"digest": "sha256:00", "size": 1},
+                "layers": [{
+                "mediaType": "application/vnd.ollama.image.model",
+                "digest": format!("sha256:{hex}"),
+                "size": 1,
+            }]});
+            std::fs::write(library.join(tag), manifest.to_string()).unwrap();
+        }
+        dir
+    }
+
+    /// A draft companion is not listed as a model.
+    /// A request that names it is served by the model that reads it, under that model's name.
+    #[tokio::test]
+    async fn a_companion_is_served_as_its_model() {
+        use crate::api::handlers::request_figures_tests::{
+            body_text, prompt, server_with_tiny_model, ROUTES,
+        };
+        let _one = ROUTES.lock().await;
+        let (tiny, tiny_dir, vocab_size) = server_with_tiny_model().await;
+        let engine = tiny.engines.read().await[0].engine.clone();
+        let dir = store_with_a_companion("companion");
+        let state = APIServer::new(
+            dir.to_string_lossy().to_string(),
+            "/nonexistent-hf-models".to_string(),
+        );
+        state
+            .engines
+            .write()
+            .await
+            .push(LoadedModelEntry::new("a:t".to_string(), engine, Some(1)));
+        let listed = ollama_list_models(
+            axum::extract::State(state.clone()),
+            axum::http::HeaderMap::new(),
+        )
+        .await;
+        let request: OllamaShowRequest =
+            serde_json::from_value(serde_json::json!({"model": "a:t-dspark"})).unwrap();
+        let shown =
+            ollama_show_model(axum::extract::State(state.clone()), OllamaJson(request)).await;
+        let request = serde_json::from_value(serde_json::json!({
+            "model": "a:t-dspark",
+            "prompt": prompt(4, vocab_size, 0),
+            "stream": false,
+            "options": {"temperature": 0, "num_predict": 2},
+        }))
+        .unwrap();
+        let answered = super::ollama_generate(
+            axum::extract::State(state.clone()),
+            axum::http::HeaderMap::new(),
+            OllamaJson(request),
+        )
+        .await;
+        let served = state.served_model_id("a:t-dspark").await;
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&tiny_dir);
+        // The media checkpoints of this process's stores are listed beside the store's models.
+        let names: Vec<String> = listed
+            .expect("a listing")
+            .0
+            .models
+            .into_iter()
+            .filter(|m| m.source == "ollama")
+            .map(|m| m.name)
+            .collect();
+        assert_eq!(names, ["a:t"]);
+        assert_eq!(served, "a:t");
+        let shown = shown.expect("the companion is shown as its model").0;
+        let modelfile = shown.modelfile.expect("a Modelfile");
+        assert!(modelfile.contains("sha256-aa"), "{modelfile}");
+        let answer: serde_json::Value = serde_json::from_str(
+            &body_text(answered.expect("the companion's model answers")).await,
+        )
+        .unwrap();
+        assert_eq!(answer["model"], "a:t");
+        assert!(!answer["response"].as_str().unwrap_or_default().is_empty());
+    }
+
+    /// A draft that several models read is served by the model its manifest names after it.
+    /// Without that layer it is served by the model whose companion tag names it.
+    /// A draft neither names is served by the first reader in catalogue order.
+    /// No companion is listed, whatever the number of its model layers.
+    #[tokio::test]
+    async fn a_shared_draft_is_served_by_the_model_its_tag_names() {
+        use crate::inference::generic_transformer::wide_sparse_names::ARCH;
+        let dir = scratch("shareddraft");
+        let blobs = dir.join("blobs");
+        std::fs::create_dir_all(&blobs).unwrap();
+        let arch = (
+            "general.architecture".to_string(),
+            Value::String(ARCH.into()),
+        );
+        let vocabulary = |token: &str| {
+            (
+                "tokenizer.ggml.tokens".to_string(),
+                Value::Array(vec![Value::String(token.into())]),
+            )
+        };
+        let draft = (format!("{ARCH}.dspark.block_size"), Value::U32(4));
+        for (hex, token) in [("aa", "a"), ("bb", "b")] {
+            write_gguf_with_metadata(
+                &blobs.join(format!("sha256-{hex}")),
+                &[arch.clone(), vocabulary(token)],
+                &[],
+            )
+            .unwrap();
+        }
+        write_gguf_with_metadata(&blobs.join("sha256-dd"), &[arch, draft], &[]).unwrap();
+        let library = dir.join("manifests/registry.ollama.ai/library");
+        for (name, tag, hexes) in [
+            ("a", "t", &["aa"][..]),
+            ("a", "u", &["bb"]),
+            ("c", "t", &["aa"]),
+            ("a", "t-dspark", &["dd"]),
+            ("a", "u-dspark", &["dd"]),
+            ("x", "y-dspark", &["dd"]),
+            ("c", "t-dspark", &["dd", "bb"]),
+        ] {
+            std::fs::create_dir_all(library.join(name)).unwrap();
+            let layers: Vec<serde_json::Value> = hexes
+                .iter()
+                .map(|hex| {
+                    serde_json::json!({
+                        "mediaType": "application/vnd.ollama.image.model",
+                        "digest": format!("sha256:{hex}"),
+                        "size": 1,
+                    })
+                })
+                .collect();
+            let manifest = serde_json::json!({
+                "config": {"digest": "sha256:00", "size": 1},
+                "layers": layers,
+            });
+            std::fs::write(library.join(name).join(tag), manifest.to_string()).unwrap();
+        }
+        let state = APIServer::new(
+            dir.to_string_lossy().to_string(),
+            "/nonexistent-hf-models".to_string(),
+        );
+        let served_u = state.served_model_id("a:u-dspark").await;
+        let served_t = state.served_model_id("a:t-dspark").await;
+        let served_untagged = state.served_model_id("x:y-dspark").await;
+        let served_declared = state.served_model_id("c:t-dspark").await;
+        let listed = ollama_list_models(
+            axum::extract::State(state.clone()),
+            axum::http::HeaderMap::new(),
+        )
+        .await;
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(served_u, "a:u");
+        assert_eq!(served_t, "a:t");
+        assert_eq!(served_untagged, "a:t");
+        // The model layer after the draft names the model, whatever the companion's tag.
+        assert_eq!(served_declared, "a:u");
+        let names: Vec<String> = listed
+            .expect("a listing")
+            .0
+            .models
+            .into_iter()
+            .filter(|m| m.source == "ollama")
+            .map(|m| m.name)
+            .collect();
+        assert_eq!(names, ["a:t", "a:u", "c:t"]);
+    }
+
+    /// A companion that no model in the store reads is answered not found, and not loaded.
+    #[tokio::test]
+    async fn a_companion_without_its_model_is_not_found() {
+        let dir = store_with_a_companion("orphan");
+        std::fs::remove_file(dir.join("manifests/registry.ollama.ai/library/a/t")).unwrap();
+        let state = APIServer::new(
+            dir.to_string_lossy().to_string(),
+            "/nonexistent-hf-models".to_string(),
+        );
+        let request: OllamaShowRequest =
+            serde_json::from_value(serde_json::json!({"model": "a:t-dspark"})).unwrap();
+        let shown =
+            ollama_show_model(axum::extract::State(state.clone()), OllamaJson(request)).await;
+        let served = state.served_model_id("a:t-dspark").await;
+        let loaded = state.ensure_loaded_with_window(&served, 0, None).await;
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(served, "a:t-dspark");
+        match shown {
+            Err(ApiError::NotFound(why)) => assert!(why.contains("no model"), "{why}"),
+            Err(e) => panic!("{e:?}"),
+            Ok(_) => panic!("a companion shown as a model"),
+        }
+        let why = loaded.expect_err("a companion is not loaded");
+        assert!(why.contains("no model in the store reads it"), "{why}");
     }
 
     /// A safetensors checkpoint the catalogue lists is shown with what its files declare:

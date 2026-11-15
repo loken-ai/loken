@@ -55,7 +55,7 @@ pub(crate) async fn ollama_chat(
     );
     sampling.validate()?;
     // Normalize model ID
-    let model_name = normalize_model_id(&request.model);
+    let model_name = state.served_model_id(&request.model).await;
     // A conversation, or a load instruction for a model held elsewhere, goes where the
     // model is; an empty conversation for a model held here stays here. Peers are asked
     // about the prompt this node would prefill, which is the text their caches key on.
@@ -935,7 +935,7 @@ pub(crate) async fn ollama_generate(
     );
     sampling.validate()?;
     // Normalize model ID
-    let model_name = normalize_model_id(&request.model);
+    let model_name = state.served_model_id(&request.model).await;
 
     // -- Cluster: serve here, or hand the whole request to a better-placed peer --------
     //

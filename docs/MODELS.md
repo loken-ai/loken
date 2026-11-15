@@ -264,6 +264,13 @@ The companions of a model in an Ollama store are the files its manifest names.
 They are the further layers of its manifest and the model of its `<tag>-dspark` manifest.
 Another model's blob in the same `blobs/` directory is never one.
 A model file outside a store takes its companions from its directory.
+A companion declares a draft or a routing prior and no vocabulary.
+The catalogue does not list a companion.
+A request that names one is served by the model that reads it, and answers under that model's name.
+When several models read it, the model whose blob a further model layer of its manifest names serves it.
+Without such a layer, the model whose `<tag>-dspark` manifest it is serves it.
+Else the first of them in catalogue order serves it, and the log names it.
+A companion that no model in the store reads is answered 404.
 
 Across machines, the model splits into runs of layers as a dense stack does, see [Cluster](CLUSTER.md#planning-a-cut).
 

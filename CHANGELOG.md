@@ -7,6 +7,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 ### Fixed
 
 - Speculation: keep a drafter from taking the card room its target needs.
+- API: leave a stored draft out of the model lists and serve its model when asked for it.
 - API: show a listed safetensors checkpoint with its window, format and capabilities.
 
 ## [0.5.0] - 2026-11-15

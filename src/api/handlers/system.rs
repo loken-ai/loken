@@ -247,8 +247,12 @@ pub(crate) async fn draft_attach(
 ) -> Result<Json<DraftAttachResponse>, ApiError> {
     validate_model_id(&request.target)?;
     validate_model_id(&request.draft)?;
-    let target_name = normalize_model_id(&request.target);
-    let draft_name = normalize_model_id(&request.draft);
+    let target_name = state.served_model_id(&request.target).await;
+    let draft_name = state.served_model_id(&request.draft).await;
+
+    if let Some(refusal) = state.companion_refusal(&draft_name).await {
+        return Err(ApiError::NotFound(refusal));
+    }
 
     // Confirm target is loaded.
     let target_engine = state
@@ -344,7 +348,7 @@ pub(crate) async fn draft_detach(
     Json(request): Json<DraftDetachRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     validate_model_id(&request.target)?;
-    let target_name = normalize_model_id(&request.target);
+    let target_name = state.served_model_id(&request.target).await;
     let target_engine = state
         .get_engine(&target_name)
         .await
@@ -948,11 +952,13 @@ pub(crate) async fn recommended_model(
         .map(|paid| paid / resident_count as u64);
     let budget = free_bytes.saturating_sub(overhead.unwrap_or(0));
 
-    let catalogue = state
+    let mut catalogue = state
         .model_manager
         .list_models()
         .await
         .map_err(|e| ApiError::Internal(format!("listing models: {e}")))?;
+    // What the tags route lists: present weights a loader reads.
+    catalogue.retain(|m| state.serves_weights(m));
     let sized: Vec<(String, u64)> = catalogue.iter().map(|m| (m.id.clone(), m.size)).collect();
     let (best, fits) = largest_that_fits(&sized, budget);
 
@@ -1082,8 +1088,8 @@ pub(crate) async fn swap_model_handler(
 ) -> Result<Json<SwapModelResponse>, ApiError> {
     validate_model_id(&request.current_model)?;
     validate_model_id(&request.new_model)?;
-    let current_model = normalize_model_id(&request.current_model);
-    let new_model = normalize_model_id(&request.new_model);
+    let current_model = state.served_model_id(&request.current_model).await;
+    let new_model = state.served_model_id(&request.new_model).await;
 
     info!("Model swap request: {} -> {}", current_model, new_model);
 

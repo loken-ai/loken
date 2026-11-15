@@ -65,15 +65,17 @@ fn skip_value<R: Read + Seek>(r: &mut R, ty: u32) -> std::io::Result<()> {
     }
 }
 
-/// Whether the GGUF at `path` declares a metadata key starting with `prefix`; false for a file
-/// that is not a GGUF or cannot be read.
-pub fn declares(path: &Path, prefix: &str) -> bool {
-    let scan = || -> std::io::Result<bool> {
+/// Walk the key table of the GGUF at `path`, handing each key to `stop` until it answers true.
+///
+/// Returns whether a key stopped the walk.
+/// `None` for a file that is not a GGUF or cannot be read.
+fn walk_keys(path: &Path, mut stop: impl FnMut(&[u8]) -> bool) -> Option<bool> {
+    let mut scan = || -> std::io::Result<Option<bool>> {
         let mut r = BufReader::new(std::fs::File::open(path)?);
         let mut magic = [0u8; 4];
         r.read_exact(&mut magic)?;
         if &magic != b"GGUF" {
-            return Ok(false);
+            return Ok(None);
         }
         let _version = read_u32(&mut r)?;
         let _tensors = read_u64(&mut r)?;
@@ -81,25 +83,72 @@ pub fn declares(path: &Path, prefix: &str) -> bool {
         for _ in 0..keys {
             let n = read_u64(&mut r)?;
             if n > MAX_KEY_BYTES {
-                return Ok(false);
+                return Ok(None);
             }
             let mut key = vec![0u8; n as usize];
             r.read_exact(&mut key)?;
-            if key.starts_with(prefix.as_bytes()) {
-                return Ok(true);
+            if stop(&key) {
+                return Ok(Some(true));
             }
             let ty = read_u32(&mut r)?;
             skip_value(&mut r, ty)?;
         }
-        r.stream_position()?;
-        Ok(false)
+        Ok(Some(false))
     };
-    scan().unwrap_or(false)
+    scan().ok().flatten()
+}
+
+/// Whether the GGUF at `path` declares a metadata key starting with `prefix`; false for a file
+/// that is not a GGUF or cannot be read.
+pub fn declares(path: &Path, prefix: &str) -> bool {
+    walk_keys(path, |key| key.starts_with(prefix.as_bytes())).unwrap_or(false)
+}
+
+/// The key a model file declares its vocabulary under.
+const VOCABULARY: &str = "tokenizer.ggml.tokens";
+
+/// The prefixes of the keys a companion declares: a block draft, a routing prior.
+fn companion_prefixes() -> [String; 2] {
+    [format!("{ARCH}.dspark."), format!("{ARCH}.hot_experts.")]
+}
+
+/// Whether the GGUF at `path` is a companion and not a model: it declares a block draft or a
+/// routing prior, and no vocabulary.
+///
+/// The walk stops at the vocabulary key, so a model costs only the keys before it.
+/// False for a file that is not a GGUF or cannot be read.
+pub fn is_companion(path: &Path) -> bool {
+    let prefixes = companion_prefixes();
+    let mut declared = false;
+    let walked = walk_keys(path, |key| {
+        declared |= prefixes.iter().any(|p| key.starts_with(p.as_bytes()));
+        key == VOCABULARY.as_bytes()
+    });
+    walked == Some(false) && declared
+}
+
+/// Whether `model` takes `companion` among the files it reads its companions from.
+pub fn takes_companion(model: &Path, companion: &Path) -> bool {
+    let Ok(wanted) = std::fs::canonicalize(companion) else {
+        return false;
+    };
+    companion_candidates(model)
+        .iter()
+        .any(|p| std::fs::canonicalize(p).ok().as_ref() == Some(&wanted))
 }
 
 /// The suffix of the tag a conversion stores a model's draft companion under: `<name>:<tag>` keeps
 /// its draft at `<name>:<tag>-dspark`.
 pub const COMPANION_TAG_SUFFIX: &str = "-dspark";
+
+/// The manifest that holds the companion tag of the model whose manifest is `manifest`.
+///
+/// The companion tag is the model's tag followed by [`COMPANION_TAG_SUFFIX`].
+pub fn companion_manifest(manifest: &Path) -> Option<PathBuf> {
+    let mut tag = manifest.file_name()?.to_os_string();
+    tag.push(COMPANION_TAG_SUFFIX);
+    Some(manifest.with_file_name(tag))
+}
 
 /// The media type of the layer that names a manifest's model file.
 const MODEL_LAYER: &str = "application/vnd.ollama.image.model";
@@ -186,14 +235,9 @@ fn store_companions(root: &Path, blob: &Path) -> Vec<PathBuf> {
         if !names_blob {
             continue;
         }
-        let companion_tag = manifest.file_name().map(|tag| {
-            let mut tag = tag.to_os_string();
-            tag.push(COMPANION_TAG_SUFFIX);
-            manifest.with_file_name(tag)
-        });
-        let companion_model = companion_tag
-            .iter()
-            .flat_map(|m| manifest_layers(m))
+        let companion_model = companion_manifest(&manifest)
+            .into_iter()
+            .flat_map(|m| manifest_layers(&m))
             .filter(|(media, _)| media == MODEL_LAYER);
         for (_, digest) in layers.iter().cloned().chain(companion_model) {
             match blob_of(root, &digest) {
@@ -246,7 +290,7 @@ fn prior_key(layer: usize) -> String {
 /// experts from the most routed-to down, every id below `n_routed`. `None` when no companion
 /// declares one that fits this model; a companion that does not fit is passed over.
 pub fn prior_beside(model: &Path, n_layers: usize, n_routed: usize) -> Option<Vec<Vec<usize>>> {
-    let key = format!("{}.hot_experts.", ARCH);
+    let [_, key] = companion_prefixes();
     for path in find_companions(model, &key) {
         let Ok(file) = open_mapped_unadvised(&path) else {
             continue;
@@ -410,6 +454,43 @@ mod tests {
         );
         // The other model lists no companion, though its own blob declares both keys.
         assert!(find_companions(&b, &draft).is_empty());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A file that declares a draft or a prior and no vocabulary is a companion.
+    /// A model that carries both keys beside its vocabulary is not, nor is another file.
+    #[test]
+    fn a_companion_is_told_from_a_model_by_its_keys() {
+        let (d, [a, a_draft, a_prior, _]) = two_model_store("companion");
+        assert!(is_companion(&a_draft));
+        assert!(is_companion(&a_prior));
+        assert!(!is_companion(&a), "no GGUF");
+        let model = d.join("model.gguf");
+        let mut md = vec![(format!("{ARCH}.dspark.block_size"), Value::U32(4))];
+        md.extend(hot_experts_metadata(&lists(3, 8)));
+        md.push((
+            VOCABULARY.to_string(),
+            Value::Array(vec![Value::String("a".into())]),
+        ));
+        write_gguf_with_metadata(&model, &md, &[]).unwrap();
+        assert!(!is_companion(&model), "a model with its vocabulary");
+        let other = d.join("other.gguf");
+        write_gguf_with_metadata(
+            &other,
+            &[("general.architecture".into(), Value::String("other".into()))],
+            &[],
+        )
+        .unwrap();
+        assert!(!is_companion(&other), "no companion key");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A model takes the companions its manifests name, and no other model's.
+    #[test]
+    fn a_companion_belongs_to_the_model_that_takes_it() {
+        let (d, [a, a_draft, _, b]) = two_model_store("owner");
+        assert!(takes_companion(&a, &a_draft));
+        assert!(!takes_companion(&b, &a_draft));
         let _ = std::fs::remove_dir_all(&d);
     }
 
