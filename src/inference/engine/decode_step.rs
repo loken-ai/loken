@@ -431,32 +431,8 @@ impl DraftLength {
         };
         let mut best = (0, f64::MIN);
         let mut best_drafting = (0, f64::MIN);
-        let mut reach = 1.0;
-        let mut expected = 1.0;
-        // The first position the drafts rarely reached takes the deepest measured rate: the
-        // window can grow one row past what it has tried, as a prior of one half would not
-        // let it; the positions beyond keep the prior.
-        let mut deepest: Option<f64> = None;
-        let mut untried = 0;
-        for k in 0..=top {
-            if k > 0 {
-                // Laplace-smoothed survival of position k-1 given the earlier ones survived.
-                let i = k - 1;
-                let smoothed = (self.kept[i] as f64 + 1.0) / (self.reached[i] as f64 + 2.0);
-                let rate = if self.reached[i] >= DRAFT_PROBES {
-                    deepest = Some(smoothed);
-                    smoothed
-                } else {
-                    untried += 1;
-                    if untried == 1 {
-                        deepest.unwrap_or(smoothed)
-                    } else {
-                        smoothed
-                    }
-                };
-                reach *= rate;
-                expected += reach;
-            }
+        let expectations = self.expectations();
+        for (k, &expected) in expectations.iter().enumerate().take(top + 1) {
             let cost = match self.cycle[k] {
                 Some((c, _)) => c,
                 None => match scaled_verify(k) {
@@ -489,6 +465,45 @@ impl DraftLength {
             return best.0 + 1;
         }
         best.0
+    }
+
+    /// Tokens a verify of a draft of each length commits, by the survival measured so far: one
+    /// for the carried token, then each draft position that survives.
+    fn expectations(&self) -> [f64; DRAFT_MAX + 1] {
+        let mut out = [1.0; DRAFT_MAX + 1];
+        let mut reach = 1.0;
+        let mut expected = 1.0;
+        // The first position the drafts rarely reached takes the deepest measured rate: the
+        // window can grow one row past what it has tried, as a prior of one half would not
+        // let it; the positions beyond keep the prior.
+        let mut deepest: Option<f64> = None;
+        let mut untried = 0;
+        for (k, slot) in out.iter_mut().enumerate().skip(1) {
+            // Laplace-smoothed survival of position k-1 given the earlier ones survived.
+            let i = k - 1;
+            let smoothed = (self.kept[i] as f64 + 1.0) / (self.reached[i] as f64 + 2.0);
+            let rate = if self.reached[i] >= DRAFT_PROBES {
+                deepest = Some(smoothed);
+                smoothed
+            } else {
+                untried += 1;
+                if untried == 1 {
+                    deepest.unwrap_or(smoothed)
+                } else {
+                    smoothed
+                }
+            };
+            reach *= rate;
+            expected += reach;
+            *slot = expected;
+        }
+        out
+    }
+
+    /// Tokens the next verify is expected to commit: at the length [`Self::next`] drafts, by
+    /// the survival measured so far, the prior where nothing is measured.
+    pub(crate) fn expected_per_verify(&self) -> f64 {
+        self.expectations()[self.next()]
     }
 
     /// Whether class `k`'s cost is a measurement left unrefreshed for a while.
@@ -1079,6 +1094,14 @@ mod tests {
             d.record(1, 1, 0.0, 0.06 + experts[2]);
         }
         d
+    }
+
+    #[test]
+    fn nothing_measured_expects_the_prior_of_the_first_draft() {
+        let length = DraftLength::default();
+        // One draft token, kept at even odds: the carried token and half a draft token.
+        assert_eq!(length.next(), 1);
+        assert_eq!(length.expected_per_verify(), 1.5);
     }
 
     #[test]

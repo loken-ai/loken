@@ -4,6 +4,10 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+### Fixed
+
+- Speculation: keep a drafter from taking the card room its target needs.
+
 ## [0.5.0] - 2026-11-15
 
 ### Added

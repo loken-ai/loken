@@ -57,14 +57,192 @@ pub fn fastest_card(owner: &str) -> Option<usize> {
     probe_cuda_gpus_for(owner).first().map(|g| g.index)
 }
 
-/// Whether the cards together have `bytes` free for `owner`, after what other subsystems
-/// declared they are about to use.
-pub fn cards_hold_for(owner: &str, bytes: u64) -> bool {
+/// Every card as a load by `owner` is offered it, fastest first.
+/// Its free memory is net of what other subsystems declared they are about to use.
+pub fn card_rooms_for(owner: &str) -> Vec<CardRoom> {
     probe_cuda_gpus_for(owner)
         .iter()
-        .map(|g| g.available)
-        .sum::<u64>()
-        >= bytes
+        .map(|g| CardRoom {
+            index: g.index,
+            perf: g.perf_score,
+            available: g.stable_free,
+            total: g.total,
+        })
+        .collect()
+}
+
+/// What a model asks of the cards.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CardNeed {
+    /// Bytes the cards hold.
+    pub bytes: u64,
+    /// Bytes each card the model uses keeps free beside them.
+    pub per_card: u64,
+}
+
+impl CardNeed {
+    /// Bytes one card needs to hold the model alone.
+    pub fn whole(&self) -> u64 {
+        self.bytes.saturating_add(self.per_card)
+    }
+
+    /// Bytes the cards leave to the host, the model spread over every card.
+    pub fn spill(&self, cards: &[CardRoom]) -> u64 {
+        let room: u64 = cards
+            .iter()
+            .map(|c| c.available.saturating_sub(self.per_card))
+            .sum();
+        self.bytes.saturating_sub(room)
+    }
+}
+
+/// What a drafter asks of one card: all of it, or its layers with its routed experts on the
+/// host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DrafterNeed {
+    pub whole: CardNeed,
+    pub layers: CardNeed,
+}
+
+/// How the cards take a drafter held for before its target is placed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DrafterHold {
+    /// The target sits on the cards: a drafter gains nothing.
+    TargetFits,
+    /// The fastest card offers `room` bytes, too few for the drafter's layers.
+    NotWhole { room: u64 },
+    /// `bytes` held on `card`, `None` without a card.
+    /// The target spills `alone` bytes without the hold and `pushed` bytes more with it.
+    Held {
+        card: Option<usize>,
+        bytes: u64,
+        alone: u64,
+        pushed: u64,
+    },
+}
+
+impl DrafterHold {
+    /// How many times the host bytes of a plain step grow under the hold.
+    /// A verify must commit more tokens than this for the hold to pay.
+    pub fn host_ratio(&self) -> Option<f64> {
+        match *self {
+            DrafterHold::Held { alone, pushed, .. } if alone > 0 => {
+                Some((alone + pushed) as f64 / alone as f64)
+            }
+            _ => None,
+        }
+    }
+}
+
+/// How the cards take `drafter` held beside `target` before the target is placed, `cards`
+/// fastest first.
+///
+/// The hold is taken on the fastest card.
+/// It is the whole drafter when that card holds it, else its layers, its routed experts on the
+/// host.
+/// Without a card the drafter runs on the host and takes nothing from the target.
+pub fn drafter_hold(target: CardNeed, drafter: DrafterNeed, cards: &[CardRoom]) -> DrafterHold {
+    let alone = target.spill(cards);
+    if alone == 0 {
+        return DrafterHold::TargetFits;
+    }
+    let Some(first) = cards.first() else {
+        return DrafterHold::Held {
+            card: None,
+            bytes: 0,
+            alone,
+            pushed: 0,
+        };
+    };
+    let Some(bytes) = [drafter.whole.whole(), drafter.layers.whole()]
+        .into_iter()
+        .find(|b| *b <= first.available)
+    else {
+        return DrafterHold::NotWhole {
+            room: first.available,
+        };
+    };
+    let mut held = cards.to_vec();
+    held[0].available -= bytes;
+    DrafterHold::Held {
+        card: Some(first.index),
+        bytes,
+        alone,
+        pushed: target.spill(&held) - alone,
+    }
+}
+
+/// The drafter of `drafters` whose hold grows the target's host bytes least, held when a verify
+/// is `expected` to commit more tokens than that growth, with the verdict of each one.
+pub fn choose_hold(
+    target: CardNeed,
+    drafters: &[DrafterNeed],
+    cards: &[CardRoom],
+    expected: f64,
+) -> (Option<usize>, Vec<DrafterHold>) {
+    let verdicts: Vec<DrafterHold> = drafters
+        .iter()
+        .map(|d| drafter_hold(target, *d, cards))
+        .collect();
+    let least = verdicts
+        .iter()
+        .enumerate()
+        .filter_map(|(n, v)| v.host_ratio().map(|r| (n, r)))
+        .min_by(|a, b| a.1.total_cmp(&b.1));
+    let chosen = least.filter(|(_, r)| *r < expected).map(|(n, _)| n);
+    (chosen, verdicts)
+}
+
+/// How the cards take a drafter beside a target already placed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DrafterFit {
+    /// No card holds the drafter whole and keeps the target's reserve beside it.
+    /// `room` is the most a card offers beside that reserve.
+    NoRoom { room: u64 },
+    /// Runs on `card`, `None` without a card, in room the target does not use.
+    Fits { card: Option<usize> },
+}
+
+/// How the cards take `drafter` beside a placed target that keeps `reserve` free on each card,
+/// `cards` fastest first, at what they have free now.
+///
+/// A drafter runs whole on the fastest card that holds it, as the ladder places it.
+/// It is taken only when that card still keeps the target's reserve beside it.
+/// So the drafter moves none of the target's layers to the host.
+///
+/// Without a card the drafter runs on the host beside the target.
+pub fn drafter_fit(reserve: u64, drafter: CardNeed, cards: &[CardRoom]) -> DrafterFit {
+    if cards.is_empty() {
+        return DrafterFit::Fits { card: None };
+    }
+    let need = drafter.whole();
+    let beside = |c: &CardRoom| c.available.saturating_sub(reserve);
+    match cards.iter().find(|c| c.available >= need) {
+        Some(c) if beside(c) >= need => DrafterFit::Fits {
+            card: Some(c.index),
+        },
+        _ => DrafterFit::NoRoom {
+            room: cards.iter().map(beside).max().unwrap_or(0),
+        },
+    }
+}
+
+/// The first of `drafters`, in their order, that the cards take beside a placed target keeping
+/// `reserve` free on each card, with the verdict of each one considered.
+pub fn choose_drafter(
+    reserve: u64,
+    drafters: &[CardNeed],
+    cards: &[CardRoom],
+) -> (Option<usize>, Vec<DrafterFit>) {
+    let mut verdicts = Vec::new();
+    for (n, drafter) in drafters.iter().enumerate() {
+        let fit = drafter_fit(reserve, *drafter, cards);
+        verdicts.push(fit);
+        if let DrafterFit::Fits { .. } = fit {
+            return (Some(n), verdicts);
+        }
+    }
+    (None, verdicts)
 }
 
 /// Holds `bytes` of the cards for `owner` until the lease drops: every placement made
@@ -182,6 +360,172 @@ mod tests {
                 whole: false,
                 across: false
             }
+        );
+    }
+
+    /// 2 cards of 16 GB, each with 16 GB free, the fastest first.
+    fn two_cards() -> [CardRoom; 2] {
+        [
+            CardRoom {
+                index: 1,
+                ..card(16 * GB, 16 * GB)
+            },
+            card(16 * GB, 16 * GB),
+        ]
+    }
+
+    fn need(bytes: u64, per_card: u64) -> CardNeed {
+        CardNeed { bytes, per_card }
+    }
+
+    fn drafter(whole: u64, layers: u64, per_card: u64) -> DrafterNeed {
+        DrafterNeed {
+            whole: need(whole, per_card),
+            layers: need(layers, per_card),
+        }
+    }
+
+    #[test]
+    fn a_target_the_cards_hold_gets_no_hold() {
+        let target = need(26 * GB, 2 * GB);
+        let (chosen, verdicts) = choose_hold(target, &[drafter(GB, GB, GB)], &two_cards(), 1.5);
+        assert_eq!(chosen, None);
+        assert_eq!(verdicts, [DrafterHold::TargetFits]);
+    }
+
+    /// A drafter whose experts stream holds its layers alone, never its file.
+    #[test]
+    fn a_drafter_whose_experts_stream_holds_its_layers() {
+        let target = need(40 * GB, 2 * GB);
+        let streamed = drafter(368 * GB, 3 * GB, GB);
+        assert_eq!(
+            drafter_hold(target, streamed, &two_cards()),
+            DrafterHold::Held {
+                card: Some(1),
+                bytes: 4 * GB,
+                alone: 12 * GB,
+                pushed: 4 * GB,
+            }
+        );
+        let too_wide = drafter(368 * GB, 20 * GB, GB);
+        assert_eq!(
+            drafter_hold(target, too_wide, &two_cards()),
+            DrafterHold::NotWhole { room: 16 * GB }
+        );
+    }
+
+    /// The hold pays only when a verify commits more tokens than the host bytes grow.
+    /// A small push against a large spill is held.
+    /// A push near the spill is not.
+    #[test]
+    fn a_hold_is_taken_when_a_verify_commits_more_than_the_host_bytes_grow() {
+        let small = drafter(2 * GB, 2 * GB, GB / 2);
+        // Spills 14 GB alone, 2.5 GB more with the hold: a growth below one and a half.
+        let large_spill = need(42 * GB, 2 * GB);
+        let (chosen, verdicts) = choose_hold(large_spill, &[small], &two_cards(), 1.5);
+        assert_eq!(chosen, Some(0));
+        assert!(verdicts[0].host_ratio().unwrap() < 1.5);
+        // Spills 3 GB alone, 2.5 GB more with the hold: a growth above one and a half.
+        let small_spill = need(31 * GB, 2 * GB);
+        let (chosen, verdicts) = choose_hold(small_spill, &[small], &two_cards(), 1.5);
+        assert_eq!(chosen, None);
+        assert!(verdicts[0].host_ratio().unwrap() > 1.5);
+    }
+
+    #[test]
+    fn the_hold_that_grows_the_host_bytes_least_is_chosen() {
+        let target = need(42 * GB, 2 * GB);
+        let larger = drafter(6 * GB, 6 * GB, GB);
+        let smaller = drafter(GB, GB, GB / 2);
+        let (chosen, _) = choose_hold(target, &[larger, smaller], &two_cards(), 2.0);
+        assert_eq!(chosen, Some(1));
+    }
+
+    #[test]
+    fn without_a_card_a_hold_takes_nothing() {
+        let (chosen, verdicts) =
+            choose_hold(need(40 * GB, 2 * GB), &[drafter(GB, GB, GB)], &[], 1.5);
+        assert_eq!(chosen, Some(0));
+        assert_eq!(verdicts[0].host_ratio(), Some(1.0));
+    }
+
+    #[test]
+    fn a_drafter_streamed_from_the_host_is_not_taken() {
+        let streamed = need(368 * GB, 4 * GB);
+        let (chosen, verdicts) = choose_drafter(2 * GB, &[streamed], &two_cards());
+        assert_eq!(chosen, None);
+        assert_eq!(verdicts, [DrafterFit::NoRoom { room: 14 * GB }]);
+    }
+
+    #[test]
+    fn a_rejected_drafter_leaves_the_next_one_the_same_room() {
+        let streamed = need(368 * GB, 4 * GB);
+        let small = need(GB, GB);
+        let (chosen, verdicts) = choose_drafter(2 * GB, &[streamed, small], &two_cards());
+        assert_eq!(chosen, Some(1));
+        assert_eq!(verdicts[1], drafter_fit(2 * GB, small, &two_cards()));
+    }
+
+    /// A spilled target leaves each card its reserve and little more.
+    /// A drafter that would eat into that reserve is not taken.
+    #[test]
+    fn a_drafter_never_takes_the_reserve_of_a_spilled_target() {
+        let full = [
+            CardRoom {
+                index: 1,
+                ..card(3 * GB, 16 * GB)
+            },
+            card(3 * GB, 16 * GB),
+        ];
+        let drafter = need(2 * GB, GB / 2);
+        assert_eq!(
+            drafter_fit(2 * GB, drafter, &full),
+            DrafterFit::NoRoom { room: GB }
+        );
+    }
+
+    /// The drafter goes where the ladder puts it, the fastest card that holds it.
+    /// A slower card with room beside the reserve does not make that card's reserve safe.
+    #[test]
+    fn a_drafter_is_judged_on_the_card_the_ladder_gives_it() {
+        let cards = [
+            CardRoom {
+                index: 1,
+                ..card(3 * GB, 16 * GB)
+            },
+            card(8 * GB, 16 * GB),
+        ];
+        let drafter = need(2 * GB, GB / 2);
+        assert!(matches!(
+            drafter_fit(2 * GB, drafter, &cards),
+            DrafterFit::NoRoom { .. }
+        ));
+        let roomy = [
+            CardRoom {
+                index: 1,
+                ..card(GB, 16 * GB)
+            },
+            card(8 * GB, 16 * GB),
+        ];
+        assert_eq!(
+            drafter_fit(2 * GB, drafter, &roomy),
+            DrafterFit::Fits { card: Some(0) }
+        );
+    }
+
+    #[test]
+    fn a_small_drafter_runs_on_the_fastest_card_with_room_left() {
+        assert_eq!(
+            drafter_fit(2 * GB, need(GB, GB), &two_cards()),
+            DrafterFit::Fits { card: Some(1) }
+        );
+    }
+
+    #[test]
+    fn without_a_card_the_drafter_runs_beside_the_target() {
+        assert_eq!(
+            drafter_fit(2 * GB, need(GB, GB), &[]),
+            DrafterFit::Fits { card: None }
         );
     }
 }

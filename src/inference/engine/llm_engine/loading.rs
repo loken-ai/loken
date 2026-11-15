@@ -164,12 +164,74 @@ impl ModelDims {
 /// weights: the runtime reserve at the model's declared window plus the staging the load
 /// of that checkpoint churns through.
 pub(crate) fn per_card_reserve(path: &std::path::Path) -> Option<u64> {
-    let content = gguf_file::open_header(path).ok()?;
-    let arch = get_gguf_string(&content, "general.architecture")?;
-    let context_length = trained_context(&content, &arch)
+    reserve_of(&gguf_file::open_header(path).ok()?)
+}
+
+/// [`per_card_reserve`] of a header already read.
+fn reserve_of(content: &gguf_file::Content) -> Option<u64> {
+    let arch = get_gguf_string(content, "general.architecture")?;
+    let context_length = trained_context(content, &arch)
         .unwrap_or(crate::inference::cache::KV_WORKING_WINDOW_TOKENS);
-    let staging = load_staging(&content, &arch);
-    Some(ModelDims::read(&content, &arch).runtime_reserve(context_length) + staging)
+    let staging = load_staging(content, &arch);
+    Some(ModelDims::read(content, &arch).runtime_reserve(context_length) + staging)
+}
+
+/// What the GGUF at `path` asks of the cards, each card it uses keeping [`per_card_reserve`].
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CardNeeds {
+    /// Every block and the output head, for the model to run alone on one card.
+    pub(crate) whole: crate::inference::place::room::CardNeed,
+    /// What the cards hold for none of the model's layers to run on the host.
+    /// A wide residual's layers are its token mixers.
+    /// A mixture's layers leave out its routed experts: the host keeps them beside a layer on a card.
+    pub(crate) layers: crate::inference::place::room::CardNeed,
+}
+
+/// [`CardNeeds`] of the GGUF at `path`, read from its header.
+pub(crate) fn card_needs(path: &std::path::Path) -> Option<CardNeeds> {
+    use crate::inference::place::room::CardNeed;
+    let content = gguf_file::open_header(path).ok()?;
+    let per_card = reserve_of(&content)?;
+    let (mut blocks, mut routed) = (0u64, 0u64);
+    for (name, t) in &content.tensor_infos {
+        let Some((_, tail)) = name.strip_prefix("blk.").and_then(|r| r.split_once('.')) else {
+            continue;
+        };
+        let bytes = t.size_in_bytes() as u64;
+        blocks += bytes;
+        if super::load::is_routed_expert_tensor(tail) {
+            routed += bytes;
+        }
+    }
+    let tensor_bytes = |name: &str| {
+        content
+            .tensor_infos
+            .get(name)
+            .map_or(0, |t| t.size_in_bytes() as u64)
+    };
+    // An untied model uploads its output projection, a tied one its embedding table.
+    let head = match tensor_bytes("output.weight") {
+        0 => tensor_bytes("token_embd.weight"),
+        b => b,
+    };
+    let whole = if blocks > 0 {
+        blocks + head
+    } else {
+        std::fs::metadata(path).ok()?.len()
+    };
+    let layers =
+        crate::inference::generic_transformer::wide_sparse_plan::card_mixer_bytes(&content)
+            .map_or(whole.saturating_sub(routed), |mixers| mixers.total());
+    Some(CardNeeds {
+        whole: CardNeed {
+            bytes: whole,
+            per_card,
+        },
+        layers: CardNeed {
+            bytes: layers,
+            per_card,
+        },
+    })
 }
 
 /// Card memory a load keeps free on each card it uses for the staging of one upload.
@@ -256,9 +318,8 @@ impl LlmEngine {
             .clone()
     }
 
-    /// Loads the configured model. A model that will spill to the host has room held for a
-    /// drafter while it is placed, and the drafter loads there only if the placed model can
-    /// use it (see `plan_drafter`).
+    /// Loads the configured model. A model that will spill to the host may take a drafter
+    /// in the room its placement leaves, once placed (see `plan_drafter`).
     pub async fn load_model(&self) -> Result<(), Box<dyn std::error::Error>> {
         let planned = self
             .find_model_file(&self.config.model_id)

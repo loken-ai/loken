@@ -5,7 +5,7 @@
 use super::ladder::{on_one_card, Demand};
 
 /// The owner a language model's placement reads the cards as.
-const OWNER: &str = "llm";
+pub(crate) const OWNER: &str = "llm";
 
 /// The cards a language model is offered.
 #[derive(Debug, Clone, Default)]

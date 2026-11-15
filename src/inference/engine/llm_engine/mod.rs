@@ -365,15 +365,19 @@ impl LlmEngine {
         self.last_stream_stats.clone()
     }
 
-    /// The smallest model in the store whose ordinary vocabulary is the target's, with its
-    /// size and file: every piece sits at the same id on both sides, so it can draft for it.
-    fn choose_drafter(
+    /// The models in the store whose ordinary vocabulary is the target's and whose file is
+    /// smaller, smallest first, each with what it asks of one card.
+    /// Every piece sits at the same id on both sides, so each can draft for the target.
+    fn drafter_candidates(
         &self,
         target: &std::path::Path,
         target_size: u64,
-    ) -> Option<(String, u64, std::path::PathBuf)> {
-        let want = discover::gguf_vocabulary_hash(target)?;
-        self.store_models()
+    ) -> Vec<(String, crate::inference::place::room::DrafterNeed)> {
+        let Some(want) = discover::gguf_vocabulary_hash(target) else {
+            return Vec::new();
+        };
+        let mut found: Vec<(u64, String, std::path::PathBuf)> = self
+            .store_models()
             .into_iter()
             .filter(|(_, path)| path.as_path() != target)
             .filter_map(|(tag, path)| {
@@ -381,43 +385,135 @@ impl LlmEngine {
                 (size < target_size && discover::gguf_vocabulary_hash(&path) == Some(want))
                     .then_some((size, tag, path))
             })
-            .min()
-            .map(|(size, tag, path)| (tag, size, path))
+            .collect();
+        found.sort();
+        found
+            .into_iter()
+            .filter_map(|(_, tag, path)| {
+                let needs = loading::card_needs(&path)?;
+                let need = crate::inference::place::room::DrafterNeed {
+                    whole: needs.whole,
+                    layers: needs.layers,
+                };
+                Some((tag, need))
+            })
+            .collect()
     }
 
     /// Decides, before the target is placed, whether it may get a drafter, and holds room
-    /// for it.
+    /// for the one it takes.
     ///
     /// Drafting pays where verification is far dearer than drafting, which is a target
-    /// spilling layers to the host, where each token reads gigabytes over the bus (measured on
-    /// deepseek-r1:70b with 26 layers on the host, drafted by llama3.2:1b); on the cards verify
-    /// costs about what drafting saves. A target larger than the cards' free memory will
-    /// spill, so the room its drafter needs is declared on the fastest card and the target is
-    /// placed around it. Nothing is loaded here: whether the target can use a drafter is
-    /// known once it is placed.
+    /// spilling layers to the host, where each token reads gigabytes over the bus; on the cards
+    /// verify costs about what drafting saves.
+    ///
+    /// A target whose layers the cards cannot hold, each card keeping its reserve, spills.
+    /// A hold moves more of its layers to the host, and every plain step then reads more host
+    /// bytes.
+    /// A hold pays only when a verify commits more tokens than those host bytes grow.
+    /// The tokens a verify commits are the draft length's own expectation, its prior while the
+    /// pair has drafted nothing.
+    /// The candidate whose hold grows the host bytes least is held when it pays, by
+    /// `room::choose_hold`.
+    /// Otherwise the candidates wait for the room the placed target leaves.
+    /// Nothing is loaded here.
     fn plan_drafter(&self, target: &std::path::Path, target_size: u64) -> Option<PlannedDrafter> {
+        use crate::inference::place::room::{self, DrafterHold};
         *self
             .drafter_choice
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = Some(None);
-        if crate::inference::place::room::cards_hold_for("llm", target_size) {
+        let model = &self.config.model_id;
+        let gb = |b: u64| b as f64 / 1e9;
+        let need = loading::card_needs(target)?.layers;
+        let cards = room::card_rooms_for(crate::inference::place::llm::OWNER);
+        let alone = need.spill(&cards);
+        if alone == 0 {
+            info!(
+                "spec-decode: {model} sits on the cards ({:.2} GB, {:.2} GB kept a card); no drafter",
+                gb(need.bytes),
+                gb(need.per_card)
+            );
             return None;
         }
-        let (id, size, path) = self.choose_drafter(target, target_size)?;
-        let reserve = loading::per_card_reserve(&path).unwrap_or(0);
+        let candidates = self.drafter_candidates(target, target_size);
+        if candidates.is_empty() {
+            info!(
+                "spec-decode: {model} spills {:.2} GB to the host; no smaller model in the store shares its vocabulary",
+                gb(alone)
+            );
+            return None;
+        }
+        let expected = self
+            .draft_length
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .expected_per_verify();
+        let needs: Vec<_> = candidates.iter().map(|(_, n)| *n).collect();
+        let (chosen, verdicts) = room::choose_hold(need, &needs, &cards, expected);
+        let verdict = |((id, _), hold): (&(String, room::DrafterNeed), &DrafterHold)| {
+            match *hold {
+            DrafterHold::TargetFits => format!("{id}: the target sits on the cards"),
+            DrafterHold::NotWhole { room } => format!(
+                "{id}: its layers need more than the {:.2} GB the fastest card offers",
+                gb(room)
+            ),
+            DrafterHold::Held {
+                card,
+                bytes,
+                pushed,
+                ..
+            } => format!(
+                "{id} would hold {:.2} GB on card {} and push {:.2} GB more to the host, the host bytes of a step times {:.2}",
+                gb(bytes),
+                card.map_or_else(|| "none".to_string(), |c| c.to_string()),
+                gb(pushed),
+                hold.host_ratio().unwrap_or(1.0)
+            ),
+        }
+        };
+        let said: Vec<String> = candidates.iter().zip(&verdicts).map(verdict).collect();
+        let held = chosen.and_then(|n| match verdicts[n] {
+            DrafterHold::Held { bytes, .. } => Some((n, room::hold(DRAFTER_DEMAND, bytes))),
+            _ => None,
+        });
+        info!(
+            "spec-decode: {model} spills {:.2} GB to the host; a verify is expected to commit {expected:.2} tokens; {}; {}",
+            gb(alone),
+            said.join("; "),
+            match &held {
+                Some((n, _)) => format!("{} is held", candidates[*n].0),
+                None => "no hold, a drafter takes only the room the placed target leaves"
+                    .to_string(),
+            }
+        );
         Some(PlannedDrafter {
-            id,
-            room: crate::inference::place::room::hold(DRAFTER_DEMAND, size + reserve),
+            candidates,
+            reserve: need.per_card,
+            held,
         })
     }
 
-    /// Once the target is placed: the planned drafter loads into the room held for it when
-    /// the target spilled to the host and its backend verifies a draft in one forward, and
-    /// shares its vocabulary; otherwise the room is given back and nothing is loaded.
+    /// Once the target is placed: the first planned drafter the cards take beside it loads
+    /// when the target spilled to the host, its backend verifies a draft in one forward, and
+    /// the drafter shares its vocabulary; otherwise nothing is loaded.
+    ///
+    /// A drafter is taken only in room the placed target leaves, by `room::choose_drafter`.
     async fn load_planned_drafter(&self, planned: Option<PlannedDrafter>) {
-        let Some(PlannedDrafter { id, room }) = planned else {
+        use crate::inference::place::room::{self, DrafterFit};
+        let Some(PlannedDrafter {
+            candidates,
+            reserve,
+            held,
+        }) = planned
+        else {
             return;
         };
+        // The drafter's own placement must see the held room, not the demand holding it.
+        let held = held.map(|(n, lease)| {
+            drop(lease);
+            n
+        });
         let (spills, verifies) =
             self.model_state
                 .lock()
@@ -431,8 +527,6 @@ impl LlmEngine {
                         .any(|(dev, ..)| dev == "CPU");
                     (spills, s.model.capabilities().pld)
                 });
-        // The drafter's own placement must see the room, not the demand holding it.
-        drop(room);
         if !spills {
             return;
         }
@@ -443,8 +537,39 @@ impl LlmEngine {
             );
             return;
         }
-        // The drafter is placed like any model: the ladder puts it whole on the fastest card
-        // that holds it, where its room was held.
+        let model = &self.config.model_id;
+        let gb = |b: u64| b as f64 / 1e9;
+        let cards = room::card_rooms_for(crate::inference::place::llm::OWNER);
+        let needs: Vec<_> = candidates.iter().map(|(_, n)| n.whole).collect();
+        let (chosen, verdicts) = match held {
+            Some(n) => (Some(n), Vec::new()),
+            None => room::choose_drafter(reserve, &needs, &cards),
+        };
+        let verdict = |((id, need), fit): (&(String, room::DrafterNeed), &DrafterFit)| match *fit {
+            DrafterFit::NoRoom { room } => format!(
+                "{id} needs {:.2} GB, more than the {:.2} GB a card leaves beside the target",
+                gb(need.whole.whole()),
+                gb(room)
+            ),
+            DrafterFit::Fits { card } => format!(
+                "{id} takes {:.2} GB on card {} that the target leaves",
+                gb(need.whole.whole()),
+                card.map_or_else(|| "none".to_string(), |c| c.to_string())
+            ),
+        };
+        if held.is_none() {
+            let said: Vec<String> = candidates.iter().zip(&verdicts).map(verdict).collect();
+            info!(
+                "spec-decode: {model} spills to the host; {}{}",
+                said.join("; "),
+                if chosen.is_some() { "" } else { "; no drafter" }
+            );
+        }
+        let Some((id, _)) = chosen.and_then(|n| candidates.into_iter().nth(n)) else {
+            return;
+        };
+        // The drafter is placed like any model: the ladder puts it on the fastest card that
+        // holds it, where its room was held or the card the choice above judged.
         let mut dcfg = self.config.clone();
         dcfg.model_id = id.clone();
         dcfg.disable_arc_layers = true;
@@ -1309,11 +1434,15 @@ fn drafter_step_recorded(
 /// The owner name the room held for a planned drafter is declared under.
 const DRAFTER_DEMAND: &str = "drafter";
 
-/// A drafter chosen for a target before the target is placed, and the card memory held for
-/// it until the target's placement is known.
+/// The drafters a target may take, chosen before the target is placed.
 struct PlannedDrafter {
-    id: String,
-    room: crate::inference::place::vram_manager::DemandLease,
+    /// The candidates, smallest first, each with what it asks of one card.
+    candidates: Vec<(String, crate::inference::place::room::DrafterNeed)>,
+    /// Bytes the target keeps free on each card it uses.
+    reserve: u64,
+    /// The candidate held for, by its place among the candidates, and the card memory held for
+    /// it until the target is placed.
+    held: Option<(usize, crate::inference::place::vram_manager::DemandLease)>,
 }
 
 /// Whether a model whose ordinary vocabulary hashes to `drafter_fp`, with `drafter_vocab`
