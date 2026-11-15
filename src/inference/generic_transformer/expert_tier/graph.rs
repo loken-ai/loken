@@ -549,14 +549,19 @@ impl Health {
 
     /// Nanoseconds a request may go unanswered while the worker does not move: [`STALL_MARGIN`]
     /// times the longest request it answered or the longest any of `tiers` takes at the paces
-    /// measured. None before anything is measured.
+    /// measured.
+    /// None before the worker answered a request: the paces of the probes leave out what a
+    /// first request does once.
     fn bound(&self, tiers: &[(String, Arc<LayerTier>)]) -> Option<u64> {
+        let longest = self.longest.load(Ordering::Relaxed);
+        if longest == 0 {
+            return None;
+        }
         let paced = tiers
             .iter()
             .map(|(_, t)| t.longest_request_ns())
             .fold(0, u64::max);
-        let base = self.longest.load(Ordering::Relaxed).max(paced);
-        (base > 0).then(|| base.saturating_mul(STALL_MARGIN))
+        Some(longest.max(paced).saturating_mul(STALL_MARGIN))
     }
 }
 
