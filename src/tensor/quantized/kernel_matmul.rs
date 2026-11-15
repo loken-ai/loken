@@ -1198,7 +1198,8 @@ impl QKernelMatMul {
             // 2-byte aligned); otherwise fall through to the per-column path.
             // Q4_K serves EVERY row count from the unified repack (M=1 interleaved
             // GEMV, M>=2 tiled GEMM) - the in-place storage path.
-            let q4k_prefill = self.dtype == GgmlDType::Q4K
+            let q4k_prefill = self.repack_fits(self.cpu_repack_q4k.get().is_some())
+                && self.dtype == GgmlDType::Q4K
                 && self.n.is_multiple_of(8)
                 && self.k.is_multiple_of(256)
                 && crate::tensor::quant_cpu::cast_blocks::<crate::tensor::quant_cpu::BlockQ4K>(
@@ -1211,7 +1212,8 @@ impl QKernelMatMul {
             // repack amortises both 8-way (the measured mistral-nemo CPU gap  -
             // Q4_0 was the only quant without an amortised decode path).
             let nb40 = self.k / 32;
-            let q4_0_decode = self.dtype == GgmlDType::Q4_0
+            let q4_0_decode = self.repack_fits(self.cpu_repack_q4_0.get().is_some())
+                && self.dtype == GgmlDType::Q4_0
                 && rows < 4
                 && self.n.is_multiple_of(8)
                 && self.k.is_multiple_of(32)
@@ -1223,7 +1225,8 @@ impl QKernelMatMul {
             // Q4_0 (mistral-nemo, moondream) gets the same tiled weight-reuse at
             // prefill; its per-column path re-streams every 4-bit weight block
             // once per prompt row. Decode (rows<4) keeps the row-grouped GEMV.
-            let q4_0_prefill = self.dtype == GgmlDType::Q4_0
+            let q4_0_prefill = self.repack_fits(self.cpu_repack_q4_0.get().is_some())
+                && self.dtype == GgmlDType::Q4_0
                 && rows >= 4
                 && self.n.is_multiple_of(8)
                 && self.k.is_multiple_of(32)
@@ -1235,7 +1238,8 @@ impl QKernelMatMul {
             // Q6_K (e.g. ffn_down) gets the same tiled weight-reuse as Q4_K on
             // the F32-activation path; without it the per-column path re-decodes
             // each weight once per prompt row, the bulk of its prefill cost.
-            let q6k_prefill = self.dtype == GgmlDType::Q6K
+            let q6k_prefill = self.repack_fits(self.cpu_repack_q6k.get().is_some())
+                && self.dtype == GgmlDType::Q6K
                 && rows >= 4
                 && self.n.is_multiple_of(8)
                 && self.k.is_multiple_of(256)
@@ -1247,7 +1251,8 @@ impl QKernelMatMul {
             // Q5_0 (the projections of the Q5-quant models) gets the same tiled
             // weight-reuse; its per-column path is doubly penalised (no reuse and
             // a 32-weight block, so the high-bit decode is paid far more often).
-            let q5_0_prefill = self.dtype == GgmlDType::Q5_0
+            let q5_0_prefill = self.repack_fits(self.cpu_repack_q5_0.get().is_some())
+                && self.dtype == GgmlDType::Q5_0
                 && rows >= 4
                 && self.n.is_multiple_of(8)
                 && self.k.is_multiple_of(32)
@@ -1256,7 +1261,8 @@ impl QKernelMatMul {
                 )
                 .map(|b| b.len() == self.n * nb40)
                 .unwrap_or(false);
-            let q5k_prefill = self.dtype == GgmlDType::Q5K
+            let q5k_prefill = self.repack_fits(self.cpu_repack_q5k.get().is_some())
+                && self.dtype == GgmlDType::Q5K
                 && rows >= 4
                 && self.n.is_multiple_of(8)
                 && self.k.is_multiple_of(256)
@@ -1268,7 +1274,8 @@ impl QKernelMatMul {
             // Q8_0 (the 8-bit small models: llama3.2:1b, ernie4-5, falcon3) gets
             // the same tiled weight-reuse; its per-column path re-streams every
             // 1-byte weight block once per prompt row.
-            let q8_0_prefill = self.dtype == GgmlDType::Q8_0
+            let q8_0_prefill = self.repack_fits(self.cpu_repack_q8_0_x8.get().is_some())
+                && self.dtype == GgmlDType::Q8_0
                 && rows >= 4
                 && self.n.is_multiple_of(8)
                 && self.k.is_multiple_of(32)
@@ -1280,7 +1287,8 @@ impl QKernelMatMul {
             // MXFP4 (gpt-oss, whole model - attention proj + MoE experts) gets the
             // same tiled weight-reuse; its per-column path re-streams and re-decodes
             // every 4-bit E2M1 block once per prompt row, the bulk of prefill cost.
-            let mxfp4_prefill = self.dtype == GgmlDType::MxFp4
+            let mxfp4_prefill = self.repack_fits(self.cpu_repack_mxfp4_x8.get().is_some())
+                && self.dtype == GgmlDType::MxFp4
                 && rows >= 4
                 && self.n.is_multiple_of(8)
                 && self.k.is_multiple_of(32)
@@ -1289,10 +1297,8 @@ impl QKernelMatMul {
                 )
                 .map(|b| b.len() == self.n * nb40)
                 .unwrap_or(false);
-            if q4k_prefill {
-                let x8 = self
-                    .q4k_x8()
-                    .expect("q4k_prefill guard implies eligibility");
+            // The copy is checked again where it is built: host memory may have moved since.
+            if let Some(x8) = q4k_prefill.then(|| self.q4k_x8()).flatten() {
                 crate::tensor::quant_cpu::matmul_q4k_plain(
                     (rows, self.k, self.n),
                     lhs,
@@ -1699,11 +1705,23 @@ impl QKernelMatMul {
         if blocks.len() != self.n * nb {
             return None;
         }
+        if !self.repack_fits(self.cpu_repack_q4k.get().is_some()) {
+            return None;
+        }
         Some(
             self.cpu_repack_q4k
                 // CONVERSION: x8 interleaved layout the host dot kernels read; the stored blocks stay.
                 .get_or_init(|| crate::tensor::quant_cpu::repack_q4k::repack(blocks, self.n, nb)),
         )
+    }
+
+    /// Whether the interleaved host copy of this weight serves its products: `built` already,
+    /// or the host has the room for its bytes beside the stored blocks now.
+    /// Without it, the products read the stored blocks.
+    fn repack_fits(&self, built: bool) -> bool {
+        built
+            || self.host.byte_len() as u64
+                <= crate::inference::place::layer_executor::host_spill_budget_bytes()
     }
 
     /// Output dim (`n`) - needed to size decode-arena buffers.

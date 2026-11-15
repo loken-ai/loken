@@ -1542,7 +1542,7 @@ fn stored_float_head_tensor(w: &Tensor, dev: &Device) -> Result<crate::tensor::q
 /// chooses: `AsStored` keeps every float projection as stored, `FourBit` rebuilds them in four
 /// bits wherever they are, and `ByPlan` lets the placement decide. By the plan, a float
 /// checkpoint keeps its stored format when the plan fits with it, and is otherwise rebuilt in
-/// the widest format of [`REQUANT_LADDER`] that fits, the narrowest when none does. The plan
+/// the widest format of [`REQUANT_LADDER`] that fits, kept as stored when none does. The plan
 /// sized every layer at its stored bytes, so the layers it gives cards fit as stored; the
 /// layers it keeps on the host are checked against `spare`, the memory the host can give, in
 /// proportion to their share of the stack.
@@ -1588,12 +1588,10 @@ fn float_projection_format(
     if fits(None) {
         return None;
     }
-    Some(
-        REQUANT_LADDER
-            .into_iter()
-            .find(|&f| fits(Some(f)))
-            .unwrap_or(REQUANT_LADDER[REQUANT_LADDER.len() - 1]),
-    )
+    // A rebuilt projection is held in the process.
+    // A stored one is read from the mapping, whose pages the kernel drops and reads again.
+    // When no rebuilt format fits, the stored one runs from the mapping.
+    REQUANT_LADDER.into_iter().find(|&f| fits(Some(f)))
 }
 
 /// The format the feed-forward's output projection takes when float weights run in `base`. In
@@ -1832,7 +1830,8 @@ fn build_generic_layer(
         let can_fuse = q.dtype() == k.dtype()
             && k.dtype() == v.dtype()
             && q.shape().dims().len() == 2
-            && q.shape().dims()[1] == k.shape().dims()[1];
+            && q.shape().dims()[1] == k.shape().dims()[1]
+            && host_copy_fits(on_gpu, &[&q, &k, &v]);
         if can_fuse {
             let dtype = q.dtype();
             let hidden = q.shape().dims()[1];
@@ -1963,7 +1962,8 @@ fn build_generic_layer(
         // dispatch (1 activation-quantize + 1 rayon region instead of 2), the
         // same dispatch-overhead lever as the fused QKV above.
         let can_fuse = gate_opt.as_ref().is_some_and(|g| {
-            g.dtype() == up.dtype()
+            host_copy_fits(on_gpu, &[g, &up])
+                && g.dtype() == up.dtype()
                 && matches!(
                     g.dtype(),
                     crate::tensor::quantized::GgmlDType::Q4K
@@ -6144,6 +6144,22 @@ fn host_spill_fits(want: u64, budget: u64) -> bool {
     budget == 0 || want <= budget
 }
 
+/// Whether a fused copy of `parts` may be built: a card holds the fused blocks alone, and a host
+/// layer keeps the copy beside the views of the file, so it is built when the host has the
+/// room for it now.
+fn host_copy_fits(on_card: bool, parts: &[&QTensor]) -> bool {
+    on_card || {
+        let bytes: u64 = parts
+            .iter()
+            .map(|p| {
+                let d = p.dtype();
+                (p.shape().elem_count() / d.block_size() * d.type_size()) as u64
+            })
+            .sum();
+        bytes <= crate::inference::place::layer_executor::host_spill_budget_bytes()
+    }
+}
+
 /// The Phase 2 workers that fit in `room` bytes, each taking `per_worker`, with one worker's
 /// slack kept free.
 /// At least 1 and at most `threads`.
@@ -6324,8 +6340,9 @@ mod split_tests {
         assert_eq!(by_plan(&host, &bf16, q8), Some(GgmlDType::Q8_0));
         assert_eq!(by_plan(&split, &bf16, q8 / 2), Some(GgmlDType::Q8_0));
         assert_eq!(by_plan(&host, &bf16, q4), Some(GgmlDType::Q4K));
-        // Nothing fits: the narrowest rung.
-        assert_eq!(by_plan(&host, &bf16, 1), Some(GgmlDType::Q4K));
+        // Nothing fits: the stored format, read from the mapping.
+        assert_eq!(by_plan(&host, &bf16, 1), None);
+        assert_eq!(by_plan(&split, &bf16, 1), None);
         // A block checkpoint's stray float matrices.
         let block = CheckpointWeights {
             float: None,
@@ -6385,7 +6402,7 @@ mod split_tests {
         );
         assert_eq!(
             float_projection_format(FloatWeights::ByPlan, &host, &bf16, 1),
-            Some(GgmlDType::Q4K)
+            None
         );
     }
 

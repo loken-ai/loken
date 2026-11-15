@@ -520,7 +520,6 @@ mod half_width {
 
     /// A `rows` by `cols` half weight of `dtype` as a view of a buffer another owner holds, as a
     /// file mapping is held, and the same weight copied into the tensor.
-    #[cfg(feature = "gpu")]
     fn viewed_and_owned(dtype: GgmlDType, rows: usize, cols: usize) -> (QTensor, QTensor) {
         let words: Vec<u16> = (0..rows * cols)
             .map(|i| {
@@ -553,6 +552,31 @@ mod half_width {
         let owned =
             QTensor::from_ggml_bytes(dtype, &bytes, vec![rows, cols], &Device::Cpu).unwrap();
         (viewed, owned)
+    }
+
+    /// A half weight the host views in its file is read in place, and its products have the
+    /// bits of the same weight held as stored in a copy.
+    #[test]
+    fn a_viewed_half_weight_runs_in_place_with_the_products_of_a_held_copy() {
+        use crate::tensor::quantized::QMatMul;
+        let (rows, cols) = (37usize, 64usize);
+        for dtype in [GgmlDType::F16, GgmlDType::BF16] {
+            let (viewed, owned) = viewed_and_owned(dtype, rows, cols);
+            let in_place = QMatMul::from_qtensor(viewed).unwrap();
+            assert!(matches!(in_place, QMatMul::QTensor(_)), "{dtype:?}");
+            assert_eq!(in_place.float_format(), Some(dtype));
+            assert_eq!(in_place.out_dim().unwrap(), rows);
+            let held = QMatMul::from_qtensor(owned).unwrap();
+            assert!(!matches!(held, QMatMul::QTensor(_)), "{dtype:?}");
+            for n in [1usize, 3] {
+                let x: Vec<f32> = (0..n * cols).map(|i| (i as f32 * 0.37).sin()).collect();
+                let x = Tensor::from_vec(x, (n, cols), &Device::Cpu).unwrap();
+                let got = in_place.forward(&x).unwrap().to_vec_f32();
+                let want = held.forward(&x).unwrap().to_vec_f32();
+                let bits = |v: &[f32]| v.iter().map(|f| f.to_bits()).collect::<Vec<_>>();
+                assert_eq!(bits(&got), bits(&want), "{dtype:?} {n} rows");
+            }
+        }
     }
 
     /// A half weight uploaded to a card by pieces of a few rows has the bits of the whole upload.

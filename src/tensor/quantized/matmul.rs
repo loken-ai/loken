@@ -21,6 +21,22 @@ fn half_rows() -> bool {
     HALF_ROWS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Whether `qt` is an F16 or BF16 weight on the host whose blocks are a view of a file mapping.
+/// Its products read the mapping in place, with the numerics of a half weight held as stored.
+fn host_half_view(qt: &QTensor) -> bool {
+    qt.device().is_cpu()
+        && matches!(qt.dtype(), GgmlDType::F16 | GgmlDType::BF16)
+        && qt.native_qtensor().is_view()
+}
+
+/// The dense dtype of a half weight format.
+fn half_dtype(dtype: GgmlDType) -> crate::tensor::DType {
+    match dtype {
+        GgmlDType::F16 => crate::tensor::DType::F16,
+        _ => crate::tensor::DType::BF16,
+    }
+}
+
 /// A projection over a quantised weight, or a dense one.
 #[derive(Debug, Clone)]
 pub enum QMatMul {
@@ -38,6 +54,10 @@ impl QMatMul {
     /// format keeps its blocks for the quantised kernels.
     pub fn from_arc(qt: Arc<QTensor>) -> Result<Self> {
         let dev = qt.device().clone();
+        // A half weight on the host that is a view of the file is read in place.
+        if host_half_view(&qt) {
+            return Ok(Self::QTensor(qt));
+        }
         match qt.dtype() {
             GgmlDType::BF16 => Self::bf16_onto(&qt, &dev),
             GgmlDType::F16 => Self::f16_onto(&qt, &dev),
@@ -110,6 +130,7 @@ impl QMatMul {
     /// The stored float format this projection holds its weight in, `None` for block formats.
     pub fn float_format(&self) -> Option<GgmlDType> {
         match self {
+            Self::QTensor(q) if host_half_view(q) => Some(q.dtype()),
             Self::QTensor(_) => None,
             Self::Tensor(_) => Some(GgmlDType::F32),
             Self::TensorF16(_) => Some(GgmlDType::F16),
@@ -202,8 +223,33 @@ impl QMatMul {
         y.reshape(odims)?.to_dtype(x.dtype())
     }
 
+    /// [`Self::host_half`] over a half weight read in place from its file mapping.
+    /// The product is the one a copy of the weight held as stored gives.
+    fn host_half_mapped(x: &Tensor, qt: &QTensor) -> Result<Tensor> {
+        let dims = x.dims().to_vec();
+        let k = *dims
+            .last()
+            .ok_or_else(|| Error::msg("QMatMul: rank-0 input"))?;
+        let n = qt.shape().dims()[0];
+        let rows = x.elem_count() / k;
+        let x2 = x.to_dtype(crate::tensor::DType::F32)?.reshape((rows, k))?;
+        let bytes = qt.native_qtensor().data();
+        let y = match x2.matmul_t_half_bytes_f32(bytes, half_dtype(qt.dtype()), n)? {
+            Some(y) => y,
+            // CONVERSION: none of value: a half matrix widens to F32 exactly.
+            None => x2.matmul_t(
+                &qt.dequantize(&Device::Cpu)?
+                    .to_dtype(crate::tensor::DType::F32)?,
+            )?,
+        };
+        let mut odims = dims;
+        *odims.last_mut().unwrap() = n;
+        y.reshape(odims)?.to_dtype(x.dtype())
+    }
+
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         match self {
+            Self::QTensor(qt) if host_half_view(qt) => Self::host_half_mapped(x, qt),
             Self::QTensor(qt) => {
                 // `x` is already a concrete tensor::Tensor: the native
                 // QMatMul forward handles its own layout/offset (any
@@ -297,7 +343,7 @@ impl QMatMul {
     /// `Ok(None)` for any non-fast-path case -> caller runs the unfused path.
     pub fn gate_up_silu_f16(&self, up: &QMatMul, x: &Tensor) -> Result<Option<Tensor>> {
         match (self, up) {
-            (Self::QTensor(g), Self::QTensor(u)) => {
+            (Self::QTensor(g), Self::QTensor(u)) if !host_half_view(g) && !host_half_view(u) => {
                 g.native_qmm()?.gate_up_silu_f16(u.native_qmm()?, x)
             }
             _ => Ok(None),
@@ -309,7 +355,7 @@ impl QMatMul {
     /// (Tensor/F16) weights -> caller falls back to `forward`.
     pub fn forward_slice_cpu(&self, x: &[f32], out: &mut [f32]) -> Result<bool> {
         match self {
-            Self::QTensor(qt) => qt.native_qmm()?.forward_slice_cpu(x, out),
+            Self::QTensor(qt) if !host_half_view(qt) => qt.native_qmm()?.forward_slice_cpu(x, out),
             _ => Ok(false),
         }
     }
@@ -318,7 +364,7 @@ impl QMatMul {
     /// one-row call. `Ok(false)` where the one-row call declines.
     pub fn forward_rows_cpu(&self, x: &[f32], out: &mut [f32]) -> Result<bool> {
         match self {
-            Self::QTensor(qt) => qt.native_qmm()?.forward_rows_cpu(x, out),
+            Self::QTensor(qt) if !host_half_view(qt) => qt.native_qmm()?.forward_rows_cpu(x, out),
             _ => Ok(false),
         }
     }
@@ -334,7 +380,7 @@ impl QMatMul {
         let mut inner = Vec::with_capacity(mats.len());
         for m in mats {
             match m {
-                Self::QTensor(qt) => inner.push(qt.native_qmm()?),
+                Self::QTensor(qt) if !host_half_view(qt) => inner.push(qt.native_qmm()?),
                 _ => return Ok(false),
             }
         }
@@ -344,6 +390,7 @@ impl QMatMul {
     /// Output dim (`n`) - to size decode-arena buffers.
     pub fn out_dim(&self) -> Result<usize> {
         match self {
+            Self::QTensor(qt) if host_half_view(qt) => Ok(qt.shape().dims()[0]),
             Self::QTensor(qt) => Ok(qt.native_qmm()?.out_dim()),
             Self::Tensor(w) | Self::TensorF16(w) | Self::Bf16(w) => Ok(w.dims()[0]),
         }
@@ -378,7 +425,7 @@ impl QMatMul {
     /// The kernel matmul `forward` runs, `None` for a dense weight.
     pub(crate) fn kernel(&self) -> Option<&super::QKernelMatMul> {
         match self {
-            Self::QTensor(qt) => qt.native_qmm().ok(),
+            Self::QTensor(qt) if !host_half_view(qt) => qt.native_qmm().ok(),
             _ => None,
         }
     }
@@ -388,7 +435,7 @@ impl QMatMul {
     /// (the borrow lives as long as `self` - `native_qmm` caches a reference).
     pub fn cpu_raw(&self) -> Option<(GgmlDType, usize, usize, &[u8])> {
         match self {
-            Self::QTensor(qt) => qt.native_qmm().ok()?.cpu_raw(),
+            Self::QTensor(qt) if !host_half_view(qt) => qt.native_qmm().ok()?.cpu_raw(),
             _ => None,
         }
     }

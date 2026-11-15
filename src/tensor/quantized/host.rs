@@ -195,6 +195,11 @@ impl QHostTensor {
         }
     }
 
+    /// Whether the blocks are a view of memory another owner holds, a file mapping.
+    pub fn is_view(&self) -> bool {
+        matches!(self.storage, QHostStorage::View { .. })
+    }
+
     /// Whether the blocks exist only on a card.
     pub fn is_card_only(&self) -> bool {
         matches!(self.storage, QHostStorage::OnCard { .. })

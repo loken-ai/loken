@@ -851,6 +851,44 @@ impl Tensor {
         self.matmul(&rhs.transpose(rank - 2, rank - 1)?)
     }
 
+    /// [`Self::matmul_t_half_f32`] over a weight `[n, k]` given as its stored little-endian
+    /// F16 or BF16 bytes, read where they lie: a view of a file mapping is read in place.
+    /// `None` where the operands are not that or the bytes are not aligned to 2.
+    pub fn matmul_t_half_bytes_f32(&self, w: &[u8], half: DType, n: usize) -> Result<Option<Self>> {
+        let xd = self.dims();
+        if xd.len() != 2 || self.dtype() != DType::F32 || !self.device().is_cpu() {
+            return Ok(None);
+        }
+        let (rows, k) = (xd[0], xd[1]);
+        if w.len() != n * k * 2 || !(w.as_ptr() as usize).is_multiple_of(2) {
+            return Ok(None);
+        }
+        let a = self.contiguous()?;
+        let a = a.f32_data()?;
+        if a.len() != rows * k {
+            return Ok(None);
+        }
+        let mut out = vec![0f32; rows * n];
+        // SAFETY: `w` holds `n * k` 16-bit words, aligned to 2 as checked above.
+        match half {
+            DType::F16 => {
+                let b =
+                    unsafe { std::slice::from_raw_parts(w.as_ptr() as *const half::f16, n * k) };
+                gemm_nt_half_f32(a, b, rows, k, n, &mut out)
+            }
+            DType::BF16 => {
+                let b =
+                    unsafe { std::slice::from_raw_parts(w.as_ptr() as *const half::bf16, n * k) };
+                gemm_nt_half_f32(a, b, rows, k, n, &mut out)
+            }
+            _ => return Ok(None),
+        }
+        Ok(Some(Self::from_packed(
+            Arc::new(Storage::Cpu(CpuStorage::F32(out))),
+            Shape::from(vec![rows, n]),
+        )))
+    }
+
     /// `self @ w^T` on the host for F32 activations `[rows, k]` and a weight `[n, k]` held as
     /// stored in F16 or BF16: `[rows, n]` F32, summed in F32. Each weight row is widened once
     /// per call and dotted with every activation row, so the weight is read once whatever the
