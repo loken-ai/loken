@@ -1612,42 +1612,24 @@ impl MoeWeights {
                 tier.decode(self, xs, topk_ids, topk_weights_scaled)?
             }
         } else if let Some(tier) = self.tier.as_ref().filter(|t| {
-            xs.device().runs_as_card() && t.stream_pays(num_tokens, self.n_experts_used)
+            xs.device().runs_as_card() && t.reads_in_place(num_tokens, self.n_experts_used)
         }) {
-            // A wide batch reads nearly every expert: the layer's experts come to the card,
-            // beside the work before them, and the whole layer runs there as if it lived there.
+            // A wide batch runs through the expert-batched kernels, which read each expert where
+            // the card holds it: the experts the card misses come to the room of a wide batch,
+            // those the rows route to only.
             let dev = xs.device().clone();
-            let stacks = super::wide::staged("tier fill wait", &dev, false, || tier.stacks())?;
-            let out = super::wide::staged("tier experts", &dev, false, || {
-                self.forward_cuda(
-                    xs,
-                    topk_ids,
-                    topk_weights_scaled,
-                    num_tokens,
-                    true,
-                    t_route,
-                    None,
-                    Some(&*stacks),
-                )
-            });
-            // The experts the batch used warm the cache the decode will read.
-            #[cfg(feature = "gpu")]
-            if let Ok(card) = dev.as_cuda_device() {
-                let stream = card.0.stream().clone();
-                if let Err(e) = tier.keep_hottest_of_prompt(topk_ids, &stream) {
-                    tracing::warn!("the cache is not warmed from the prompt: {e}");
-                }
-            }
-            tier.release_stacks()?;
-            out?
+            super::wide::staged("tier experts", &dev, false, || {
+                tier.wide_rows(self, xs, topk_ids, topk_weights_scaled)
+            })?
         } else if let Some(tier) = self.tier.as_ref().filter(|t| {
             xs.device().runs_as_card()
                 && num_tokens > 1
                 && t.rows_through_cache(num_tokens, self.n_experts_used)
         }) {
-            // Too few rows to pay for the layer's experts to come: the rows go through the cache
-            // together, as the decoded tokens they stand for would one after the other. The rows
-            // of a recorded verify go through the kernels of the recorded decode.
+            // Too few rows for the expert-batched kernels, or a layer they do not read: the rows go
+            // through the cache together, as the decoded tokens they stand for would one after
+            // the other. The rows of a recorded verify go through the kernels of the recorded
+            // decode.
             if tier.records(&xs.device()) && num_tokens <= tier.graph_rows() {
                 tier.decode_rows_graph(self, xs, topk_ids, topk_weights_scaled)?
             } else {

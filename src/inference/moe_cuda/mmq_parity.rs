@@ -6,7 +6,7 @@
 //! two hundredths of the largest output from the float answer on random weights; the tile
 //! kernels must be no further from it than the decode kernels are.
 
-use super::mmq_experts::{Glu, MmqRouting};
+use super::mmq_experts::{Glu, MmqRouting, Region};
 use crate::tensor::quantized::{GgmlDType, QTensor};
 use crate::tensor::{Device, Tensor};
 use std::sync::Arc;
@@ -766,6 +766,115 @@ fn the_grouped_launches_match_the_first_launches_bit_for_bit() {
             assert!(
                 got.1 == want.1,
                 "{dtype:?} {what}: the folded result differs"
+            );
+        }
+    }
+}
+
+/// A routing whose experts sit in several stacks, in any order, launched a region at a time,
+/// gives the bits of the same routing over one stack: what a cache of experts on a card reads
+/// where its slots hold them. A region may hold fewer experts than its stack, and may be empty.
+#[test]
+fn launches_over_several_stacks_give_the_bits_of_one_stack() {
+    let Some(dev) = card("the launches over several stacks are") else {
+        return;
+    };
+    let host = Device::Cpu;
+    let (e, topk, hidden, inter, tokens) = (24usize, 8usize, 512usize, 256usize, 300usize);
+    let mut rng = Lcg(47);
+    for dtype in [
+        GgmlDType::Q4K,
+        GgmlDType::Q6K,
+        GgmlDType::Q8_0,
+        GgmlDType::Q5_0,
+    ] {
+        // Each stack's bytes as a file holds them: gate, up, down.
+        let mut bytes = |rows: usize, k: usize| -> Vec<u8> {
+            let w = random(&mut rng, e * rows * k, 0.08);
+            let w = Tensor::from_vec(w, (e, rows, k), &host).unwrap();
+            let q = QTensor::quantize_onto(&w, dtype, &host).unwrap();
+            q.native_qtensor().data().to_vec()
+        };
+        let raw = [
+            bytes(inter, hidden),
+            bytes(inter, hidden),
+            bytes(hidden, inter),
+        ];
+        let shape = [(inter, hidden), (inter, hidden), (hidden, inter)];
+        let stack = |i: usize, experts: &[usize]| -> QTensor {
+            let per = raw[i].len() / e;
+            let mut buf = Vec::with_capacity(experts.len() * per);
+            for &ex in experts {
+                buf.extend_from_slice(&raw[i][ex * per..(ex + 1) * per]);
+            }
+            let (rows, k) = shape[i];
+            QTensor::from_ggml_bytes(dtype, &buf, vec![experts.len(), rows, k], &dev).unwrap()
+        };
+        let all: Vec<usize> = (0..e).collect();
+        let whole = [stack(0, &all), stack(1, &all), stack(2, &all)];
+        let x = Tensor::from_vec(
+            random(&mut rng, tokens * hidden, 1.0),
+            (tokens, hidden),
+            &dev,
+        )
+        .unwrap();
+        let (slots, experts, weights) = routing(&mut rng, tokens, topk, e);
+        let mut choice = vec![0u32; slots.len()];
+        for (&pair, &ex) in slots.iter().zip(&experts) {
+            choice[pair as usize] = ex;
+        }
+        let weights = Tensor::from_vec(weights, slots.len(), &dev).unwrap();
+        let choices = Tensor::from_vec(choice.clone(), (tokens, topk), &dev).unwrap();
+        let plan = MmqRouting::from_choices(&choices, e).unwrap();
+        let h = plan.gate_up_silu(&x, &whole[0], Some(&whole[1])).unwrap();
+        let want = to_vec(&plan.down_fold(&h, &whole[2], &weights, None).unwrap());
+        assert!(want.iter().all(|v| v.is_finite()) && want.iter().any(|&v| v != 0.0));
+        // The places of the experts: a shuffle of them.
+        let mut place: Vec<usize> = (0..e).collect();
+        for i in (1..e).rev() {
+            place.swap(i, rng.below(i + 1));
+        }
+        let mut at = vec![0u32; e];
+        for (p, &ex) in place.iter().enumerate() {
+            at[ex] = p as u32;
+        }
+        let placed: Vec<u32> = choice.iter().map(|&ex| at[ex as usize]).collect();
+        let placed = Tensor::from_vec(placed, (tokens, topk), &dev).unwrap();
+        // Cuts of the places into stacks; the last stack holds 3 more experts than its region.
+        for cuts in [[0usize, 11, 16, e], [0, 16, 16, e], [0, e, e, e]] {
+            let mut held: Vec<[QTensor; 3]> = Vec::new();
+            let mut spans = Vec::new();
+            for w in cuts.windows(2) {
+                let (lo, hi) = (w[0], w[1]);
+                let mut experts: Vec<usize> = place[lo..hi].to_vec();
+                if hi == e {
+                    experts.extend_from_slice(&place[..3]);
+                }
+                if experts.is_empty() {
+                    experts.push(place[0]);
+                }
+                held.push([stack(0, &experts), stack(1, &experts), stack(2, &experts)]);
+                spans.push((lo, hi - lo));
+            }
+            let plan = MmqRouting::from_choices(&placed, e).unwrap();
+            let regions = |i: usize, up: bool| -> Vec<Region<'_>> {
+                held.iter()
+                    .zip(&spans)
+                    .map(|(s, &(first, experts))| Region {
+                        stack: &s[i],
+                        second: up.then_some(&s[1]),
+                        first,
+                        experts,
+                    })
+                    .collect()
+            };
+            let h = plan.gate_up_over(&x, &regions(0, true), Glu::Silu).unwrap();
+            let got = plan
+                .down_fold_over(&h, &regions(2, false), &weights, None, None)
+                .unwrap();
+            assert!(
+                to_vec(&got) == want,
+                "{dtype:?} cuts {cuts:?}: the result differs from one stack's"
             );
         }
     }

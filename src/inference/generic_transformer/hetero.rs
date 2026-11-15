@@ -578,7 +578,7 @@ impl GenericHeteroTransformer {
                 l.moe.as_ref().is_some_and(|m| {
                     m.tier
                         .as_ref()
-                        .is_some_and(|t| t.stream_pays(seq_len, m.n_experts_used))
+                        .is_some_and(|t| t.reads_in_place(seq_len, m.n_experts_used))
                         || m.reads_every_expert_on_host(seq_len)
                 })
             })
@@ -3238,21 +3238,6 @@ impl GenericHeteroTransformer {
             // dispatches to a device and one that runs on the host are told apart.
             for layer_idx in seg_start..seg_end {
                 let _timer = crate::inference::place::layer_perf::LayerTimer::start(layer_idx);
-                // A wide batch will read this layer's experts and the next one's: they start
-                // coming to the card now, behind the work already queued.
-                if seq_len > 1 {
-                    for l in [layer_idx, layer_idx + 1] {
-                        if let Some(moe) = self.layers.get(l).and_then(|x| x.moe.as_ref()) {
-                            if let Some(tier) = moe
-                                .tier
-                                .as_ref()
-                                .filter(|t| t.stream_pays(seq_len, moe.n_experts_used))
-                            {
-                                tier.prefetch()?;
-                            }
-                        }
-                    }
-                }
                 // PLE: the layer's input moves to the layer's device, host or card.
                 let ple_on_dev = match ple_inputs.as_ref().and_then(|inputs| inputs.get(layer_idx))
                 {

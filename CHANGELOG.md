@@ -10,6 +10,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Fixed
 
+- Experts: read a prompt without copying the experts its rows do not use.
 - Serving: answer lone requests serially until a burst has measured the worker.
 - Experts: keep a token from hanging while another request loads kernels on its card.
 - Serving: weigh a lone request's prompt on both decode paths, whatever its length.

@@ -47,8 +47,14 @@ impl LayerTier {
         crate::tensor::bail!("an expert cache lives on a card")
     }
 
-    pub(super) fn keep_hottest_of_prompt(&self, _: &Tensor, _: &()) -> Result<()> {
-        Ok(())
+    pub(super) fn wide_rows(
+        self: &Arc<Self>,
+        _: &MoeWeights,
+        _: &Tensor,
+        _: &Tensor,
+        _: &Tensor,
+    ) -> Result<Tensor> {
+        crate::tensor::bail!("an expert cache lives on a card")
     }
 
     pub(crate) fn rows_through_cache(&self, _rows: usize, _used: usize) -> bool {
@@ -103,7 +109,7 @@ impl LayerTier {
         (0, 0, 0)
     }
 
-    pub fn stream_pays(&self, _rows: usize, _used: usize) -> bool {
+    pub fn reads_in_place(&self, _rows: usize, _used: usize) -> bool {
         false
     }
 
@@ -115,19 +121,7 @@ impl LayerTier {
         unreachable!("an expert cache lives on a card")
     }
 
-    pub fn prefetch(&self) -> Result<()> {
-        Ok(())
-    }
-
     pub fn hold_stacks(&self, _on: bool) -> Result<()> {
-        Ok(())
-    }
-
-    pub(super) fn stacks(&self) -> Result<&[crate::tensor::quantized::QTensor; 3]> {
-        crate::tensor::bail!("an expert cache lives on a card")
-    }
-
-    pub(super) fn release_stacks(&self) -> Result<()> {
         Ok(())
     }
 }

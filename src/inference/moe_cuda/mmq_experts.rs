@@ -93,6 +93,18 @@ pub fn moe_mmq_serves(dtype: GgmlDType, k: usize) -> bool {
     mmq_moe_supports(dtype) && k.is_multiple_of(mmq_moe_qk(dtype))
 }
 
+/// The routing's experts `first..first + experts`, held as the first `experts` experts of
+/// `stack`: a launch over a routing whose experts sit in several stacks takes one region for
+/// each. `second` is the up stack beside a gate stack, `None` for a fused gate‖up stack and
+/// for a down stack.
+#[derive(Clone, Copy)]
+pub struct Region<'a> {
+    pub stack: &'a QTensor,
+    pub second: Option<&'a QTensor>,
+    pub first: usize,
+    pub experts: usize,
+}
+
 /// The routing, in the form the expert-batched launches read it.
 pub struct MmqRouting {
     /// `[experts + 1]`: where each expert's run of sorted rows starts.
@@ -234,6 +246,43 @@ impl MmqRouting {
         self.tokens * self.topk
     }
 
+    /// The rows of one expert of `regions` and the format they share.
+    ///
+    /// The regions hold one format and one expert shape reducing over `k`.
+    /// They cover the routing's experts in order, each region within its stack.
+    fn regions_shape(&self, regions: &[Region<'_>], k: usize) -> Result<(usize, GgmlDType)> {
+        let Some(head) = regions.first() else {
+            crate::tensor::bail!("moe mmq: a launch over no stack");
+        };
+        let (_, n, _) = stack_dims(head.stack)?;
+        let dtype = head.stack.dtype();
+        let mut next = 0;
+        for r in regions {
+            let (e, rn, rk) = stack_dims(r.stack)?;
+            if r.first != next || r.experts > e || rn != n || rk != k || r.stack.dtype() != dtype {
+                crate::tensor::bail!(
+                    "moe mmq: a stack [{e}, {rn}, {rk}] of {:?} for the experts {}..{} at k={k}",
+                    r.stack.dtype(),
+                    r.first,
+                    r.first + r.experts
+                );
+            }
+            if let Some(s) = r.second {
+                if s.shape().dims() != r.stack.shape().dims() || s.dtype() != dtype {
+                    crate::tensor::bail!("moe mmq: the gate and up stacks differ");
+                }
+            }
+            next += r.experts;
+        }
+        if next != self.experts {
+            crate::tensor::bail!(
+                "moe mmq: stacks of {next} experts against a plan of {}",
+                self.experts
+            );
+        }
+        Ok((n, dtype))
+    }
+
     /// `silu(gate . x) * (up . x)` for every routed row, in sorted order: `[rows, n]`.
     ///
     /// `up` is `None` when `gate` is a fused gate‖up stack of `2n` rows per expert.
@@ -255,37 +304,75 @@ impl MmqRouting {
         up: Option<&QTensor>,
         glu: Glu<'_>,
     ) -> Result<Tensor> {
+        let experts = stack_dims(gate)?.0;
+        let whole = Region {
+            stack: gate,
+            second: up,
+            first: 0,
+            experts,
+        };
+        self.gate_up_over(xs, &[whole], glu)
+    }
+
+    /// [`Self::gate_up`] over a routing whose experts sit in several stacks, a launch for each
+    /// region. Every region reads the same quantised rows and writes its experts' rows of the
+    /// same buffer, so a row's result does not depend on the stack its expert is in.
+    pub fn gate_up_over(
+        &self,
+        xs: &Tensor,
+        regions: &[Region<'_>],
+        glu: Glu<'_>,
+    ) -> Result<Tensor> {
         let (tokens, k) = xs.dims2()?;
         if tokens != self.tokens {
             crate::tensor::bail!("moe mmq: {tokens} tokens against a plan of {}", self.tokens);
         }
-        let (e, n_gate, gk) = stack_dims(gate)?;
-        let width = match up {
-            Some(u) => {
-                if u.shape().dims() != gate.shape().dims() || u.dtype() != gate.dtype() {
-                    crate::tensor::bail!("moe mmq: the gate and up stacks differ");
-                }
-                n_gate
-            }
-            None => n_gate / 2,
-        };
-        if gk != k || e != self.experts {
-            crate::tensor::bail!("moe mmq: stack [{e}, {n_gate}, {gk}] against k={k}");
+        let (n_gate, dtype) = self.regions_shape(regions, k)?;
+        let split = regions[0].second.is_some();
+        if regions.iter().any(|r| r.second.is_some() != split) {
+            crate::tensor::bail!("moe mmq: some stacks have their up stack apart, others not");
         }
+        let width = match split {
+            true => n_gate,
+            false => n_gate / 2,
+        };
         let dev = xs.device().as_cuda_device()?;
         let rows = self.rows();
-        let y = self.quantize(xs, Some(&self.src_rows), gate.dtype(), k)?;
+        let y = self.quantize(xs, Some(&self.src_rows), dtype, k)?;
         let gu = scratch::<f32>(&dev, rows * 2 * width)?;
         let gu_ptr = gu.device_ptr(gu.stream()).0;
         // Gate and up apart are one launch: the up results land `width` floats after the
         // gate's in each row, where a fused gate||up stack puts them.
-        match up {
-            Some(u) if self.first_launches() => {
-                self.matmul(gate, None, &y, k, gu_ptr, 2 * width, None)?;
-                let up_ptr = gu_ptr + (width * std::mem::size_of::<f32>()) as u64;
-                self.matmul(u, None, &y, k, up_ptr, 2 * width, None)?;
+        for r in regions {
+            let (first, experts) = (r.first, r.experts);
+            match r.second {
+                Some(u) if self.first_launches() => {
+                    self.matmul(
+                        r.stack,
+                        None,
+                        first,
+                        experts,
+                        &y,
+                        k,
+                        gu_ptr,
+                        2 * width,
+                        None,
+                    )?;
+                    let up_ptr = gu_ptr + (width * std::mem::size_of::<f32>()) as u64;
+                    self.matmul(u, None, first, experts, &y, k, up_ptr, 2 * width, None)?;
+                }
+                second => self.matmul(
+                    r.stack,
+                    second.map(|u| (u, width)),
+                    first,
+                    experts,
+                    &y,
+                    k,
+                    gu_ptr,
+                    2 * width,
+                    None,
+                )?,
             }
-            _ => self.matmul(gate, up.map(|u| (u, width)), &y, k, gu_ptr, 2 * width, None)?,
         }
         let out = scratch::<f32>(&dev, rows * width)?;
         let out_ptr = out.device_ptr(out.stream()).0 as *mut f32;
@@ -371,19 +458,53 @@ impl MmqRouting {
         residual: Option<&Tensor>,
         down_bias: Option<&Tensor>,
     ) -> Result<Tensor> {
+        let experts = stack_dims(down)?.0;
+        let whole = Region {
+            stack: down,
+            second: None,
+            first: 0,
+            experts,
+        };
+        self.down_fold_over(hs, &[whole], topk_weights, residual, down_bias)
+    }
+
+    /// [`Self::down_fold_biased`] over a routing whose experts sit in several down stacks, a
+    /// launch for each region: every launch writes the rows of its experts' pairs, and the fold
+    /// reads them all in slot order.
+    pub fn down_fold_over(
+        &self,
+        hs: &Tensor,
+        regions: &[Region<'_>],
+        topk_weights: &Tensor,
+        residual: Option<&Tensor>,
+        down_bias: Option<&Tensor>,
+    ) -> Result<Tensor> {
         let (rows, k) = hs.dims2()?;
-        let (e, hidden, dk) = stack_dims(down)?;
-        if rows != self.rows() || dk != k || e != self.experts {
-            crate::tensor::bail!(
-                "moe mmq: {rows} rows of k={k} against a down stack [{e}, {hidden}, {dk}]"
-            );
+        if rows != self.rows() {
+            crate::tensor::bail!("moe mmq: {rows} rows against a plan of {}", self.rows());
         }
+        if regions.iter().any(|r| r.second.is_some()) {
+            crate::tensor::bail!("moe mmq: a down launch reads one stack");
+        }
+        let (hidden, dtype) = self.regions_shape(regions, k)?;
         let dev = hs.device().as_cuda_device()?;
-        let y = self.quantize(hs, None, down.dtype(), k)?;
+        let y = self.quantize(hs, None, dtype, k)?;
         let pairs = scratch::<f32>(&dev, rows * hidden)?;
         let pairs_ptr = pairs.device_ptr(pairs.stream()).0;
         let slots = self.slots.device_ptr(self.slots.stream()).0 as *const i32;
-        self.matmul(down, None, &y, k, pairs_ptr, hidden, Some(slots))?;
+        for r in regions {
+            self.matmul(
+                r.stack,
+                None,
+                r.first,
+                r.experts,
+                &y,
+                k,
+                pairs_ptr,
+                hidden,
+                Some(slots),
+            )?;
+        }
         let out = match residual {
             // A fresh buffer holding the residual: the fold adds into it in place.
             Some(r) => r
@@ -482,7 +603,8 @@ impl MmqRouting {
         Ok(y)
     }
 
-    /// One expert-batched launch of `stack` against the quantised sorted rows `y`, writing
+    /// One expert-batched launch of the first `experts` experts of `stack`, the routing's
+    /// experts from `first` on, against the quantised sorted rows `y`, writing
     /// sorted row `i` to destination row `ids_dst[i]` (or `i`) of a `dst` whose rows are
     /// `stride` floats apart. A `second` stack of the same shape and format is multiplied in
     /// the same launch, its results the given number of floats after the first's in each row.
@@ -491,6 +613,8 @@ impl MmqRouting {
         &self,
         stack: &QTensor,
         second: Option<(&QTensor, usize)>,
+        first: usize,
+        experts: usize,
         y: &CudaSlice<u8>,
         k: usize,
         dst: u64,
@@ -502,6 +626,20 @@ impl MmqRouting {
         if !moe_mmq_serves(dtype, sk) || sk != k {
             crate::tensor::bail!("moe mmq: no expert-batched kernel for {dtype:?} at k={sk}");
         }
+        if experts > e || first + experts > self.experts {
+            crate::tensor::bail!(
+                "moe mmq: experts {first}..{} of a plan of {} from a stack of {e}",
+                first + experts,
+                self.experts
+            );
+        }
+        // An empty region launches nothing: a grid of no experts is not a launch.
+        if experts == 0 {
+            return Ok(());
+        }
+        // The kernel reads the bounds of its experts from the region's first on.
+        let bounds = self.bounds.device_ptr(self.bounds.stream()).0
+            + (first * std::mem::size_of::<i32>()) as u64;
         let rows = self.rows();
         let blocks_per_row = k / dtype.block_size();
         let expert_bytes = n * blocks_per_row * dtype.type_size();
@@ -531,7 +669,7 @@ impl MmqRouting {
                 second_offset as i64,
                 y.device_ptr(y.stream()).0 as *const c_void,
                 dst as *mut c_void,
-                self.bounds.device_ptr(self.bounds.stream()).0 as *const i32,
+                bounds as *const i32,
                 ids_dst.unwrap_or(std::ptr::null()),
                 expert_bytes as i64,
                 k as i64,
@@ -539,7 +677,7 @@ impl MmqRouting {
                 rows as i64,
                 blocks_per_row as i64,
                 stride as i64,
-                e as i32,
+                experts as i32,
                 ncols_grid as i64,
                 ncols_hint as i64,
                 self.mmq_x,

@@ -15,6 +15,10 @@
 //! A card with room for every expert of its layers holds them all: the layer is resident, and the
 //! tier is the stacks the kernels read, with no host in the token.
 //!
+//! A wide batch runs through the expert-batched kernels, which read the slots where they are.
+//! The experts its rows route to and the card misses are copied into the room of a wide batch,
+//! and nothing else is.
+//!
 //! The counts decay within a few tens of tokens (`ADAPT_DECAY` every `ADAPT_EVERY_TOKENS`), so
 //! the cache follows the routing of the text in hand rather than that of the prompt or the load.
 
@@ -160,18 +164,21 @@ pub struct LayerTier {
     promotions: AtomicU64,
     /// The layer that reports the cache's hit rate.
     leader: std::sync::atomic::AtomicBool,
-    /// What a wide batch of rows reads instead: the whole layer, on the card for the one launch.
+    /// The rooms a missing expert passes through: the transit room of a decode, and the room of
+    /// a wide batch.
     stage: Option<Stage>,
     /// The cache holds every expert, expert `e` in slot `e`: nothing is ever missing.
     resident: bool,
-    /// While a prompt holds the layer's stacks: the routing of its chunks so far and the stream
-    /// they ran on, ranked into the cache once, when the hold ends.
+    /// While a prompt holds the layer's room: the routed experts of its chunks so far and the
+    /// stream they ran on, ranked into the cache once, when the hold ends.
     prompt_ids: Mutex<
         Option<(
             Arc<crate::tensor::gpu_runtime::driver::CudaStream>,
-            Vec<Tensor>,
+            Vec<u32>,
         )>,
     >,
+    /// Experts a wide batch copied into the room of a wide batch, since the load.
+    to_room: AtomicU64,
     /// The stream this layer's copies into the cache run on.
     copy: Arc<crate::tensor::gpu_runtime::driver::CudaStream>,
     /// A copy into the cache is queued or running.
@@ -372,8 +379,9 @@ pub struct CardStager {
     buffers: [StageBuffer; 2],
     /// What each buffer holds, for the layer it was filled for.
     held: [Mutex<super::expert_ahead::Held>; 2],
-    /// The room a wide batch fills with a layer's whole stacks, from the memory the caches lend
-    /// while a prefill runs.
+    /// The room of a wide batch, wide enough for a layer's whole stacks, which holds the experts
+    /// its rows route to and the card misses: from the memory the caches lend while a prefill
+    /// runs.
     full: Mutex<Option<[FullBuffer; 2]>>,
     /// The most a decode has taken of the card between a prefill's end and the next prefill,
     /// measured; `None` until one has run. The extra slots come back only within what it leaves.
@@ -394,11 +402,12 @@ struct StageBuffer {
     arenas: [Arc<crate::tensor::gpu_runtime::driver::CudaSlice<u8>>; 3],
 }
 
-/// [`StageBuffer`] wide enough for the whole stacks of the widest layer.
+/// [`StageBuffer`] wide enough for the whole stacks of the widest layer: the room of a wide
+/// batch, which holds the experts its rows route to and the card misses.
 struct FullBuffer {
     arenas: [Arc<crate::tensor::gpu_runtime::driver::CudaSlice<u8>>; 3],
     /// Recorded when the layer that read the buffer last has queued all its kernels: the next
-    /// fill waits for it.
+    /// copy into the buffer waits for it.
     free: Mutex<Option<crate::tensor::gpu_runtime::driver::CudaEvent>>,
 }
 
@@ -409,19 +418,18 @@ struct Stage {
     buffer: usize,
     /// The transit room as stacks of `transit` experts.
     compact: [QTensor; 3],
-    /// The whole stacks of the layer in the room of a wide batch, while there is one.
+    /// The room of a wide batch as stacks of the layer's shape, while there is one.
     full: Mutex<Option<Arc<[QTensor; 3]>>>,
-    /// The fill's end, when one has been queued and not yet read.
-    ready: Mutex<Option<crate::tensor::gpu_runtime::driver::CudaEvent>>,
+    /// The experts in the room of a wide batch, in the order of their places there.
+    /// Empty while the room holds nothing of this layer.
+    placed: Mutex<Vec<u32>>,
     /// Host ranges, per stack, that are page-locked: copies from them are asynchronous.
     pinned: [Option<(usize, usize)>; 3],
     /// The direct reader for the parts of an upload the page cache does not hold.
     #[cfg(target_os = "linux")]
     bounce: Mutex<BounceState>,
-    /// The stacks are kept for several forwards in a row (see `hold_stacks`).
+    /// The room keeps its experts for several forwards in a row (see `hold_stacks`).
     held: std::sync::atomic::AtomicBool,
-    /// While held: the fill has landed and the compute stream has waited for it.
-    filled: std::sync::atomic::AtomicBool,
 }
 
 /// A stage's direct reader: not opened yet, open, or given up after a failure.
@@ -981,8 +989,9 @@ impl super::GenericHeteroTransformer {
             return 0;
         }
         let rows = tokens.min(shape.target_chunk);
-        // A prompt that routes more pairs than a layer has experts reads nearly all of them: it
-        // fills a room with the layer's whole stacks, which the card has to find.
+        // A prompt that routes more pairs than a layer has experts runs through the expert-batched
+        // kernels: the experts it misses come to the room of a wide batch, which the card has to
+        // find.
         let wide = self
             .layers
             .iter()
@@ -1024,7 +1033,7 @@ impl super::GenericHeteroTransformer {
             crate::inference::place::ladder::release_pools();
             crate::inference::place::vram_manager::residency_changed();
         }
-        // The room of whole stacks is taken from what the card has free, and a chunk's
+        // The room of a wide batch is taken from what the card has free, and a chunk's
         // activations come out of what is left. A card that cannot give both keeps the room
         // unmade: the prompt then reads chunk by chunk, each bringing the experts it routes
         // to, where a room that left no memory for a chunk would fail whatever the chunk's size.
@@ -1184,7 +1193,7 @@ impl LayerTier {
         Ok(self)
     }
 
-    /// The layer's whole stacks over the room of a wide batch, which is made if it is not.
+    /// The layer's stacks over the room of a wide batch, which is made if it is not.
     pub fn attach_full(&self) -> Result<()> {
         let Some(stage) = self.stage.as_ref() else {
             return Ok(());
@@ -1208,8 +1217,11 @@ impl LayerTier {
     pub fn detach_full(&self) {
         if let Some(stage) = self.stage.as_ref() {
             *stage.full.lock().unwrap_or_else(|e| e.into_inner()) = None;
-            *stage.ready.lock().unwrap_or_else(|e| e.into_inner()) = None;
-            stage.filled.store(false, Ordering::Release);
+            stage
+                .placed
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clear();
             stage.held.store(false, Ordering::Release);
         }
     }
@@ -1468,6 +1480,7 @@ impl LayerTier {
             decode_us: AtomicU64::new(0),
             scratch: Mutex::new(None),
             prompt_ids: Mutex::new(None),
+            to_room: AtomicU64::new(0),
             upload_us: [AtomicU64::new(0), AtomicU64::new(0)],
             host_us: [AtomicU64::new(0), AtomicU64::new(0)],
             paced: [AtomicU64::new(0), AtomicU64::new(0)],
@@ -2063,7 +2076,7 @@ impl LayerTier {
                 &mut laps,
             )?;
             drop(guard);
-            self.keep_in_transit(transit_ids, false, &mut in_use, &stream)?;
+            self.keep_in_transit(transit_ids, None, &mut in_use, &stream)?;
             self.promote(host_ids, &in_use);
             laps.mark("tier token: finish");
             return Ok(out);
@@ -2245,7 +2258,7 @@ impl LayerTier {
         // An expert that came to the card for this token stays in a slot where it is hotter than
         // what the slot holds, without a second copy over the link; the host's misses go to the
         // worker.
-        self.keep_in_transit(transit_ids, false, &mut in_use, &stream)?;
+        self.keep_in_transit(transit_ids, None, &mut in_use, &stream)?;
         self.promote(host_ids, &in_use);
         laps.mark("tier token: finish");
         Ok(out)
@@ -2366,7 +2379,7 @@ impl LayerTier {
             )?;
             drop(guard);
             let host_experts: Vec<u32> = missing[to_transit..].to_vec();
-            self.keep_in_transit(&transit_experts, false, &mut in_use, &stream)?;
+            self.keep_in_transit(&transit_experts, None, &mut in_use, &stream)?;
             self.promote_up_to(&host_experts, &in_use, rows.max(ADAPT_SWAPS_A_REQUEST));
             laps.mark("tier rows: finish");
             return Ok(out);
@@ -2553,56 +2566,24 @@ impl LayerTier {
         }
         let out = out.expect("a token routes to at least one expert");
         drop(guard);
-        self.keep_in_transit(&transit_experts, false, &mut in_use, &stream)?;
+        self.keep_in_transit(&transit_experts, None, &mut in_use, &stream)?;
         self.promote_up_to(&host_experts, &in_use, rows.max(ADAPT_SWAPS_A_REQUEST));
         laps.mark("tier rows: finish");
         Ok(out)
     }
 
-    /// A prompt's routing through this layer, `ids` `[rows, k]`, warms the cache before the first
-    /// token is decoded: the experts the prompt used are ranked into the heat, below what a
-    /// decoded token's use earns, and those of them that are now in the transit room, hottest first,
-    /// take the slots of the colder ones by copies on the card. The layer's whole stack is in the
-    /// room while a wide batch runs through it, so the copies cost no transfer over the link.
-    pub(super) fn keep_hottest_of_prompt(
-        &self,
-        ids: &Tensor,
-        stream: &Arc<crate::tensor::gpu_runtime::driver::CudaStream>,
-    ) -> Result<()> {
-        if self.stage.is_none() || self.resident {
-            return Ok(());
-        }
-        // A prompt that holds the layer's stacks goes through it in several chunks: their routing
-        // is ranked together when the hold ends, one read of the ids back to the host for the
-        // layer where a read for each chunk would drain the card each time.
-        if self
-            .stage
-            .as_ref()
-            .is_some_and(|s| s.held.load(Ordering::Acquire))
-        {
-            let mut pending = self.prompt_ids.lock().unwrap_or_else(|e| e.into_inner());
-            match pending.as_mut() {
-                Some((_, all)) => all.push(ids.clone()),
-                None => *pending = Some((stream.clone(), vec![ids.clone()])),
-            }
-            return Ok(());
-        }
-        self.keep_hottest_now(ids, stream)
-    }
-
-    /// Rank the routing `ids` of a prompt into the cache from the experts now in the transit room.
+    /// Rank the routed experts `ids` of a prompt into the cache from the room of a wide batch,
+    /// which holds the experts of `placed` in that order: the experts the prompt used are ranked
+    /// into the heat, below what a decoded token's use earns, and those of them the room holds,
+    /// hottest first, take the slots of the colder ones by copies on the card.
     fn keep_hottest_now(
         &self,
-        ids: &Tensor,
+        ids: &[u32],
+        placed: &[u32],
         stream: &Arc<crate::tensor::gpu_runtime::driver::CudaStream>,
     ) -> Result<()> {
-        let ids_h: Vec<u32> = ids
-            .to_dtype(crate::tensor::DType::U32)?
-            .to_device(&Device::Cpu)?
-            .flatten_all()?
-            .to_vec1()?;
         let mut count = vec![0f32; self.n_experts];
-        for &e in &ids_h {
+        for &e in ids {
             count[e as usize] += 1.0;
         }
         // The prompt ranks the experts but must not outweigh what the decode finds it needs: the
@@ -2623,19 +2604,21 @@ impl LayerTier {
                 .collect()
         };
         let mut in_use = vec![false; self.slots()];
-        self.keep_in_transit(&present, true, &mut in_use, stream)
+        self.keep_in_transit(&present, Some(placed), &mut in_use, stream)
     }
 
-    /// Move the experts of `experts` that are in the transit room, hottest first, into the slots
-    /// that hold something colder and are not read by this token, as copies on the card behind the
-    /// token's own work: a kernel that reads a slot later is queued after its copy. `in_use` marks
-    /// the slots this token reads, and is extended with the slots filled here. The experts are in
-    /// the order they were copied in the transit room, or each at its own place in the room of a
-    /// wide batch (`by_id`).
+    /// Move the experts of `experts` that are in a room, hottest first, into the slots that hold
+    /// something colder and are not read by this token, as copies on the card behind the token's
+    /// own work: a kernel that reads a slot later is queued after its copy. `in_use` marks the
+    /// slots this token reads, and is extended with the slots filled here.
+    ///
+    /// Without `room`, the experts are in the transit room in the order they were copied there.
+    /// With `room`, they are in the room of a wide batch at the place of each in `room`, and one
+    /// that has none is not moved.
     fn keep_in_transit(
         &self,
         experts: &[u32],
-        by_id: bool,
+        room: Option<&[u32]>,
         in_use: &mut [bool],
         stream: &Arc<crate::tensor::gpu_runtime::driver::CudaStream>,
     ) -> Result<()> {
@@ -2644,7 +2627,7 @@ impl LayerTier {
             return Ok(());
         };
         let full;
-        let arenas = if by_id {
+        let arenas = if room.is_some() {
             full = stage.stager.full.lock().unwrap_or_else(|e| e.into_inner());
             match full.as_ref() {
                 Some(f) => &f[stage.buffer].arenas,
@@ -2656,7 +2639,10 @@ impl LayerTier {
         let mut order: Vec<(u32, usize)> = experts
             .iter()
             .enumerate()
-            .map(|(j, &e)| (e, if by_id { e as usize } else { j }))
+            .filter_map(|(j, &e)| match room {
+                Some(placed) => placed.iter().position(|&p| p == e).map(|at| (e, at)),
+                None => Some((e, j)),
+            })
             .collect();
         let mut moves = Vec::new();
         {
@@ -3128,7 +3114,7 @@ impl CardStager {
     /// Room on `dev` for experts to pass through: two sets of arenas for the transit room, each
     /// holding the experts the link can carry while the host computes the rest of a token's
     /// misses, of the `experts` a layer has, `widest` bytes per stack for the widest layer. The
-    /// rooms a wide batch fills with whole stacks are made when a prefill runs, see
+    /// rooms of a wide batch are made when a prefill runs, see
     /// [`Self::ensure_full`].
     pub fn new(dev: &Device, widest: [usize; 3], experts: usize) -> Result<Arc<Self>> {
         let cd = dev.as_cuda_device()?;
@@ -3282,8 +3268,8 @@ impl CardStager {
         2 * self.widest.iter().sum::<usize>() as u64
     }
 
-    /// Make the rooms a wide batch fills with a layer's whole stacks, from the memory the caches
-    /// lend. Nothing is done while they exist.
+    /// Make the rooms of a wide batch, each wide enough for a layer's whole stacks, from the
+    /// memory the caches lend. Nothing is done while they exist.
     pub fn ensure_full(&self) -> Result<()> {
         let mut full = self.full.lock().unwrap_or_else(|e| e.into_inner());
         if full.is_some() {
@@ -3472,12 +3458,11 @@ impl Stage {
             buffer,
             compact: [mk(0)?, mk(1)?, mk(2)?],
             full: Mutex::new(None),
-            ready: Mutex::new(None),
+            placed: Mutex::new(Vec::new()),
             pinned,
             #[cfg(target_os = "linux")]
             bounce: Mutex::new(BounceState::Closed),
             held: std::sync::atomic::AtomicBool::new(false),
-            filled: std::sync::atomic::AtomicBool::new(false),
         })
     }
 }
@@ -3495,17 +3480,16 @@ impl Drop for Stage {
 }
 
 impl LayerTier {
-    /// Whether a batch of `rows` pays for the whole layer's experts to come to the card: when
-    /// the rows' routed pairs outnumber the experts, nearly every expert is used.
-    ///
-    /// The rows run one by one through the cache where that is cheaper: the copy of what the card
-    /// does not hold, at the rate the host reaches the card, against the rows at the pace tokens
-    /// have been decoded here. Before any token was decoded the copy is taken.
-    pub fn stream_pays(&self, rows: usize, used: usize) -> bool {
+    /// Whether a batch of `rows` runs through the expert-batched kernels, which read the layer's
+    /// experts where the card holds them: the room of a wide batch is there for the experts the
+    /// card misses, the layer's formats are ones those kernels read, and the rows' routed pairs
+    /// reach the count from which they pay. The batch's shape alone decides.
+    pub fn reads_in_place(&self, rows: usize, used: usize) -> bool {
+        use crate::inference::moe_cuda::{moe_mmq_pays, moe_mmq_serves};
         let Some(stage) = self.stage.as_ref() else {
             return false;
         };
-        if rows * used < self.n_experts
+        if self.resident
             || stage
                 .full
                 .lock()
@@ -3514,108 +3498,186 @@ impl LayerTier {
         {
             return false;
         }
-        let per_token = self.decode_us.load(Ordering::Relaxed) as f64;
-        let held = self
-            .state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .slot_of
-            .iter()
-            .filter(|&&s| s >= 0)
-            .count();
-        let missing = (self.n_experts - held) * self.expert_bytes.iter().sum::<usize>();
-        let copy_us = missing as f64 / stage.stager.bandwidth.max(1e-9);
-        per_token == 0.0 || (rows as f64) * per_token > copy_us
+        // The tile kernels have no bounded SwiGLU.
+        if self.exact.is_some_and(|e| e.limit != 0.0) {
+            return false;
+        }
+        let reads = |t: &QTensor| moe_mmq_serves(t.dtype(), t.shape().dims()[2]);
+        reads(&self.host[0]) && reads(&self.host[2]) && moe_mmq_pays(rows * used, self.n_experts)
     }
 
-    /// Start the copies that fill this layer's buffer with every expert: the ones the card
-    /// holds from the card, the others from the host's mapping. Nothing waits for them here.
-    /// A fill already queued and not yet read stands.
-    pub fn prefetch(&self) -> Result<()> {
-        let Some(stage) = self.stage.as_ref() else {
-            return Ok(());
+    /// A wide batch's expert block through the expert-batched kernels: `xs` `[rows, hidden]`
+    /// and the router's choices `ids`, `weights` `[rows, k]`, all on the card. Returns
+    /// `[rows, hidden]` on the card.
+    ///
+    /// The kernels read each expert where the card holds it: the base slots, the extra slots,
+    /// and the room of a wide batch for the experts the rows route to and the card misses.
+    /// Only those are copied, each once while the room is held.
+    /// A row gives the bits it gives on a layer whose every expert is on the card.
+    pub(super) fn wide_rows(
+        self: &Arc<Self>,
+        moe: &MoeWeights,
+        xs: &Tensor,
+        ids: &Tensor,
+        weights: &Tensor,
+    ) -> Result<Tensor> {
+        use crate::inference::moe_cuda::{Glu, MmqRouting, Region};
+        use crate::tensor::gpu_runtime::driver::DevicePtr;
+        self.health_check()?;
+        let stage = self
+            .stage
+            .as_ref()
+            .expect("a wide batch reads a staged layer");
+        let host = Device::Cpu;
+        let dev = xs.device().clone();
+        let cd = dev.as_cuda_device()?;
+        let stream = cd.0.stream().clone();
+        let k = moe.n_experts_used;
+        // The layer's one wait: the choices of every row come to the host.
+        let ids_h: Vec<u32> = ids
+            .to_dtype(crate::tensor::DType::U32)?
+            .to_device(&host)?
+            .flatten_all()?
+            .to_vec1()?;
+        let rows = ids_h.len() / k.max(1);
+        let Some(full) = stage.full.lock().unwrap_or_else(|e| e.into_inner()).clone() else {
+            crate::tensor::bail!("a wide batch's room is not there");
         };
-        // A prompt holding the stacks of this layer for its later chunks has them on the card
-        // already: a second fill would carry the layer over the link again into the buffer the
-        // chunks are reading.
-        if stage.held.load(Ordering::Acquire) && stage.filled.load(Ordering::Acquire) {
-            return Ok(());
-        }
-        let mut ready = stage.ready.lock().unwrap_or_else(|e| e.into_inner());
-        if ready.is_some() {
-            return Ok(());
-        }
-        let cd = self.dev.as_cuda_device()?;
-        cd.0.context()
-            .bind_to_thread()
-            .map_err(|e| crate::tensor::Error::msg(format!("bind context: {e:?}")))?;
-        let copy = &stage.stager.copy;
-        let full = stage.stager.full.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(full) = full.as_ref() else {
-            crate::tensor::bail!("a wide batch's fill has no room");
+        let extra = self.extra.lock().unwrap_or_else(|e| e.into_inner());
+        let extra_n = extra.as_ref().map_or(0, |m| m[0].shape().dims()[0]);
+        let first_room = self.base_slots + extra_n;
+        let mut placed = stage.placed.lock().unwrap_or_else(|e| e.into_inner());
+        let had = placed.len();
+        // Each pair's place: the slot of its expert, or the expert's place in the room.
+        // An expert on its way into a slot has none yet, and the slot it takes is read by none.
+        let places: Vec<u32> = {
+            let st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            let mut room_at = vec![u32::MAX; self.n_experts];
+            for (j, &e) in placed.iter().enumerate() {
+                room_at[e as usize] = j as u32;
+            }
+            let mut missing: Vec<u32> = ids_h
+                .iter()
+                .copied()
+                .filter(|&e| st.slot_of[e as usize] < 0 && room_at[e as usize] == u32::MAX)
+                .collect();
+            missing.sort_unstable();
+            missing.dedup();
+            for &e in &missing {
+                room_at[e as usize] = placed.len() as u32;
+                placed.push(e);
+            }
+            ids_h
+                .iter()
+                .map(|&e| match st.slot_of[e as usize] {
+                    s if s >= 0 => s as u32,
+                    _ => first_room as u32 + room_at[e as usize],
+                })
+                .collect()
         };
-        let buffer = &full[stage.buffer];
-        if let Some(free) = buffer.free.lock().unwrap_or_else(|e| e.into_inner()).take() {
-            copy.wait(&free)
+        // The experts new to the room come from the host, behind the last reader of the room.
+        if placed.len() > had {
+            let bufs = stage.stager.full.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(bufs) = bufs.as_ref() else {
+                crate::tensor::bail!("a wide batch's room is not there");
+            };
+            let buffer = &bufs[stage.buffer];
+            let copy = &stage.stager.copy;
+            cd.0.context()
+                .bind_to_thread()
+                .map_err(|e| crate::tensor::Error::msg(format!("bind context: {e:?}")))?;
+            if had == 0 {
+                if let Some(free) = buffer.free.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                    copy.wait(&free)
+                        .map_err(|e| crate::tensor::Error::msg(format!("wait: {e:?}")))?;
+                }
+            }
+            let new = &placed[had..];
+            for i in 0..3 {
+                let eb = self.expert_bytes[i];
+                let arena = &buffer.arenas[i];
+                let base = arena.device_ptr(arena.stream()).0;
+                let data = self.host[i].native_qtensor().data();
+                // A run of consecutive experts is one copy.
+                let mut j = 0;
+                while j < new.len() {
+                    let mut end = j + 1;
+                    while end < new.len() && new[end] == new[end - 1] + 1 {
+                        end += 1;
+                    }
+                    self.upload(
+                        i,
+                        data,
+                        new[j] as usize * eb,
+                        (end - j) * eb,
+                        base + ((had + j) * eb) as u64,
+                        copy,
+                    )?;
+                    j = end;
+                }
+                // The kernels read whole blocks past the room's last expert, against activations
+                // padded with zeros: that tail is zero, and not what the layer before left there.
+                driver("room tail", unsafe {
+                    crate::tensor::gpu_runtime::driver::sys::cuMemsetD8Async(
+                        base + (placed.len() * eb) as u64,
+                        0,
+                        crate::tensor::quantized::BLOB_TAIL_PAD_BYTES,
+                        copy.cu_stream(),
+                    )
+                })?;
+            }
+            self.to_room
+                .fetch_add((placed.len() - had) as u64, Ordering::Relaxed);
+            let landed = copy
+                .record_event(None)
+                .map_err(|e| crate::tensor::Error::msg(format!("record: {e:?}")))?;
+            stream
+                .wait(&landed)
                 .map_err(|e| crate::tensor::Error::msg(format!("wait: {e:?}")))?;
         }
-        let slot_of = self
-            .state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .slot_of
-            .clone();
-        use crate::tensor::gpu_runtime::driver::DevicePtr;
-        for i in 0..3 {
-            let eb = self.expert_bytes[i];
-            let arena = &buffer.arenas[i];
-            let base = arena.device_ptr(arena.stream()).0;
-            let data = self.host[i].native_qtensor().data();
-            // The kernels read whole blocks past the end of a stack, against activations padded
-            // with zeros: that tail is zero, as every blob's is, and not what the layer before
-            // left in the arena - a scale in it that is not finite would poison the zeros.
-            driver("stage tail", unsafe {
-                crate::tensor::gpu_runtime::driver::sys::cuMemsetD8Async(
-                    base + data.len() as u64,
-                    0,
-                    crate::tensor::quantized::BLOB_TAIL_PAD_BYTES,
-                    copy.cu_stream(),
-                )
-            })?;
-            let mut e = 0;
-            while e < self.n_experts {
-                if slot_of[e] >= 0 {
-                    driver("slot to stage", unsafe {
-                        crate::tensor::gpu_runtime::driver::sys::cuMemcpyDtoDAsync_v2(
-                            base + (e * eb) as u64,
-                            self.slot_addr(i, slot_of[e] as usize)?,
-                            eb,
-                            copy.cu_stream(),
-                        )
-                    })?;
-                    e += 1;
-                    continue;
-                }
-                // The run of experts the card does not hold, in one copy.
-                let first = e;
-                while e < self.n_experts && slot_of[e] < 0 {
-                    e += 1;
-                }
-                self.upload(
-                    i,
-                    data,
-                    first * eb,
-                    (e - first) * eb,
-                    base + (first * eb) as u64,
-                    copy,
-                )?;
+        let choices = Tensor::from_vec(places, (rows, k), &host)?.to_device(&dev)?;
+        let plan = MmqRouting::from_choices(&choices, first_room + placed.len())?;
+        let regions = |i: usize, up: bool| -> Vec<Region<'_>> {
+            let mut out = vec![Region {
+                stack: &self.card[i],
+                second: up.then_some(&self.card[1]),
+                first: 0,
+                experts: self.base_slots,
+            }];
+            if let Some(m) = extra.as_ref() {
+                out.push(Region {
+                    stack: &m[i],
+                    second: up.then_some(&m[1]),
+                    first: self.base_slots,
+                    experts: extra_n,
+                });
             }
+            out.push(Region {
+                stack: &full[i],
+                second: up.then_some(&full[1]),
+                first: first_room,
+                experts: placed.len(),
+            });
+            out.retain(|r| r.experts > 0);
+            out
+        };
+        let h = plan.gate_up_over(xs, &regions(0, true), Glu::Silu)?;
+        let out = plan.down_fold_over(&h, &regions(2, false), weights, None, None)?;
+        drop(extra);
+        if stage.held.load(Ordering::Acquire) {
+            // A held room ranks the prompt's routing once, when the hold ends.
+            let mut pending = self.prompt_ids.lock().unwrap_or_else(|e| e.into_inner());
+            match pending.as_mut() {
+                Some((_, all)) => all.extend_from_slice(&ids_h),
+                None => *pending = Some((stream.clone(), ids_h)),
+            }
+        } else {
+            if let Err(e) = self.keep_hottest_now(&ids_h, &placed, &stream) {
+                tracing::warn!("the cache is not warmed from the prompt: {e}");
+            }
+            self.release_room(&mut placed)?;
         }
-        *ready = Some(
-            copy.record_event(None)
-                .map_err(|e| crate::tensor::Error::msg(format!("record: {e:?}")))?,
-        );
-        Ok(())
+        Ok(out)
     }
 
     /// `len` bytes of stack `i` from `start` to the card at `dst`: from the page-locked part
@@ -3773,44 +3835,15 @@ impl LayerTier {
         self.copy_mapped(from + done, to, a, dst, copy)
     }
 
-    /// The layer's experts as stacks on the card, once the fill has landed: the compute stream
-    /// waits for it. The fill is started here if nothing started it.
-    pub(super) fn stacks(&self) -> Result<Arc<[QTensor; 3]>> {
-        let stage = self.stage.as_ref().expect("a staged layer");
-        let Some(stacks) = stage.full.lock().unwrap_or_else(|e| e.into_inner()).clone() else {
-            crate::tensor::bail!("a wide batch's fill has no room");
-        };
-        // Held and already filled: the compute stream waited for the fill at the first forward,
-        // and the next ones queue behind that wait.
-        if stage.held.load(Ordering::Acquire) && stage.filled.load(Ordering::Acquire) {
-            return Ok(stacks);
-        }
-        self.prefetch()?;
-        let event = stage
-            .ready
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take()
-            .expect("the fill was queued");
-        let cd = self.dev.as_cuda_device()?;
-        cd.0.stream()
-            .wait(&event)
-            .map_err(|e| crate::tensor::Error::msg(format!("wait: {e:?}")))?;
-        if stage.held.load(Ordering::Acquire) {
-            stage.filled.store(true, Ordering::Release);
-        }
-        Ok(stacks)
-    }
-
-    /// Keep the layer's stacks on the card across the forwards that follow, for a prompt that
-    /// goes through the layer in several chunks: the experts come once, not once per chunk.
-    /// `false` ends the hold and hands the buffer on, as the last forward's release would.
+    /// Keep the experts a prompt copies into the room of a wide batch across the forwards that
+    /// follow, for a prompt that goes through the layer in several chunks: an expert comes once,
+    /// not once per chunk. `false` ends the hold, ranks the prompt's routing into the cache and
+    /// hands the room on.
     pub fn hold_stacks(&self, on: bool) -> Result<()> {
         let Some(stage) = self.stage.as_ref() else {
             return Ok(());
         };
         if on {
-            stage.filled.store(false, Ordering::Release);
             stage.held.store(true, Ordering::Release);
             return Ok(());
         }
@@ -3819,26 +3852,22 @@ impl LayerTier {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .take();
-        if let Some((stream, chunks)) = pending {
+        let mut placed = stage.placed.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((stream, ids)) = pending {
             // Ranking the prompt is a convenience: a pass that failed, or a card out of memory,
-            // must still end the hold and hand the buffer on.
-            let refs: Vec<&Tensor> = chunks.iter().collect();
-            let ranked = Tensor::cat(&refs, 0).and_then(|all| self.keep_hottest_now(&all, &stream));
-            if let Err(e) = ranked {
+            // must still end the hold and hand the room on.
+            if let Err(e) = self.keep_hottest_now(&ids, &placed, &stream) {
                 tracing::warn!("the cache is not warmed from the prompt: {e}");
             }
         }
         stage.held.store(false, Ordering::Release);
-        if stage.filled.swap(false, Ordering::AcqRel) {
-            self.release_stacks()?;
-        }
-        Ok(())
+        self.release_room(&mut placed)
     }
 
-    /// Forget the fills and holds of the layers' passes through the buffers. A pass cut short
-    /// leaves a fill queued for a layer that never ran, and layers share two buffers, so the
-    /// next pass would read another layer's experts as its own. The copies already issued
-    /// are waited for first, so nothing writes a buffer after it is handed on.
+    /// Forget what the room of a wide batch holds of this layer. A pass cut short leaves experts
+    /// there, and layers share two rooms, so the next pass would read another layer's experts as
+    /// its own. The copies already issued are waited for first, so nothing writes a room after it
+    /// is handed on.
     pub(super) fn reset_stage(&self) -> Result<()> {
         let Some(stage) = self.stage.as_ref() else {
             return Ok(());
@@ -3848,7 +3877,11 @@ impl LayerTier {
             .copy
             .synchronize()
             .map_err(|e| crate::tensor::Error::msg(format!("copy stream: {e:?}")))?;
-        *stage.ready.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        stage
+            .placed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         if let Some(full) = stage
             .stager
             .full
@@ -3864,12 +3897,14 @@ impl LayerTier {
         Ok(())
     }
 
-    /// The layer's kernels are queued: the buffer of a wide batch is free once they have run.
-    pub(super) fn release_stacks(&self) -> Result<()> {
-        let stage = self.stage.as_ref().expect("a staged layer");
-        if stage.held.load(Ordering::Acquire) {
+    /// The layer's kernels that read the room of a wide batch are queued: the room is free once
+    /// they have run, and holds nothing of this layer from here on.
+    fn release_room(&self, placed: &mut Vec<u32>) -> Result<()> {
+        if placed.is_empty() {
             return Ok(());
         }
+        placed.clear();
+        let stage = self.stage.as_ref().expect("a staged layer");
         let full = stage.stager.full.lock().unwrap_or_else(|e| e.into_inner());
         let Some(full) = full.as_ref() else {
             return Ok(());
@@ -3884,6 +3919,11 @@ impl LayerTier {
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = Some(event);
         Ok(())
+    }
+
+    /// Experts wide batches copied into the room of a wide batch since the load.
+    pub fn copied_to_room(&self) -> u64 {
+        self.to_room.load(Ordering::Relaxed)
     }
 }
 
@@ -5369,7 +5409,7 @@ mod tests {
                 .unwrap()
                 .with_stage(&stager, 0, pin)
                 .unwrap();
-            assert!(tier.stream_pays(rows, used));
+            assert!(tier.reads_in_place(rows, used));
             tiered.tier = Some(Arc::new(tier));
             let x = values(rows * hidden, 55, 1.0);
             let on_host = Tensor::from_vec(x.clone(), (1, rows, hidden), &Device::Cpu).unwrap();
@@ -5427,7 +5467,7 @@ mod tests {
             .with_stage(&stager, 0, false)
             .unwrap();
         let rows = 1520usize;
-        assert!(tier.stream_pays(rows, used));
+        assert!(tier.reads_in_place(rows, used));
         let before = tier.counters().2;
         tiered.tier = Some(Arc::new(tier));
         let tier = tiered.tier.clone().unwrap();
@@ -5549,6 +5589,344 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Bytes whose f16 scales are not finite in the rooms of a wide batch: what another layer
+    /// may have left there.
+    fn poison_rooms(stager: &CardStager) {
+        use crate::tensor::gpu_runtime::driver::DevicePtr;
+        let cd = stager.dev.as_cuda_device().unwrap();
+        cd.0.context().bind_to_thread().unwrap();
+        let full = stager.full.lock().unwrap();
+        for buffer in full.as_ref().expect("the rooms of a wide batch are made") {
+            for arena in &buffer.arenas {
+                let base = arena.device_ptr(arena.stream()).0;
+                let r = unsafe {
+                    crate::tensor::gpu_runtime::driver::sys::cuMemsetD8_v2(base, 0xFF, arena.len())
+                };
+                assert_eq!(
+                    r,
+                    crate::tensor::gpu_runtime::driver::sys::cudaError_enum::CUDA_SUCCESS
+                );
+            }
+        }
+    }
+
+    /// The bytes of each stack of `moe` and the stager of a card for a layer of its shape.
+    fn stager_for(moe: &MoeWeights, card: &Device, experts: usize) -> Arc<CardStager> {
+        let widest = [0, 1, 2].map(|i| {
+            [
+                moe.gate_exps_sep.as_ref().unwrap(),
+                moe.up_exps_sep.as_ref().unwrap(),
+                &moe.down_exps,
+            ][i]
+                .native_qtensor()
+                .data()
+                .len()
+        });
+        CardStager::new(card, widest, experts).unwrap()
+    }
+
+    /// The flattened output of `moe` for the rows `x` of a prompt.
+    fn prompt_rows(moe: &MoeWeights, card: &Device, x: &[f32], hidden: usize) -> Vec<f32> {
+        let rows = x.len() / hidden;
+        let on_card = Tensor::from_vec(x.to_vec(), (1, rows, hidden), card).unwrap();
+        moe.forward(&on_card, &on_card, hidden, 1e-5, true)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+    }
+
+    /// How a test cache holds its experts: base slots, extra slots, whether the extra slots are
+    /// lent, and whether a profile primed the slots.
+    #[derive(Clone, Copy, Debug)]
+    struct Holding {
+        base: usize,
+        extra: usize,
+        lent: bool,
+        primed: bool,
+    }
+
+    /// A tier over `moe` holding as `holding` says, its room of a wide batch poisoned.
+    ///
+    /// A primed tier holds the experts a profile ranks highest, spread over the stack, each at the
+    /// heat the profile gives it.
+    /// An unprimed one holds the first experts, with no heat.
+    fn holding_tier(
+        moe: &MoeWeights,
+        card: &Device,
+        experts: usize,
+        holding: Holding,
+    ) -> Arc<LayerTier> {
+        let stager = stager_for(moe, card, experts);
+        let mut built = LayerTier::new(moe, card, holding.base).unwrap();
+        if holding.extra > 0 {
+            built = built.with_extra(holding.extra).unwrap();
+        }
+        let tier = Arc::new(built.with_stage(&stager, 0, false).unwrap());
+        if holding.primed {
+            let counts: Vec<u32> = (0..experts)
+                .map(|e| ((e * 7) % experts + 1) as u32)
+                .collect();
+            tier.prime(&counts).unwrap();
+        }
+        if holding.extra > 0 {
+            tier.restore_extra().unwrap();
+            tier.settle();
+            assert!(tier.has_extra());
+            if holding.lent {
+                assert!(tier.lend_extra());
+            }
+        }
+        poison_rooms(&stager);
+        tier
+    }
+
+    /// A wide batch reads the experts the cache holds where they are and copies only those its
+    /// rows route to and the card misses: each row gives the bits a layer whose every expert is
+    /// on the card gives, whatever the cache holds, with the extra slots held or lent, and with
+    /// what another layer left in the room.
+    #[test]
+    fn a_wide_batch_reads_the_cache_in_place_with_the_bits_of_a_resident_layer() {
+        let _pool = LENT_POOL.lock().unwrap_or_else(|e| e.into_inner());
+        let Ok(card) = Device::new_cuda(0) else {
+            eprintln!("skipping: no usable CUDA device");
+            return;
+        };
+        let experts = 32usize;
+        for ((used, hidden, ffn), formats, rows) in [
+            (
+                (4usize, 64usize, 64usize),
+                [GgmlDType::Q8_0; 2],
+                vec![24usize, 700, 1520],
+            ),
+            (
+                (8, 512, 256),
+                [GgmlDType::Q4K, GgmlDType::Q6K],
+                vec![100, 700],
+            ),
+            (
+                (8, 512, 256),
+                [GgmlDType::Q4K, GgmlDType::Q5_0],
+                vec![100, 700],
+            ),
+        ] {
+            let mut resident = layer_of(&card, experts, used, hidden, ffn, formats);
+            resident.tier = Some(Arc::new(LayerTier::all_on_card(&resident, &card).unwrap()));
+            for holding in [
+                Holding {
+                    base: 9,
+                    extra: 0,
+                    lent: false,
+                    primed: true,
+                },
+                Holding {
+                    base: 9,
+                    extra: 0,
+                    lent: false,
+                    primed: false,
+                },
+                Holding {
+                    base: 6,
+                    extra: 8,
+                    lent: false,
+                    primed: true,
+                },
+                Holding {
+                    base: 6,
+                    extra: 8,
+                    lent: true,
+                    primed: true,
+                },
+                Holding {
+                    base: experts,
+                    extra: 0,
+                    lent: false,
+                    primed: true,
+                },
+            ] {
+                let mut tiered = layer_of(&card, experts, used, hidden, ffn, formats);
+                let tier = holding_tier(&tiered, &card, experts, holding);
+                tiered.tier = Some(tier.clone());
+                for &n in &rows {
+                    assert!(tier.reads_in_place(n, used), "{formats:?} rows {n}");
+                    let x = values(n * hidden, 91 + n as u64, 1.0);
+                    let want = prompt_rows(&resident, &card, &x, hidden);
+                    let before = tier.copied_to_room();
+                    let held = (0..experts).filter(|&e| tier.resident(e)).count();
+                    let got = prompt_rows(&tiered, &card, &x, hidden);
+                    assert!(
+                        got == want,
+                        "{formats:?} {holding:?} rows {n}: not the bits of a resident layer"
+                    );
+                    let copied = tier.copied_to_room() - before;
+                    assert!(
+                        copied as usize <= experts - held,
+                        "{formats:?} {holding:?} rows {n}: {copied} copies"
+                    );
+                    if holding.base == experts {
+                        assert_eq!(copied, 0, "a cache holding every expert copied some");
+                    }
+                }
+            }
+        }
+    }
+
+    /// A prompt in several chunks through a layer that holds its room, as a prompt read layer by
+    /// layer goes: every chunk gives the bits of a resident layer, the room holds exactly the
+    /// experts the chunks route to and the card misses, each copied once, and the end of the hold
+    /// hands the room on. With slots colder than the prompt makes its experts, the end of the
+    /// hold moves experts of the room into them.
+    #[test]
+    fn a_held_room_copies_each_missing_expert_once_across_the_chunks() {
+        held_room_across_chunks(
+            Holding {
+                base: 6,
+                extra: 0,
+                lent: false,
+                primed: false,
+            },
+            true,
+        );
+    }
+
+    /// The same with every slot hotter than the prompt can make an expert: the end of the hold
+    /// moves nothing into the slots, and still hands the room on.
+    #[test]
+    fn a_held_room_leaves_slots_hotter_than_the_prompt() {
+        held_room_across_chunks(
+            Holding {
+                base: 6,
+                extra: 8,
+                lent: false,
+                primed: true,
+            },
+            false,
+        );
+    }
+
+    /// Three chunks of a prompt through a held room over a cache holding as `holding` says;
+    /// `moves` says whether the slots are colder than what the prompt makes its experts.
+    fn held_room_across_chunks(holding: Holding, moves: bool) {
+        let _pool = LENT_POOL.lock().unwrap_or_else(|e| e.into_inner());
+        let Ok(card) = Device::new_cuda(0) else {
+            eprintln!("skipping: no usable CUDA device");
+            return;
+        };
+        let (experts, used, hidden, ffn) = (32usize, 8usize, 512usize, 256usize);
+        let formats = [GgmlDType::Q4K, GgmlDType::Q6K];
+        let mut resident = layer_of(&card, experts, used, hidden, ffn, formats);
+        resident.tier = Some(Arc::new(LayerTier::all_on_card(&resident, &card).unwrap()));
+        let mut tiered = layer_of(&card, experts, used, hidden, ffn, formats);
+        let tier = holding_tier(&tiered, &card, experts, holding);
+        tiered.tier = Some(tier.clone());
+        let missing_before: Vec<bool> = (0..experts).map(|e| !tier.resident(e)).collect();
+        let heat_before = tier.state.lock().unwrap().heat.clone();
+        let owners_before = tier.state.lock().unwrap().owner.clone();
+        let (copied_before, promoted_before) = (tier.copied_to_room(), tier.counters().2);
+        tier.hold_stacks(true).unwrap();
+        for chunk in 0..3u64 {
+            let x = values(100 * hidden, 300 + chunk, 1.0);
+            let want = prompt_rows(&resident, &card, &x, hidden);
+            let got = prompt_rows(&tiered, &card, &x, hidden);
+            assert!(
+                got == want,
+                "{holding:?} chunk {chunk}: not the bits of a resident layer"
+            );
+        }
+        let stage = tier.stage.as_ref().unwrap();
+        let placed = stage.placed.lock().unwrap().clone();
+        let routed: Vec<u32> = tier
+            .prompt_ids
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|(_, ids)| ids.clone())
+            .expect("the held chunks keep their routing");
+        let mut want_placed: Vec<u32> = routed
+            .iter()
+            .copied()
+            .filter(|&e| missing_before[e as usize])
+            .collect();
+        want_placed.sort_unstable();
+        want_placed.dedup();
+        assert!(
+            !want_placed.is_empty(),
+            "{holding:?}: the prompt missed no expert"
+        );
+        // The end of the hold ranks each routed expert at the share of its uses in the hottest
+        // one's, keeping a hotter heat. An expert of the room takes a slot only when it ends
+        // hotter than the coldest slot.
+        let mut uses = vec![0f32; experts];
+        for &e in &routed {
+            uses[e as usize] += 1.0;
+        }
+        let top = uses.iter().copied().fold(1f32, f32::max);
+        let after: Vec<f32> = (0..experts)
+            .map(|e| heat_before[e].max(uses[e] / top))
+            .collect();
+        let coldest_slot = owners_before
+            .iter()
+            .filter(|&&o| o >= 0)
+            .map(|&o| after[o as usize])
+            .fold(f32::INFINITY, f32::min);
+        let hottest_placed = placed
+            .iter()
+            .map(|&e| after[e as usize])
+            .fold(0f32, f32::max);
+        assert_eq!(
+            hottest_placed > coldest_slot,
+            moves,
+            "{holding:?}: the coldest slot ends at {coldest_slot}, the room's hottest at {hottest_placed}"
+        );
+        let mut sorted = placed.clone();
+        sorted.sort_unstable();
+        assert_eq!(
+            sorted, want_placed,
+            "{holding:?}: the room holds other experts than the missed ones"
+        );
+        assert_eq!(
+            tier.copied_to_room() - copied_before,
+            placed.len() as u64,
+            "{holding:?}: an expert came to the room more than once"
+        );
+        tier.hold_stacks(false).unwrap();
+        assert!(
+            stage.placed.lock().unwrap().is_empty(),
+            "{holding:?}: the room was not handed on"
+        );
+        let promoted = tier.counters().2 - promoted_before;
+        if moves {
+            assert!(
+                promoted > 0,
+                "no expert of the room took the slot of a colder one"
+            );
+            let now_held: Vec<u32> = placed
+                .iter()
+                .copied()
+                .filter(|&e| tier.resident(e as usize))
+                .collect();
+            assert_eq!(
+                now_held.len() as u64,
+                promoted,
+                "the experts moved into slots are not those of the room"
+            );
+        } else {
+            assert_eq!(promoted, 0, "an expert took the slot of a hotter one");
+            assert_eq!(
+                tier.state.lock().unwrap().owner,
+                owners_before,
+                "the slots changed hands"
+            );
+        }
+        // The cache the hold left serves the next prompt with the same bits.
+        let x = values(100 * hidden, 400, 1.0);
+        assert!(
+            prompt_rows(&tiered, &card, &x, hidden) == prompt_rows(&resident, &card, &x, hidden),
+            "{holding:?}: the next prompt is not the bits of a resident layer"
+        );
     }
 
     /// A routed pair's row is the same bits whether its expert sits in a slot of the cache, in the
