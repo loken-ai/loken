@@ -41,6 +41,8 @@ pub(crate) use crate::tensor::{DType, Device, IndexOp, Result, Tensor};
 
 #[cfg(all(test, feature = "gpu"))]
 mod card_host_parity;
+#[cfg(all(test, feature = "gpu"))]
+mod wide_quant_mixer_card_tests;
 #[cfg(test)]
 mod wide_tests;
 

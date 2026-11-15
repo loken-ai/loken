@@ -121,5 +121,7 @@ pub use varbuilder::QVarBuilder;
 /// A card keeps this much free for each such step in flight.
 pub const WEIGHT_TILE_BYTES: usize = 96 << 20;
 
+#[cfg(all(test, feature = "gpu"))]
+mod nibble_matvec_tests;
 #[cfg(test)]
 mod tests;

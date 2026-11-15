@@ -5728,6 +5728,145 @@ mod tests {
         }
     }
 
+    /// A layer of a served file, its slots lent to a prompt and returned, then decoding token
+    /// after token: every decoded row gives the host's, for every format the down stack may be
+    /// stored in, its missing experts coming through the transit room or every expert held.
+    #[test]
+    #[ignore = "needs an idle CUDA card"]
+    fn decoded_rows_after_a_prompt_and_a_return_match_the_host() {
+        let _pool = LENT_POOL.lock().unwrap_or_else(|e| e.into_inner());
+        let Ok(card) = Device::new_cuda(0) else {
+            eprintln!("skipping: no usable CUDA device");
+            return;
+        };
+        let (experts, used, hidden) = (32usize, 8usize, 2560usize);
+        // Inputs at the scale a normed hidden state has against these weights: the sums a
+        // quantised activation block carries stay within half precision.
+        const SCALE: f32 = 0.1;
+        // A decoded row's distance from the host: the rounding of the 8-bit activation and of the
+        // 3- and 5-bit superblocks.
+        const DECODED: f32 = 3e-2;
+        // A prompt's rows go through the tiled kernels, whose activation quantiser rounds more.
+        const PROMPT: f32 = 5e-2;
+        let mut failures = Vec::new();
+        for down in EXPERT_QUANT_CODES_FOR_TESTS {
+            // The depth of a down row is a whole number of the format's blocks.
+            let ffn = if down.block_size() == 256 { 768 } else { 640 };
+            let formats = [GgmlDType::Q4K, down];
+            let quantised = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                (
+                    layer_of(&Device::Cpu, experts, used, hidden, ffn, formats),
+                    layer_of(&card, experts, used, hidden, ffn, formats),
+                )
+            }));
+            let Ok((reference, mut tiered)) = quantised else {
+                eprintln!("{down:?}: not quantised on the host");
+                continue;
+            };
+            for base in [6usize, experts] {
+                let stager = stager_for(&tiered, &card, experts);
+                poison(&stager);
+                let mut built = LayerTier::new(&tiered, &card, base).unwrap();
+                if base < experts {
+                    built = built.with_extra(8).unwrap();
+                }
+                tiered.tier = Some(Arc::new(built.with_stage(&stager, 0, false).unwrap()));
+                let tier = tiered.tier.clone().unwrap();
+                if base < experts {
+                    tier.restore_extra().unwrap();
+                }
+                tier.settle();
+                let measure = |got: &[f32], want: &[f32]| -> (f32, usize) {
+                    let peak = want.iter().map(|v| v.abs()).fold(0f32, f32::max);
+                    let bad = got.iter().filter(|v| !v.is_finite()).count();
+                    let d = got
+                        .iter()
+                        .zip(want)
+                        .map(|(a, b)| (a - b).abs())
+                        .fold(0f32, f32::max);
+                    (d / peak, bad)
+                };
+                let decoded = |seed: u64| -> (f32, usize) {
+                    let x = values(hidden, seed, SCALE);
+                    let on_host =
+                        Tensor::from_vec(x.clone(), (1, 1, hidden), &Device::Cpu).unwrap();
+                    let on_card = Tensor::from_vec(x, (1, 1, hidden), &card).unwrap();
+                    let want = reference
+                        .forward(&on_host, &on_host, hidden, 1e-5, false)
+                        .unwrap()
+                        .flatten_all()
+                        .unwrap()
+                        .to_vec1::<f32>()
+                        .unwrap();
+                    let got = tiered
+                        .forward(&on_card, &on_card, hidden, 1e-5, false)
+                        .unwrap()
+                        .flatten_all()
+                        .unwrap()
+                        .to_vec1::<f32>()
+                        .unwrap();
+                    tier.settle();
+                    measure(&got, &want)
+                };
+                let fold = |a: (f32, usize), b: (f32, usize)| (a.0.max(b.0), a.1 + b.1);
+                let decode_before = (0..3).map(|t| decoded(200 + t)).fold((0f32, 0usize), fold);
+                if base < experts {
+                    assert!(tier.lend_extra());
+                }
+                let rows = 109;
+                let x = values(rows * hidden, 55, SCALE);
+                let on_host = Tensor::from_vec(x.clone(), (1, rows, hidden), &Device::Cpu).unwrap();
+                let want = reference
+                    .forward(&on_host, &on_host, hidden, 1e-5, true)
+                    .unwrap()
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap();
+                let prompt = measure(&prompt_rows(&tiered, &card, &x, hidden), &want);
+                if base < experts {
+                    tier.restore_extra().unwrap();
+                }
+                tier.settle();
+                let after = (0..4).map(|t| decoded(300 + t)).fold((0f32, 0usize), fold);
+                let (worst, not_finite) = fold(decode_before, after);
+                eprintln!(
+                    "{down:?} slots {base}: decoded before {:.4} ({} not finite), prompt {:.4} \
+                     ({} not finite), decoded in all {worst:.4} ({not_finite} not finite)",
+                    decode_before.0, decode_before.1, prompt.0, prompt.1
+                );
+                if worst > DECODED || not_finite > 0 || prompt.0 > PROMPT || prompt.1 > 0 {
+                    failures.push(format!(
+                        "{down:?} with {base} slots: decoded rows off by {worst} with \
+                         {not_finite} values not finite, prompt off by {} with {} not finite",
+                        prompt.0, prompt.1
+                    ));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// The formats the expert kernels serve, in the order the kernels number them.
+    const EXPERT_QUANT_CODES_FOR_TESTS: [GgmlDType; 16] = [
+        GgmlDType::Q8_0,
+        GgmlDType::Q4K,
+        GgmlDType::Q2K,
+        GgmlDType::Q3K,
+        GgmlDType::Q5K,
+        GgmlDType::Q6K,
+        GgmlDType::Q5_0,
+        GgmlDType::MxFp4,
+        GgmlDType::Q5_1,
+        GgmlDType::Iq4Nl,
+        GgmlDType::Iq4Xs,
+        GgmlDType::Iq3Xxs,
+        GgmlDType::Iq3S,
+        GgmlDType::Iq2S,
+        GgmlDType::Q2_0,
+        GgmlDType::Iq2Xxs,
+    ];
+
     /// A wide batch warms the cache with the experts it used: afterwards every slot holds one,
     /// and a decoded token reads the right blocks from them.
     #[test]

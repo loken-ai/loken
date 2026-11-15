@@ -419,21 +419,63 @@ template <int vdr> static __device__ __forceinline__ float vec_dot_nibbles_q8_1_
 #define VDR_Q5_0_Q8_1_MMVQ 2
 #define VDR_Q5_0_Q8_1_MMQ  4
 
-/// q5_0: five-bit codes biased by sixteen, the fifth bit held apart in `qh`.
-template <int vdr> static __device__ __forceinline__ float vec_dot_q5_0_q8_1_impl(
-    const int * vl, const int * vh, const int * u, const float & d5, const half2 & ds8) {
-    return total_biased(dot_nibbles_q8_1<vdr, true>(vl, vh, u), d5, 16 * vdr / QI5_0, ds8);
-}
-
 #define VDR_Q5_1_Q8_1_MMVQ 2
 #define VDR_Q5_1_Q8_1_MMQ  4
 
-/// q5_1: q5_0's fifth bit with q4_1's minimum, and no bias to fold - the codes are unsigned as
-/// they stand.
-template <int vdr> static __device__ __forceinline__ float vec_dot_q5_1_q8_1_impl(
+/// The activation codes of a lane's `2 * vdr` ints, summed.
+template <int vdr>
+static __device__ __forceinline__ int sum_codes_q8_1(const int * __restrict__ u) {
+    int sum = 0;
+#pragma unroll
+    for (int i = 0; i < 2 * vdr; ++i) {
+        sum = dot4_i8(0x01010101, u[i], sum);
+    }
+    return sum;
+}
+
+/// A biased format's total over a lane's codes: the bias leaves the integer dot against the
+/// lane's own activation codes, so the total is exact for the quantised activation.
+static __device__ __forceinline__ float total_biased_codes(
+    const int dot, const int codes, const float & d, const int bias, const half2 & ds8) {
+    return d * __low2float(ds8) * (float) (dot - bias * codes);
+}
+
+/// A format with a minimum, its total over a lane's codes: `q.d + m` against the activation
+/// codes `a` is `da.(d.Σ(q.a) + m.Σa)`, both sums integers over the lane's own codes.
+static __device__ __forceinline__ float total_with_minimum_codes(
+    const int dot, const int codes, const half2 & dm, const half2 & ds8) {
+    const float2 weight = __half22float2(dm);  // .x = scale, .y = minimum
+    return __low2float(ds8) * (dot * weight.x + codes * weight.y);
+}
+
+// The mat-vec totals of the four nibble formats, from the lane's codes alone.
+
+/// q4_0: four-bit codes biased by eight.
+template <int vdr> static __device__ __forceinline__ float vec_dot_q4_0_q8_1_codes(
+    const int * v, const int * u, const float & d4, const half2 & ds8) {
+    return total_biased_codes(dot_nibbles_q8_1<vdr, false>(v, nullptr, u),
+                              sum_codes_q8_1<vdr>(u), d4, 8, ds8);
+}
+
+/// q4_1: unsigned four-bit codes with a per-block minimum.
+template <int vdr> static __device__ __forceinline__ float vec_dot_q4_1_q8_1_codes(
+    const int * v, const int * u, const half2 & dm4, const half2 & ds8) {
+    return total_with_minimum_codes(dot_nibbles_q8_1<vdr, false>(v, nullptr, u),
+                                    sum_codes_q8_1<vdr>(u), dm4, ds8);
+}
+
+/// q5_0: five-bit codes biased by sixteen, the fifth bit held apart in `qh`.
+template <int vdr> static __device__ __forceinline__ float vec_dot_q5_0_q8_1_codes(
+    const int * vl, const int * vh, const int * u, const float & d5, const half2 & ds8) {
+    return total_biased_codes(dot_nibbles_q8_1<vdr, true>(vl, vh, u),
+                              sum_codes_q8_1<vdr>(u), d5, 16, ds8);
+}
+
+/// q5_1: q5_0's fifth bit with q4_1's minimum; the codes are unsigned as they stand.
+template <int vdr> static __device__ __forceinline__ float vec_dot_q5_1_q8_1_codes(
     const int * vl, const int * vh, const int * u, const half2 & dm5, const half2 & ds8) {
-    return total_with_minimum(dot_nibbles_q8_1<vdr, true>(vl, vh, u), dm5, ds8,
-                              QI8_1 / (vdr * QR5_1));
+    return total_with_minimum_codes(dot_nibbles_q8_1<vdr, true>(vl, vh, u),
+                                    sum_codes_q8_1<vdr>(u), dm5, ds8);
 }
 
 #define VDR_Q8_0_Q8_1_MMVQ 2
@@ -797,7 +839,7 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1_impl_mmq(
             u[2*i + 0] = four_bytes(bq8_1->qs, iqs + i);                                      \
             u[2*i + 1] = four_bytes(bq8_1->qs, iqs + i + qi);                                 \
         }                                                                                     \
-        return name##_impl<vdr>(v, u, bq->scale, bq8_1->ds);                                  \
+        return name##_codes<vdr>(v, u, bq->scale, bq8_1->ds);                                 \
     }
 
 /// A five-bit format: four bits with the others in a plane of their own. The high-bit word
@@ -816,7 +858,7 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1_impl_mmq(
             u[2*i + 0] = four_bytes(bq8_1->qs, iqs + i);                                      \
             u[2*i + 1] = four_bytes(bq8_1->qs, iqs + i + qi);                                 \
         }                                                                                     \
-        return name##_impl<vdr>(vl, vh, u, bq->scale, bq8_1->ds);                             \
+        return name##_codes<vdr>(vl, vh, u, bq->scale, bq8_1->ds);                            \
     }
 
 //              name                block       scale  low-bit reader          qi      vdr
