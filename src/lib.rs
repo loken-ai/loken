@@ -87,3 +87,44 @@ pub mod tensor;
 
 // Re-export commonly used types
 pub use inference::InferenceEngine;
+
+/// The cargo features this binary was built with, each with whether it is on.
+///
+/// The startup log and `GET /api/distributed/devices` both read this list.
+pub const COMPILED_FEATURES: [(&str, bool); 10] = [
+    ("cuda", cfg!(feature = "cuda")),
+    ("rocm", cfg!(feature = "rocm")),
+    ("opencl", cfg!(feature = "opencl")),
+    ("vulkan", cfg!(feature = "vulkan")),
+    ("cpu", cfg!(feature = "cpu")),
+    ("image", cfg!(feature = "image")),
+    ("video", cfg!(feature = "video")),
+    ("audio", cfg!(feature = "audio")),
+    ("midi", cfg!(feature = "midi")),
+    ("metrics", cfg!(feature = "metrics")),
+];
+
+/// The names of the features of [`COMPILED_FEATURES`] that are on, in its order.
+pub fn compiled_features() -> Vec<&'static str> {
+    COMPILED_FEATURES
+        .iter()
+        .filter_map(|&(name, on)| on.then_some(name))
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    /// The list names each feature once, and the build's runtimes as cargo set them.
+    #[test]
+    fn the_compiled_features_are_the_build_s() {
+        let mut names: Vec<&str> = super::COMPILED_FEATURES.iter().map(|f| f.0).collect();
+        names.sort();
+        names.dedup();
+        assert_eq!(names.len(), super::COMPILED_FEATURES.len());
+        let on = super::compiled_features();
+        assert_eq!(on.contains(&"cuda"), cfg!(feature = "cuda"));
+        assert_eq!(on.contains(&"rocm"), cfg!(feature = "rocm"));
+        assert_eq!(on.contains(&"vulkan"), cfg!(feature = "vulkan"));
+        assert_eq!(on.contains(&"cpu"), cfg!(feature = "cpu"));
+    }
+}

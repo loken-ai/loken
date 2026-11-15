@@ -252,16 +252,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
 
-            // The compiled feature set, so an operator sees whether this is the CUDA, OpenCL or
-            // CPU-only build; empty for a minimal CPU-only build.
-            let feature_flags: Vec<&'static str> = [
-                ("cuda", cfg!(feature = "gpu")),
-                ("opencl", cfg!(feature = "opencl")),
-                ("cpu", cfg!(feature = "cpu")),
-            ]
-            .into_iter()
-            .filter_map(|(name, on)| on.then_some(name))
-            .collect();
+            // The compiled feature set, as the devices route reports it.
+            // Empty for a minimal CPU-only build.
+            let feature_flags = loken::compiled_features();
             if feature_flags.is_empty() {
                 info!("🧱 Compiled features: (none - minimal CPU-only build)");
             } else {

@@ -810,19 +810,12 @@ pub(crate) async fn list_devices(
             "available_devices": available_count,
             "unavailable_devices": devices.len() - available_count,
             "total_memory_gb": total_memory_gb,
-            // What this binary was actually built with, so the Hardware tab can tell "no
-            // device" from "no support compiled in". It used to report `sycl`, which is not
-            // a feature of this crate and so was always false, and to omit `opencl`, which
-            // is the one that gates the Intel Arc backend.
-            "compiled_features": {
-                "cuda": cfg!(feature = "gpu"),
-                "opencl": cfg!(feature = "opencl"),
-                "vulkan": cfg!(feature = "vulkan"),
-                "image": cfg!(feature = "image"),
-                "video": cfg!(feature = "video"),
-                "audio": cfg!(feature = "audio"),
-                "midi": cfg!(feature = "midi")
-            }
+            // What this binary was built with, so the Hardware tab can tell "no device" from
+            // "no support compiled in".
+            "compiled_features": crate::COMPILED_FEATURES
+                .iter()
+                .map(|&(name, on)| (name.to_string(), serde_json::Value::Bool(on)))
+                .collect::<serde_json::Map<_, _>>()
         },
         "energy": energy
     })))
