@@ -128,42 +128,57 @@ pub fn opencl_address(device: &opencl3::device::Device) -> Option<PciAddress> {
     None
 }
 
+/// The cards a native runtime claims: those `read` gives when the runtime is `allowed`, none
+/// otherwise.
+/// `read` runs only for an allowed runtime.
+#[cfg(any(feature = "opencl", test))]
+pub fn claimed_cards(allowed: bool, read: impl FnOnce() -> Vec<PciAddress>) -> Vec<PciAddress> {
+    match allowed {
+        true => read(),
+        false => Vec::new(),
+    }
+}
+
 /// The PCI addresses of the cards the native runtimes of the build drive, CUDA and ROCm.
 /// Read once.
-/// Empty in a build without them, or when their libraries do not open.
+/// Empty in a build without them, when `--backends` keeps none of them, or when their
+/// libraries do not open.
 #[cfg(feature = "opencl")]
 pub fn native_addresses() -> &'static [PciAddress] {
     static READ: std::sync::OnceLock<Vec<PciAddress>> = std::sync::OnceLock::new();
-    READ.get_or_init(|| {
-        #[cfg(feature = "gpu")]
-        {
-            use crate::tensor::gpu_runtime::driver::sys::{cuDeviceGetPCIBusId, cudaError_enum};
-            if !crate::tensor::cuda::runtime::usable() {
-                return Vec::new();
-            }
-            let _ = crate::tensor::gpu_runtime::driver::result::init();
-            let n = crate::tensor::gpu_runtime::driver::result::device::get_count().unwrap_or(0);
-            (0..n)
-                .filter_map(|ordinal| {
-                    let mut id = [0 as std::os::raw::c_char; 64];
-                    let ok =
-                        unsafe { cuDeviceGetPCIBusId(id.as_mut_ptr(), id.len() as i32, ordinal) }
-                            == cudaError_enum::CUDA_SUCCESS;
-                    if !ok {
-                        return None;
-                    }
-                    let bytes: Vec<u8> = id
-                        .iter()
-                        .take_while(|&&c| c != 0)
-                        .map(|&c| c as u8)
-                        .collect();
-                    PciAddress::parse(&String::from_utf8_lossy(&bytes))
-                })
-                .collect()
+    READ.get_or_init(|| claimed_cards(crate::gpu::cards_allowed(), read_native_addresses))
+}
+
+/// The PCI addresses of the cards the native runtime of the build sees.
+#[cfg(feature = "opencl")]
+fn read_native_addresses() -> Vec<PciAddress> {
+    #[cfg(feature = "gpu")]
+    {
+        use crate::tensor::gpu_runtime::driver::sys::{cuDeviceGetPCIBusId, cudaError_enum};
+        if !crate::tensor::cuda::runtime::usable() {
+            return Vec::new();
         }
-        #[cfg(not(feature = "gpu"))]
-        Vec::new()
-    })
+        let _ = crate::tensor::gpu_runtime::driver::result::init();
+        let n = crate::tensor::gpu_runtime::driver::result::device::get_count().unwrap_or(0);
+        (0..n)
+            .filter_map(|ordinal| {
+                let mut id = [0 as std::os::raw::c_char; 64];
+                let ok = unsafe { cuDeviceGetPCIBusId(id.as_mut_ptr(), id.len() as i32, ordinal) }
+                    == cudaError_enum::CUDA_SUCCESS;
+                if !ok {
+                    return None;
+                }
+                let bytes: Vec<u8> = id
+                    .iter()
+                    .take_while(|&&c| c != 0)
+                    .map(|&c| c as u8)
+                    .collect();
+                PciAddress::parse(&String::from_utf8_lossy(&bytes))
+            })
+            .collect()
+    }
+    #[cfg(not(feature = "gpu"))]
+    Vec::new()
 }
 
 /// Whether placement may offer an OpenCL device at `address`, against the cards at `native`
@@ -256,6 +271,18 @@ mod tests {
         assert!(!at("0001:05:00.0").same_slot(&a));
         assert!(!at("0000:06:00.0").same_slot(&a));
         assert!(PciAddress::parse("card").is_none());
+    }
+
+    /// A card whose native runtime is not allowed is claimed by none: OpenCL is offered it.
+    #[test]
+    fn a_card_of_a_runtime_not_allowed_is_offered() {
+        let card = || vec![at("0000:05:00.0")];
+        let claimed = super::claimed_cards(false, || panic!("a runtime not allowed is not read"));
+        assert!(claimed.is_empty());
+        assert!(offered_beside(Some(at("0000:05:00.0")), &claimed));
+        assert!(offered_beside(None, &claimed));
+        let claimed = super::claimed_cards(true, card);
+        assert!(!offered_beside(Some(at("0000:05:00.0")), &claimed));
     }
 
     /// A device at a native card's address is never offered, and a device of unknown address

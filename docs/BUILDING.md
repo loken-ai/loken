@@ -120,6 +120,7 @@ A machine without a loader lists no OpenCL device.
 A driver that does not answer when asked what it has counts as no device.
 
 A card that CUDA or ROCm drives is told by its PCI address and is not offered for OpenCL layers.
+A card is theirs only while `--backends` keeps their runtime.
 Devices of Mesa's OpenCL platform are not offered for layers.
 The layers of a language model and the blocks of Z-Image run through Intel's OpenCL runtime on an Intel GPU, see [Status](STATUS.md#opencl).
 A GPU that shares the host's memory offers what the host can spare at load.
