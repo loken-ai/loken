@@ -86,6 +86,16 @@ impl Fmt {
         }
     }
 
+    /// The terms a row of `len` values leaves in a kernel's shared memory, with its pad: a run
+    /// format's run terms, a q8_K format's block shares (`tx_terms_stride`).
+    fn terms_stride(self, len: usize) -> usize {
+        if self.runs() {
+            len / RUN + 1
+        } else {
+            len / BLOCK + 1
+        }
+    }
+
     /// Whether a weight row of `len` values in format `dtype` can be read: whole blocks of 256
     /// values for a q8_K format, whole runs of 32 and whole blocks of the format for a run format.
     fn reads_rows_of(self, dtype: GgmlDType, len: usize) -> bool {
@@ -100,6 +110,24 @@ impl Fmt {
 
 /// Values of a run: the unit a run format's row is counted in.
 const RUN: usize = 32;
+
+/// Output rows a block of the gate and up kernels computes, and its threads.
+const H_ROWS: usize = 8;
+const H_THREADS: u32 = 256;
+
+/// Output rows a block of the down kernels computes, and its threads.
+const DOWN_ROWS: usize = 32;
+const DOWN_THREADS: u32 = 128;
+
+/// The shared memory a launch takes without asking the card for more.
+const SHARED_BYTES: usize = 48 * 1024;
+
+/// Up to `rows` output rows a block computes, as many as `copies` rows of `stride` terms each
+/// leave room for in [`SHARED_BYTES`].
+fn rows_within(rows: usize, copies: usize, stride: usize) -> usize {
+    rows.min(SHARED_BYTES / (copies * stride * std::mem::size_of::<f32>()))
+        .max(1)
+}
 
 /// The formats and widths of a layer whose experts the exact kernels serve.
 #[derive(Clone, Copy, Debug)]
@@ -275,7 +303,16 @@ fn launch_h(
     b.arg(&dim);
     b.arg(&inter);
     b.arg(&exact.limit);
-    launched(&name, unsafe { b.launch(warps((inter as u32, n as u32))) })
+    let stride = exact.gate.terms_stride(exact.dim);
+    let rows = rows_within(H_ROWS, 2, stride);
+    let rows_arg = rows as i32;
+    b.arg(&rows_arg);
+    let cfg = LaunchConfig {
+        grid_dim: (exact.inter.div_ceil(rows) as u32, n as u32, 1),
+        block_dim: (H_THREADS, 1, 1),
+        shared_mem_bytes: (2 * rows * stride * std::mem::size_of::<f32>()) as u32,
+    };
+    launched(&name, unsafe { b.launch(cfg) })
 }
 
 /// The rows of `rooms.h` of [`run_pairs`] as the down projection's activation blocks.
@@ -338,7 +375,16 @@ fn launch_down(
     b.arg(&rooms.out);
     b.arg(&inter);
     b.arg(&dim);
-    launched(&name, unsafe { b.launch(warps((dim as u32, n as u32))) })
+    let stride = exact.down.terms_stride(exact.inter);
+    let rows = rows_within(DOWN_ROWS, 1, stride);
+    let rows_arg = rows as i32;
+    b.arg(&rows_arg);
+    let cfg = LaunchConfig {
+        grid_dim: (exact.dim.div_ceil(rows) as u32, n as u32, 1),
+        block_dim: (DOWN_THREADS, 1, 1),
+        shared_mem_bytes: (rows * stride * std::mem::size_of::<f32>()) as u32,
+    };
+    launched(&name, unsafe { b.launch(cfg) })
 }
 
 /// After a recorded decode's answer: the transit room's pairs at `late_slots` and the source of

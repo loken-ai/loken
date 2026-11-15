@@ -7,6 +7,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 ### Changed
 
 - Sampling: apply no repeat penalty when neither the request nor the model sets one.
+- Experts: decode a mixture's cached experts faster on a card.
 
 ### Fixed
 

@@ -2784,6 +2784,19 @@ __device__ static __forceinline__ unsigned int tx_u32_2(const unsigned char * p)
     return (unsigned int) h[0] | ((unsigned int) h[1] << 16);
 }
 
+// `n` words of 4 bytes from `p`, 2-byte aligned, read as `n + 1` aligned words shifted into place.
+template <int N> __device__ static __forceinline__ void tx_words(const unsigned char * p, unsigned int * out) {
+    const unsigned int shift = 8u * (unsigned int) (reinterpret_cast<unsigned long long>(p) & 3u);
+    const unsigned int * a = reinterpret_cast<const unsigned int *>(p - (reinterpret_cast<unsigned long long>(p) & 3u));
+    unsigned int prev = a[0];
+    #pragma unroll
+    for (int k = 0; k < N; ++k) {
+        const unsigned int next = a[k + 1];
+        out[k] = __funnelshift_r(prev, next, shift);
+        prev = next;
+    }
+}
+
 // The 4 bytes of `x`, each 0..15, looked up in the 16 signed levels `t` held as 4 words.
 __device__ static __forceinline__ int tx_lookup16(const unsigned int x, const unsigned int * t) {
     const unsigned int low3 = x & 0x07070707u;
@@ -2810,8 +2823,8 @@ template <> __device__ void tx_lane_sums<TX_Q4K>(
         const unsigned char * w, const unsigned char * a, const int lane, int * scaled, int * offset) {
     const int s = lane >> 2, l0 = (lane & 3) * 8, shift = 4 * (s & 1);
     const unsigned char * q = w + 16 + 32 * (s >> 1) + l0;
-    const int w0 = (int) ((tx_u32(q) >> shift) & 0x0F0F0F0Fu);
-    const int w1 = (int) ((tx_u32(q + 4) >> shift) & 0x0F0F0F0Fu);
+    const int w0 = (int) ((*reinterpret_cast<const unsigned int *>(q) >> shift) & 0x0F0F0F0Fu);
+    const int w1 = (int) ((*reinterpret_cast<const unsigned int *>(q + 4) >> shift) & 0x0F0F0F0Fu);
     const int * ap = reinterpret_cast<const int *>(a + 4 + 8 * lane);
     const int dot = __dp4a(w1, ap[1], __dp4a(w0, ap[0], 0));
     const unsigned char * sc = w + 4;
@@ -2857,8 +2870,8 @@ template <> __device__ void tx_lane_sums<TX_Q2K>(
     const int s = lane >> 1, l0 = (lane & 1) * 8, t = s & 7;
     const int base = 32 * (s >> 3) + 16 * (t & 1), shift = 2 * (t >> 1);
     const unsigned char * q = w + 16 + base + l0;
-    const int w0 = (int) ((tx_u32(q) >> shift) & 0x03030303u);
-    const int w1 = (int) ((tx_u32(q + 4) >> shift) & 0x03030303u);
+    const int w0 = (int) ((*reinterpret_cast<const unsigned int *>(q) >> shift) & 0x03030303u);
+    const int w1 = (int) ((*reinterpret_cast<const unsigned int *>(q + 4) >> shift) & 0x03030303u);
     const int * ap = reinterpret_cast<const int *>(a + 4 + 8 * lane);
     const int dot = __dp4a(w1, ap[1], __dp4a(w0, ap[0], 0));
     *scaled = (w[s] & 0x0F) * dot;
@@ -2866,154 +2879,143 @@ template <> __device__ void tx_lane_sums<TX_Q2K>(
     *offset = (lane & 1) == 0 ? (w[s] >> 4) * (int) bsums[s] : 0;
 }
 
-// The four bytes of `mags` as signed bytes, negated where the matching bit of `signs` is set.
+// The four bytes of `mags` as signed bytes, negated where the matching bit of `signs` is set: a
+// byte flipped and less 0xFF is its negation.
 __device__ static __forceinline__ int tx_signed_quad(const unsigned int mags, const int signs) {
-    int packed = 0;
+    const unsigned int bits = (unsigned int) signs & 15u;
+    const unsigned int mask = ((bits & 1u) | ((bits & 2u) << 7) | ((bits & 4u) << 14) | ((bits & 8u) << 21)) * 0xFFu;
+    return (int) __vsub4(mags ^ mask, mask);
+}
+
+// A run format's run `rr` of a 256-value block `w`: its 32 signed codes, 4 to an int in value
+// order, and the integer scales of its 2 halves of 16 values.
+template <int F> __device__ static void tx_run_codes(const unsigned char * w, const int rr, int * q, int * lo, int * hi);
+
+// The grid entries of codes 4 * rr .. 4 * rr + 3, each with 2 high bits from the run's byte, under
+// the sign bytes 4 * rr ..; a nibble per half of the run gives its odd scale.
+template <> __device__ void tx_run_codes<TX_IQ2S>(const unsigned char * w, const int rr, int * q, int * lo, int * hi) {
+    const unsigned int codes = tx_u32_2(w + 2 + 4 * rr), signs = tx_u32_2(w + 34 + 4 * rr);
+    const unsigned int qh = w[66 + rr];
     #pragma unroll
-    for (int j = 0; j < 4; ++j) {
-        const int m = (int) ((mags >> (8 * j)) & 0xFF);
-        packed |= ((((signs >> j) & 1) ? -m : m) & 0xff) << (8 * j);
+    for (int l = 0; l < 4; ++l) {
+        const unsigned int code = ((codes >> (8 * l)) & 0xFFu) | ((qh << (8 - 2 * l)) & 0x300u);
+        const unsigned long long mags = IQ2S_GRID[code];
+        const int sg = (int) ((signs >> (8 * l)) & 0xFFu);
+        q[2 * l] = tx_signed_quad((unsigned int) mags, sg & 15);
+        q[2 * l + 1] = tx_signed_quad((unsigned int) (mags >> 32), sg >> 4);
     }
-    return packed;
+    const int sc = w[74 + rr];
+    *lo = 1 + 2 * (sc & 0x0F);
+    *hi = 1 + 2 * (sc >> 4);
 }
 
-// The lane's eight values are the grid entry `lane`: code byte, its 2 high bits, sign byte.
-// `a` is a q8_K32 block.
-template <> __device__ void tx_lane_sums<TX_IQ2S>(
-        const unsigned char * w, const unsigned char * a, const int lane, int * scaled, int * offset) {
-    const int run = lane >> 2, l = lane & 3;
-    const unsigned int code = (unsigned int) w[2 + lane] | (((unsigned int) w[66 + run] << (8 - 2 * l)) & 0x300u);
-    const unsigned long long mags = IQ2S_GRID[code];
-    const int signs = w[34 + lane];
-    const int w0 = tx_signed_quad((unsigned int) mags, signs & 15);
-    const int w1 = tx_signed_quad((unsigned int) (mags >> 32), signs >> 4);
-    const int * ap = reinterpret_cast<const int *>(a + 16 + 8 * lane);
-    const int dot = __dp4a(w1, ap[1], __dp4a(w0, ap[0], 0));
-    const int sc = w[74 + run];
-    *scaled = (1 + 2 * (l < 2 ? (sc & 0x0F) : (sc >> 4))) * dot;
-    *offset = 0;
+// Grid codes 8 * rr .. 8 * rr + 7 under the signs of the run's word, whose top 4 bits give the
+// run's scale.
+template <> __device__ void tx_run_codes<TX_IQ3XXS>(const unsigned char * w, const int rr, int * q, int * lo, int * hi) {
+    const unsigned int c0 = tx_u32_2(w + 2 + 8 * rr), c1 = tx_u32_2(w + 6 + 8 * rr);
+    const unsigned int word = tx_u32_2(w + 66 + 4 * rr);
+    #pragma unroll
+    for (int l = 0; l < 4; ++l) {
+        const int signs = KSIGNS_IQ2XS[(word >> (7 * l)) & 127];
+        const unsigned int c = l < 2 ? c0 : c1, sh = 16 * (l & 1);
+        q[2 * l] = tx_signed_quad(IQ3XXS_GRID[(c >> sh) & 0xFFu], signs & 15);
+        q[2 * l + 1] = tx_signed_quad(IQ3XXS_GRID[(c >> (sh + 8)) & 0xFFu], signs >> 4);
+    }
+    *lo = *hi = 1 + 2 * (int) (word >> 28);
 }
 
-// The lane's eight values are the grid codes 2 * lane and 2 * lane + 1 under the signs of its
-// run's word, whose top 4 bits give the run's scale. `a` is a q8_K32 block.
-template <> __device__ void tx_lane_sums<TX_IQ3XXS>(
-        const unsigned char * w, const unsigned char * a, const int lane, int * scaled, int * offset) {
-    const int run = lane >> 2, l = lane & 3;
-    const unsigned int word = tx_u32(w + 66 + 4 * run);
-    const int signs = KSIGNS_IQ2XS[(word >> (7 * l)) & 127];
-    const int w0 = tx_signed_quad(IQ3XXS_GRID[w[2 + 2 * lane]], signs & 15);
-    const int w1 = tx_signed_quad(IQ3XXS_GRID[w[3 + 2 * lane]], signs >> 4);
-    const int * ap = reinterpret_cast<const int *>(a + 16 + 8 * lane);
-    const int dot = __dp4a(w1, ap[1], __dp4a(w0, ap[0], 0));
-    *scaled = (1 + 2 * (int) (word >> 28)) * dot;
-    *offset = 0;
+// Grid codes 8 * rr .. with their 9th bits from the run's byte, under the sign bytes 4 * rr ..;
+// a nibble per run gives its scale.
+template <> __device__ void tx_run_codes<TX_IQ3S>(const unsigned char * w, const int rr, int * q, int * lo, int * hi) {
+    const unsigned int c0 = tx_u32_2(w + 2 + 8 * rr), c1 = tx_u32_2(w + 6 + 8 * rr);
+    const unsigned int qh = w[66 + rr], signs = tx_u32_2(w + 74 + 4 * rr);
+    #pragma unroll
+    for (int l = 0; l < 4; ++l) {
+        const unsigned int c = l < 2 ? c0 : c1, sh = 16 * (l & 1);
+        const unsigned int i1 = ((c >> sh) & 0xFFu) | ((qh << (8 - 2 * l)) & 256u);
+        const unsigned int i2 = ((c >> (sh + 8)) & 0xFFu) | ((qh << (7 - 2 * l)) & 256u);
+        const int sg = (int) ((signs >> (8 * l)) & 0xFFu);
+        q[2 * l] = tx_signed_quad(IQ3S_GRID[i1], sg & 15);
+        q[2 * l + 1] = tx_signed_quad(IQ3S_GRID[i2], sg >> 4);
+    }
+    *lo = *hi = 1 + 2 * ((w[106 + (rr >> 1)] >> (4 * (rr & 1))) & 0x0F);
 }
 
-// The lane's eight values are the grid codes 2 * lane and 2 * lane + 1, their 9th bits from the
-// run's high byte, under the sign byte `lane`; a nibble per run gives its scale. `a` is a q8_K32
-// block.
-template <> __device__ void tx_lane_sums<TX_IQ3S>(
-        const unsigned char * w, const unsigned char * a, const int lane, int * scaled, int * offset) {
-    const int run = lane >> 2, l = lane & 3;
-    const unsigned int qh = w[66 + run];
-    const unsigned int i1 = (unsigned int) w[2 + 2 * lane] | ((qh << (8 - 2 * l)) & 256u);
-    const unsigned int i2 = (unsigned int) w[3 + 2 * lane] | ((qh << (7 - 2 * l)) & 256u);
-    const int signs = w[74 + lane];
-    const int w0 = tx_signed_quad(IQ3S_GRID[i1], signs & 15);
-    const int w1 = tx_signed_quad(IQ3S_GRID[i2], signs >> 4);
-    const int * ap = reinterpret_cast<const int *>(a + 16 + 8 * lane);
-    const int dot = __dp4a(w1, ap[1], __dp4a(w0, ap[0], 0));
-    const int nibble = (w[106 + (run >> 1)] >> (4 * (run & 1))) & 0x0F;
-    *scaled = (1 + 2 * nibble) * dot;
-    *offset = 0;
-}
-
-// 8 blocks of 32 values, 18 bytes each, a run each. Lane `l` reads quarter `l & 3` of block
-// `l >> 2`: the low nibbles of bytes 0..16 are the block's first 16 values, the high nibbles the
-// last 16. The values are the levels of KVALUES_IQ4NL. `a` is a q8_K32 block.
-template <> __device__ void tx_lane_sums<TX_IQ4NL>(
-        const unsigned char * w, const unsigned char * a, const int lane, int * scaled, int * offset) {
-    const int run = lane >> 2, quarter = lane & 3;
-    const unsigned char * q = w + 18 * run + 2 + 8 * (quarter & 1);
-    const int shift = 4 * (quarter >> 1);
+// Block `rr` of 8 blocks of 32 values, 18 bytes each: the low nibbles of its 16 bytes are values
+// 0..16, the high nibbles 16..32, each a level of KVALUES_IQ4NL.
+template <> __device__ void tx_run_codes<TX_IQ4NL>(const unsigned char * w, const int rr, int * q, int * lo, int * hi) {
     const unsigned char * levels = reinterpret_cast<const unsigned char *>(KVALUES_IQ4NL);
     const unsigned int table[4] = {tx_u32(levels), tx_u32(levels + 4), tx_u32(levels + 8), tx_u32(levels + 12)};
-    int packed[2];
+    unsigned int words[4];
+    tx_words<4>(w + 18 * rr + 2, words);
     #pragma unroll
-    for (int k = 0; k < 2; ++k) {
-        packed[k] = tx_lookup16((tx_u32_2(q + 4 * k) >> shift) & 0x0F0F0F0Fu, table);
+    for (int k = 0; k < 4; ++k) {
+        const unsigned int x = words[k];
+        q[k] = tx_lookup16(x & 0x0F0F0F0Fu, table);
+        q[k + 4] = tx_lookup16((x >> 4) & 0x0F0F0F0Fu, table);
     }
-    const int * ap = reinterpret_cast<const int *>(a + 16 + 8 * lane);
-    *scaled = __dp4a(packed[1], ap[1], __dp4a(packed[0], ap[0], 0));
-    *offset = 0;
+    *lo = *hi = 1;
 }
 
-// 4 blocks of 64 values, 18 bytes each, 2 runs each. Lane `l` reads values 8 * (l & 3).. of
-// half `l >> 2 & 1` of block `l >> 3`: 2 bytes of 4 two-bit codes, lowest first, each the level
-// `code - 1`. `a` is a q8_K32 block.
-template <> __device__ void tx_lane_sums<TX_Q2_0>(
-        const unsigned char * w, const unsigned char * a, const int lane, int * scaled, int * offset) {
-    const int run = lane >> 2;
-    const unsigned char * q = w + 18 * (run >> 1) + 2 + 8 * (run & 1) + 2 * (lane & 3);
-    const unsigned int two = *reinterpret_cast<const unsigned short *>(q);
-    int packed[2];
+// Half `rr & 1` of block `rr >> 1` of 4 blocks of 64 values, 18 bytes each: 8 bytes of 4 two-bit
+// codes each, lowest first, each the level `code - 1`.
+template <> __device__ void tx_run_codes<TX_Q2_0>(const unsigned char * w, const int rr, int * q, int * lo, int * hi) {
+    const unsigned char * b = w + 18 * (rr >> 1) + 2 + 8 * (rr & 1);
     #pragma unroll
     for (int k = 0; k < 2; ++k) {
-        const unsigned int x = (two >> (8 * k)) & 0xFFu;
-        const unsigned int codes = (x & 3u) | ((x & 0xCu) << 6) | ((x & 0x30u) << 12) | ((x & 0xC0u) << 18);
-        packed[k] = (int) __vsub4(codes, 0x01010101u);
+        const unsigned int x4 = tx_u32_2(b + 4 * k);
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const unsigned int x = (x4 >> (8 * j)) & 0xFFu;
+            const unsigned int codes = (x & 3u) | ((x & 0xCu) << 6) | ((x & 0x30u) << 12) | ((x & 0xC0u) << 18);
+            q[4 * k + j] = (int) __vsub4(codes, 0x01010101u);
+        }
     }
-    const int * ap = reinterpret_cast<const int *>(a + 16 + 8 * lane);
-    *scaled = __dp4a(packed[1], ap[1], __dp4a(packed[0], ap[0], 0));
-    *offset = 0;
+    *lo = *hi = 1;
 }
 
-// 8 blocks of 32 values, 34 bytes each, a run each. Lane `l` reads codes 8 * (l & 3).. of block
-// `l >> 2`. `a` is a q8_K32 block.
-template <> __device__ void tx_lane_sums<TX_Q8_0>(
-        const unsigned char * w, const unsigned char * a, const int lane, int * scaled, int * offset) {
-    const unsigned char * q = w + 34 * (lane >> 2) + 2 + 8 * (lane & 3);
-    const int * ap = reinterpret_cast<const int *>(a + 16 + 8 * lane);
-    *scaled = __dp4a((int) tx_u32_2(q + 4), ap[1], __dp4a((int) tx_u32_2(q), ap[0], 0));
-    *offset = 0;
-}
-
-// 8 blocks of 32 values, 22 bytes each (scale, 32 high bits, 16 bytes of nibbles), a run each.
-// Lane `l` reads values 8 * (l & 3).. of block `l >> 2`: the low nibbles of bytes 0..16 are the
-// first 16 values, the high nibbles the last 16; bit `v` of the high bits tops value `v`; each
-// value is its 5-bit code less 16. `a` is a q8_K32 block.
-template <> __device__ void tx_lane_sums<TX_Q5_0>(
-        const unsigned char * w, const unsigned char * a, const int lane, int * scaled, int * offset) {
-    const unsigned char * b = w + 22 * (lane >> 2);
-    const int quarter = lane & 3;
-    const unsigned int qh = tx_u32_2(b + 2);
-    const unsigned char * q = b + 6 + 8 * (quarter & 1);
-    const int shift = 4 * (quarter >> 1);
-    int packed[2];
+// Block `rr` of 8 blocks of 32 values, 34 bytes each: its 32 signed codes.
+template <> __device__ void tx_run_codes<TX_Q8_0>(const unsigned char * w, const int rr, int * q, int * lo, int * hi) {
+    unsigned int words[8];
+    tx_words<8>(w + 34 * rr + 2, words);
     #pragma unroll
-    for (int k = 0; k < 2; ++k) {
-        const unsigned int low = (tx_u32_2(q + 4 * k) >> shift) & 0x0F0F0F0Fu;
-        const unsigned int top = (qh >> (8 * quarter + 4 * k)) & 0xFu;
-        const unsigned int high = ((top & 1u) | ((top & 2u) << 7) | ((top & 4u) << 14) | ((top & 8u) << 21)) << 4;
-        packed[k] = (int) __vsub4(low | high, 0x10101010u);
+    for (int k = 0; k < 8; ++k) q[k] = (int) words[k];
+    *lo = *hi = 1;
+}
+
+// Block `rr` of 8 blocks of 32 values, 22 bytes each (scale, 32 high bits, 16 bytes of nibbles):
+// the low nibbles are values 0..16, the high nibbles 16..32; bit `v` of the high bits tops value
+// `v`; each value is its 5-bit code less 16.
+template <> __device__ void tx_run_codes<TX_Q5_0>(const unsigned char * w, const int rr, int * q, int * lo, int * hi) {
+    unsigned int words[5];
+    tx_words<5>(w + 22 * rr + 2, words);
+    const unsigned int qh = words[0];
+    #pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        const unsigned int x = words[k + 1];
+        #pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            const unsigned int low = (x >> (4 * h)) & 0x0F0F0F0Fu;
+            const unsigned int top = (qh >> (16 * h + 4 * k)) & 0xFu;
+            const unsigned int high = ((top & 1u) | ((top & 2u) << 7) | ((top & 4u) << 14) | ((top & 8u) << 21)) << 4;
+            q[k + 4 * h] = (int) __vsub4(low | high, 0x10101010u);
+        }
     }
-    const int * ap = reinterpret_cast<const int *>(a + 16 + 8 * lane);
-    *scaled = __dp4a(packed[1], ap[1], __dp4a(packed[0], ap[0], 0));
-    *offset = 0;
+    *lo = *hi = 1;
 }
 
 // A block's share from its two integer sums, as quant_cpu's `combine` of each format.
 template <int F> __device__ static float tx_combine(const unsigned char * w, float yd, int scaled, int offset);
 template <> __device__ float tx_combine<TX_Q4K>(const unsigned char * w, float yd, int scaled, int offset) {
-    return __fmul_rn(yd, __fsub_rn(__fmul_rn(req_f16_at(w), (float) scaled),
-                                   __fmul_rn(req_f16_at(w + 2), (float) offset)));
+    return __fmul_rn(yd, __fsub_rn(__fmul_rn(tx_f16(w), (float) scaled),
+                                   __fmul_rn(tx_f16(w + 2), (float) offset)));
 }
 template <> __device__ float tx_combine<TX_Q6K>(const unsigned char * w, float yd, int scaled, int) {
-    return __fmul_rn(yd, __fmul_rn(req_f16_at(w + 208), (float) scaled));
+    return __fmul_rn(yd, __fmul_rn(tx_f16(w + 208), (float) scaled));
 }
 template <> __device__ float tx_combine<TX_Q2K>(const unsigned char * w, float yd, int scaled, int offset) {
-    return __fmul_rn(yd, __fsub_rn(__fmul_rn(req_f16_at(w + 80), (float) scaled),
-                                   __fmul_rn(req_f16_at(w + 82), (float) offset)));
+    return __fmul_rn(yd, __fsub_rn(__fmul_rn(tx_f16(w + 80), (float) scaled),
+                                   __fmul_rn(tx_f16(w + 82), (float) offset)));
 }
 
 // The float weight scale of run `run` of a block, as quant_cpu's `ExactDot` of each run format
@@ -3046,46 +3048,212 @@ template <int F> __device__ static __forceinline__ long tx_row_bytes(const int l
     return (long) len * TxFmt<F>::BYTES / 256;
 }
 
-// A weight row of `len` values against an activation row of ceil(len / 256) blocks: the dot of
-// ExactDot, the same on every lane.
-// A q8_K format sums a block's lanes and folds the sums in 1 step; its rows are whole blocks.
-// A run format sums each run's 4 lanes, forms each run's (ws * s) * da, and every lane folds the
-// block's terms from -0 in run order, as quant_cpu's `exact_block_share`.
-// The last block of a run format's row holds (len % 256) / 32 runs when len is not whole blocks:
-// the lanes past them read nothing and the fold stops at them.
-template <int F> __device__ static float tx_row(const unsigned char * w, const unsigned char * a, const int len, const int lane) {
-    float acc = -0.0f;
-    const int nsb = (len + 255) / 256;
-    for (int b = 0; b < nsb; ++b) {
-        const unsigned char * wb = w + (long) b * TxFmt<F>::BYTES;
-        const unsigned char * ab = a + (long) b * TxFmt<F>::ACT;
-        int scaled = 0, offset = 0;
-        if constexpr (TxFmt<F>::RUNS) {
-            const int runs = min(8, (len - 256 * b) / 32);
-            const int run = lane >> 2;
-            if (run < runs) tx_lane_sums<F>(wb, ab, lane, &scaled, &offset);
-            scaled += __shfl_xor_sync(0xffffffffu, scaled, 1);
-            scaled += __shfl_xor_sync(0xffffffffu, scaled, 2);
-            const float term = run < runs
-                ? __fmul_rn(__fmul_rn(tx_run_scale<F>(wb, run), (float) scaled), tx_f16(ab + 2 * run))
-                : 0.0f;
-            float share = -0.0f;
-            #pragma unroll
-            for (int r = 0; r < 8; ++r) {
-                if (r < runs) share = __fadd_rn(share, __shfl_sync(0xffffffffu, term, 4 * r));
-            }
-            acc = __fadd_rn(acc, share);
+// A run format's integer sum of run `rr` of a block: each half's codes against the activation's
+// under the half's scale.
+template <int F> __device__ static __forceinline__ int tx_run_sum(
+        const unsigned char * wb, const unsigned char * ab, const int rr) {
+    int q[8], lo, hi;
+    tx_run_codes<F>(wb, rr, q, &lo, &hi);
+    const int4 a0 = *reinterpret_cast<const int4 *>(ab + 16 + 32 * rr);
+    const int4 a1 = *reinterpret_cast<const int4 *>(ab + 32 + 32 * rr);
+    const int d0 = __dp4a(q[3], a0.w, __dp4a(q[2], a0.z, __dp4a(q[1], a0.y, __dp4a(q[0], a0.x, 0))));
+    const int d1 = __dp4a(q[7], a1.w, __dp4a(q[6], a1.z, __dp4a(q[5], a1.y, __dp4a(q[4], a1.x, 0))));
+    return lo * d0 + hi * d1;
+}
+
+// A run format's term of run `run` of the weight row `w` against the activation row `a`:
+// (ws * s) * da, as quant_cpu's `exact_block_share` forms it.
+template <int F> __device__ static __forceinline__ float tx_run_term(
+        const unsigned char * w, const unsigned char * a, const int run) {
+    const int b = run >> 3, rr = run & 7;
+    const unsigned char * wb = w + (long) b * TxFmt<F>::BYTES;
+    const unsigned char * ab = a + (long) b * TxFmt<F>::ACT;
+    return __fmul_rn(__fmul_rn(tx_run_scale<F>(wb, rr), (float) tx_run_sum<F>(wb, ab, rr)), tx_f16(ab + 2 * rr));
+}
+
+// A q8_K format's 2 integer sums over the 4 lane parts `part`, `part + 8`, .. of a block: the
+// lane's share of the block, which its 8 lanes add up.
+template <int F> __device__ static __forceinline__ void tx_part_sums(
+        const unsigned char * wb, const unsigned char * ab, const int part, int * scaled, int * offset) {
+    int sc = 0, of = 0;
+    #pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        int s, o;
+        tx_lane_sums<F>(wb, ab, part + 8 * j, &s, &o);
+        sc += s;
+        of += o;
+    }
+    *scaled = sc;
+    *offset = of;
+}
+
+// q4_K's 4 lane parts at once, the 12 bytes of its scales and minimums read as 3 words.
+template <> __device__ void tx_part_sums<TX_Q4K>(
+        const unsigned char * w, const unsigned char * a, const int part, int * scaled, int * offset) {
+    const unsigned int * sw = reinterpret_cast<const unsigned int *>(w + 4);
+    const unsigned int s0 = sw[0], s1 = sw[1], s2 = sw[2];
+    const int half = part >> 2, l0 = (part & 3) * 8, shift = 4 * half;
+    const short * bsums = reinterpret_cast<const short *>(a + 260);
+    int sc = 0, of = 0;
+    #pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const int s = half + 2 * j;
+        const unsigned int * q = reinterpret_cast<const unsigned int *>(w + 16 + 32 * j + l0);
+        const int w0 = (int) ((q[0] >> shift) & 0x0F0F0F0Fu);
+        const int w1 = (int) ((q[1] >> shift) & 0x0F0F0F0Fu);
+        const int * ap = reinterpret_cast<const int *>(a + 4 + 8 * (part + 8 * j));
+        const int dot = __dp4a(w1, ap[1], __dp4a(w0, ap[0], 0));
+        int scale, mn;
+        if (s < 4) {
+            scale = (s0 >> (8 * s)) & 63;
+            mn = (s1 >> (8 * s)) & 63;
         } else {
-            tx_lane_sums<F>(wb, ab, lane, &scaled, &offset);
-            #pragma unroll
-            for (int off = 16; off > 0; off >>= 1) {
-                scaled += __shfl_xor_sync(0xffffffffu, scaled, off);
-                offset += __shfl_xor_sync(0xffffffffu, offset, off);
-            }
-            acc = __fadd_rn(acc, tx_combine<F>(wb, *reinterpret_cast<const float *>(ab), scaled, offset));
+            const int t = s - 4;
+            scale = ((s2 >> (8 * t)) & 0x0F) | (((s0 >> (8 * t + 6)) & 3) << 4);
+            mn = ((s2 >> (8 * t + 4)) & 0x0F) | (((s1 >> (8 * t + 6)) & 3) << 4);
+        }
+        sc += scale * dot;
+        if ((part & 3) == 0) of += mn * ((int) bsums[2 * s] + (int) bsums[2 * s + 1]);
+    }
+    *scaled = sc;
+    *offset = of;
+}
+
+// The part sums of 2 matrices `w` and `w2` against the same activation block.
+template <int F> __device__ static __forceinline__ void tx_part_sums2(
+        const unsigned char * w, const unsigned char * w2, const unsigned char * a, const int part,
+        int * s1, int * o1, int * s2, int * o2) {
+    tx_part_sums<F>(w, a, part, s1, o1);
+    tx_part_sums<F>(w2, a, part, s2, o2);
+}
+
+// q4_K's part sums of 2 matrices, each activation word and bsum read once for both.
+template <> __device__ void tx_part_sums2<TX_Q4K>(
+        const unsigned char * w, const unsigned char * w2, const unsigned char * a, const int part,
+        int * s1, int * o1, int * s2, int * o2) {
+    const unsigned int * sw = reinterpret_cast<const unsigned int *>(w + 4);
+    const unsigned int * sv = reinterpret_cast<const unsigned int *>(w2 + 4);
+    const unsigned int a0 = sw[0], a1 = sw[1], a2 = sw[2], b0 = sv[0], b1 = sv[1], b2 = sv[2];
+    const int half = part >> 2, l0 = (part & 3) * 8, shift = 4 * half;
+    const short * bsums = reinterpret_cast<const short *>(a + 260);
+    int sc1 = 0, of1 = 0, sc2 = 0, of2 = 0;
+    #pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const int s = half + 2 * j;
+        const unsigned int * q = reinterpret_cast<const unsigned int *>(w + 16 + 32 * j + l0);
+        const unsigned int * r = reinterpret_cast<const unsigned int *>(w2 + 16 + 32 * j + l0);
+        const int * ap = reinterpret_cast<const int *>(a + 4 + 8 * (part + 8 * j));
+        const int x0 = ap[0], x1 = ap[1];
+        const int d1 = __dp4a((int) ((q[1] >> shift) & 0x0F0F0F0Fu), x1, __dp4a((int) ((q[0] >> shift) & 0x0F0F0F0Fu), x0, 0));
+        const int d2 = __dp4a((int) ((r[1] >> shift) & 0x0F0F0F0Fu), x1, __dp4a((int) ((r[0] >> shift) & 0x0F0F0F0Fu), x0, 0));
+        int k1, m1, k2, m2;
+        if (s < 4) {
+            k1 = (a0 >> (8 * s)) & 63;
+            m1 = (a1 >> (8 * s)) & 63;
+            k2 = (b0 >> (8 * s)) & 63;
+            m2 = (b1 >> (8 * s)) & 63;
+        } else {
+            const int t = s - 4;
+            k1 = ((a2 >> (8 * t)) & 0x0F) | (((a0 >> (8 * t + 6)) & 3) << 4);
+            m1 = ((a2 >> (8 * t + 4)) & 0x0F) | (((a1 >> (8 * t + 6)) & 3) << 4);
+            k2 = ((b2 >> (8 * t)) & 0x0F) | (((b0 >> (8 * t + 6)) & 3) << 4);
+            m2 = ((b2 >> (8 * t + 4)) & 0x0F) | (((b1 >> (8 * t + 6)) & 3) << 4);
+        }
+        sc1 += k1 * d1;
+        sc2 += k2 * d2;
+        if ((part & 3) == 0) {
+            const int bs = (int) bsums[2 * s] + (int) bsums[2 * s + 1];
+            of1 += m1 * bs;
+            of2 += m2 * bs;
         }
     }
+    *s1 = sc1;
+    *o1 = of1;
+    *s2 = sc2;
+    *o2 = of2;
+}
+
+// The 4 integers `a`, `b`, `c`, `d` of the 8 lanes of a block summed over those lanes, held by
+// every lane of them: each level of the butterfly passes half of what a lane holds, so the 4
+// sums take 4 shuffles, and 4 more hand them to every lane.
+__device__ static __forceinline__ void tx_reduce4(int & a, int & b, int & c, int & d) {
+    const int lane = threadIdx.x & 31, part = lane & 7;
+    const bool up = (part & 4) != 0, up2 = (part & 2) != 0;
+    const int k0 = (up ? c : a) + __shfl_xor_sync(0xffffffffu, up ? a : c, 4);
+    const int k1 = (up ? d : b) + __shfl_xor_sync(0xffffffffu, up ? b : d, 4);
+    int x = (up2 ? k1 : k0) + __shfl_xor_sync(0xffffffffu, up2 ? k0 : k1, 2);
+    x += __shfl_xor_sync(0xffffffffu, x, 1);
+    const int base = lane - part;
+    a = __shfl_sync(0xffffffffu, x, base);
+    b = __shfl_sync(0xffffffffu, x, base + 2);
+    c = __shfl_sync(0xffffffffu, x, base + 4);
+    d = __shfl_sync(0xffffffffu, x, base + 6);
+}
+
+// The terms of `rows` weight rows of `len` values from `w`, `row_bytes` apart, against the
+// activation row `a`, written to `terms` [rows][T + 1]: a run format's T = len / 32 run terms, a
+// q8_K format's T = len / 256 block shares. A run format takes a thread per run; a q8_K format 8
+// lanes per block, 4 blocks to a warp at a time.
+// With `w2` too, the terms of its rows go to `terms2` in the same pass over the activation.
+template <int F> __device__ static void tx_terms(
+        const unsigned char * w, const unsigned char * w2, const long row_bytes,
+        const unsigned char * a, const int len, const int rows, float * terms, float * terms2) {
+    if constexpr (TxFmt<F>::RUNS) {
+        const int T = len / 32;
+        for (int un = threadIdx.x; un < rows * T; un += blockDim.x) {
+            const int row = un / T, run = un - row * T;
+            terms[row * (T + 1) + run] = tx_run_term<F>(w + row * row_bytes, a, run);
+            if (w2 != nullptr) terms2[row * (T + 1) + run] = tx_run_term<F>(w2 + row * row_bytes, a, run);
+        }
+    } else {
+        const int T = len / 256, units = rows * T, lane = threadIdx.x & 31, part = lane & 7;
+        for (int u0 = (threadIdx.x >> 5) * 4; u0 < units; u0 += blockDim.x >> 3) {
+            // A lane past the units takes the last one and keeps nothing, so the shuffles see
+            // every lane.
+            const int unit = u0 + (lane >> 3), uu = min(unit, units - 1);
+            const int row = uu / T, b = uu - row * T;
+            const long off = row * row_bytes + (long) b * TxFmt<F>::BYTES;
+            const unsigned char * ab = a + (long) b * TxFmt<F>::ACT;
+            // With `w2`, the 2 matrices' sums read the activation once and are reduced together.
+            int s1, o1, s2 = 0, o2 = 0;
+            if (w2 != nullptr) {
+                tx_part_sums2<F>(w + off, w2 + off, ab, part, &s1, &o1, &s2, &o2);
+            } else {
+                tx_part_sums<F>(w + off, ab, part, &s1, &o1);
+            }
+            tx_reduce4(s1, o1, s2, o2);
+            const float yd = *reinterpret_cast<const float *>(ab);
+            if (part == 0 && unit < units) {
+                terms[row * (T + 1) + b] = tx_combine<F>(w + off, yd, s1, o1);
+                if (w2 != nullptr) terms2[row * (T + 1) + b] = tx_combine<F>(w2 + off, yd, s2, o2);
+            }
+        }
+    }
+}
+
+// The dot of ExactDot from a row's terms: a run format's run terms folded from -0 in run order
+// into each block's share, the shares folded from -0 in block order; a q8_K format's shares
+// folded from -0 in block order.
+template <int F> __device__ static float tx_fold(const float * t, const int len) {
+    float acc = -0.0f;
+    if constexpr (TxFmt<F>::RUNS) {
+        const int T = len / 32;
+        for (int b = 0; 8 * b < T; ++b) {
+            float share = -0.0f;
+            const int n = min(8, T - 8 * b);
+            for (int r = 0; r < n; ++r) share = __fadd_rn(share, t[8 * b + r]);
+            acc = __fadd_rn(acc, share);
+        }
+    } else {
+        for (int b = 0; b < len / 256; ++b) acc = __fadd_rn(acc, t[b]);
+    }
     return acc;
+}
+
+// The terms a row of `len` values takes in shared memory, with the pad that keeps the rows'
+// folds on distinct banks.
+template <int F> __device__ static __forceinline__ int tx_terms_stride(const int len) {
+    return (TxFmt<F>::RUNS ? len / 32 : len / 256) + 1;
 }
 
 // Where instance i's expert sits in stack `stack`, or null for an instance the launch skips.
@@ -3097,25 +3265,86 @@ __device__ static __forceinline__ const unsigned char * tx_expert(
     return (const unsigned char *) (extra[stack] + (unsigned long long) ((int) slot - base_slots) * bytes);
 }
 
+// Each of `n` rows of terms `terms` [n][stride] (the rows of `m` matrices of `rows` rows each)
+// folded into its first term, in the order of tx_fold: a run format's blocks each folded into
+// their first run by a thread per block, then the shares folded by a thread per row. Every thread
+// of the block takes part.
+template <int F> __device__ static void tx_fold_rows(float * terms, const int n, const int stride, const int len) {
+    if constexpr (TxFmt<F>::RUNS) {
+        const int T = len / 32, nsb = (T + 7) / 8;
+        for (int un = threadIdx.x; un < n * nsb; un += blockDim.x) {
+            const int row = un / nsb, b = un - row * nsb;
+            float * t = terms + row * stride + 8 * b;
+            const int m = min(8, T - 8 * b);
+            float share = -0.0f;
+            for (int r = 0; r < m; ++r) share = __fadd_rn(share, t[r]);
+            t[0] = share;
+        }
+        __syncthreads();
+        for (int row = threadIdx.x; row < n; row += blockDim.x) {
+            float * t = terms + row * stride;
+            float acc = -0.0f;
+            for (int b = 0; b < nsb; ++b) acc = __fadd_rn(acc, t[8 * b]);
+            t[0] = acc;
+        }
+    } else {
+        for (int row = threadIdx.x; row < n; row += blockDim.x) {
+            float * t = terms + row * stride;
+            t[0] = tx_fold<F>(t, len);
+        }
+    }
+    __syncthreads();
+}
+
 // The rows entering the down projections: h[pair, row] = swiglu(gate . x, up . x), bounded at
-// `limit` when it is positive. A warp per (output row, instance).
+// `limit` when it is positive. A block per (`rows` output rows, instance): the terms of the gate
+// and up rows go to shared memory, 2 * rows * tx_terms_stride(dim) floats, and a thread per row
+// folds them.
 template <int F> __device__ static void tx_h(
         const unsigned long long gate, const unsigned long long up, const unsigned long long * extra,
         const int base_slots, const long long bytes, const unsigned int * slots,
         const unsigned int * pairs, const int k, const unsigned char * xq, float * h,
-        const int dim, const int inter, const float limit) {
-    const int row = blockIdx.x, i = blockIdx.y, lane = threadIdx.x;
+        const int dim, const int inter, const float limit, const int rows) {
+    extern __shared__ float tx_shared[];
+    const int row0 = blockIdx.x * rows, i = blockIdx.y;
     const unsigned int slot = slots[i];
     const unsigned char * g = tx_expert(gate, extra, 0, base_slots, bytes, slot);
     if (g == nullptr) return;
     const unsigned char * u = tx_expert(up, extra, 1, base_slots, bytes, slot);
     const int pair = pairs != nullptr ? (int) pairs[i] : i;
-    const int nsb = (dim + 255) / 256;
-    const long roff = (long) row * tx_row_bytes<F>(dim);
+    const int nsb = (dim + 255) / 256, stride = tx_terms_stride<F>(dim);
+    const long rb = tx_row_bytes<F>(dim);
+    const int here = min(rows, inter - row0);
     const unsigned char * a = xq + (long) (pair / k) * nsb * TxFmt<F>::ACT;
-    const float gv = tx_row<F>(g + roff, a, dim, lane);
-    const float uv = tx_row<F>(u + roff, a, dim, lane);
-    if (lane == 0) h[(long) pair * inter + row] = cx_swiglu(gv, uv, limit);
+    float * tg = tx_shared;
+    float * tu = tx_shared + rows * stride;
+    if constexpr (TxFmt<F>::RUNS) {
+        tx_terms<F>(g + row0 * rb, u + row0 * rb, rb, a, dim, here, tg, tu);
+    } else {
+        // 8 lanes to a block, the warp's 4 (row, block) units at a time, gate and up together.
+        const int T = dim / 256, units = here * T, lane = threadIdx.x & 31, part = lane & 7;
+        for (int u0 = (threadIdx.x >> 5) * 4; u0 < units; u0 += blockDim.x >> 3) {
+            // A lane past the units takes the last one and keeps nothing, so the shuffles see
+            // every lane.
+            const int unit = u0 + (lane >> 3), uu = min(unit, units - 1);
+            const int row = uu / T, b = uu - row * T;
+            const long off = (long) (row0 + row) * rb + (long) b * TxFmt<F>::BYTES;
+            const unsigned char * ab = a + (long) b * TxFmt<F>::ACT;
+            int s1, o1, s2, o2;
+            tx_part_sums2<F>(g + off, u + off, ab, part, &s1, &o1, &s2, &o2);
+            tx_reduce4(s1, o1, s2, o2);
+            const float yd = *reinterpret_cast<const float *>(ab);
+            if (part == 0 && unit < units) {
+                tg[row * stride + b] = tx_combine<F>(g + off, yd, s1, o1);
+                tu[row * stride + b] = tx_combine<F>(u + off, yd, s2, o2);
+            }
+        }
+    }
+    __syncthreads();
+    // The up rows follow the gate rows at `rows * stride`: both fold as rows + here rows.
+    tx_fold_rows<F>(tx_shared, rows + here, stride, dim);
+    const int t = threadIdx.x;
+    if (t < here) h[(long) pair * inter + row0 + t] = cx_swiglu(tg[t * stride], tu[t * stride], limit);
 }
 
 // The rows of `h` of the launch's instances as q8_K blocks. A warp per (block, instance).
@@ -3183,19 +3412,27 @@ extern "C" __global__ void tx_quantize_h_q8_k32(
                    inter - 256 * blk);
 }
 
-// The pairs' rows: out[pair, row] = weight[pair] * (down . hq[pair]). A warp per (output row,
-// instance).
+// The pairs' rows: out[pair, row] = weight[pair] * (down . hq[pair]). A block per (`rows` output
+// rows, instance): the terms go to shared memory, rows * tx_terms_stride(inter) floats, and a
+// thread per row folds them.
 template <int F> __device__ static void tx_down(
         const unsigned long long down, const unsigned long long * extra, const int base_slots,
         const long long bytes, const unsigned int * slots, const unsigned int * pairs,
-        const float * weights, const unsigned char * hq, float * out, const int inter, const int dim) {
-    const int row = blockIdx.x, i = blockIdx.y, lane = threadIdx.x;
+        const float * weights, const unsigned char * hq, float * out, const int inter, const int dim,
+        const int rows) {
+    extern __shared__ float tx_shared[];
+    const int row0 = blockIdx.x * rows, i = blockIdx.y;
     const unsigned char * d = tx_expert(down, extra, 2, base_slots, bytes, slots[i]);
     if (d == nullptr) return;
     const int pair = pairs != nullptr ? (int) pairs[i] : i;
-    const int nsb = (inter + 255) / 256;
-    const float v = tx_row<F>(d + (long) row * tx_row_bytes<F>(inter), hq + (long) pair * nsb * TxFmt<F>::ACT, inter, lane);
-    if (lane == 0) out[(long) pair * dim + row] = __fmul_rn(weights[pair], v);
+    const int nsb = (inter + 255) / 256, stride = tx_terms_stride<F>(inter);
+    const long rb = tx_row_bytes<F>(inter);
+    const int here = min(rows, dim - row0);
+    tx_terms<F>(d + row0 * rb, nullptr, rb, hq + (long) pair * nsb * TxFmt<F>::ACT, inter, here, tx_shared, nullptr);
+    __syncthreads();
+    tx_fold_rows<F>(tx_shared, here, stride, inter);
+    const int t = threadIdx.x;
+    if (t < here) out[(long) pair * dim + row0 + t] = __fmul_rn(weights[pair], tx_shared[t * stride]);
 }
 
 #define TX_ENTRIES(name, F)                                                                          \
@@ -3203,15 +3440,15 @@ extern "C" __global__ void tx_h_##name(                                         
         const unsigned long long gate, const unsigned long long up, const unsigned long long * extra,\
         const int base_slots, const long long bytes, const unsigned int * slots,                     \
         const unsigned int * pairs, const int k, const unsigned char * xq, float * h,                \
-        const int dim, const int inter, const float limit) {                                         \
-    tx_h<F>(gate, up, extra, base_slots, bytes, slots, pairs, k, xq, h, dim, inter, limit);          \
+        const int dim, const int inter, const float limit, const int rows) {                         \
+    tx_h<F>(gate, up, extra, base_slots, bytes, slots, pairs, k, xq, h, dim, inter, limit, rows);    \
 }                                                                                                    \
 extern "C" __global__ void tx_down_##name(                                                           \
         const unsigned long long down, const unsigned long long * extra, const int base_slots,      \
         const long long bytes, const unsigned int * slots, const unsigned int * pairs,               \
         const float * weights, const unsigned char * hq, float * out, const int inter,               \
-        const int dim) {                                                                             \
-    tx_down<F>(down, extra, base_slots, bytes, slots, pairs, weights, hq, out, inter, dim);          \
+        const int dim, const int rows) {                                                             \
+    tx_down<F>(down, extra, base_slots, bytes, slots, pairs, weights, hq, out, inter, dim, rows);    \
 }
 TX_ENTRIES(q2_k, TX_Q2K)
 TX_ENTRIES(q4_k, TX_Q4K)
@@ -3227,7 +3464,7 @@ TX_ENTRIES(q5_0, TX_Q5_0)
 // A dense projection on a card as the host computes it: the weight rows `w` [n, nsb * block bytes]
 // against `rows` q8_K rows `xq` [rows, nsb * CX_Q8K_BYTES], written to y [rows, n]. A warp per
 // (output row, group of PX_ROWS activation rows): the weight block is read once for the group,
-// and each row takes the steps of tx_row, the dot of ExactDot.
+// and each row takes the steps of tx_combine and tx_fold, the dot of ExactDot.
 #define PX_ROWS 4
 template <int F> __device__ static void px_matvec(
         const unsigned char * __restrict__ w, const unsigned char * __restrict__ xq,
@@ -3363,7 +3600,7 @@ extern "C" __global__ void dequant_q2_k_f32(
     const unsigned char sc = b[sub];
     const int base = 32 * (sub / 8) + 16 * (t % 2), shift = 2 * (t / 2);
     const int code = (b[16 + base + i % 16] >> shift) & 3;
-    const float d = req_f16_at(b + 80), dmin = req_f16_at(b + 82);
+    const float d = tx_f16(b + 80), dmin = tx_f16(b + 82);
     out[idx] = d * (float) (sc & 0x0F) * (float) code - dmin * (float) (sc >> 4);
 }
 
@@ -3385,7 +3622,7 @@ extern "C" __global__ void dequant_q6_k_f32(
     const unsigned char lo = ql[l + 32 * (k % 2)];
     const int low = k < 2 ? (lo & 0x0F) : (lo >> 4);
     const int q = (low | (((qh[l] >> (2 * k)) & 3) << 4)) - 32;
-    const float d = req_f16_at(b + 208);
+    const float d = tx_f16(b + 208);
     out[idx] = d * (float) sc[l / 16 + 2 * k] * (float) q;
 }
 
