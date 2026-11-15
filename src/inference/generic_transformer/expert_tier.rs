@@ -696,6 +696,7 @@ impl super::GenericHeteroTransformer {
         ordinals.sort_unstable();
         for ordinal in ordinals {
             let dev = &cuda_devices[&ordinal];
+            let mut streams = CopyStreams::new(dev);
             let tiered: Vec<usize> = (0..self.layers.len())
                 .filter(|&l| self.layer_devs[l] == LayerDevice::Cuda(ordinal))
                 .filter(|&l| {
@@ -780,7 +781,11 @@ impl super::GenericHeteroTransformer {
                         .moe
                         .as_mut()
                         .expect("a tiered layer has experts");
-                    moe.tier = Some(Arc::new(LayerTier::all_on_card(moe, dev)?));
+                    moe.tier = Some(Arc::new(LayerTier::all_on_card_on(
+                        moe,
+                        dev,
+                        streams.take()?,
+                    )?));
                 }
                 tracing::info!(
                     "expert tier on card {ordinal}: {} layers resident, every expert on the card, {:.2} GB",
@@ -841,7 +846,8 @@ impl super::GenericHeteroTransformer {
                     .moe
                     .as_mut()
                     .expect("a tiered layer has experts");
-                let mut tier = LayerTier::new(moe, dev, slots)?.with_extra(extra)?;
+                let mut tier =
+                    LayerTier::new_on(moe, dev, slots, streams.take()?)?.with_extra(extra)?;
                 let layer_bytes = (tier.expert_bytes.iter().sum::<usize>() * tier.n_experts) as u64;
                 let pin = !per_expert && layer_bytes <= pin_left;
                 pin_left = pin_left.saturating_sub(if pin { layer_bytes } else { 0 });
@@ -886,7 +892,11 @@ impl super::GenericHeteroTransformer {
             // answer to wait for at a guess.
             if draft_bytes.is_some() {
                 if let Some(moe) = self.draft.as_mut().and_then(|d| d.layer.moe.as_mut()) {
-                    moe.tier = Some(Arc::new(LayerTier::all_on_card(moe, dev)?));
+                    moe.tier = Some(Arc::new(LayerTier::all_on_card_on(
+                        moe,
+                        dev,
+                        streams.take()?,
+                    )?));
                 }
             }
             // The layers' decoded tokens run as kernels alone, served by one thread of the host.
@@ -920,11 +930,12 @@ impl super::GenericHeteroTransformer {
             }
             self.tier_workers.push(TierWorker::start(dev, arcs)?);
             tracing::info!(
-                "expert tier on card {ordinal}: {} layers{} ({locked} with locked host pages, {:.1} GB/s to the card, {} experts in the transit room), {} experts each cached of {} ({extra} of them lent to a prefill), {:.2} GB",
+                "expert tier on card {ordinal}: {} layers{} ({locked} with locked host pages, {:.1} GB/s to the card, {} experts in the transit room, {} copy streams), {} experts each cached of {} ({extra} of them lent to a prefill), {:.2} GB",
                 tiered.len(),
                 if draft_bytes.is_some() { " and the draft head" } else { "" },
                 stager.bandwidth * 1e-3,
                 stager.transit,
+                streams.len(),
                 (slots + extra).min(self.layers[first].moe.as_ref().map_or(0, |m| m.n_experts)),
                 self.layers[first].moe.as_ref().map_or(0, |m| m.n_experts),
                 ((slots + extra) * bytes) as f64 / 1e9
@@ -1305,6 +1316,74 @@ pub fn expert_bytes(moe: &MoeWeights) -> usize {
 
 /// Reader threads for the read-ahead of `tier`'s experts: the fewest that reach the rate of the
 /// device its file is on, measured now over the host's cores, else the experts a row routes to.
+/// A copy stream of its own on the card `dev`.
+fn new_copy_stream(dev: &Device) -> Result<Arc<crate::tensor::gpu_runtime::driver::CudaStream>> {
+    dev.as_cuda_device()?
+        .0
+        .context()
+        .new_stream()
+        .map_err(|e| crate::tensor::Error::msg(format!("copy stream: {e:?}")))
+}
+
+/// The copy streams the tiers of one card copy their experts on.
+///
+/// A stream takes host memory of its own in some runtimes.
+/// The first one measures it: the process's anonymous memory before and after.
+/// A layer gets a stream of its own while the host's room holds one more.
+/// Past that, the layers take the card's streams in turn.
+struct CopyStreams {
+    dev: Device,
+    streams: Vec<Arc<crate::tensor::gpu_runtime::driver::CudaStream>>,
+    cost: u64,
+    next: usize,
+}
+
+impl CopyStreams {
+    fn new(dev: &Device) -> Self {
+        Self {
+            dev: dev.clone(),
+            streams: Vec::new(),
+            cost: 0,
+            next: 0,
+        }
+    }
+
+    /// The stream the next layer copies on.
+    fn take(&mut self) -> Result<Arc<crate::tensor::gpu_runtime::driver::CudaStream>> {
+        use crate::inference::place::layer_executor::{
+            host_spill_budget_bytes, process_anon_bytes,
+        };
+        if self.streams.is_empty() {
+            let before = process_anon_bytes();
+            let stream = new_copy_stream(&self.dev)?;
+            self.cost = match (before, process_anon_bytes()) {
+                (Some(b), Some(a)) => a.saturating_sub(b),
+                _ => 0,
+            };
+            self.streams.push(stream.clone());
+            return Ok(stream);
+        }
+        if own_stream_fits(self.cost, host_spill_budget_bytes()) {
+            let stream = new_copy_stream(&self.dev)?;
+            self.streams.push(stream.clone());
+            return Ok(stream);
+        }
+        let stream = self.streams[self.next % self.streams.len()].clone();
+        self.next += 1;
+        Ok(stream)
+    }
+
+    /// The streams made, for the log.
+    fn len(&self) -> usize {
+        self.streams.len()
+    }
+}
+
+/// Whether one more stream of `cost` host bytes fits in the host's `room`.
+fn own_stream_fits(cost: u64, room: u64) -> bool {
+    cost <= room
+}
+
 fn read_ahead_readers(tier: &LayerTier) -> usize {
     let data = tier.host[0].native_qtensor().data();
     let unit = tier.expert_bytes.iter().sum::<usize>();
@@ -1327,8 +1406,19 @@ fn read_ahead_readers(tier: &LayerTier) -> usize {
 }
 
 impl LayerTier {
-    /// A cache of `slots` experts on `dev` for the layer `moe`, filled with its first experts.
+    /// A cache of `slots` experts on `dev` for the layer `moe`, filled with its first experts,
+    /// copied on a stream of its own.
     pub fn new(moe: &MoeWeights, dev: &Device, slots: usize) -> Result<Self> {
+        Self::new_on(moe, dev, slots, new_copy_stream(dev)?)
+    }
+
+    /// [`Self::new`] with its copies on `copy`, a stream other layers may share.
+    pub fn new_on(
+        moe: &MoeWeights,
+        dev: &Device,
+        slots: usize,
+        copy: Arc<crate::tensor::gpu_runtime::driver::CudaStream>,
+    ) -> Result<Self> {
         let slots = slots.min(moe.n_experts);
         let host = [
             moe.gate_exps_sep
@@ -1378,12 +1468,7 @@ impl LayerTier {
             leader: std::sync::atomic::AtomicBool::new(false),
             stage: None,
             resident: false,
-            copy: dev
-                .as_cuda_device()?
-                .0
-                .context()
-                .new_stream()
-                .map_err(|e| crate::tensor::Error::msg(format!("copy stream: {e:?}")))?,
+            copy,
             promoting: std::sync::atomic::AtomicBool::new(false),
             decode_us: AtomicU64::new(0),
             scratch: Mutex::new(None),
@@ -1407,7 +1492,16 @@ impl LayerTier {
 
     /// A layer whose every expert is on the card `dev`: no copy room, no host.
     pub fn all_on_card(moe: &MoeWeights, dev: &Device) -> Result<Self> {
-        let mut tier = Self::new(moe, dev, moe.n_experts)?;
+        Self::all_on_card_on(moe, dev, new_copy_stream(dev)?)
+    }
+
+    /// [`Self::all_on_card`] with its copies on `copy`, a stream other layers may share.
+    pub fn all_on_card_on(
+        moe: &MoeWeights,
+        dev: &Device,
+        copy: Arc<crate::tensor::gpu_runtime::driver::CudaStream>,
+    ) -> Result<Self> {
+        let mut tier = Self::new_on(moe, dev, moe.n_experts, copy)?;
         tier.resident = true;
         Ok(tier)
     }
@@ -5491,5 +5585,17 @@ mod probe_size_tests {
         assert_eq!(super::probe_size(64 << 20, 32 << 20), 1 << 20);
         assert_eq!(super::probe_size(4096, 1 << 30), 1 << 20);
         assert_eq!(super::probe_size(64 << 20, 0), 1 << 20);
+    }
+}
+
+#[cfg(test)]
+mod copy_stream_tests {
+    /// A layer takes a stream of its own while the room holds what a stream costs.
+    #[test]
+    fn a_layer_takes_its_own_stream_while_the_room_holds_one() {
+        assert!(super::own_stream_fits(8 << 20, 1 << 30));
+        assert!(!super::own_stream_fits(8 << 20, 4 << 20));
+        // A stream that costs nothing measurable is always taken.
+        assert!(super::own_stream_fits(0, 0));
     }
 }

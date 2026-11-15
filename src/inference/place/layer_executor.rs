@@ -50,6 +50,23 @@ fn memory_cap() -> Option<(u64, u64)> {
     }
 }
 
+/// The anonymous memory this process holds now, from `/proc/self/status`.
+/// `None` where the system does not say.
+#[cfg(feature = "gpu")]
+pub(crate) fn process_anon_bytes() -> Option<u64> {
+    rss_anon_bytes(&std::fs::read_to_string("/proc/self/status").ok()?)
+}
+
+/// The `RssAnon` line of a `/proc/<pid>/status`, in bytes.
+#[cfg(any(feature = "gpu", test))]
+fn rss_anon_bytes(status: &str) -> Option<u64> {
+    status
+        .lines()
+        .find_map(|l| l.strip_prefix("RssAnon:"))
+        .and_then(|v| v.split_whitespace().next()?.parse::<u64>().ok())
+        .map(|kb| kb * 1024)
+}
+
 /// The cgroup path of a process in the unified hierarchy, from `/proc/<pid>/cgroup`.
 fn cgroup_path(proc_cgroup: &str) -> Option<&str> {
     proc_cgroup.lines().find_map(|l| l.strip_prefix("0::"))
@@ -2020,6 +2037,14 @@ mod memory_cap_tests {
         let stat = "anon 7340032\nfile 1048576\nkernel 4096\n";
         assert_eq!(anonymous_bytes(stat), Some(7340032));
         assert_eq!(anonymous_bytes("file 1\n"), None);
+    }
+
+    /// The anonymous memory of a process is read from its status file, in bytes.
+    #[test]
+    fn the_anonymous_memory_is_read_from_the_status_file() {
+        let status = "Name:\tlokend\nRssAnon:\t   61536 kB\nRssFile:\t  1024 kB\n";
+        assert_eq!(rss_anon_bytes(status), Some(61536 * 1024));
+        assert_eq!(rss_anon_bytes("Name:\tx\n"), None);
     }
 
     /// The host's figure and the cap's room: the smaller one wins.
