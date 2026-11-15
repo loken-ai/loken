@@ -156,13 +156,18 @@ pub(crate) fn listed_facts(
         capabilities.push("audio".to_string());
     }
     let family = reported_family(media.as_ref(), arch, || None);
+    // A checkpoint's bytes per parameter follow its quantisation, so its size gives no count.
+    let checkpoint = gguf.is_none() && weights.as_ref().is_some_and(|w| w.is_dir());
+    let parameter_size = match declared {
+        Some(n) => format_parameter_count(n),
+        None if checkpoint => "unknown".to_string(),
+        None => estimate_parameter_size(m.size, format_str),
+    };
     let details = OllamaModelDetails {
         format: format_str.to_string(),
         families: Some(vec![family.clone()]),
         family,
-        parameter_size: declared
-            .map(format_parameter_count)
-            .unwrap_or_else(|| estimate_parameter_size(m.size, format_str)),
+        parameter_size,
         quantization_level: quant,
         running_format: None,
     };
@@ -536,15 +541,107 @@ pub(crate) fn file_architecture(path: &std::path::Path) -> Option<String> {
     header_facts(path).0
 }
 
-/// What a checkpoint directory declares: the `model_type` of its `config.json`, and whether
-/// it pools, which a sentence-transformers `modules.json` says.
+/// What a checkpoint directory declares: the `model_type` of its `config.json`, the parameters
+/// its shards hold, and whether it pools, which a sentence-transformers `modules.json` says.
 fn checkpoint_facts(dir: &std::path::Path) -> Facts {
     (
         file_architecture(dir),
         None,
-        None,
+        checkpoint_parameters(dir),
         dir.join("modules.json").exists(),
     )
+}
+
+/// The weight files of a checkpoint directory: the shards its index maps, else its single
+/// safetensors file.
+fn checkpoint_shards(dir: &std::path::Path) -> Option<Vec<std::path::PathBuf>> {
+    if let Ok(text) = std::fs::read_to_string(dir.join("model.safetensors.index.json")) {
+        let index: serde_json::Value = serde_json::from_str(&text).ok()?;
+        let files: std::collections::BTreeSet<&str> = index
+            .get("weight_map")?
+            .as_object()?
+            .values()
+            .filter_map(|f| f.as_str())
+            .collect();
+        return Some(files.into_iter().map(|f| dir.join(f)).collect());
+    }
+    let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "safetensors"))
+        .collect();
+    (files.len() == 1).then(|| files.remove(0)).map(|f| vec![f])
+}
+
+/// The tensors the header of the safetensors file at `path` declares, by name.
+///
+/// The header is the JSON object after the 8 bytes that give its length.
+/// Its `__metadata__` entry is not a tensor and is left out.
+fn safetensors_header(
+    path: &std::path::Path,
+) -> Option<serde_json::Map<String, serde_json::Value>> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut len = [0u8; 8];
+    file.read_exact(&mut len).ok()?;
+    let len = u64::from_le_bytes(len);
+    if len > file.metadata().ok()?.len() {
+        return None;
+    }
+    let mut header = vec![0u8; usize::try_from(len).ok()?];
+    file.read_exact(&mut header).ok()?;
+    let mut tensors: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_slice(&header).ok()?;
+    tensors.remove("__metadata__");
+    Some(tensors)
+}
+
+/// The parameters a safetensors checkpoint holds, counted from its shards' headers.
+///
+/// A checkpoint without a `quantization_config` counts every element of every tensor.
+/// An AWQ checkpoint counts each packed weight at the values its integers hold.
+/// It leaves out the zero points and the scales that sit beside a packed weight.
+/// `None` for another quantisation, or for a shard whose header does not read.
+pub(crate) fn checkpoint_parameters(dir: &std::path::Path) -> Option<u64> {
+    let config: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).ok()?).ok()?;
+    let quantization = crate::inference::load::hf_config::lookup(&config, &["quantization_config"]);
+    let packed_bits = match quantization {
+        None => None,
+        Some(q) => {
+            let method = q.get("quant_method").and_then(|m| m.as_str())?;
+            if !method.eq_ignore_ascii_case("awq") {
+                return None;
+            }
+            Some(q.get("bits").and_then(|b| b.as_u64()).filter(|b| *b > 0)?)
+        }
+    };
+    let mut tensors: Vec<(String, usize, u64)> = Vec::new();
+    for shard in checkpoint_shards(dir)? {
+        for (name, info) in safetensors_header(&shard)? {
+            let dtype = serde_json::from_value::<safetensors::Dtype>(info["dtype"].clone()).ok()?;
+            let shape = info["shape"].as_array()?;
+            let elements = shape.iter().map(|d| d.as_u64()).product::<Option<u64>>()?;
+            tensors.push((name, dtype.bitsize(), elements));
+        }
+    }
+    let packed: std::collections::HashSet<&str> = match packed_bits {
+        Some(_) => tensors
+            .iter()
+            .filter_map(|(name, _, _)| name.strip_suffix(".qweight"))
+            .collect(),
+        None => std::collections::HashSet::new(),
+    };
+    let count = tensors.iter().map(|(name, width, elements)| {
+        let (group, leaf) = name.rsplit_once('.').unwrap_or(("", name));
+        match (packed.contains(group), packed_bits) {
+            (true, Some(bits)) if leaf == "qweight" => elements * (*width as u64 / bits),
+            (true, _) => 0,
+            (false, _) => *elements,
+        }
+    });
+    Some(count.sum())
 }
 
 /// The GGUF a Hugging Face entry is, when it is one: the file a load resolves `model_id` to,
@@ -1605,6 +1702,81 @@ mod catalogue_tests {
             .capabilities
             .unwrap()
             .contains(&"completion".to_string()));
+    }
+
+    /// A safetensors file of zeros whose tensors are `(name, dtype, shape, element bytes)`.
+    fn write_zero_safetensors(path: &std::path::Path, tensors: &[(&str, &str, &[u64], u64)]) {
+        let mut header = serde_json::Map::new();
+        let mut offset = 0u64;
+        for (name, dtype, shape, width) in tensors {
+            let end = offset + shape.iter().product::<u64>() * width;
+            header.insert(
+                name.to_string(),
+                serde_json::json!({"dtype": dtype, "shape": shape, "data_offsets": [offset, end]}),
+            );
+            offset = end;
+        }
+        header.insert("__metadata__".into(), serde_json::json!({"format": "pt"}));
+        let header = serde_json::to_vec(&header).unwrap();
+        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+        bytes.extend(header);
+        bytes.resize(bytes.len() + offset as usize, 0);
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    /// A dense checkpoint counts every element its headers declare.
+    /// An AWQ checkpoint counts each packed weight at its values, without its zero points and
+    /// scales.
+    /// A checkpoint of another quantisation gives no count.
+    #[test]
+    fn a_checkpoint_counts_the_parameters_its_headers_declare() {
+        let dir = scratch("ckptparams");
+        let dense = dir.join("dense");
+        std::fs::create_dir_all(&dense).unwrap();
+        std::fs::write(dense.join("config.json"), r#"{"model_type": "test"}"#).unwrap();
+        write_zero_safetensors(
+            &dense.join("model.safetensors"),
+            &[
+                ("embed.weight", "BF16", &[16, 8], 2),
+                ("norm.weight", "F32", &[8], 4),
+            ],
+        );
+        let awq = dir.join("awq");
+        std::fs::create_dir_all(&awq).unwrap();
+        std::fs::write(
+            awq.join("config.json"),
+            r#"{"model_type": "test", "quantization_config":
+                {"quant_method": "awq", "bits": 4, "group_size": 4}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            awq.join("model.safetensors.index.json"),
+            r#"{"weight_map": {"proj.qweight": "a.safetensors", "norm.weight": "b.safetensors"}}"#,
+        )
+        .unwrap();
+        write_zero_safetensors(
+            &awq.join("a.safetensors"),
+            &[
+                ("proj.qweight", "I32", &[8, 2], 4),
+                ("proj.qzeros", "I32", &[2, 2], 4),
+                ("proj.scales", "F16", &[2, 16], 2),
+            ],
+        );
+        write_zero_safetensors(
+            &awq.join("b.safetensors"),
+            &[("norm.weight", "F16", &[8], 2)],
+        );
+        let other = dir.join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(
+            other.join("config.json"),
+            r#"{"quantization_config": {"quant_method": "gptq", "bits": 4}}"#,
+        )
+        .unwrap();
+        std::fs::copy(awq.join("a.safetensors"), other.join("model.safetensors")).unwrap();
+        let counts = [&dense, &awq, &other].map(|d| checkpoint_parameters(d));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(counts, [Some(136), Some(136), None]);
     }
 
     /// A GGUF in the Hugging Face store resolves to its file; a checkpoint of safetensors does not.

@@ -140,7 +140,13 @@ pub(crate) async fn ollama_ps(
             Some(p) if !crate::tensor::quantized::gguf_file::has_gguf_magic(p) => "safetensors",
             _ => "gguf",
         };
-        let parameter_size = estimate_parameter_size(model_size, format_str);
+        // A checkpoint's bytes per parameter follow its quantisation, so its size gives no count.
+        let parameter_size = match weights.as_deref().filter(|w| w.is_dir()) {
+            Some(dir) => super::models::checkpoint_parameters(dir)
+                .map(super::models::format_parameter_count)
+                .unwrap_or_else(|| "unknown".to_string()),
+            None => estimate_parameter_size(model_size, format_str),
+        };
         let details = OllamaModelDetails {
             format: format_str.to_string(),
             family: reported_family(None, None, || {
