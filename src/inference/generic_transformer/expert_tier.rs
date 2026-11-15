@@ -872,6 +872,9 @@ impl super::GenericHeteroTransformer {
                     hot_tiers.push((l, tier.clone()));
                 }
                 moe.tier = Some(tier);
+                // The buffers the layer's copies freed go back to the kernel past the burst
+                // headroom.
+                crate::inference::place::heap::release_retained();
             }
             if let Some(ra) = &readahead {
                 tracing::info!(
@@ -1306,6 +1309,18 @@ fn read_ahead_readers(tier: &LayerTier) -> usize {
     let data = tier.host[0].native_qtensor().data();
     let unit = tier.expert_bytes.iter().sum::<usize>();
     let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+    // Each reader the probe tries holds 1 expert in host memory.
+    // Its rounds double the readers up to the cores, so they hold at most twice the cores' worth.
+    // A host without that room takes the count without a probe.
+    let room = {
+        use crate::inference::place::layer_executor::{
+            host_burst_headroom_bytes, host_spill_budget_bytes,
+        };
+        host_spill_budget_bytes().min(host_burst_headroom_bytes())
+    };
+    if (2 * cores as u64).saturating_mul(unit as u64) > room {
+        return tier.per_row;
+    }
     crate::tensor::mapped::file_span(data.as_ptr() as usize, data.len())
         .and_then(|(file, _)| super::expert_readahead::probe_readers(&file, unit, cores))
         .unwrap_or(tier.per_row)
@@ -3237,9 +3252,31 @@ fn transit_experts(experts: usize, link: f64, host: f64) -> usize {
 /// Bytes per microsecond the host's threads read a stack of `bytes` bytes at, as the host
 /// computation of an expert does: the best of a few reads of a block of zeros that is not in any
 /// cache. Zero when it could not be measured.
+/// The host bytes a rate probe of `want` bytes takes: all of them while they fit in the burst
+/// headroom and the host's room now, the smallest probe otherwise.
+fn probe_bytes(want: usize) -> usize {
+    use crate::inference::place::layer_executor::{
+        host_burst_headroom_bytes, host_spill_budget_bytes,
+    };
+    probe_size(
+        want,
+        host_spill_budget_bytes().min(host_burst_headroom_bytes()),
+    )
+}
+
+/// [`probe_bytes`] for a host with `room` bytes to give a probe.
+fn probe_size(want: usize, room: u64) -> usize {
+    const SMALLEST: usize = 1 << 20;
+    if want as u64 <= room {
+        want.max(SMALLEST)
+    } else {
+        SMALLEST
+    }
+}
+
 fn host_read_bandwidth(bytes: usize) -> f64 {
     use rayon::prelude::*;
-    let len = bytes.clamp(1 << 20, 1 << 28);
+    let len = probe_bytes(bytes.min(1 << 28));
     let block = vec![1u8; len];
     let mut best = f64::MAX;
     for _ in 0..3 {
@@ -3271,7 +3308,7 @@ fn measure_upload_bandwidth(
     cd.0.context()
         .bind_to_thread()
         .map_err(|e| crate::tensor::Error::msg(format!("bind context: {e:?}")))?;
-    let bytes = arena_bytes.min(64 << 20);
+    let bytes = probe_bytes(arena_bytes.min(64 << 20)).min(arena_bytes);
     let host = unsafe { crate::tensor::gpu_runtime::driver::result::malloc_host(bytes, 0) }
         .map_err(|e| crate::tensor::Error::msg(format!("pinned probe: {e}")))?;
     let dst = arena.device_ptr(arena.stream()).0;
@@ -5442,5 +5479,17 @@ mod tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod probe_size_tests {
+    /// A probe takes its bytes while the room holds them, and the smallest probe otherwise.
+    #[test]
+    fn a_probe_fits_the_room_or_takes_the_smallest_size() {
+        assert_eq!(super::probe_size(64 << 20, 1 << 30), 64 << 20);
+        assert_eq!(super::probe_size(64 << 20, 32 << 20), 1 << 20);
+        assert_eq!(super::probe_size(4096, 1 << 30), 1 << 20);
+        assert_eq!(super::probe_size(64 << 20, 0), 1 << 20);
     }
 }
