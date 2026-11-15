@@ -4,6 +4,10 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+### Changed
+
+- Sampling: apply no repeat penalty when neither the request nor the model sets one.
+
 ### Fixed
 
 - Speculation: keep a drafter from taking the card room its target needs.

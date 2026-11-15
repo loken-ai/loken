@@ -841,23 +841,23 @@ mod tests {
     use super::*;
 
     /// What a request gets for a knob it leaves out: the model's own Modelfile value where it
-    /// states one, the Ollama API's default where it does not; a value the request names wins
-    /// over both.
+    /// states one, the API default where it does not; a value the request names wins over both.
+    /// The default repetition penalty is none.
     #[test]
     fn an_absent_option_takes_the_models_value_then_the_api_default() {
         use crate::inference::engine::llm_engine::generation_defaults::*;
         let none = GenerationParams::default();
         let api = resolve_gen_params(&none, &GenerationDefaults::default(), 4096, 10);
-        assert_eq!(api.repeat_penalty, API_REPEAT_PENALTY);
+        assert_eq!(api.repeat_penalty, 1.0);
         assert_eq!(api.repeat_last_n, API_REPEAT_LAST_N);
         assert_eq!(api.temperature, API_TEMPERATURE);
         assert_eq!((api.top_k, api.top_p), (API_TOP_K, API_TOP_P));
 
         let manifest = GenerationDefaults::from_ollama_params(
-            r#"{"repeat_penalty":1,"temperature":0.6,"top_k":20,"top_p":0.95}"#,
+            r#"{"repeat_penalty":1.1,"temperature":0.6,"top_k":20,"top_p":0.95}"#,
         );
         let model = resolve_gen_params(&none, &manifest, 4096, 10);
-        assert_eq!(model.repeat_penalty, 1.0);
+        assert_eq!(model.repeat_penalty, 1.1);
         assert_eq!(model.repeat_last_n, API_REPEAT_LAST_N);
         assert_eq!(
             (model.temperature, model.top_k, model.top_p),

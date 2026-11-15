@@ -83,10 +83,13 @@ impl SamplingParams {
     }
 }
 
-/// The last `last_n` tokens of (prompt ++ generated) - the repeat-penalty window
-/// the model adapter applies to this step's logits. Empty when penalty is off.
-fn recent_window(prompt: &[u32], generated: &[u32], last_n: usize) -> Vec<u32> {
-    if last_n == 0 {
+/// The last `repeat_last_n` tokens of (prompt ++ generated): the repeat-penalty window
+/// the model adapter applies to this step's logits.
+///
+/// Empty when the penalty is 1.0 or below: the batch samplers apply none then.
+fn recent_window(prompt: &[u32], generated: &[u32], sampling: &SamplingParams) -> Vec<u32> {
+    let last_n = sampling.repeat_last_n;
+    if last_n == 0 || sampling.repeat_penalty <= 1.0 {
         return Vec::new();
     }
     let total = prompt.len() + generated.len();
@@ -281,7 +284,7 @@ impl<M: BatchedModel> ContinuousBatchEngine<M> {
                 r.admitted = true;
                 self.admitted.push((p.seq, started, p.cached_len));
             }
-            let recent = recent_window(&r.prompt, &r.generated, r.sampling.repeat_last_n);
+            let recent = recent_window(&r.prompt, &r.generated, &r.sampling);
             // A sequence preempted after generating prefills its generated tokens with its
             // prompt, and its next token continues the stream the client already holds.
             let mut tokens = r.prompt.clone();
@@ -309,7 +312,7 @@ impl<M: BatchedModel> ContinuousBatchEngine<M> {
                 .last()
                 .unwrap_or_else(|| r.prompt.last().expect("non-empty prompt"));
             r.last_was_prefill = false;
-            let recent = recent_window(&r.prompt, &r.generated, r.sampling.repeat_last_n);
+            let recent = recent_window(&r.prompt, &r.generated, &r.sampling);
             items.push(StepItem {
                 seq: d.seq,
                 is_prefill: false,
@@ -481,6 +484,22 @@ mod tests {
         assert_eq!((roomy.len(), roomy_prefills), (4, 4));
         assert!(tight_prefills > 4, "the tight cache preempts");
         assert_eq!(tight, roomy);
+    }
+
+    /// A penalty of 1.0 hands the sampler no window; a penalty above it hands the last tokens.
+    #[test]
+    fn the_penalty_window_is_built_only_for_a_penalty() {
+        let (prompt, generated) = ([1, 2, 3], [4, 5]);
+        let at = |repeat_penalty| SamplingParams {
+            repeat_penalty,
+            repeat_last_n: 4,
+            ..SamplingParams::greedy()
+        };
+        assert!(recent_window(&prompt, &generated, &at(1.0)).is_empty());
+        assert_eq!(
+            recent_window(&prompt, &generated, &at(1.1)),
+            vec![2, 3, 4, 5]
+        );
     }
 
     #[test]

@@ -135,7 +135,7 @@ A key of that name in an older `config.toml` loads and is reported as no longer 
 
 | Decision | Where it comes from |
 |---|---|
-| Sampling (`temperature`, `top_p`, `top_k`, repetition penalty, stop sequences) | The request, else the model's own recommendation (the `params` layer of an Ollama manifest, the checkpoint's generation config), else the Ollama API defaults. |
+| Sampling (`temperature`, `top_p`, `top_k`, repetition penalty, stop sequences) | The request, else the model's own recommendation (the `params` layer of an Ollama manifest, the checkpoint's generation config), else the Ollama API defaults. The repetition penalty defaults to 1.0, which penalises nothing. |
 | Seed | The request's, else a fresh one per request. |
 | Generation length | The request's cap, else the end of the context window. |
 | Context window | The request's `num_ctx`, a load request's included, else what the checkpoint declares. A quantised cache grows into it on demand. An F16 cache is sized by the placement plan. A model whose cards keep some of its weights in the room the plan leaves opens the working window when no request asks for more: a larger cache would take that room. A longer prompt reloads it with a wider window. |

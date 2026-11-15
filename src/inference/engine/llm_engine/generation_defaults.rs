@@ -5,6 +5,8 @@
 //! `generation_config.json`. Those win over any server-wide value, because they are the
 //! values the model was tuned and evaluated with. What neither states falls back to the
 //! defaults of the Ollama API, the one clients of this server already assume.
+//!
+//! The repetition penalty falls back to none.
 
 use std::path::Path;
 
@@ -14,8 +16,8 @@ pub const API_TEMPERATURE: f32 = 0.8;
 pub const API_TOP_P: f32 = 0.9;
 /// Candidate count the Ollama API applies by default.
 pub const API_TOP_K: usize = 40;
-/// Repetition penalty the Ollama API applies by default.
-pub const API_REPEAT_PENALTY: f32 = 1.1;
+/// Repetition penalty when neither the request nor the model sets one: it penalises nothing.
+pub const API_REPEAT_PENALTY: f32 = 1.0;
 /// Window the repetition penalty looks back over, as the Ollama API defaults it.
 pub const API_REPEAT_LAST_N: usize = 64;
 
@@ -147,7 +149,14 @@ mod tests {
         let d = GenerationDefaults::from_ollama_params("not json");
         assert_eq!(d, GenerationDefaults::default());
         assert_eq!(d.temperature(), API_TEMPERATURE);
+        assert_eq!(d.repeat_penalty(), 1.0);
         assert_eq!(d.repeat_last_n(), API_REPEAT_LAST_N);
+    }
+
+    #[test]
+    fn a_modelfile_penalty_is_kept() {
+        let d = GenerationDefaults::from_ollama_params(r#"{"repeat_penalty":1.1}"#);
+        assert_eq!(d.repeat_penalty(), 1.1);
     }
 
     #[test]
