@@ -266,6 +266,26 @@ impl QTensor {
         if device.is_dry() {
             return Tensor::dry(device, crate::tensor::DType::F32, self.shape.clone());
         }
+        // A 16-bit float tensor decoded on the host keeps its width.
+        // Its words are copied once, with no F32 buffer in between.
+        if matches!(device, tensor::Device::Cpu) {
+            let words = match self.dtype() {
+                GgmlDType::F16 => Some(Tensor::from_vec(
+                    halves(&self.host_blocks()?, half::f16::from_bits),
+                    self.shape.clone(),
+                    device,
+                )?),
+                GgmlDType::BF16 => Some(Tensor::from_vec(
+                    halves(&self.host_blocks()?, half::bf16::from_bits),
+                    self.shape.clone(),
+                    device,
+                )?),
+                _ => None,
+            };
+            if let Some(t) = words {
+                return Ok(t);
+            }
+        }
         let f = if self.inner.is_card_only() {
             let mut out = vec![0f32; self.inner.elem_count()];
             crate::tensor::quant_cpu::to_float_bytes(
@@ -293,6 +313,19 @@ impl QTensor {
         // a counting device must not build it: what lands there is the F16 result.
         if device.is_dry() {
             return Tensor::dry(device, crate::tensor::DType::F16, self.shape.clone());
+        }
+        // A 16-bit float tensor turns into F16 word by word.
+        // The host holds 1 F16 buffer and no F32 one.
+        let words = match self.dtype() {
+            GgmlDType::F16 => Some(halves(&self.host_blocks()?, half::f16::from_bits)),
+            GgmlDType::BF16 => Some(halves(&self.host_blocks()?, |b| {
+                half::f16::from_f32(half::bf16::from_bits(b).to_f32())
+            })),
+            _ => None,
+        };
+        if let Some(words) = words {
+            return Tensor::from_vec(words, self.shape.clone(), &tensor::Device::Cpu)?
+                .to_device(device);
         }
         // CONVERSION: F16 dequantisation goes through the host decode.
         self.dequantize(&tensor::Device::Cpu)?
@@ -336,6 +369,96 @@ impl QTensor {
             Arc::new(QHostTensor::from_bytes(raw_data, ggml_dtype, dims)?),
             device,
         )
+    }
+}
+
+/// The little-endian 16-bit words of `bytes`, each turned into a `T` by `from_bits`.
+/// The only buffer is the result, filled in parallel.
+fn halves<T: Copy + Send>(bytes: &[u8], from_bits: fn(u16) -> T) -> Vec<T> {
+    use rayon::prelude::*;
+    bytes
+        .par_chunks_exact(2)
+        .map(|w| from_bits(u16::from_le_bytes([w[0], w[1]])))
+        .collect()
+}
+
+#[cfg(test)]
+mod half_width {
+    use super::*;
+    use crate::tensor::{DType, Device, Tensor};
+
+    /// Values a weight can hold: signs, a subnormal of F16, a large and an exact one.
+    const VALUES: [f32; 8] = [0.0, -0.0, 1.5, -3.25e-6, 6.0e-8, 1024.5, -65504.0, 0.333];
+
+    fn stored(dtype: GgmlDType) -> QTensor {
+        let bytes: Vec<u8> = VALUES
+            .iter()
+            .flat_map(|&v| match dtype {
+                GgmlDType::F16 => half::f16::from_f32(v).to_bits().to_le_bytes(),
+                _ => half::bf16::from_f32(v).to_bits().to_le_bytes(),
+            })
+            .collect();
+        QTensor::from_ggml_bytes(dtype, &bytes, vec![2, 4], &Device::Cpu).unwrap()
+    }
+
+    /// The decode through F32 the host took before: every value widened, then narrowed.
+    fn through_f32(q: &QTensor, to: DType) -> Vec<u16> {
+        let wide = q.native_qtensor().dequantize_f32().unwrap();
+        bits(
+            &Tensor::from_vec(wide, (2, 4), &Device::Cpu)
+                .unwrap()
+                .to_dtype(to)
+                .unwrap(),
+        )
+    }
+
+    fn bits(t: &Tensor) -> Vec<u16> {
+        let flat = t.flatten_all().unwrap();
+        match t.dtype() {
+            DType::F16 => flat
+                .to_vec1::<half::f16>()
+                .unwrap()
+                .iter()
+                .map(|v| v.to_bits())
+                .collect(),
+            DType::BF16 => flat
+                .to_vec1::<half::bf16>()
+                .unwrap()
+                .iter()
+                .map(|v| v.to_bits())
+                .collect(),
+            other => panic!("not a 16-bit float: {other:?}"),
+        }
+    }
+
+    /// A 16-bit float tensor decoded on the host stays in its width, with the bits of the
+    /// decode through F32.
+    #[test]
+    fn a_half_tensor_decodes_on_the_host_in_its_own_width() {
+        for (dtype, held) in [(GgmlDType::F16, DType::F16), (GgmlDType::BF16, DType::BF16)] {
+            let q = stored(dtype);
+            let t = q.dequantize(&Device::Cpu).unwrap();
+            assert_eq!(t.dtype(), held, "{dtype:?}");
+            assert_eq!(bits(&t), through_f32(&q, held), "{dtype:?}");
+        }
+    }
+
+    /// A BF16 or F16 tensor turned into F16 has the bits of the decode through F32.
+    #[test]
+    fn a_half_tensor_turns_into_f16_as_the_decode_through_f32_does() {
+        for dtype in [GgmlDType::F16, GgmlDType::BF16] {
+            let q = stored(dtype);
+            let t = q.dequantize_f16(&Device::Cpu).unwrap();
+            assert_eq!(t.dtype(), DType::F16, "{dtype:?}");
+            assert_eq!(bits(&t), through_f32(&q, DType::F16), "{dtype:?}");
+        }
+    }
+
+    /// The words of a buffer come back in order, one per pair of bytes.
+    #[test]
+    fn the_words_of_a_buffer_come_back_in_order() {
+        let bytes = [0x01, 0x02, 0xff, 0x7f, 0x00, 0x80];
+        assert_eq!(halves(&bytes, |b| b), vec![0x0201, 0x7fff, 0x8000]);
     }
 }
 

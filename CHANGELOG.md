@@ -161,6 +161,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 - Serving: read a long prompt on the serial path in the rows the cards afford.
 - Speculation: judge a prompt lookup trial after a hold on its own cost.
 - Hub: pull the merges file of a tokenizer that ships no tokenizer.json.
+- Models: load a 16-bit float checkpoint without 32-bit copies on the host.
 
 ### Removed
 
