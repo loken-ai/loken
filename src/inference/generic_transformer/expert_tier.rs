@@ -71,6 +71,8 @@ impl TierState {
 
 pub(crate) mod direct;
 mod exact;
+#[cfg(feature = "microbench")]
+pub use exact::bench::{ExactPairs, HostPairs, Projection};
 mod graph;
 mod hot;
 pub(crate) use graph::mapped;

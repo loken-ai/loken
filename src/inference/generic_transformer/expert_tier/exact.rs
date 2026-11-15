@@ -236,6 +236,23 @@ pub(super) fn run_pairs(
     if n == 0 {
         return Ok(());
     }
+    launch_h(dev, exact, stacks, slots, pairs, n, k, rooms)?;
+    launch_quantize_h(dev, exact, slots, pairs, n, rooms)?;
+    launch_down(dev, exact, stacks, slots, pairs, n, weights, rooms)
+}
+
+/// The gate and up products of [`run_pairs`]: `rooms.h[pair]`.
+#[allow(clippy::too_many_arguments)]
+fn launch_h(
+    dev: &Device,
+    exact: &Exact,
+    stacks: &Stacks,
+    slots: u64,
+    pairs: u64,
+    n: usize,
+    k: usize,
+    rooms: Rooms,
+) -> Result<()> {
     let cd = dev.as_cuda_device()?;
     let stream = cd.0.stream();
     let (dim, inter) = (exact.dim as i32, exact.inter as i32);
@@ -258,7 +275,21 @@ pub(super) fn run_pairs(
     b.arg(&dim);
     b.arg(&inter);
     b.arg(&exact.limit);
-    launched(&name, unsafe { b.launch(warps((inter as u32, n as u32))) })?;
+    launched(&name, unsafe { b.launch(warps((inter as u32, n as u32))) })
+}
+
+/// The rows of `rooms.h` of [`run_pairs`] as the down projection's activation blocks.
+fn launch_quantize_h(
+    dev: &Device,
+    exact: &Exact,
+    slots: u64,
+    pairs: u64,
+    n: usize,
+    rooms: Rooms,
+) -> Result<()> {
+    let cd = dev.as_cuda_device()?;
+    let stream = cd.0.stream();
+    let inter = exact.inter as i32;
     let name = if exact.down.runs() {
         "tx_quantize_h_q8_k32"
     } else {
@@ -273,7 +304,25 @@ pub(super) fn run_pairs(
     b.arg(&inter);
     launched(name, unsafe {
         b.launch(warps((exact.inter.div_ceil(BLOCK) as u32, n as u32)))
-    })?;
+    })
+}
+
+/// The down products of [`run_pairs`]: `rooms.out[pair]`, at the pair's weight.
+#[allow(clippy::too_many_arguments)]
+fn launch_down(
+    dev: &Device,
+    exact: &Exact,
+    stacks: &Stacks,
+    slots: u64,
+    pairs: u64,
+    n: usize,
+    weights: u64,
+    rooms: Rooms,
+) -> Result<()> {
+    let cd = dev.as_cuda_device()?;
+    let stream = cd.0.stream();
+    let (dim, inter) = (exact.dim as i32, exact.inter as i32);
+    let base_slots = stacks.base_slots as i32;
     let name = format!("tx_down_{}", exact.down.name());
     let f = cd.0.quantized_fn(&name)?;
     let down_bytes = stacks.bytes[2] as i64;
@@ -369,16 +418,6 @@ pub(super) fn host_pairs(
     x: &[f32],
     pairs: &[(usize, u32, f32)],
 ) -> Result<Vec<f32>> {
-    fn typed<T: BlockFormat>(t: &QTensor) -> &[T] {
-        let bytes = t.native_qtensor().data();
-        // Safety: the stack holds blocks of `T`, its format, laid out as the file stores them.
-        unsafe {
-            std::slice::from_raw_parts(
-                bytes.as_ptr() as *const T,
-                bytes.len() / std::mem::size_of::<T>(),
-            )
-        }
-    }
     fn run<G: ExactDot, D: ExactDot>(
         exact: &Exact,
         host: &[Arc<QTensor>; 3],
@@ -423,6 +462,18 @@ pub(super) fn host_pairs(
         Fmt::Q8_0 => with_down::<BlockQ8_0>(exact, host, x, pairs),
         Fmt::Q5_0 => with_down::<BlockQ5_0>(exact, host, x, pairs),
     })
+}
+
+/// The blocks of the stack `t`, whose format is `T`.
+fn typed<T: BlockFormat>(t: &QTensor) -> &[T] {
+    let bytes = t.native_qtensor().data();
+    // Safety: the stack holds blocks of `T`, its format, laid out as the file stores them.
+    unsafe {
+        std::slice::from_raw_parts(
+            bytes.as_ptr() as *const T,
+            bytes.len() / std::mem::size_of::<T>(),
+        )
+    }
 }
 
 /// [`host_pairs`] over typed stacks: gate and up `[experts, inter, dim]`, down
@@ -896,6 +947,290 @@ pub(super) struct Mail {
     pub(super) product: u64,
 }
 
+/// The exact kernels of 1 layer's routed pairs on a card, launched one by one for the
+/// `expert-pairs` microbench, over the buffers a recorded decode keeps.
+#[cfg(feature = "microbench")]
+pub mod bench {
+    use super::*;
+
+    /// 1 layer's stacks on a card, `rows` input rows of `k` pairs each routed by 1 of several
+    /// routings, and the rooms the exact kernels read and write.
+    pub struct ExactPairs {
+        exact: Exact,
+        stacks: Stacks,
+        card: Vec<QTensor>,
+        rooms: Rooms,
+        buffers: Vec<Tensor>,
+        slots: Vec<Tensor>,
+        routing: std::cell::Cell<usize>,
+        src: Tensor,
+        weights: Tensor,
+        x: Tensor,
+        dev: Device,
+        rows: usize,
+        k: usize,
+    }
+
+    impl ExactPairs {
+        /// The stacks `host` (gate, up, down) copied to `dev`, the rows `x` `[rows, hidden]` on
+        /// `dev`, and, in routing `r`, pair `p` routed to expert `routings[r][p]`, `k` pairs a
+        /// row. `None` when the stacks have no exact form.
+        pub fn new(
+            dev: &Device,
+            host: &[Arc<QTensor>; 3],
+            x: &Tensor,
+            routings: &[Vec<u32>],
+            k: usize,
+        ) -> Result<Option<Self>> {
+            let experts = &routings[0];
+            let Some(exact) = Exact::of(host, 0.0) else {
+                return Ok(None);
+            };
+            let count = host[0].shape().dims()[0];
+            let card = host
+                .iter()
+                .map(|t| experts_range(t, 0, count, dev))
+                .collect::<Result<Vec<_>>>()?;
+            let stacks = Stacks {
+                base: [
+                    card[0].device_ptr()? as u64,
+                    card[1].device_ptr()? as u64,
+                    card[2].device_ptr()? as u64,
+                ],
+                extra: 0,
+                base_slots: count,
+                bytes: [0, 1, 2].map(|i| host[i].native_qtensor().data().len() / count),
+            };
+            let (pairs, rows) = (experts.len(), experts.len() / k.max(1));
+            let f32s = |n: usize| Tensor::zeros_on(n, crate::tensor::DType::F32, dev);
+            let buffers = vec![
+                f32s(Exact::act_bytes(exact.gate, rows, exact.dim) / 4)?,
+                f32s(pairs * exact.inter)?,
+                f32s(Exact::act_bytes(exact.down, pairs, exact.inter) / 4)?,
+                f32s(pairs * exact.dim)?,
+                f32s(rows * exact.dim)?,
+            ];
+            let rooms = Rooms {
+                xq: address_of::<f32>(&buffers[0])?,
+                h: address_of::<f32>(&buffers[1])?,
+                hq: address_of::<f32>(&buffers[2])?,
+                out: address_of::<f32>(&buffers[3])?,
+            };
+            let upload = |v: Vec<u32>| Tensor::from_vec(v, pairs, &Device::Cpu)?.to_device(dev);
+            Ok(Some(Self {
+                exact,
+                stacks,
+                card,
+                rooms,
+                buffers,
+                slots: routings
+                    .iter()
+                    .map(|r| upload(r.clone()))
+                    .collect::<Result<Vec<_>>>()?,
+                routing: std::cell::Cell::new(0),
+                src: upload(vec![SKIP; pairs])?,
+                weights: Tensor::from_vec(vec![1.0 / k as f32; pairs], pairs, &Device::Cpu)?
+                    .to_device(dev)?,
+                x: x.contiguous()?,
+                dev: dev.clone(),
+                rows,
+                k,
+            }))
+        }
+
+        /// The stacks on the card, gate, up and down, for the fused kernels to read.
+        pub fn card_stacks(&self) -> &[QTensor] {
+            &self.card
+        }
+
+        /// The routing the next launches take.
+        pub fn select(&self, routing: usize) {
+            self.routing.set(routing % self.slots.len());
+        }
+
+        fn slots_at(&self) -> Result<u64> {
+            address_of::<u32>(&self.slots[self.routing.get()])
+        }
+
+        /// The input rows as the gate's activation blocks.
+        pub fn quantize_x(&self) -> Result<()> {
+            quantize_rows(
+                &self.dev,
+                self.exact.gate,
+                address_of::<f32>(&self.x)?,
+                self.rooms.xq,
+                self.rows,
+                self.exact.dim,
+            )
+        }
+
+        /// The gate and up products and the SwiGLU of every pair.
+        pub fn gate_up(&self) -> Result<()> {
+            let n = self.rows * self.k;
+            launch_h(
+                &self.dev,
+                &self.exact,
+                &self.stacks,
+                self.slots_at()?,
+                0,
+                n,
+                self.k,
+                self.rooms,
+            )
+        }
+
+        /// Every pair's row entering the down projection, as its activation blocks.
+        pub fn quantize_h(&self) -> Result<()> {
+            let n = self.rows * self.k;
+            launch_quantize_h(&self.dev, &self.exact, self.slots_at()?, 0, n, self.rooms)
+        }
+
+        /// Every pair's down product at its weight.
+        pub fn down(&self) -> Result<()> {
+            let n = self.rows * self.k;
+            launch_down(
+                &self.dev,
+                &self.exact,
+                &self.stacks,
+                self.slots_at()?,
+                0,
+                n,
+                address_of::<f32>(&self.weights)?,
+                self.rooms,
+            )
+        }
+
+        /// Every row's pairs summed in the router's order.
+        pub fn sum(&self) -> Result<()> {
+            sum(
+                &self.dev,
+                self.rooms.out,
+                0,
+                address_of::<u32>(&self.src)?,
+                address_of::<f32>(&self.buffers[4])?,
+                self.rows,
+                self.k,
+                self.exact.dim,
+            )
+        }
+    }
+
+    /// 1 layer's routed pairs on the host, for the `host-pairs` microbench: through the
+    /// formats' own dots, as a layer without exact kernels computes them, and through the
+    /// exact dots.
+    pub struct HostPairs {
+        host: [Arc<QTensor>; 3],
+        exact: Option<Exact>,
+        hidden: usize,
+    }
+
+    /// The projection of an expert a one-thread variant reads.
+    #[derive(Clone, Copy, Debug)]
+    pub enum Projection {
+        Gate,
+        Down,
+    }
+
+    impl HostPairs {
+        /// The stacks `host`: gate and up `[experts, inter, hidden]`, down
+        /// `[experts, hidden, inter]`.
+        pub fn new(host: &[Arc<QTensor>; 3]) -> Self {
+            Self {
+                host: host.clone(),
+                exact: Exact::of(host, 0.0),
+                hidden: host[0].shape().dims()[2],
+            }
+        }
+
+        /// Whether the stacks have an exact form.
+        pub fn has_exact(&self) -> bool {
+            self.exact.is_some()
+        }
+
+        /// Each pair `(input row, expert, weight)` of the rows `x` `[rows, hidden]` through the
+        /// formats' own dots, in the calls the tier makes for a layer without exact kernels:
+        /// `[pairs, hidden]`.
+        pub fn own_dots(&self, x: &[f32], pairs: &[(usize, u32, f32)]) -> Result<Vec<f32>> {
+            let (host, hidden, m) = (Device::Cpu, self.hidden, pairs.len());
+            let mut rows = Vec::with_capacity(m * hidden);
+            for &(r, _, _) in pairs {
+                rows.extend_from_slice(&x[r * hidden..(r + 1) * hidden]);
+            }
+            let rows = Tensor::from_vec(rows, (m, hidden), &host)?;
+            let choice = Tensor::from_vec(
+                pairs.iter().map(|p| p.1).collect::<Vec<u32>>(),
+                (m, 1),
+                &host,
+            )?;
+            let routing = ExpertRouting::group(&choice, 1)?;
+            let h = routing.host_gate_up_silu(&rows, &self.host[0], &self.host[1])?;
+            let w = Tensor::from_vec(
+                pairs.iter().map(|p| p.2).collect::<Vec<f32>>(),
+                (m, 1),
+                &host,
+            )?;
+            routing
+                .host_down_reduce(&h, &self.host[2], &w, m, None)?
+                .flatten_all()?
+                .to_vec1::<f32>()
+        }
+
+        /// The same pairs through the exact dots: [`host_pairs`].
+        pub fn exact_dots(&self, x: &[f32], pairs: &[(usize, u32, f32)]) -> Result<Vec<f32>> {
+            let exact = self
+                .exact
+                .as_ref()
+                .ok_or_else(|| crate::tensor::Error::msg("the stacks have no exact form"))?;
+            host_pairs(exact, &self.host, x, pairs)
+        }
+
+        /// Every row of projection `p` of expert `e` against the row `x` on the calling thread,
+        /// the quantisation of `x` included, through the format's own dot (`own`) or its exact
+        /// dot: the sum of the products.
+        pub fn one_thread(&self, p: Projection, e: usize, x: &[f32], own: bool) -> f32 {
+            fn rows<T: ExactDot>(t: &QTensor, e: usize, x: &[f32], own: bool) -> f32 {
+                let dims = t.shape().dims();
+                let (rows, cols) = (dims[1], dims[2]);
+                let per_row = cols / T::BLOCK_LEN;
+                let w = &typed::<T>(t)[e * rows * per_row..(e + 1) * rows * per_row];
+                let mut total = 0f32;
+                if own {
+                    let mut a =
+                        vec![T::ActivationBlock::zeros(); cols / T::ActivationBlock::BLOCK_LEN];
+                    T::ActivationBlock::quantize(x, &mut a);
+                    for row in w.chunks_exact(per_row) {
+                        total += T::dot(row, &a);
+                    }
+                } else {
+                    let mut a = vec![T::Act::zeros(); cols.div_ceil(BLOCK)];
+                    quantize_padded(x, &mut a);
+                    for row in w.chunks_exact(per_row) {
+                        total += T::dot_exact(row, &a);
+                    }
+                }
+                total
+            }
+            let t = match p {
+                Projection::Gate => &self.host[0],
+                Projection::Down => &self.host[2],
+            };
+            match Fmt::of(t.dtype()) {
+                Some(Fmt::Q2K) => rows::<BlockQ2K>(t, e, x, own),
+                Some(Fmt::Q4K) => rows::<BlockQ4K>(t, e, x, own),
+                Some(Fmt::Q6K) => rows::<BlockQ6K>(t, e, x, own),
+                Some(Fmt::Iq2S) => rows::<BlockIq2S>(t, e, x, own),
+                Some(Fmt::Iq3Xxs) => rows::<BlockIq3Xxs>(t, e, x, own),
+                Some(Fmt::Iq3S) => rows::<BlockIq3S>(t, e, x, own),
+                Some(Fmt::Iq4Nl) => rows::<BlockIq4Nl>(t, e, x, own),
+                Some(Fmt::Q2_0) => rows::<BlockQ2_0>(t, e, x, own),
+                Some(Fmt::Q8_0) => rows::<BlockQ8_0>(t, e, x, own),
+                Some(Fmt::Q5_0) => rows::<BlockQ5_0>(t, e, x, own),
+                None => f32::NAN,
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1294,109 +1629,6 @@ mod tests {
             .flat_map(|f| f.to_le_bytes())
             .collect();
         assert_eq!(got, want, "rows of {len} values");
-    }
-
-    /// The card's time per pair of `run_pairs` for formats of about the same size, read through
-    /// q8_K and through q8_K32. Prints the times; asserts nothing.
-    #[test]
-    #[ignore = "a measure: run alone on an idle card"]
-    fn time_the_exact_kernels_per_pair() {
-        let Ok(card) = Device::new_cuda(0) else {
-            eprintln!("skipping: no usable CUDA device");
-            return;
-        };
-        let (experts, dim, inter, k) = (8usize, 2048usize, 1024usize, 8usize);
-        for dt in [
-            GgmlDType::Q2K,
-            GgmlDType::Iq2S,
-            GgmlDType::Iq3Xxs,
-            GgmlDType::Iq3S,
-            GgmlDType::Iq4Nl,
-            GgmlDType::Q2_0,
-            GgmlDType::Q8_0,
-            GgmlDType::Q5_0,
-        ] {
-            let host = [
-                stack(experts, inter, dim, 1, dt),
-                stack(experts, inter, dim, 2, dt),
-                stack(experts, dim, inter, 3, dt),
-            ];
-            let exact = Exact::of(&host, 0.0).unwrap();
-            let on_card: Vec<QTensor> = host
-                .iter()
-                .map(|t| experts_range(t, 0, experts, &card).unwrap())
-                .collect();
-            let stacks = Stacks {
-                base: [0, 1, 2].map(|i| on_card[i].device_ptr().unwrap() as u64),
-                extra: 0,
-                base_slots: experts,
-                bytes: [0, 1, 2].map(|i| host[i].native_qtensor().data().len() / experts),
-            };
-            let f32s = |n: usize| Tensor::zeros_on(n, crate::tensor::DType::F32, &card).unwrap();
-            let x = Tensor::from_vec(
-                (0..dim)
-                    .map(|i| (i % 13) as f32 * 0.1 - 0.6)
-                    .collect::<Vec<f32>>(),
-                dim,
-                &card,
-            )
-            .unwrap();
-            let (xq, h, hq, out) = (
-                f32s(Exact::act_bytes(exact.gate, 1, dim) / 4),
-                f32s(k * inter),
-                f32s(Exact::act_bytes(exact.down, k, inter) / 4),
-                f32s(k * dim),
-            );
-            let rooms = Rooms {
-                xq: address_of::<f32>(&xq).unwrap(),
-                h: address_of::<f32>(&h).unwrap(),
-                hq: address_of::<f32>(&hq).unwrap(),
-                out: address_of::<f32>(&out).unwrap(),
-            };
-            let slots = Tensor::from_vec((0..k as u32).collect::<Vec<u32>>(), k, &Device::Cpu)
-                .unwrap()
-                .to_device(&card)
-                .unwrap();
-            let w = f32s(k);
-            quantize_rows(
-                &card,
-                exact.gate,
-                address_of::<f32>(&x).unwrap(),
-                rooms.xq,
-                1,
-                dim,
-            )
-            .unwrap();
-            let stream = card.as_cuda_device().unwrap().0.stream().clone();
-            let launch = || {
-                run_pairs(
-                    &card,
-                    &exact,
-                    &stacks,
-                    address_of::<u32>(&slots).unwrap(),
-                    0,
-                    k,
-                    k,
-                    address_of::<f32>(&w).unwrap(),
-                    rooms,
-                )
-                .unwrap()
-            };
-            for _ in 0..20 {
-                launch();
-            }
-            stream.synchronize().unwrap();
-            let rounds = 200;
-            let t = std::time::Instant::now();
-            for _ in 0..rounds {
-                launch();
-            }
-            stream.synchronize().unwrap();
-            let per_pair = t.elapsed().as_secs_f64() * 1e6 / (rounds * k) as f64;
-            eprintln!(
-                "{dt:?}: {per_pair:.2} us per pair, dim {dim}, inter {inter}, {k} pairs a launch"
-            );
-        }
     }
 
     /// Under a SwiGLU bound the host's pairs are the bits of the bounded SwiGLU of

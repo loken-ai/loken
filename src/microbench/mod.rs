@@ -25,6 +25,8 @@ pub mod decode_layout;
 pub mod dequant_gemm;
 #[cfg(feature = "gpu")]
 pub mod expert_ahead;
+#[cfg(feature = "gpu")]
+pub mod expert_pairs;
 pub mod expert_read;
 #[cfg(feature = "gpu")]
 pub mod expert_upload;
@@ -147,7 +149,8 @@ pub struct Options {
     pub guess_hit: Vec<f64>,
 
     /// Tokens verified together, a draft's block: the experts the block routes to are read once
-    /// for all of it, one variant for each size (`cache-policy`)
+    /// for all of it, one variant for each size (`cache-policy`); the rows of a verify, one
+    /// variant each (`expert-pairs`)
     #[arg(long, value_delimiter = ',', default_values_t = vec![1])]
     pub block: Vec<usize>,
 
@@ -164,11 +167,12 @@ pub struct Options {
     #[arg(long, default_value_t = 6.0)]
     pub disk_gbs: f64,
 
-    /// The format of an expert's gate and up weights, for `host-expert`
+    /// The format of an expert's gate and up weights, without a file (`host-expert`,
+    /// `expert-pairs`)
     #[arg(long, default_value = "iq2_xxs")]
     pub gate_format: String,
 
-    /// The format of an expert's down weights, for `host-expert`
+    /// The format of an expert's down weights, without a file (`host-expert`, `expert-pairs`)
     #[arg(long, default_value = "q2_k")]
     pub down_format: String,
 
@@ -325,6 +329,18 @@ pub fn benches() -> Vec<Bench> {
             about: "the experts of the next layer copied to the card while the current layer runs: no prefetch, the last token's set, the early router, by experts missing and lead time",
             needs_card: true,
             run: expert_ahead::run,
+        });
+        all.push(Bench {
+            name: "expert-pairs",
+            about: "one layer's routed pairs of a token and of a verify on a card: the fused expert kernels against the exact kernels, launch by launch",
+            needs_card: true,
+            run: expert_pairs::run,
+        });
+        all.push(Bench {
+            name: "host-pairs",
+            about: "one layer's routed pairs of a token and of a verify on the host cores: the formats' own dots against the exact dots, and each projection on 1 thread",
+            needs_card: false,
+            run: expert_pairs::run_host,
         });
         all.push(Bench {
             name: "expert-upload",

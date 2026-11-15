@@ -19,6 +19,8 @@ cargo bench --features cuda,microbench --bench microbench -- crossing --shapes-f
 cargo bench --features cuda,microbench --bench microbench -- expert-upload --shapes-from /models/large.gguf --json results/upload.json
 cargo bench --features cuda,microbench --bench microbench -- expert-ahead --shapes-from /models/large.gguf --guess-hit 0,0.5,1 --json results/expert-ahead.json
 cargo bench --features cuda,microbench --bench microbench -- expert-read --shapes-from /models/large.gguf --layer 10
+cargo bench --features cuda,microbench --bench microbench -- expert-pairs --shapes-from /models/large.gguf --layer 3 --block 1,9 --json results/expert-pairs.json
+cargo bench --features cuda,microbench --bench microbench -- host-pairs --shapes-from /models/large.gguf --layer 3 --block 1,9 --json results/host-pairs.json
 cargo bench --features cuda,microbench --bench microbench -- prefill-layer --shapes-from /models/dense.gguf --json results/prefill-layer.json
 cargo bench --features cuda,microbench --bench microbench -- marlin-rows --json results/marlin-rows.json
 cargo bench --features cuda,microbench --bench microbench -- decode-inputs --batch 64 --context 512
@@ -29,7 +31,7 @@ cargo bench --features microbench --bench microbench -- schedule-host --batch 64
 ```
 
 A ROCm build takes `rocm` in place of `cuda`.  
-A build without a GPU runtime omits `crossing`, `decode-inputs`, `decode-layer`, `dequant-gemm`, `expert-ahead`, `expert-upload`, `marlin-rows`, `media-overlap`, `prefill-layer` and `parler-step`.
+A build without a GPU runtime omits `crossing`, `decode-inputs`, `decode-layer`, `dequant-gemm`, `expert-ahead`, `expert-pairs`, `expert-upload`, `host-pairs`, `marlin-rows`, `media-overlap`, `prefill-layer` and `parler-step`.
 `parler-step` also needs the `audio` feature, which `media` brings.
 
 Arguments after `--`:
@@ -47,8 +49,8 @@ Arguments after `--`:
 | `--inter` | The feed-forward length, without a file. | 2048 for an expert, 12288 for `marlin-rows` |
 | `--weight-bits` | Bits per stored weight, without a file. 4.5 for q4_k, 8.5 for q8_0. | 4.5 |
 | `--projection-bytes` | The bytes of each projection, 1 value or 3, in place of `--inter` and `--weight-bits`. | derived |
-| `--gate-format` | The format of an expert's gate and up weights, for `host-expert`. | iq2_xxs |
-| `--down-format` | The format of an expert's down weights, for `host-expert`. | q2_k |
+| `--gate-format` | The format of an expert's gate and up weights, without a file (`host-expert`, `expert-pairs`). | iq2_xxs |
+| `--down-format` | The format of an expert's down weights, without a file (`host-expert`, `expert-pairs`). | q2_k |
 | `--rows` | Rows of the prompt batch one layer of `prefill-layer` moves. | 130 |
 | `--heads` | Query heads, without a file (`prefill-layer`, `marlin-rows`, `decode-layer`). | the file's for `prefill-layer`, 32 for `marlin-rows` |
 | `--kv-heads` | Key-value heads, without a file (`prefill-layer`, `marlin-rows`, `decode-layer`). | the file's, else the heads for `prefill-layer`, 8 for `marlin-rows` |
@@ -73,7 +75,7 @@ Arguments after `--`:
 | `--card-slots` | The hottest experts per layer the cards hold, which the host tier never serves (`cache-policy`). | 58 |
 | `--slots` | Slots per layer the host tier is tried with, 1 variant each (`cache-policy`). | 94,130,170 |
 | `--guess-hit` | The share of a token's experts the read-ahead guess names, 1 variant each (`cache-policy`, `expert-ahead`). | 1.0 |
-| `--block` | Tokens verified together, a draft's block. The block reads its experts once. 1 variant each (`cache-policy`). | 1 |
+| `--block` | Tokens verified together, a draft's block. The block reads its experts once. 1 variant each (`cache-policy`). The rows of a verify, 1 variant each (`expert-pairs`). | 1 |
 | `--accept` | The share of a draft token accepted once the token before it was (`cache-policy`). | 0.8 |
 | `--tokens` | Tokens routed per variant (`cache-policy`). | 20000 |
 | `--group-size` | Weights per quantisation group, only 128 runs (`marlin-rows`). | 128 |
@@ -101,6 +103,42 @@ Its variants:
 - The round trips, pageable and page-locked.
 - `--pack` rows in separate copies, against the same rows packed in 1 copy each way.
 - A stream synchronisation and an event wait with nothing queued.
+
+### expert-pairs
+
+`expert-pairs` times the routed pairs of 1 layer on a card, for a decoded token and for the rows of a verify.
+It runs at the widths and formats of the layer `--layer` of the shapes file, with the pairs a row its `expert_used_count` states.
+Without a file, `--hidden`, `--inter`, `--gate-format` and `--down-format` set the layer, and a row routes to 8 pairs.
+
+The rows of each variant are the row counts of `--block`, 1 variant each.
+Each row routes to distinct experts drawn from a fixed seed, as a router's choice.
+Consecutive calls take different routings, enough of them that the weights read between 2 uses of one exceed the card's cache.
+A call reads its weights from the card's memory, as a token's layer does after the layers before it.
+
+The stacks hold the layer's routed experts, so the pairs read their weights from the card's memory as a served model does.
+Without a file they hold the pairs of every row.
+They take 3 projections of each expert on the card, a few gigabytes for a large layer.
+A card whose free memory holds fewer keeps what it holds, and the fused gate and up row says how many.
+
+The weights are synthetic bytes of the stacks' formats, with a small finite scale in front of each block.
+The times do not depend on the values.
+
+Its variants, for each row count:
+
+- `fused gate and up`: the expert kernel of a layer without exact kernels, gate and up with the SiLU in 1 launch, its quantisation of the input included.
+- `fused down, pairs`: that layer's down kernel writing each pair's row, as a recorded decode runs it.
+- `fused down, reduced`: the same, each row's pairs folded into it.
+- `fused, gate and up then down reduced`: the 2 fused launches in sequence, as a token of a layer without exact kernels runs them.
+- `exact quantise x`, `exact gate and up`, `exact quantise h`, `exact down` and `exact sum`: the launches of the exact kernels 1 at a time.
+- `exact, all 5`: those 5 in sequence, as 1 token of a recorded decode runs them on the card.
+
+A layer whose stacks have no exact form gets a note in place of the exact rows.
+
+Each call is timed between 2 events of the card's stream.
+The bandwidth is the weight bytes the pairs read, which the GEMM rows and the totals carry.
+
+Read `exact gate and up` against `fused gate and up`, `exact down` against `fused down, pairs`, and `exact, all 5` against `fused, gate and up then down reduced`.
+The quantisations and the sum are what the exact path adds around them.
 
 ### expert-upload
 
@@ -278,7 +316,25 @@ Its variants:
 - A buffered read.
 - A direct read into an aligned buffer, which bypasses the page cache.
 
-### host-expert
+### host-pairs
+
+`host-pairs` times the routed pairs of 1 layer on the host cores, for a decoded token and for the rows of a verify.
+It measures what a pair the host takes costs through the exact dots against the formats' own dots.  
+It runs at the layer `expert-pairs` reads, with the same synthetic stacks and the same draw of experts.
+It needs no card.
+
+The stacks hold the layer's routed experts in the process's memory.
+Consecutive calls take different routings, as many as the layer has experts, so a call reads its weights from memory.
+
+Its variants:
+
+- `1 pair` and each row count of `--block`, through the formats' own dots: the calls the tier makes for a layer without exact kernels, the quantisation of the input included.
+- The same pairs through the exact dots, as the tier computes a cached layer's pairs.
+- The gate of 1 expert and its down, each on 1 thread, through the format's own dot and through its exact dot.
+
+Read `exact dots` against `own dots` at the same pairs.
+The 1-thread rows set the dots of 1 format against each other, without the pool.
+
 
 `host-expert` computes routed experts on the host cores.
 
