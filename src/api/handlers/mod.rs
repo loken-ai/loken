@@ -1761,6 +1761,7 @@ impl APIServer {
         // least recently used go first when they would push it off the cards.
         let per_card = self.model_load_reserve(model_id, &config);
         self.evict_to_make_room(model_id, hot, per_card).await;
+        self.evict_for_host_room(model_id).await;
         if hot > 0 {
             crate::inference::place::vram_manager::ensure_gpu_headroom("llm", hot, 0).await;
         }

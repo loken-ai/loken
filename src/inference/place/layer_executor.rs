@@ -11,9 +11,15 @@ pub(crate) fn available_host_ram_bytes() -> u64 {
     let mut sys = System::new();
     sys.refresh_memory();
     let host = sys.available_memory();
-    // Under a memory cap (a container, a systemd unit) the process dies at the cap, not at the
-    // host's memory: what the cap leaves, less what the group holds, bounds what it may take.
-    match memory_cap() {
+    room_under_cap(host, memory_cap())
+}
+
+/// What a process may take of `host` available bytes under a memory cap `(limit, held)`.
+/// Under a cap (a container, a systemd unit) the process dies at the cap, not at the host's
+/// memory: what the cap leaves, less what the group holds, bounds what it may take.
+/// The smaller figure wins.
+fn room_under_cap(host: u64, cap: Option<(u64, u64)>) -> u64 {
+    match cap {
         Some((limit, held)) => host.min(limit.saturating_sub(held)),
         None => host,
     }
@@ -2014,5 +2020,20 @@ mod memory_cap_tests {
         let stat = "anon 7340032\nfile 1048576\nkernel 4096\n";
         assert_eq!(anonymous_bytes(stat), Some(7340032));
         assert_eq!(anonymous_bytes("file 1\n"), None);
+    }
+
+    /// The host's figure and the cap's room: the smaller one wins.
+    #[test]
+    fn the_smaller_of_the_host_and_the_cap_wins() {
+        // A 1 GiB cap of which 300 MiB is held, on a host with 50 GiB available.
+        assert_eq!(
+            room_under_cap(50 << 30, Some((1 << 30, 300 << 20))),
+            724 << 20
+        );
+        // A cap looser than the host leaves the host's figure.
+        assert_eq!(room_under_cap(2 << 30, Some((16 << 30, 1 << 30))), 2 << 30);
+        // A group holding more than its cap has no room, and no underflow.
+        assert_eq!(room_under_cap(2 << 30, Some((1 << 30, 3 << 30))), 0);
+        assert_eq!(room_under_cap(2 << 30, None), 2 << 30);
     }
 }

@@ -226,6 +226,58 @@ pub(crate) struct DraftHeld {
     carried: Option<Tens>,
 }
 
+impl Rows {
+    fn host_bytes(&self) -> u64 {
+        ((self.k.len() + self.v.len()) * 4) as u64
+    }
+}
+
+impl Tens {
+    fn host_bytes(&self) -> u64 {
+        (self.data.len() * 4) as u64
+    }
+}
+
+impl Point {
+    /// The bytes the point's rows and tensors take in host memory.
+    fn host_bytes(&self) -> u64 {
+        let pair = |p: &Option<(Tens, Tens)>| {
+            p.as_ref()
+                .map_or(0, |(a, b)| a.host_bytes() + b.host_bytes())
+        };
+        let window = |w: &WindowHeld| (w.window.len() * 4) as u64;
+        let layers: u64 = self
+            .layers
+            .iter()
+            .map(|h| match h {
+                Held::Nothing => 0,
+                Held::Global(r) | Held::Window(r) => r.host_bytes(),
+                Held::Mixer(MixerHost::Conv(t)) => t.as_ref().map_or(0, Tens::host_bytes),
+                Held::Mixer(MixerHost::Ssm(p) | MixerHost::Delta(p)) => pair(p),
+                Held::Latent(w) => window(w),
+                Held::Band(b) => {
+                    window(&b.window)
+                        + ((b.compressed.len() + b.index.len() + b.filling.len()) * 4) as u64
+                }
+            })
+            .sum();
+        let draft = self.draft.as_ref().map_or(0, |d| {
+            d.rows.host_bytes()
+                + d.indexer
+                    .as_ref()
+                    .map_or(0, |(a, b, c, _)| ((a.len() + b.len() + c.len()) * 4) as u64)
+                + d.carried.as_ref().map_or(0, Tens::host_bytes)
+        });
+        layers + draft
+    }
+}
+
+/// Whether a write of `point` to a store in host memory fits the host's room now.
+/// The write holds the encoded manifest, its sealed form and the store's copy beside the point.
+fn fits_in_memory(point_bytes: u64, room: u64) -> bool {
+    point_bytes.saturating_mul(3) <= room
+}
+
 fn dtype_code(d: DType) -> Result<u8> {
     match d {
         DType::F16 => Ok(0),
@@ -1845,6 +1897,13 @@ impl HybridStateCache {
         if prompt.len() < g {
             return;
         }
+        // A host with no room left takes no copy of the state for a store in host memory.
+        if self.store.is_in_memory()
+            && crate::inference::place::layer_executor::host_spill_budget_bytes() == 0
+        {
+            tracing::info!("state cache: not stored: no host memory left");
+            return;
+        }
         let end = match model.capture_point(prompt.len(), layout) {
             Ok(p) => p,
             Err(e) => {
@@ -1852,6 +1911,19 @@ impl HybridStateCache {
                 return;
             }
         };
+        // A store in host memory takes a write only while the host has the room for it now.
+        if self.store.is_in_memory() {
+            let room = crate::inference::place::layer_executor::host_spill_budget_bytes();
+            let bytes = end.host_bytes();
+            if !fits_in_memory(bytes, room) {
+                tracing::info!(
+                    "state cache: not stored: a {} MB state does not fit the {} MB of host memory left",
+                    bytes >> 20,
+                    room >> 20
+                );
+                return;
+            }
+        }
         let identity = model.cache_scope.mixed_into(&self.identity);
         let keys = self.store.keys(&identity, prompt);
         let nblocks = prompt.len() / g;
@@ -1967,4 +2039,16 @@ pub(crate) fn restore_from_bytes(
     model
         .restore_point(&point, &rows, tokens)
         .map_err(|e| anyhow!("{e}"))
+}
+
+#[cfg(test)]
+mod in_memory_room_tests {
+    /// A write to a store in host memory needs 3 times the state, and is skipped past that.
+    #[test]
+    fn a_state_is_kept_in_memory_only_within_the_room() {
+        assert!(super::fits_in_memory(100, 300));
+        assert!(!super::fits_in_memory(101, 300));
+        assert!(!super::fits_in_memory(1, 0));
+        assert!(!super::fits_in_memory(u64::MAX, u64::MAX - 1));
+    }
 }

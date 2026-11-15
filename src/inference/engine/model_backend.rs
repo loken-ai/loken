@@ -160,7 +160,13 @@ fn prefill_sizing_uncached(shape: PrefillShape) -> PrefillSizing {
     // not handed the chunk of an empty one and left to discover the difference by running out
     // of memory. A share of the free VRAM, because the activation peak is not the only thing a
     // forward allocates: the attention transients and the KV growth come out of the same pool.
-    let free = crate::inference::place::vram_manager::tightest_free_on_cards(shape.cards) as usize;
+    let mut free =
+        crate::inference::place::vram_manager::tightest_free_on_cards(shape.cards) as usize;
+    // A model with layers on the host keeps their activations in host memory too.
+    if shape.cards == 0 && free > 0 {
+        let host = crate::inference::place::layer_executor::host_spill_budget_bytes();
+        free = free.min(usize::try_from(host).unwrap_or(usize::MAX));
+    }
     if free == 0 {
         // No CUDA, or nothing to probe: the host path is bounded by RAM, which this is not
         // measuring, so keep the conservative default rather than inventing a number.

@@ -1061,6 +1061,19 @@ impl APIServer {
         }
     }
 
+    /// Unloads idle language models, least recently used first, while the host has no room
+    /// left beyond its safety headroom: a load then needs the memory they hold.
+    /// A machine with host memory to spare unloads nothing.
+    pub(crate) async fn evict_for_host_room(&self, incoming_id: &str) {
+        while crate::inference::place::layer_executor::host_spill_budget_bytes() == 0 {
+            if self.evict_idle_llm(incoming_id).await == 0 {
+                return;
+            }
+            // What the unloaded model freed goes back to the kernel past the burst headroom.
+            crate::inference::place::heap::release_retained();
+        }
+    }
+
     /// Unloads the least recently used language model that is not `except` and serves no
     /// request; returns the bytes its weights took, 0 when every other model is busy or none
     /// is loaded.

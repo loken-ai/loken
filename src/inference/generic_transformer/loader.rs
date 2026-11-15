@@ -2880,6 +2880,17 @@ fn build_generic_layer(
                 .effective_max_context()
                 .max(512)
                 .min(LAZY_KV_INITIAL_CAP);
+            // A host layer's cache starts at the positions its share of the host's room holds
+            // now, F32 keys and values, 512 at the least.
+            let init_cap = if on_gpu {
+                init_cap
+            } else {
+                let per_position = (2 * n_kv_head_layer * head_dim * 4) as u64;
+                let share = crate::inference::place::layer_executor::host_spill_budget_bytes()
+                    / config.n_layers.max(1) as u64;
+                let held = usize::try_from(share / per_position.max(1)).unwrap_or(usize::MAX);
+                init_cap.min(held.max(512))
+            };
             let mut c = SpecKvCache::new(init_cap);
             // gemma4 bounded sliding-window attention: SWA layers only attend within
             // `sliding_window`, so the cache need keep only the last
@@ -4888,10 +4899,42 @@ impl GenericHeteroTransformer {
                 .map(|(idx, dk)| load_layer(idx, dk, split_plan))
                 .collect::<Result<Vec<_>>>()?
         } else {
-            layer_devices
-                .into_par_iter()
-                .map(|(idx, dk)| load_layer(idx, dk, split_plan))
-                .collect::<Result<Vec<_>>>()?
+            // A worker may hold a host copy of every tensor of its layer: the ones the mapping
+            // cannot view, and the ones it splits, joins or converts.
+            // The host's room, read now, bounds the workers by the widest layer.
+            let per_worker = layer_devices
+                .iter()
+                .map(|&(idx, _)| {
+                    let (owned, mapped) = source.host_layer_bytes(idx);
+                    owned.saturating_add(mapped)
+                })
+                .max()
+                .unwrap_or(0);
+            let host_room = crate::inference::place::layer_executor::host_spill_budget_bytes();
+            let workers = phase2_workers(host_room, per_worker, rayon::current_num_threads());
+            if workers < rayon::current_num_threads() {
+                info!(
+                    "  Phase 1: {} worker(s) (host {:.0} MB / {:.0} MB per worker)",
+                    workers,
+                    host_room as f64 / 1e6,
+                    per_worker as f64 / 1e6
+                );
+            }
+            let pool = crate::cpu::worker_pool_builder()
+                .num_threads(workers)
+                .build()
+                .map_err(|e| crate::tensor::Error::msg(format!("Phase 1 pool: {e}")))?;
+            pool.install(|| {
+                layer_devices
+                    .into_par_iter()
+                    .map(|(idx, dk)| {
+                        let raw = load_layer(idx, dk, split_plan);
+                        // The buffers a layer freed go back to the kernel past the burst headroom.
+                        crate::inference::place::heap::release_retained();
+                        raw
+                    })
+                    .collect::<Result<Vec<_>>>()
+            })?
         };
 
         info!("✅ Phase 1: {} layers loaded", raw_layers.len());
@@ -5027,6 +5070,8 @@ impl GenericHeteroTransformer {
             if matches!(dev_enum, LayerDevice::Cuda(_)) {
                 source.release_layer_pages(layer_idx);
             }
+            // The buffers the build freed go back to the kernel past the burst headroom.
+            crate::inference::place::heap::release_retained();
             Ok((layer, dev_enum))
         };
         let built: Vec<(GenericTransformerLayer, LayerDevice)> = if distinct_gpus.len() <= 1 {
@@ -5044,16 +5089,16 @@ impl GenericHeteroTransformer {
             let per_worker = (config.embedding_length as u64)
                 .saturating_mul(config.ffn_dim as u64)
                 .saturating_mul(std::mem::size_of::<f32>() as u64 + 1);
-            let workers = if per_worker == 0 || post_phase1_free == u64::MAX {
-                rayon::current_num_threads()
-            } else {
-                ((post_phase1_free.saturating_sub(per_worker) / per_worker) as usize)
-                    .clamp(1, rayon::current_num_threads())
-            };
+            // The dequantised copy a worker rebuilds from lives in host memory.
+            // The host's room, read now, bounds the workers as the card's does.
+            let host_room = crate::inference::place::layer_executor::host_spill_budget_bytes();
+            let room = post_phase1_free.min(host_room);
+            let workers = phase2_workers(room, per_worker, rayon::current_num_threads());
             info!(
-                "  Phase 2: {} worker(s) (headroom {:.0} MB / {:.0} MB per worker)",
+                "  Phase 2: {} worker(s) (headroom {:.0} MB, host {:.0} MB / {:.0} MB per worker)",
                 workers,
                 post_phase1_free as f64 / 1e6,
+                host_room as f64 / 1e6,
                 per_worker as f64 / 1e6
             );
             let pool = crate::cpu::worker_pool_builder()
@@ -6099,6 +6144,18 @@ fn host_spill_fits(want: u64, budget: u64) -> bool {
     budget == 0 || want <= budget
 }
 
+/// The Phase 2 workers that fit in `room` bytes, each taking `per_worker`, with one worker's
+/// slack kept free.
+/// At least 1 and at most `threads`.
+/// Every thread when the room is unbounded or a worker takes nothing.
+fn phase2_workers(room: u64, per_worker: u64, threads: usize) -> usize {
+    let threads = threads.max(1);
+    if per_worker == 0 || room == u64::MAX {
+        return threads;
+    }
+    ((room.saturating_sub(per_worker) / per_worker) as usize).clamp(1, threads)
+}
+
 #[cfg(test)]
 mod host_head_tests {
     use super::host_head_needed;
@@ -6166,6 +6223,22 @@ mod host_spill_admission_tests {
     fn the_boundary_admits_and_one_byte_past_it_refuses() {
         assert!(host_spill_fits(1_000, 1_000));
         assert!(!host_spill_fits(1_001, 1_000));
+    }
+
+    /// The host's room bounds the Phase 2 workers, 1 worker at the least.
+    #[test]
+    fn phase2_workers_fit_the_room_they_are_given() {
+        use super::phase2_workers;
+        // 10 workers of 100 bytes fit in 1100 with 1 worker's slack.
+        assert_eq!(phase2_workers(1_100, 100, 20), 10);
+        // A room smaller than 1 worker still builds, 1 layer at a time.
+        assert_eq!(phase2_workers(50, 100, 20), 1);
+        assert_eq!(phase2_workers(0, 100, 20), 1);
+        // The threads cap the count.
+        assert_eq!(phase2_workers(u64::MAX - 1, 100, 8), 8);
+        // An unbounded room or a worker that takes nothing uses every thread.
+        assert_eq!(phase2_workers(u64::MAX, 100, 8), 8);
+        assert_eq!(phase2_workers(1_000, 0, 8), 8);
     }
 }
 
