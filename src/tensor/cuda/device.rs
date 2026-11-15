@@ -494,6 +494,19 @@ impl CudaDevice {
         Ok(d)
     }
 
+    /// The shared device handles someone holds now, by ordinal.
+    /// No card is opened.
+    pub fn live() -> Vec<Arc<Self>> {
+        let g = cards();
+        let mut live: Vec<Arc<Self>> = g
+            .shared
+            .values()
+            .filter_map(std::sync::Weak::upgrade)
+            .collect();
+        live.sort_by_key(|d| d.ordinal());
+        live
+    }
+
     /// A device of its own on `ordinal`, with its own stream.
     pub fn new(ordinal: usize) -> Result<Arc<Self>> {
         Self::open(&mut cards(), ordinal)

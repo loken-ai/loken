@@ -671,6 +671,32 @@ fn probe_runtime_gpus() -> Vec<CudaGpuInfo> {
     gpu_info
 }
 
+/// Ordinal, name, free and total bytes of each card NVML does not see that a live handle holds.
+/// No card is opened and nothing is logged, so a periodic report may call it.
+#[cfg(feature = "gpu")]
+pub fn live_runtime_cards() -> Vec<(usize, String, u64, u64)> {
+    use crate::tensor::gpu_runtime::driver::result as cu;
+    crate::tensor::cuda::CudaDevice::live()
+        .into_iter()
+        .filter(|card| !crate::tensor::gpu_runtime::is_nvidia_ordinal(card.ordinal()))
+        .filter_map(|card| {
+            let i = card.ordinal();
+            let name = cu::device::get(i as i32)
+                .and_then(cu::device::get_name)
+                .unwrap_or_else(|_| format!("GPU {i}"));
+            // PLACEMENT-EXEMPT: a monitoring answer, not a placement.
+            let (free, total) = card.context().mem_get_info().ok()?;
+            Some((i, name, free as u64, total as u64))
+        })
+        .collect()
+}
+
+/// A build without a GPU runtime holds no card.
+#[cfg(not(feature = "gpu"))]
+pub fn live_runtime_cards() -> Vec<(usize, String, u64, u64)> {
+    Vec::new()
+}
+
 /// GB/s the PCI device `domain:bus:device` carries to the host: the generation its link
 /// supports at the width it negotiated, from sysfs. 0.0 when sysfs does not say.
 #[cfg(feature = "gpu")]

@@ -150,6 +150,23 @@ impl StatsMonitor {
             }
         } // !force_cpu
 
+        // A card NVML does not see is read through its runtime while a model holds it.
+        for (index, name, free, total) in
+            crate::inference::place::device_probe::live_runtime_cards()
+        {
+            stats.gpus.push(GpuStats {
+                index: index as u32,
+                name,
+                memory_used_gb: total.saturating_sub(free) as f64 / 1e9,
+                memory_total_gb: total as f64 / 1e9,
+                utilization: None,
+                temp: None,
+                power: None,
+                power_limit: None,
+                graphics_clock: None,
+            });
+        }
+
         stats.loaded_models = loaded_models;
         stats.total_model_size_gb = total_model_size as f64 / (1024.0 * 1024.0 * 1024.0);
 
@@ -162,7 +179,7 @@ impl StatsMonitor {
 
         // Build per-GPU info strings
         let gpu_info = if stats.gpus.is_empty() {
-            " | GPU: Not detected".to_string()
+            no_card_reading().to_string()
         } else {
             let mut gpu_parts: Vec<String> = Vec::new();
             for g in &stats.gpus {
@@ -237,5 +254,31 @@ impl StatsMonitor {
 impl Default for StatsMonitor {
     fn default() -> Self {
         Self::new(None)
+    }
+}
+
+/// What the stats line says when it reads no card.
+/// A ROCm card is read only while a model holds it, so its absence means no card in use.
+fn no_card_reading() -> &'static str {
+    match cfg!(feature = "rocm") && crate::gpu::backends::cards_allowed() {
+        true => " | GPU: none in use",
+        false => " | GPU: Not detected",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// A build without ROCm keeps saying that it detects no card.
+    #[cfg(not(feature = "rocm"))]
+    #[test]
+    fn a_build_without_rocm_detects_no_card() {
+        assert_eq!(super::no_card_reading(), " | GPU: Not detected");
+    }
+
+    /// A build without a GPU runtime holds no card the runtime could report.
+    #[cfg(not(feature = "gpu"))]
+    #[test]
+    fn a_build_without_a_gpu_runtime_reports_no_live_card() {
+        assert!(crate::inference::place::device_probe::live_runtime_cards().is_empty());
     }
 }

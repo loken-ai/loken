@@ -163,6 +163,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 - Hub: pull the merges file of a tokenizer that ships no tokenizer.json.
 - Models: load a 16-bit float checkpoint without 32-bit copies on the host.
 - Models: end a multimodal checkpoint's answer at its end token, not at "!".
+- Stats: report the memory of a ROCm card in the periodic stats line.
 
 ### Removed
 
