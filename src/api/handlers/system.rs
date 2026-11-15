@@ -716,9 +716,7 @@ pub(crate) async fn list_devices(
     #[cfg(feature = "vulkan")]
     let devices = {
         let mut devices = devices;
-        for d in crate::inference::kernel::vulkan::offered(
-            &state.default_inference_config.vulkan_devices,
-        ) {
+        for d in crate::inference::kernel::vulkan::offered() {
             let free = crate::inference::kernel::vulkan::free_bytes(d.index);
             devices.push(serde_json::json!({
                 "id": d.index,

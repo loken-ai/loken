@@ -170,7 +170,7 @@ metrics = []
 # Enable SYCL support (Intel Arc/Xe)
 # Enable OpenCL backend for Intel Arc / AMD GPU inference via OpenCL kernels
 opencl = ["dep:opencl3"]
-# Vulkan for the cards no other runtime drives, or the ones the configuration names: the dense
+# Vulkan for the cards no other runtime the backends keep drives: the dense
 # decoder layers a placement gives a Vulkan device run there.
 vulkan = ["dep:ash", "dep:naga"]
 # Pure CPU build - no GPU runtime deps. Useful for cloud CPU

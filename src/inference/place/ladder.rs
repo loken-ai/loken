@@ -490,12 +490,12 @@ pub fn accelerators(reserve: u64) -> Vec<(DeviceKind, u64)> {
 }
 
 /// The Vulkan devices placement may use, with the bytes each offers once `reserve` is kept
-/// free on it: those `chosen` names, or with `chosen` empty, those no other runtime of the
-/// build drives. Empty in a build without Vulkan.
-pub fn vulkan_devices(chosen: &[String], reserve: u64) -> Vec<(DeviceKind, u64)> {
+/// free on it: those no other runtime of the build drives.
+/// Empty in a build without Vulkan.
+pub fn vulkan_devices(reserve: u64) -> Vec<(DeviceKind, u64)> {
     #[cfg(feature = "vulkan")]
     {
-        crate::inference::kernel::vulkan::offered(chosen)
+        crate::inference::kernel::vulkan::offered()
             .into_iter()
             .map(|d| {
                 let free = crate::inference::kernel::vulkan::free_bytes(d.index);
@@ -506,7 +506,7 @@ pub fn vulkan_devices(chosen: &[String], reserve: u64) -> Vec<(DeviceKind, u64)>
     }
     #[cfg(not(feature = "vulkan"))]
     {
-        let _ = (chosen, reserve);
+        let _ = reserve;
         Vec::new()
     }
 }

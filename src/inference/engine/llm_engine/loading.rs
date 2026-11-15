@@ -414,7 +414,6 @@ impl LlmEngine {
         // No allowed backend drives a card: every layer goes to the host or to the
         // Vulkan and OpenCL devices.
         let disable_cuda = self.config.disable_cuda || !crate::gpu::cards_allowed();
-        let vulkan_devices = self.config.vulkan_devices.clone();
         let kv_quant = self.config.kv_quant;
         let expert_profile = self.config.expert_profile.clone();
         let layer_share = self.config.layer_share;
@@ -1360,7 +1359,6 @@ impl LlmEngine {
                                 let mut offered = Vec::new();
                                 if crate::gpu::backends::allows(crate::gpu::backends::Backend::Vulkan) {
                                     offered = crate::inference::place::ladder::vulkan_devices(
-                                        &vulkan_devices,
                                         runtime_reserve_bytes,
                                     );
                                 }

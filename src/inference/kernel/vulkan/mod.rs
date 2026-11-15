@@ -140,20 +140,12 @@ fn claimed_by_other_runtime(vendor_id: u32) -> bool {
         && crate::inference::place::device_probe::card_count() > 0
 }
 
-/// The Vulkan devices placement may use: those `chosen` names, by index or by a part of their
-/// name, or with `chosen` empty, those whose vendor no other runtime of this build drives.
-pub fn offered(chosen: &[String]) -> Vec<DeviceInfo> {
+/// The Vulkan devices placement may use: those whose vendor no other runtime of this build,
+/// kept by `--backends`, drives.
+pub fn offered() -> Vec<DeviceInfo> {
     devices()
         .into_iter()
-        .filter(|d| {
-            if chosen.is_empty() {
-                return !claimed_by_other_runtime(d.vendor_id);
-            }
-            chosen.iter().any(|c| {
-                c.parse::<usize>().ok() == Some(d.index)
-                    || d.name.to_lowercase().contains(&c.to_lowercase())
-            })
-        })
+        .filter(|d| !claimed_by_other_runtime(d.vendor_id))
         .collect()
 }
 
