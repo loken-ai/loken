@@ -13,6 +13,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 - OpenCL: offer a card when the backends leave its native runtime out.
 - Vulkan: offer a GPU when the backends leave its native runtime out.
 - OpenCL: build the layers in the OpenCL C version the device declares.
+- Release: carry the Vulkan backend in the Linux archive.
 
 ## [0.5.0] - 2026-11-15
 

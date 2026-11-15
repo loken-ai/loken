@@ -10,8 +10,9 @@
 # binary opens lib/ beside itself before it looks anywhere else.
 #
 # What makes it portable:
-#   - The CUDA libraries (driver, NVRTC, cuBLAS, NCCL) and the OpenCL loader are opened at run
-#     time. A machine without them starts, reports no device, and serves on the CPU.
+#   - The CUDA libraries (driver, NVRTC, cuBLAS, NCCL), the OpenCL loader and the Vulkan loader
+#     are opened at run time. A machine without them starts, reports no device, and serves on
+#     the CPU.
 #   - TLS is rustls with bundled roots: no OpenSSL, no system certificate store.
 #   - The CUDA runtime and the C++ runtime are linked in.
 #   - The CPU kernels are built for a fixed baseline (CPU_BASELINE), not for the build machine.
@@ -26,8 +27,8 @@
 #                    development image of the host's ROCm version when FEATURES holds rocm)
 #   CPU_BASELINE     value of -C target-cpu for the CPU kernels (default x86-64-v3: AVX2, FMA, BMI2)
 #   MAX_GLIBC        highest glibc symbol version the binaries may need (default 2.34)
-#   FEATURES         cargo features, comma separated (default: the crate's defaults plus rocm
-#                    when hipcc is found, so one binary serves NVIDIA and AMD cards)
+#   FEATURES         cargo features, comma separated (default: the crate's defaults plus vulkan,
+#                    plus rocm when hipcc is found, so one binary serves NVIDIA and AMD cards)
 #   ROCM_PATH        ROCm root, read from hipcc when unset
 #   LOKEN_ROCM_ARCHS AMD targets to build for (default: every target build.rs lists)
 #   CUDA_PATH        CUDA toolkit root
@@ -53,10 +54,12 @@ crate_defaults="$(sed -n 's/^default = \[\(.*\)\]/\1/p' Cargo.toml | head -1 | t
 if [ -z "${ROCM_PATH:-}" ] && command -v hipcc >/dev/null; then
     ROCM_PATH="$(dirname "$(dirname "$(readlink -f "$(command -v hipcc)")")")"
 fi
-if [ -z "${FEATURES:-}" ] && [ -n "${ROCM_PATH:-}" ]; then
-    FEATURES="$crate_defaults,rocm"
+if [ -z "${FEATURES:-}" ]; then
+    FEATURES="$crate_defaults,vulkan"
+    if [ -n "${ROCM_PATH:-}" ]; then
+        FEATURES="$FEATURES,rocm"
+    fi
 fi
-FEATURES="${FEATURES:-}"
 with_rocm=
 case ",$FEATURES," in *,rocm,*) with_rocm=1 ;; esac
 rocm_version=
@@ -177,8 +180,8 @@ cpu baseline:   $CPU_BASELINE
 features:       $features
 glibc needed:   $(objdump -T "$BIN_DIR/lokend" | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -Vu | tail -1)
 build mode:     $MODE ($BASE_IMAGE)
-runtime libs:   none required. CUDA driver, NVRTC, cuBLAS, NCCL, the ROCm runtime and the OpenCL loader are
-                opened when present; without them the server runs on the CPU. The archive
+runtime libs:   none required. CUDA driver, NVRTC, cuBLAS, NCCL, the ROCm runtime, the OpenCL loader and
+                the Vulkan loader are opened when present; without them the server runs on the CPU. The archive
                 named -cuda-libs carries NVRTC, cuBLAS and cuBLASLt in lib/.
 EOF
 
