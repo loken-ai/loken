@@ -59,9 +59,6 @@ const SUBGROUP_LANES: u32 = 32;
 /// The device extension of the packed integer dot product the mat-vec kernels use.
 const DOT_EXTENSION: &std::ffi::CStr = c"VK_KHR_shader_integer_dot_product";
 
-const VENDOR_NVIDIA: u32 = 0x10de;
-const VENDOR_AMD: u32 = 0x1002;
-
 struct Instance {
     _entry: ash::Entry,
     instance: ash::Instance,
@@ -137,14 +134,10 @@ pub fn devices() -> Vec<DeviceInfo> {
         .unwrap_or_default()
 }
 
-/// Whether another runtime of this build drives cards of `vendor_id`.
+/// Whether another runtime of this build, kept by `--backends`, drives cards of `vendor_id`.
 fn claimed_by_other_runtime(vendor_id: u32) -> bool {
-    let cards = || crate::inference::place::device_probe::card_count() > 0;
-    match vendor_id {
-        VENDOR_NVIDIA => cfg!(feature = "cuda") && cards(),
-        VENDOR_AMD => cfg!(feature = "rocm") && cards(),
-        _ => false,
-    }
+    crate::gpu::backends::native_runtime_drives(vendor_id)
+        && crate::inference::place::device_probe::card_count() > 0
 }
 
 /// The Vulkan devices placement may use: those `chosen` names, by index or by a part of their

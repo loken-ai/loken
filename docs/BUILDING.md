@@ -139,6 +139,7 @@ The server opens the Vulkan loader when it starts, and compiles the kernels for 
 Placement offers the Vulkan GPUs that no other runtime of the build drives.  
 They come after the CUDA or HIP cards and before the host.  
 The build above has no other runtime, so every GPU is offered.
+A runtime that `--backends` leaves out drives no card, so its GPUs are offered too.
 `--features vulkan` on the default build adds Vulkan beside CUDA and OpenCL, and needs the CUDA toolkit.
 
 The layers of a decoder in `Q4_K`, `Q6_K`, `Q8_0`, `Q5_0`, `MXFP4`, `BF16`, `F16` or `F32` run on Vulkan, with the output head when the last layer does.

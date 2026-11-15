@@ -11,6 +11,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 - API: show a listed safetensors checkpoint with its window, format and capabilities.
 - Serving: log and report every runtime and media feature the build has.
 - OpenCL: offer a card when the backends leave its native runtime out.
+- Vulkan: offer a GPU when the backends leave its native runtime out.
 
 ## [0.5.0] - 2026-11-15
 
