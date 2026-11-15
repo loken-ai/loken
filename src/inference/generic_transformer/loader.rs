@@ -5168,7 +5168,16 @@ impl GenericHeteroTransformer {
                         );
                     }
                     // CONVERSION: a float head is held once, in F16, for the dense matmul the card paths take.
-                    (None, Some(qt.dequantize_f16(cuda_dev)?))
+                    // The host stages it by pieces that fit the memory kept free for a burst.
+                    let piece =
+                        crate::inference::place::layer_executor::host_burst_headroom_bytes();
+                    (
+                        None,
+                        Some(qt.dequantize_f16_in_pieces(
+                            cuda_dev,
+                            usize::try_from(piece).unwrap_or(usize::MAX),
+                        )?),
+                    )
                 } else {
                     let qt = source.read(output_weight_name, cuda_dev)?;
                     (

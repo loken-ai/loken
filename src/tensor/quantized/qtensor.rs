@@ -333,6 +333,70 @@ impl QTensor {
             .to_device(device)
     }
 
+    /// [`Self::dequantize_f16`] with the host holding at most `piece_bytes` of F16 words.
+    ///
+    /// A 16-bit float tensor bound for a card is converted and copied by blocks of whole rows.
+    /// The card buffer is allocated once and each block lands at its offset.
+    /// A block is never smaller than 1 row.
+    /// Every other case takes [`Self::dequantize_f16`].
+    pub fn dequantize_f16_in_pieces(&self, device: &Device, piece_bytes: usize) -> Result<Tensor> {
+        #[cfg(feature = "gpu")]
+        if let tensor::Device::Cuda(dev) = device {
+            let from_bits: Option<fn(u16) -> half::f16> = match self.dtype() {
+                GgmlDType::F16 => Some(half::f16::from_bits),
+                GgmlDType::BF16 => Some(|b| half::f16::from_f32(half::bf16::from_bits(b).to_f32())),
+                _ => None,
+            };
+            if let Some(from_bits) = from_bits {
+                return self.f16_onto_card_in_pieces(dev, piece_bytes, from_bits);
+            }
+        }
+        let _ = piece_bytes;
+        // CONVERSION: F16 is what the caller asked for; off a card or from a block format, whole.
+        self.dequantize_f16(device)
+    }
+
+    /// The 16-bit words of this tensor turned into F16 by `from_bits`, written to a card buffer
+    /// by blocks of whole rows of at most `piece_bytes`.
+    #[cfg(feature = "gpu")]
+    fn f16_onto_card_in_pieces(
+        &self,
+        dev: &Arc<crate::tensor::cuda::CudaDevice>,
+        piece_bytes: usize,
+        from_bits: fn(u16) -> half::f16,
+    ) -> Result<Tensor> {
+        use crate::tensor::cuda::CudaStorage;
+        let n = self.shape.elem_count();
+        let row = self.shape.dims().last().copied().unwrap_or(n).max(1);
+        let piece = (piece_bytes / (row * 2)).max(1) * row;
+        let blocks = self.host_blocks()?;
+        let mut out = CudaStorage::alloc_uninit(dev, crate::tensor::DType::F16, n)?;
+        let CudaStorage::F16(slice) = &mut out else {
+            return Err(Error::msg("an F16 card buffer of another type"));
+        };
+        let stream = dev.stream();
+        let mut words: Vec<half::f16> = Vec::with_capacity(piece.min(n));
+        for (i, chunk) in blocks.chunks(piece * 2).enumerate() {
+            words.clear();
+            {
+                use rayon::prelude::*;
+                chunk
+                    .par_chunks_exact(2)
+                    .map(|w| from_bits(u16::from_le_bytes([w[0], w[1]])))
+                    .collect_into_vec(&mut words);
+            }
+            let at = i * piece;
+            stream
+                .memcpy_htod(&words[..], &mut slice.slice_mut(at..at + words.len()))
+                .map_err(|e| Error::msg(format!("F16 upload by pieces: {e}")))?;
+            // The next block refills the host buffer this copy reads.
+            stream
+                .synchronize()
+                .map_err(|e| Error::msg(format!("F16 upload by pieces: {e}")))?;
+        }
+        Tensor::from_cuda_storage(out, dev.clone(), self.shape.clone())
+    }
+
     /// The production-kernel matmul over this tensor's shared blob
     /// (built once; QMatMul::forward delegates here).
     pub(crate) fn native_qmm(&self) -> Result<&QKernelMatMul> {
@@ -451,6 +515,68 @@ mod half_width {
             let t = q.dequantize_f16(&Device::Cpu).unwrap();
             assert_eq!(t.dtype(), DType::F16, "{dtype:?}");
             assert_eq!(bits(&t), through_f32(&q, DType::F16), "{dtype:?}");
+        }
+    }
+
+    /// A `rows` by `cols` half weight of `dtype` as a view of a buffer another owner holds, as a
+    /// file mapping is held, and the same weight copied into the tensor.
+    #[cfg(feature = "gpu")]
+    fn viewed_and_owned(dtype: GgmlDType, rows: usize, cols: usize) -> (QTensor, QTensor) {
+        let words: Vec<u16> = (0..rows * cols)
+            .map(|i| {
+                let v = ((i * 37) % 23) as f32 * 0.125 - 1.4;
+                match dtype {
+                    GgmlDType::F16 => half::f16::from_f32(v).to_bits(),
+                    _ => half::bf16::from_f32(v).to_bits(),
+                }
+            })
+            .collect();
+        let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        // 8-byte words keep the view aligned as a mapped tensor is.
+        let mut backing = vec![0u64; bytes.len().div_ceil(8)];
+        // SAFETY: `backing` holds at least `bytes.len()` bytes.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                bytes.as_ptr(),
+                backing.as_mut_ptr() as *mut u8,
+                bytes.len(),
+            );
+        }
+        let owner: Arc<dyn std::any::Any + Send + Sync> = Arc::new(backing);
+        let base = owner.downcast_ref::<Vec<u64>>().unwrap().as_ptr() as *const u8;
+        // SAFETY: `base` points at `bytes.len()` bytes `owner` keeps alive.
+        let view = unsafe {
+            QHostTensor::view(owner.clone(), base, 0, bytes.len(), dtype, vec![rows, cols])
+        }
+        .unwrap();
+        let viewed = QTensor::from_native(Arc::new(view), &Device::Cpu).unwrap();
+        let owned =
+            QTensor::from_ggml_bytes(dtype, &bytes, vec![rows, cols], &Device::Cpu).unwrap();
+        (viewed, owned)
+    }
+
+    /// A half weight uploaded to a card by pieces of a few rows has the bits of the whole upload.
+    #[cfg(feature = "gpu")]
+    #[test]
+    #[ignore = "needs a card"]
+    fn a_half_weight_uploaded_by_pieces_matches_the_whole_upload() {
+        let Ok(dev) = Device::new_cuda(0) else {
+            return;
+        };
+        let (rows, cols) = (37usize, 64usize);
+        for dtype in [GgmlDType::F16, GgmlDType::BF16] {
+            let (viewed, _) = viewed_and_owned(dtype, rows, cols);
+            let whole = viewed.dequantize_f16(&dev).unwrap();
+            // 5 rows a piece leaves a last piece of 2 rows.
+            for piece in [1usize, 5 * cols * 2, rows * cols * 2, usize::MAX] {
+                let pieces = viewed.dequantize_f16_in_pieces(&dev, piece).unwrap();
+                assert_eq!(pieces.dims(), whole.dims());
+                assert_eq!(
+                    bits(&pieces.to_device(&Device::Cpu).unwrap()),
+                    bits(&whole.to_device(&Device::Cpu).unwrap()),
+                    "{dtype:?} pieces of {piece} bytes"
+                );
+            }
         }
     }
 
