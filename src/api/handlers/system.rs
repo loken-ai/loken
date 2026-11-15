@@ -711,28 +711,37 @@ pub(crate) async fn list_devices(
         })
     }).collect();
 
-    // The Vulkan devices placement may give layers to: no other runtime of the build stands for
-    // them, so the host-side probes above do not list them.
-    #[cfg(feature = "vulkan")]
+    // The Vulkan and OpenCL devices a plan may give layers to, the same list the load reads.
+    // The probes above list the cards of the native runtimes and the host only.
     let devices = {
+        use crate::inference::place::layer_executor::DeviceKind;
         let mut devices = devices;
-        for d in crate::inference::kernel::vulkan::offered() {
-            let free = crate::inference::kernel::vulkan::free_bytes(d.index);
+        for (kind, free) in crate::inference::place::ladder::layer_accelerators(0) {
+            let (id, kind_name, backend, priority) = match kind {
+                DeviceKind::Vulkan(index) => (index, "Vulkan", "vulkan", 60),
+                DeviceKind::OpenCL(index) => (index, "OpenCL", "opencl", 70),
+                _ => continue,
+            };
+            let (name, total) =
+                crate::inference::place::ladder::accelerator_facts(kind).unwrap_or_default();
+            // A card a native runtime already lists keeps its row.
+            if backend == "opencl" && devices.iter().any(|d| d["name"] == name.as_str()) {
+                continue;
+            }
             devices.push(serde_json::json!({
-                "id": d.index,
-                "type": "Vulkan",
-                "backend": "vulkan",
-                // The driver's own suffix, as in "(RADV GFX1201)", is not part of the card's name.
-                "name": d.name.split(" (").next().unwrap_or(&d.name),
-                "memory_gb": d.total as f64 / (1024.0 * 1024.0 * 1024.0),
-                "memory_bytes": d.total,
+                "id": id,
+                "type": kind_name,
+                "backend": backend,
+                "name": name,
+                "memory_gb": total as f64 / (1024.0 * 1024.0 * 1024.0),
+                "memory_bytes": total,
                 "free_bytes": free,
                 "utilization_gpu_percent": null,
                 "utilization_memory_percent": null,
                 "temperature_c": null,
                 "power_watts": null,
                 "power_limit_watts": null,
-                "priority": 60,
+                "priority": priority,
                 "status": "available",
                 "reason": null,
                 "suggestion": null,
@@ -742,57 +751,11 @@ pub(crate) async fn list_devices(
         devices
     };
 
-    // The OpenCL GPUs the layers run on. The host-side probes list a device by its vendor
-    // library and miss the ones OpenCL alone reaches; one already listed keeps its row.
-    #[cfg(feature = "opencl")]
-    let devices = {
-        let mut devices = devices;
-        for (i, id) in crate::inference::kernel::opencl::layer_devices()
-            .into_iter()
-            .enumerate()
-            .filter(|(_, id)| {
-                crate::inference::kernel::opencl_probe::offered(&opencl3::device::Device::new(*id))
-                    && crate::inference::kernel::opencl_stack::runs_layers(*id)
-            })
-        {
-            let name = opencl3::device::Device::new(id).name().unwrap_or_default();
-            if devices.iter().any(|d| d["name"] == name.as_str()) {
-                continue;
-            }
-            let total = crate::inference::kernel::opencl::get_opencl_device_memory(id);
-            let offered = crate::inference::kernel::opencl::offered_memory(id);
-            devices.push(serde_json::json!({
-                "id": i,
-                "type": "OpenCL",
-                "backend": "opencl",
-                "name": name,
-                "memory_gb": total as f64 / (1024.0 * 1024.0 * 1024.0),
-                "memory_bytes": total,
-                "free_bytes": offered,
-                "utilization_gpu_percent": null,
-                "utilization_memory_percent": null,
-                "temperature_c": null,
-                "power_watts": null,
-                "power_limit_watts": null,
-                "priority": 70,
-                "status": "available",
-                "reason": null,
-                "suggestion": null,
-                "usable_memory_gb": offered as f64 / (1024.0 * 1024.0 * 1024.0),
-            }));
-        }
-        devices
-    };
-
     let available_count = devices
         .iter()
         .filter(|d| d["status"] == "available")
         .count();
-    let total_memory_gb: f32 = device_manager
-        .devices()
-        .iter()
-        .map(crate::distributed::device_manager::ComputeDevice::memory_gb)
-        .sum();
+    let total_memory_gb: f64 = devices.iter().filter_map(|d| d["memory_gb"].as_f64()).sum();
 
     // Cumulative session energy for the GUI's Hardware-tab Energy card.
     // `None` (-> JSON null) when energy reporting is disabled, so the GUI

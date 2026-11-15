@@ -331,9 +331,10 @@ impl DeviceManager {
     /// Detect NVIDIA CUDA devices
     #[cfg(feature = "gpu")]
     fn detect_cuda_devices(&mut self) -> Result<()> {
-        // No allowed backend drives a card: only the CPU device is registered.
+        // No allowed native runtime drives a card: no CUDA or ROCm card is registered.
+        // The Vulkan and OpenCL devices a plan may use are listed apart, by their backend.
         if !crate::gpu::cards_allowed() {
-            info!("no allowed backend drives a card: skipping card detection");
+            info!("no allowed native runtime drives a card: no CUDA or ROCm card is listed");
             return Ok(());
         }
 

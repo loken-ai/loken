@@ -511,6 +511,60 @@ pub fn vulkan_devices(reserve: u64) -> Vec<(DeviceKind, u64)> {
     }
 }
 
+/// The Vulkan and OpenCL devices a plan may give layers to, with the bytes each offers once
+/// `reserve` is kept free on it: the Vulkan devices first, then the OpenCL ones.
+/// A backend the allowed backends leave out offers none.
+pub fn layer_accelerators(reserve: u64) -> Vec<(DeviceKind, u64)> {
+    use crate::gpu::backends::{allows, Backend};
+    offered_by(allows, || vulkan_devices(reserve), || accelerators(reserve))
+}
+
+/// The devices of `vulkan` then `opencl`, each when `allows` keeps its backend.
+fn offered_by(
+    allows: impl Fn(crate::gpu::backends::Backend) -> bool,
+    vulkan: impl FnOnce() -> Vec<(DeviceKind, u64)>,
+    opencl: impl FnOnce() -> Vec<(DeviceKind, u64)>,
+) -> Vec<(DeviceKind, u64)> {
+    use crate::gpu::backends::Backend;
+    let mut offered = Vec::new();
+    if allows(Backend::Vulkan) {
+        offered.extend(vulkan());
+    }
+    if allows(Backend::OpenCl) {
+        offered.extend(opencl());
+    }
+    offered
+}
+
+/// What a Vulkan or OpenCL device of a plan is: its name as its runtime gives it, and the
+/// bytes of its memory.
+/// `None` for another kind, or a device its runtime no longer lists.
+pub fn accelerator_facts(kind: DeviceKind) -> Option<(String, u64)> {
+    match kind {
+        #[cfg(feature = "vulkan")]
+        DeviceKind::Vulkan(index) => crate::inference::kernel::vulkan::devices()
+            .into_iter()
+            .find(|d| d.index == index)
+            // The driver's own suffix, as in "(RADV GFX1201)", is not part of the card's name.
+            .map(|d| {
+                (
+                    d.name.split(" (").next().unwrap_or(&d.name).to_string(),
+                    d.total,
+                )
+            }),
+        #[cfg(feature = "opencl")]
+        DeviceKind::OpenCL(i) => {
+            let id = *crate::inference::kernel::opencl::layer_devices().get(i)?;
+            let name = opencl3::device::Device::new(id).name().unwrap_or_default();
+            Some((
+                name,
+                crate::inference::kernel::opencl::get_opencl_device_memory(id),
+            ))
+        }
+        _ => None,
+    }
+}
+
 /// Free bytes on the card `device` runs on, with the pools handed back first; `None` for
 /// the host or a card that does not report.
 pub fn free_on_card(device: &Device) -> Option<u64> {
@@ -1592,6 +1646,36 @@ mod tests {
         );
         assert_eq!(plan.segments[1].layer_start, 4);
         assert_eq!(plan.segments[1].layer_end, 10);
+    }
+
+    #[test]
+    fn an_accelerator_is_offered_only_through_an_allowed_backend() {
+        use crate::gpu::backends::Backend;
+        let vulkan = || vec![(DeviceKind::Vulkan(0), GB), (DeviceKind::Vulkan(1), GB)];
+        let opencl = || vec![(DeviceKind::OpenCL(0), GB)];
+        let kinds = |allowed: &[Backend]| -> Vec<DeviceKind> {
+            offered_by(|b| allowed.contains(&b), vulkan, opencl)
+                .into_iter()
+                .map(|(k, _)| k)
+                .collect()
+        };
+        assert_eq!(
+            kinds(&[Backend::Vulkan, Backend::Cpu]),
+            [DeviceKind::Vulkan(0), DeviceKind::Vulkan(1)]
+        );
+        assert_eq!(
+            kinds(&[Backend::OpenCl, Backend::Cpu]),
+            [DeviceKind::OpenCL(0)]
+        );
+        assert_eq!(
+            kinds(&[Backend::Vulkan, Backend::OpenCl]),
+            [
+                DeviceKind::Vulkan(0),
+                DeviceKind::Vulkan(1),
+                DeviceKind::OpenCL(0)
+            ]
+        );
+        assert!(kinds(&[Backend::Cuda, Backend::Cpu]).is_empty());
     }
 
     #[test]

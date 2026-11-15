@@ -902,17 +902,17 @@ impl LlmEngine {
             let model_fits_single_gpu = file_size > 0 && offer.whole_on.is_some();
             let gpu_idx = offer.primary().unwrap_or_default();
 
-            // --- 4.5 The non-CUDA GPUs, if any answer ---
+            // --- 4.5 The Vulkan and OpenCL devices the plan may use, each by its backend ---
             //
-            // Behind a deadline, because this is a driver call: a card removed while the system
-            // ran leaves a device node that blocks every OpenCL client, and enumerating here
-            // once wedged a whole node mid-load. See `opencl_probe`.
+            // The OpenCL enumeration is behind a deadline, because it is a driver call: a card
+            // removed while the system ran leaves a device node that blocks every OpenCL client.
+            // See `opencl_probe`.
             if !disable_arc_layers {
-                for (idx, (name, vram)) in crate::inference::kernel::opencl_probe::non_cuda_devices()
-                    .into_iter()
-                    .enumerate()
-                {
-                    debug!("🖥️  OpenCL device {}: {} ({:.1} GB)", idx, name, vram as f64 / 1e9);
+                for (kind, free) in crate::inference::place::ladder::layer_accelerators(0) {
+                    let name = crate::inference::place::ladder::accelerator_facts(kind)
+                        .map(|(name, _)| name)
+                        .unwrap_or_default();
+                    info!("🖥️  {kind}: {name} ({:.1} GB free)", free as f64 / 1e9);
                 }
             }
 
@@ -1368,23 +1368,13 @@ impl LlmEngine {
                                 std::collections::HashMap::new();
                             // The Vulkan devices take the layers a rung leaves on the host
                             // before the host does.
+                            // The OpenCL GPUs no CUDA card stands for take their share after them.
                             let vulkan = if host_only.is_some() {
                                 Vec::new()
                             } else {
-                                let mut offered = Vec::new();
-                                if crate::gpu::backends::allows(crate::gpu::backends::Backend::Vulkan) {
-                                    offered = crate::inference::place::ladder::vulkan_devices(
-                                        runtime_reserve_bytes,
-                                    );
-                                }
-                                // The OpenCL GPUs no CUDA card stands for take their share
-                                // after them.
-                                if crate::gpu::backends::allows(crate::gpu::backends::Backend::OpenCl) {
-                                    offered.extend(crate::inference::place::ladder::accelerators(
-                                        runtime_reserve_bytes,
-                                    ));
-                                }
-                                offered
+                                crate::inference::place::ladder::layer_accelerators(
+                                    runtime_reserve_bytes,
+                                )
                             };
                             let model = crate::inference::place::ladder::load_planned(
                                 &arch,

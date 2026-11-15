@@ -162,7 +162,7 @@ impl LayerPerformanceTracker {
                     format!("CUDA #{}", idx)
                 }
                 crate::inference::place::layer_executor::DeviceKind::OpenCL(idx) => {
-                    format!("Arc #{}", idx)
+                    format!("OpenCL #{}", idx)
                 }
                 crate::inference::place::layer_executor::DeviceKind::Vulkan(idx) => {
                     format!("Vulkan #{}", idx)

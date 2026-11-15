@@ -300,44 +300,6 @@ pub fn offered(device: &opencl3::device::Device) -> bool {
     offered_beside(opencl_address(device), native_addresses())
 }
 
-/// The GPUs OpenCL exposes beside the native cards, as `(name, bytes of memory)` in
-/// enumeration order.
-/// A card a native runtime of the build drives is skipped, as [`offered`] says.
-#[cfg(feature = "opencl")]
-pub fn non_cuda_devices() -> Vec<(String, u64)> {
-    use opencl3::device::{Device, CL_DEVICE_TYPE_GPU};
-
-    if !responsive() {
-        return Vec::new();
-    }
-    let Ok(platforms) = opencl3::platform::get_platforms() else {
-        return Vec::new();
-    };
-    let mut out = Vec::new();
-    for platform in platforms {
-        let Ok(ids) = platform.get_devices(CL_DEVICE_TYPE_GPU) else {
-            continue;
-        };
-        for id in ids {
-            let d = Device::new(id);
-            if !offered(&d) {
-                continue;
-            }
-            let name = d.name().unwrap_or_else(|_| "unknown".to_string());
-            // A device that will not state its memory is still a device; the planner's own
-            // default is a better answer than dropping it.
-            let mem = d.global_mem_size().unwrap_or(0);
-            out.push((name, mem));
-        }
-    }
-    out
-}
-
-#[cfg(not(feature = "opencl"))]
-pub fn non_cuda_devices() -> Vec<(String, u64)> {
-    Vec::new()
-}
-
 #[cfg(test)]
 mod tests {
     /// The answer is computed once. A second call must not start a second probe, or a hung
