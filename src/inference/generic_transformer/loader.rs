@@ -1506,6 +1506,12 @@ pub fn set_narrows(allowed: bool) {
     crate::tensor::quantized::set_half_rows(allowed);
 }
 
+/// Serialises the tests that set the level of the next loads.
+/// A test that loads at a level of its own holds it for writing until its load ends.
+/// An engine load holds it for reading while it sets the configured level.
+#[cfg(test)]
+pub(crate) static LEVEL_LOCK: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
 /// Whether the next loads may hold values narrower than the model computes them.
 pub(crate) fn narrows() -> bool {
     NARROWS.load(std::sync::atomic::Ordering::Relaxed)

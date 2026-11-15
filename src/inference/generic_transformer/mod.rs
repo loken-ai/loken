@@ -63,6 +63,8 @@ mod dense;
 mod dense_layouts;
 mod draft_head;
 pub use draft_head::set_probe_dir;
+#[cfg(test)]
+pub(crate) use loader::LEVEL_LOCK;
 pub use loader::{set_float_weights, set_narrows};
 mod context_parallel;
 #[cfg(test)]

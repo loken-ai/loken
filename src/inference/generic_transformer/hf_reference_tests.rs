@@ -498,6 +498,9 @@ fn load_at_level(
 ) -> GenericHeteroTransformer {
     use crate::inference::engine::llm_engine::FloatWeights;
     use crate::inference::generic_transformer::{set_float_weights, set_narrows};
+    let _level = crate::inference::generic_transformer::LEVEL_LOCK
+        .write()
+        .unwrap_or_else(|e| e.into_inner());
     set_float_weights(FloatWeights::AsStored);
     set_narrows(narrows);
     let model = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {

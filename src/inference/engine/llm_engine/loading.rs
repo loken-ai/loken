@@ -359,8 +359,14 @@ impl LlmEngine {
         let layer_share = self.config.layer_share;
         let quality = self.config.quality;
         let fidelity = self.config.fidelity;
+        #[cfg(test)]
+        let level = crate::inference::generic_transformer::LEVEL_LOCK
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
         crate::inference::generic_transformer::set_float_weights(fidelity.float_weights());
         crate::inference::generic_transformer::set_narrows(fidelity.narrows());
+        #[cfg(test)]
+        drop(level);
         let state_cache = self.state_cache.clone();
         let user_context_length = self.config.context_length;
         let model_state = self.model_state.clone();
