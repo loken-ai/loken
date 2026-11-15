@@ -76,6 +76,8 @@ static QUANTIZED_PTX: OnceLock<
 /// concatenated instead. It carried a SECOND copy of all of this until then: two versions of
 /// the same arithmetic that had to agree, and only one of them got rewritten.
 const GGUF_BLOCKS_CUH: &str = include_str!("../../../cuda/moe/gguf.cuh");
+/// The codebooks of the IQ formats, which the exact expert kernels of `requant.cu` read.
+const IQ_TABLES_CUH: &str = include_str!("../../../cuda/moe/iq_tables.cuh");
 /// The mat-vec kernels themselves: the warp-per-row reduction and the entry points.
 const MMVQ_CU: &str = include_str!("../cuda/mmvq_gguf.cu");
 static MMVQ_PTX: OnceLock<std::sync::Mutex<std::collections::HashMap<&'static str, Compiled>>> =

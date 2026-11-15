@@ -77,13 +77,35 @@ pub trait BlockFormat: Sized + Clone + Send + Sync {
     fn dot_scalar(xs: &[Self], ys: &[Self::ActivationBlock]) -> f32;
 }
 
-/// A weight format whose dot against q8_K rows every kernel takes in the same steps: the integer
-/// sums of a 256-value block are exact in any order, one fixed float step folds them into the
+/// A weight format whose dot against activation rows every kernel takes in the same steps: the
+/// integer sums of a 256-value block are exact in any order, fixed float steps fold them into the
 /// block's share, and the shares are added in block order from -0. The card's kernels for the
 /// routed experts of a cached layer take these steps too, so an expert's product is the same
 /// bits on a card and on the host.
-pub trait ExactDot: BlockFormat<ActivationBlock = BlockQ8K> {
-    fn dot_exact(xs: &[Self], ys: &[BlockQ8K]) -> f32;
+///
+/// A k-quant reads q8_K blocks and folds a block in 1 step.
+/// A codebook or 2-bit format reads q8_K32 blocks and folds a block run by run, see
+/// [`exact_block_share`].
+/// `xs` and `ys` cover the same values: a format's blocks divide the 256 values of an activation
+/// block.
+pub trait ExactDot: BlockFormat {
+    /// The activation block the dot reads, 256 values.
+    type Act: BlockFormat;
+    fn dot_exact(xs: &[Self], ys: &[Self::Act]) -> f32;
+}
+
+/// A block's share of an exact dot against a q8_K32 block: the fold from -0, in run order, of
+/// each run's `(ws * s) * da`.
+/// `run(r)` gives run `r`'s float weight scale `ws` and its integer sum `s`.
+/// `da` is the run's activation scale.
+#[inline(always)]
+pub fn exact_block_share(y: &BlockQ8K32, run: impl Fn(usize) -> (f32, i32)) -> f32 {
+    let mut share = -0.0f32;
+    for (r, da) in y.d.iter().enumerate() {
+        let (ws, s) = run(r);
+        share += ws * s as f32 * da.to_f32();
+    }
+    share
 }
 
 /// The eight `(scale, min)` pairs a q4_K or q5_K block packs into twelve bytes.

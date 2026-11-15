@@ -6,6 +6,8 @@
 
 use super::*;
 
+#[cfg(target_arch = "x86_64")]
+mod exact_runs;
 #[cfg(test)]
 mod ggml_parity;
 pub mod iq2_s;

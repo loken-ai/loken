@@ -5948,6 +5948,9 @@ mod tests {
             [GgmlDType::Q6K, GgmlDType::Q6K],
             [GgmlDType::Q2K, GgmlDType::Q2K],
             [GgmlDType::Q2K, GgmlDType::Q4K],
+            [GgmlDType::Iq2S, GgmlDType::Iq2S],
+            [GgmlDType::Iq3Xxs, GgmlDType::Iq3Xxs],
+            [GgmlDType::Iq3S, GgmlDType::Iq3S],
         ]
         .into_iter()
         .flat_map(|f| [(f, 0.0f32), (f, BOUNDED_SWIGLU_LIMIT)])
@@ -6066,6 +6069,280 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The shape of the layers the bits-by-place tests build: experts, experts a row routes
+    /// to, hidden width, expert width.
+    const PLACE_SHAPE: (usize, usize, usize, usize) = (16, 4, 256, 512);
+
+    /// The rows `x` routed to `ids` with weights `w`, through a fresh tier over a layer of
+    /// `formats` whose `slots` slots hold the first experts, the misses split between the
+    /// transit room and the host in `eighths` of eight to the room, through the recorded decode
+    /// when `recorded`. `run` makes the request; the output comes back as bits.
+    #[allow(clippy::too_many_arguments)]
+    fn bits_through_tier(
+        card: &Device,
+        formats: [GgmlDType; 2],
+        slots: usize,
+        eighths: u64,
+        recorded: bool,
+        x: &[f32],
+        ids: &[u32],
+        w: &[f32],
+        run: impl Fn(&Arc<LayerTier>, &MoeWeights, &Tensor, &Tensor, &Tensor) -> Vec<f32>,
+    ) -> Vec<u32> {
+        let host = Device::Cpu;
+        let (experts, used, hidden, ffn) = PLACE_SHAPE;
+        let rows = x.len() / hidden;
+        let mut tiered = layer_of(card, experts, used, hidden, ffn, formats);
+        assert!(
+            serves(&tiered),
+            "{formats:?}: the tier does not serve the layer"
+        );
+        let widest = [
+            tiered.gate_exps_sep.as_ref().unwrap(),
+            tiered.up_exps_sep.as_ref().unwrap(),
+            &tiered.down_exps,
+        ]
+        .map(|t| t.native_qtensor().data().len());
+        let stager = CardStager::new(card, widest, experts).unwrap();
+        // The stacks page-locked: a copy from pageable memory waits for a card that waits on the
+        // worker.
+        let built = LayerTier::new(&tiered, card, slots)
+            .unwrap()
+            .with_stage(&stager, 0, true)
+            .unwrap();
+        for class in 0..2 {
+            built.host_us[class].store((1e3 * eighths as f64).to_bits(), Ordering::Relaxed);
+            built.upload_us[class].store((1e3 * (8 - eighths) as f64).to_bits(), Ordering::Relaxed);
+            built.paced[class].store(TRANSIT_PACE_SAMPLES, Ordering::Relaxed);
+        }
+        tiered.tier = Some(Arc::new(built));
+        let tier = tiered.tier.clone().unwrap();
+        let worker = if recorded {
+            tier.enable_graph(&tiered, 4).unwrap();
+            let w = TierWorker::start(card, vec![("layer".into(), tier.clone())]).unwrap();
+            GRAPH_WITHOUT_CAPTURE.store(true, Ordering::Relaxed);
+            Some(w)
+        } else {
+            None
+        };
+        let xs = Tensor::from_vec(x.to_vec(), (rows, hidden), card).unwrap();
+        let ids_t = Tensor::from_vec(ids.to_vec(), (rows, used), &host)
+            .unwrap()
+            .to_device(card)
+            .unwrap();
+        let w_t = Tensor::from_vec(w.to_vec(), (rows, used), &host)
+            .unwrap()
+            .to_device(card)
+            .unwrap();
+        let got = run(&tier, &tiered, &xs, &ids_t, &w_t);
+        GRAPH_WITHOUT_CAPTURE.store(false, Ordering::Relaxed);
+        let failure = worker.as_ref().and_then(|w| w.failure());
+        assert!(failure.is_none(), "{failure:?}");
+        tier.settle();
+        drop(worker);
+        while Arc::strong_count(&tier) > 2 {
+            std::thread::yield_now();
+        }
+        drop(tiered);
+        drop(tier);
+        got.iter().map(|f| f.to_bits()).collect()
+    }
+
+    /// The output of one tier request on the card, as host floats.
+    fn request_rows(card: &Device, request: Result<Tensor>) -> Vec<f32> {
+        let out = request.unwrap();
+        card.as_cuda_device()
+            .unwrap()
+            .0
+            .stream()
+            .synchronize()
+            .unwrap();
+        out.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+    }
+
+    /// One token whose routed pairs all hit the cache, whose one missing pair runs on the host,
+    /// and whose one missing pair runs in the transit room, eager and recorded: the places where
+    /// the output's bits differ from those of the eager token that hits every pair.
+    fn pair_places_that_move_the_bits(card: &Device, formats: [GgmlDType; 2]) -> Vec<String> {
+        let (experts, used, hidden, _) = PLACE_SHAPE;
+        let ids: Vec<u32> = vec![1, 6, 9, 14];
+        let w: Vec<f32> = (0..used).map(|i| 0.1 + 0.05 * i as f32).collect();
+        let x = values(hidden, 77, 1.0);
+        let token =
+            |tier: &Arc<LayerTier>, moe: &MoeWeights, xs: &Tensor, ids: &Tensor, w: &Tensor| {
+                request_rows(card, tier.decode(moe, xs, ids, w))
+            };
+        // The first experts are in the slots: with all but the last 2 there, expert 14 misses.
+        let cases = [
+            ("every pair hits", experts, 4u64),
+            ("1 pair on the host", experts - 2, 1),
+            ("1 pair in transit", experts - 2, 7),
+        ];
+        let want = bits_through_tier(card, formats, experts, 4, false, &x, &ids, &w, token);
+        let mut moved = Vec::new();
+        for recorded in [false, true] {
+            for (what, slots, eighths) in cases {
+                let got =
+                    bits_through_tier(card, formats, slots, eighths, recorded, &x, &ids, &w, token);
+                if got != want {
+                    moved.push(format!("{what}, recorded {recorded}"));
+                }
+            }
+        }
+        moved
+    }
+
+    /// The 3 rows of a verify through the eager tier and through the recorded one, against the
+    /// same 3 rows as 3 plain recorded steps: the verifies whose bits differ from the steps'.
+    /// The rows route to experts no other row uses, 2 of them missing from the slots.
+    fn verifies_that_differ_from_the_steps(card: &Device, formats: [GgmlDType; 2]) -> Vec<String> {
+        let (experts, used, hidden, _) = PLACE_SHAPE;
+        let rows = 3usize;
+        let ids: Vec<u32> = (0..rows)
+            .flat_map(|r| [1u32, 6, 9, 14].map(|e| (e + r as u32) % experts as u32))
+            .collect();
+        let w: Vec<f32> = (0..rows * used).map(|i| 0.1 + 0.05 * i as f32).collect();
+        let x = values(rows * hidden, 91, 1.0);
+        let slots = experts - 4;
+        let steps =
+            |tier: &Arc<LayerTier>, moe: &MoeWeights, xs: &Tensor, ids: &Tensor, w: &Tensor| {
+                (0..rows)
+                    .flat_map(|r| {
+                        let one = |t: &Tensor| t.narrow(0, r, 1).unwrap().contiguous().unwrap();
+                        request_rows(card, tier.decode(moe, &one(xs), &one(ids), &one(w)))
+                    })
+                    .collect::<Vec<f32>>()
+            };
+        let want = bits_through_tier(card, formats, slots, 4, true, &x, &ids, &w, steps);
+        let mut differ = Vec::new();
+        let eager = bits_through_tier(
+            card,
+            formats,
+            slots,
+            4,
+            false,
+            &x,
+            &ids,
+            &w,
+            |tier, moe, xs, ids, w| request_rows(card, tier.decode_rows(moe, xs, ids, w)),
+        );
+        if eager != want {
+            differ.push("the eager verify".to_string());
+        }
+        let recorded = bits_through_tier(
+            card,
+            formats,
+            slots,
+            4,
+            true,
+            &x,
+            &ids,
+            &w,
+            |tier, moe, xs, ids, w| request_rows(card, tier.decode_rows_graph(moe, xs, ids, w)),
+        );
+        if recorded != want {
+            differ.push("the recorded verify".to_string());
+        }
+        differ
+    }
+
+    /// Expert formats with exact kernels: gate and up, down.
+    const FORMATS_WITH_EXACT_KERNELS: [[GgmlDType; 2]; 4] = [
+        [GgmlDType::Q4K, GgmlDType::Q6K],
+        [GgmlDType::Iq2S, GgmlDType::Q6K],
+        [GgmlDType::Iq3Xxs, GgmlDType::Q6K],
+        [GgmlDType::Iq3S, GgmlDType::Q6K],
+    ];
+
+    /// The expert formats of a served file whose experts have no exact kernels: gate and up, down.
+    const FORMATS_WITHOUT_EXACT_KERNELS: [[GgmlDType; 2]; 3] = [
+        [GgmlDType::Iq2S, GgmlDType::Iq4Nl],
+        [GgmlDType::Iq3Xxs, GgmlDType::Q2_0],
+        [GgmlDType::Iq3S, GgmlDType::Iq4Nl],
+    ];
+
+    /// A routed pair gives the same bits wherever it runs, in the formats with exact kernels:
+    /// a slot, the host or the transit room, eager or recorded.
+    #[test]
+    fn a_pair_gives_the_same_bits_wherever_it_runs_in_formats_with_exact_kernels() {
+        let _pool = LENT_POOL.lock().unwrap_or_else(|e| e.into_inner());
+        let Ok(card) = Device::new_cuda(0) else {
+            eprintln!("skipping: no usable CUDA device");
+            return;
+        };
+        for formats in FORMATS_WITH_EXACT_KERNELS {
+            let moved = pair_places_that_move_the_bits(&card, formats);
+            assert!(
+                moved.is_empty(),
+                "{formats:?}: the bits moved with the place: {moved:?}"
+            );
+        }
+    }
+
+    /// The same in the formats without exact kernels.
+    #[test]
+    #[ignore = "a known gap: a pair in a format without exact kernels gives other bits on the host or in transit than in a slot"]
+    fn a_pair_gives_the_same_bits_wherever_it_runs_in_formats_without_exact_kernels() {
+        let _pool = LENT_POOL.lock().unwrap_or_else(|e| e.into_inner());
+        let Ok(card) = Device::new_cuda(0) else {
+            eprintln!("skipping: no usable CUDA device");
+            return;
+        };
+        let mut failures = Vec::new();
+        for formats in FORMATS_WITHOUT_EXACT_KERNELS {
+            let moved = pair_places_that_move_the_bits(&card, formats);
+            if !moved.is_empty() {
+                failures.push(format!("{formats:?}: {moved:?}"));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "the bits moved with the place:\n{}",
+            failures.join("\n")
+        );
+    }
+
+    /// A verify of 3 rows gives the bits of the same rows as 3 plain recorded steps, in the
+    /// formats with exact kernels.
+    #[test]
+    fn a_verify_gives_the_bits_of_plain_steps_in_formats_with_exact_kernels() {
+        let _pool = LENT_POOL.lock().unwrap_or_else(|e| e.into_inner());
+        let Ok(card) = Device::new_cuda(0) else {
+            eprintln!("skipping: no usable CUDA device");
+            return;
+        };
+        for formats in FORMATS_WITH_EXACT_KERNELS {
+            let differ = verifies_that_differ_from_the_steps(&card, formats);
+            assert!(
+                differ.is_empty(),
+                "{formats:?}: not the bits of the steps: {differ:?}"
+            );
+        }
+    }
+
+    /// The same in the formats without exact kernels.
+    #[test]
+    #[ignore = "a known gap: a verify in a format without exact kernels gives other bits than the plain steps"]
+    fn a_verify_gives_the_bits_of_plain_steps_in_formats_without_exact_kernels() {
+        let _pool = LENT_POOL.lock().unwrap_or_else(|e| e.into_inner());
+        let Ok(card) = Device::new_cuda(0) else {
+            eprintln!("skipping: no usable CUDA device");
+            return;
+        };
+        let mut failures = Vec::new();
+        for formats in FORMATS_WITHOUT_EXACT_KERNELS {
+            let differ = verifies_that_differ_from_the_steps(&card, formats);
+            if !differ.is_empty() {
+                failures.push(format!("{formats:?}: {differ:?}"));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "not the bits of the steps:\n{}",
+            failures.join("\n")
+        );
     }
 }
 

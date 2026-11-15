@@ -100,6 +100,48 @@ impl BlockFormat for BlockIq3Xxs {
     }
 }
 
+impl ExactDot for BlockIq3Xxs {
+    type Act = BlockQ8K32;
+    fn dot_exact(xs: &[Self], ys: &[BlockQ8K32]) -> f32 {
+        #[cfg(target_arch = "x86_64")]
+        if crate::cpu::dispatch_avx2() {
+            // SAFETY: dispatch_avx2 implies the CPU has every feature `dot_grid` enables.
+            return unsafe { super::exact_runs::dot_grid(xs, ys) };
+        }
+        dot_exact_scalar(xs, ys)
+    }
+}
+
+/// [`ExactDot::dot_exact`] one value at a time: the steps the vector kernel is held to.
+pub(super) fn dot_exact_scalar(xs: &[BlockIq3Xxs], ys: &[BlockQ8K32]) -> f32 {
+    let mut total = -0.0f32;
+    for (x, y) in xs.iter().zip(ys) {
+        let ws = x.d.to_f32() * 0.25;
+        total += exact_block_share(y, |r| (ws, exact_run_sum(x, y, r)));
+    }
+    total
+}
+
+/// Run `ib`'s integer sum against a q8_K32 block: the signed grid values against the activations
+/// under the run's odd scale `1 + 2 * (word >> 28)`.
+fn exact_run_sum(x: &BlockIq3Xxs, y: &BlockQ8K32, ib: usize) -> i32 {
+    let (codes, tail) = x.qs.split_at(QK_K / 4);
+    let word = u32::from_le_bytes(tail[4 * ib..4 * ib + 4].try_into().unwrap());
+    let mut dot = 0i32;
+    for l in 0..4 {
+        let signs = KSIGNS_IQ2XS[((word >> (7 * l)) & 127) as usize];
+        let g1 = IQ3XXS_GRID[codes[8 * ib + 2 * l] as usize].to_le_bytes();
+        let g2 = IQ3XXS_GRID[codes[8 * ib + 2 * l + 1] as usize].to_le_bytes();
+        let acts = &y.qs[32 * ib + 8 * l..32 * ib + 8 * l + 8];
+        for j in 0..8 {
+            let mag = if j < 4 { g1[j] } else { g2[j - 4] };
+            let v = mag as i32 * acts[j] as i32;
+            dot += if signs & KMASK_IQ2XS[j] != 0 { -v } else { v };
+        }
+    }
+    (1 + 2 * (word >> 28) as i32) * dot
+}
+
 impl super::iq_read::Runs for BlockIq3Xxs {
     fn run_scale(&self, ib: usize) -> f32 {
         let tail = &self.qs[QK_K / 4 + 4 * ib..QK_K / 4 + 4 * ib + 4];

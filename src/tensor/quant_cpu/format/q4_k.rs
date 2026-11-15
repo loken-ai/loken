@@ -115,6 +115,7 @@ impl BlockFormat for BlockQ4K {
 }
 
 impl ExactDot for BlockQ4K {
+    type Act = BlockQ8K;
     fn dot_exact(xs: &[Self], ys: &[BlockQ8K]) -> f32 {
         #[cfg(target_arch = "x86_64")]
         if crate::cpu::dispatch_avx2() {

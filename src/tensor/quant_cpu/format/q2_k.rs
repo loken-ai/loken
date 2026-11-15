@@ -111,6 +111,7 @@ impl BlockFormat for BlockQ2K {
 
 /// The dot is already taken in these steps by every kernel.
 impl ExactDot for BlockQ2K {
+    type Act = BlockQ8K;
     fn dot_exact(xs: &[Self], ys: &[BlockQ8K]) -> f32 {
         Self::dot(xs, ys)
     }

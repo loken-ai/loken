@@ -102,6 +102,49 @@ impl BlockFormat for BlockIq3S {
     }
 }
 
+impl ExactDot for BlockIq3S {
+    type Act = BlockQ8K32;
+    fn dot_exact(xs: &[Self], ys: &[BlockQ8K32]) -> f32 {
+        #[cfg(target_arch = "x86_64")]
+        if crate::cpu::dispatch_avx2() {
+            // SAFETY: dispatch_avx2 implies the CPU has every feature `dot_iq3_s` enables.
+            return unsafe { super::exact_runs::dot_iq3_s(xs, ys) };
+        }
+        dot_exact_scalar(xs, ys)
+    }
+}
+
+/// [`ExactDot::dot_exact`] one value at a time: the steps the vector kernel is held to.
+pub(super) fn dot_exact_scalar(xs: &[BlockIq3S], ys: &[BlockQ8K32]) -> f32 {
+    let mut total = -0.0f32;
+    for (x, y) in xs.iter().zip(ys) {
+        let ws = x.d.to_f32();
+        total += exact_block_share(y, |r| (ws, exact_run_sum(x, y, r)));
+    }
+    total
+}
+
+/// Run `ib`'s integer sum against a q8_K32 block: the signed grid values against the activations
+/// under the run's odd scale `1 + 2 * nibble`.
+fn exact_run_sum(x: &BlockIq3S, y: &BlockQ8K32, ib: usize) -> i32 {
+    let qh = x.qh[ib] as u32;
+    let mut dot = 0i32;
+    for l in 0..4 {
+        let i1 = x.qs[8 * ib + 2 * l] as usize | (((qh << (8 - 2 * l)) & 256) as usize);
+        let i2 = x.qs[8 * ib + 2 * l + 1] as usize | (((qh << (7 - 2 * l)) & 256) as usize);
+        let (g1, g2) = (IQ3S_GRID[i1].to_le_bytes(), IQ3S_GRID[i2].to_le_bytes());
+        let signs = x.signs[4 * ib + l];
+        let acts = &y.qs[32 * ib + 8 * l..32 * ib + 8 * l + 8];
+        for j in 0..8 {
+            let mag = if j < 4 { g1[j] } else { g2[j - 4] };
+            let v = mag as i32 * acts[j] as i32;
+            dot += if signs & KMASK_IQ2XS[j] != 0 { -v } else { v };
+        }
+    }
+    let nibble = (x.scales[ib / 2] >> (4 * (ib % 2))) & 0x0F;
+    (1 + 2 * nibble as i32) * dot
+}
+
 impl super::iq_read::Runs for BlockIq3S {
     fn run_scale(&self, ib: usize) -> f32 {
         let scale = if ib.is_multiple_of(2) {

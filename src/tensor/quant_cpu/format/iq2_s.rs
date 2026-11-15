@@ -139,6 +139,58 @@ impl BlockFormat for BlockIq2S {
     }
 }
 
+impl ExactDot for BlockIq2S {
+    type Act = BlockQ8K32;
+    fn dot_exact(xs: &[Self], ys: &[BlockQ8K32]) -> f32 {
+        #[cfg(target_arch = "x86_64")]
+        if crate::cpu::dispatch_avx2() {
+            // SAFETY: dispatch_avx2 implies the CPU has every feature `dot_grid` enables.
+            return unsafe { super::exact_runs::dot_grid(xs, ys) };
+        }
+        dot_exact_scalar(xs, ys)
+    }
+}
+
+/// [`ExactDot::dot_exact`] one value at a time: the steps the vector kernel is held to.
+pub(super) fn dot_exact_scalar(xs: &[BlockIq2S], ys: &[BlockQ8K32]) -> f32 {
+    let mut total = -0.0f32;
+    for (x, y) in xs.iter().zip(ys) {
+        let ws = x.d.to_f32() * 0.125;
+        total += exact_block_share(y, |r| (ws, exact_run_sum(x, y, r)));
+    }
+    total
+}
+
+/// Run `ib`'s integer sum against a q8_K32 block: the signed grid values against the activations
+/// under each sixteen values' odd scale `1 + 2 * nibble`.
+fn exact_run_sum(x: &BlockIq2S, y: &BlockQ8K32, ib: usize) -> i32 {
+    let signs = &x.qs[QK_K / 8..];
+    let mut scaled = 0i32;
+    for l in 0..4 {
+        let entry = 4 * ib + l;
+        let code = x.qs[entry] as usize | ((((x.qh[ib] as u32) << (8 - 2 * l)) & 0x300) as usize);
+        let grid = IQ2S_GRID[code].to_le_bytes();
+        let acts = &y.qs[8 * entry..8 * entry + 8];
+        let dot: i32 = (0..8)
+            .map(|j| {
+                let v = grid[j] as i32 * acts[j] as i32;
+                if signs[entry] & KMASK_IQ2XS[j] != 0 {
+                    -v
+                } else {
+                    v
+                }
+            })
+            .sum();
+        let nibble = if l < 2 {
+            x.scales[ib] & 0x0F
+        } else {
+            x.scales[ib] >> 4
+        };
+        scaled += (1 + 2 * nibble as i32) * dot;
+    }
+    scaled
+}
+
 /// The run-by-run dot the grid kernel replaced, kept as its reference.
 #[cfg(all(test, target_arch = "x86_64"))]
 #[target_feature(enable = "avx2,fma,f16c,bmi2")]
