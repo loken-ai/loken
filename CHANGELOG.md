@@ -4,6 +4,8 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-11-15
+
 ### Added
 
 - Speech: speak English and French with Qwen3-TTS from its published checkpoint.
