@@ -266,6 +266,13 @@ impl Errors {
             .find(|(r, _)| *r == route)
             .map_or(f64::INFINITY, |(_, e)| *e)
     }
+
+    /// Orders `a` before `b` when it is nearer the exact product.
+    ///
+    /// Equal errors fall to the order of `Route::ALL`.
+    fn nearer(&self, a: Route, b: Route) -> std::cmp::Ordering {
+        self.of(a).total_cmp(&self.of(b)).then(a.cmp(&b))
+    }
 }
 
 /// The route of one size of rows, and the timings behind it.
@@ -277,8 +284,23 @@ pub(super) struct Decision {
     pub(super) tick: f64,
 }
 
+/// The timing of the fastest admissible route of `errors` in `times`, `None` when none is timed.
+///
+/// Equal medians fall to the route nearest the exact product.
+pub(super) fn fastest<'a>(errors: &Errors, times: &'a [Timing]) -> Option<&'a Timing> {
+    let admissible = errors.admissible();
+    times
+        .iter()
+        .filter(|t| admissible.contains(&t.route))
+        .min_by(|a, b| {
+            a.median
+                .total_cmp(&b.median)
+                .then(errors.nearer(a.route, b.route))
+        })
+}
+
 /// The route `errors` and `times` give: the admissible route nearest the exact product among
-/// those tied with the fastest admissible one.
+/// those tied with the [`fastest`] admissible one.
 ///
 /// A route is [`tied`] with the fastest when its median exceeds the fastest's by no more than the
 /// `noise` of the 2, the clock's `tick` included, or when the fastest does not win the pairs of
@@ -288,7 +310,7 @@ pub(super) struct Decision {
 /// A route without a time counts as the slowest, which only matters when it is alone.
 pub(super) fn choose(errors: &Errors, times: &[Timing], tick: f64) -> Route {
     let time = |r: Route| times.iter().find(|t| t.route == r);
-    let by_error = |a: &Route, b: &Route| errors.of(*a).total_cmp(&errors.of(*b)).then(a.cmp(b));
+    let by_error = |a: &Route, b: &Route| errors.nearer(*a, *b);
     let admissible = errors.admissible();
     if admissible.is_empty() {
         return errors
@@ -298,20 +320,17 @@ pub(super) fn choose(errors: &Errors, times: &[Timing], tick: f64) -> Route {
             .min_by(by_error)
             .unwrap_or(Route::HostSteps);
     }
-    let median = |r: Route| time(r).map_or(f64::INFINITY, |t| t.median);
-    let fastest = admissible
-        .iter()
-        .copied()
-        .min_by(|a, b| median(*a).total_cmp(&median(*b)).then(by_error(a, b)))
-        .unwrap_or(Route::HostSteps);
-    let Some(lead) = time(fastest) else {
-        return fastest;
+    let Some(lead) = fastest(errors, times) else {
+        return admissible
+            .into_iter()
+            .min_by(by_error)
+            .unwrap_or(Route::HostSteps);
     };
     admissible
         .into_iter()
         .filter(|&r| time(r).is_some_and(|t| tied(lead, t, tick)))
         .min_by(by_error)
-        .unwrap_or(fastest)
+        .unwrap_or(lead.route)
 }
 
 /// What a unit has measured.

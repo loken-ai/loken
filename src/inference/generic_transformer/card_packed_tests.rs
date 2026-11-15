@@ -11,8 +11,8 @@
 
 use super::card_mixer_tests::{closeness, distances, no_farther};
 use super::card_packed::{
-    beyond_chance, choose, f32_rounding, pairs_won, route, tied, Choices, Errors, PackedDev, Route,
-    Timing,
+    beyond_chance, choose, f32_rounding, fastest, pairs_won, route, tied, Choices, Decision,
+    Errors, PackedDev, Route, Timing,
 };
 use super::compressed_band::{
     BandCell, BandDims, BandIndexerWeights, CompressedBand, CompressorWeights,
@@ -463,6 +463,44 @@ fn product_of(
     got
 }
 
+/// Asserts that decision `d` follows the rule of the measured choice over `errors`.
+///
+/// The chosen route is admissible, or the nearest when none is.
+/// It is tied with the fastest admissible route.
+/// No route tied with the fastest is nearer the exact product.
+fn follows_the_rule(what: &str, errors: &Errors, d: &Decision) {
+    let admissible = errors.admissible();
+    let error = |r: Route| errors.routes.iter().find(|(x, _)| *x == r).unwrap().1;
+    if admissible.is_empty() {
+        let least = errors
+            .routes
+            .iter()
+            .map(|(_, e)| *e)
+            .fold(f64::INFINITY, f64::min);
+        assert_eq!(
+            error(d.route),
+            least,
+            "{what}: with none admissible the smallest error wins"
+        );
+        return;
+    }
+    assert!(
+        admissible.contains(&d.route),
+        "{what}: {d:?} is not admissible in {errors:?}"
+    );
+    let fastest = fastest(errors, &d.times);
+    let tied = |f: &Timing, t: &Timing| tied(f, t, d.tick);
+    if let (Some(f), Some(m)) = (fastest, d.times.iter().find(|t| t.route == d.route)) {
+        assert!(tied(f, m), "{what}: {d:?} is not tied with {f:?}");
+        for t in &d.times {
+            assert!(
+                !(tied(f, t) && error(t.route) < error(d.route)),
+                "{what}: {t:?} is tied and nearer than {d:?}"
+            );
+        }
+    }
+}
+
 /// The product a block weight measures is admissible by the measured errors, and the fastest
 /// admissible one by the measured times, and it is the product `apply` gives.
 #[test]
@@ -479,41 +517,7 @@ fn the_measured_product_is_admissible_and_is_the_one_applied() {
             let xs = values(rows * inp, 40 + rows as u64, 1.0);
             let got = product_of(&packed, &dev, &xs, rows);
             let (errors, d) = packed.decision(rows).expect("the first product measures");
-            let admissible = errors.admissible();
-            if admissible.is_empty() {
-                let least = errors
-                    .routes
-                    .iter()
-                    .map(|(_, e)| *e)
-                    .fold(f64::INFINITY, f64::min);
-                let mine = errors.routes.iter().find(|(r, _)| *r == d.route).unwrap().1;
-                assert_eq!(
-                    mine, least,
-                    "{name}: with none admissible the smallest error wins"
-                );
-            } else {
-                assert!(
-                    admissible.contains(&d.route),
-                    "{name}, {rows} rows: {d:?} is not admissible in {errors:?}"
-                );
-                // The chosen route is tied with the fastest.
-                // No route tied with the fastest is nearer the exact product.
-                let error = |r: Route| errors.routes.iter().find(|(x, _)| *x == r).unwrap().1;
-                let fastest = d.times.iter().min_by(|a, b| a.median.total_cmp(&b.median));
-                let tied = |f: &Timing, t: &Timing| tied(f, t, d.tick);
-                if let (Some(f), Some(m)) = (fastest, d.times.iter().find(|t| t.route == d.route)) {
-                    assert!(
-                        tied(f, m),
-                        "{name}, {rows} rows: {d:?} is not tied with {f:?}"
-                    );
-                    for t in &d.times {
-                        assert!(
-                            !(tied(f, t) && error(t.route) < error(d.route)),
-                            "{name}, {rows} rows: {t:?} is tied and nearer than {d:?}"
-                        );
-                    }
-                }
-            }
+            follows_the_rule(&format!("{name}, {rows} rows"), &errors, &d);
             route::set(d.route);
             let forced = product_of(&packed, &dev, &xs, rows);
             route::clear();
@@ -812,6 +816,59 @@ fn a_decision_made_twice_with_perturbed_timings_gives_the_same_route() {
         Timing::of(Route::F32, &jittered(&slow, 0.2, 9)),
     ];
     assert_eq!(choose(&e, &times, tick), Route::HostSteps);
+}
+
+/// The timings a card recorded for a Q4_K weight of 1 row, where 2 routes share the least median.
+///
+/// The q8_1 route is nearer than the host's steps, so it leads the ties.
+/// F32 is tied with the host's steps but slower than the q8_1 route beyond chance.
+#[test]
+fn two_routes_of_the_least_median_lead_by_their_error() {
+    let e = Errors {
+        host: 0.003799352285924926,
+        routes: vec![
+            (Route::HostSteps, 0.00379935426820409),
+            (Route::Q81, 0.0037737262411300853),
+            (Route::F32, 0.0005538836322946031),
+        ],
+        rows: 9,
+        terms: 2 * WIDE,
+    };
+    let tick = 0.31999999191612005;
+    let times = vec![
+        Timing::of(
+            Route::HostSteps,
+            &[
+                6.496000103652477,
+                5.824000108987093,
+                13.088000006973743,
+                6.047999951988459,
+            ],
+        ),
+        Timing::of(
+            Route::Q81,
+            &[
+                6.047999951988459,
+                6.111999973654747,
+                6.111999973654747,
+                4.70399996265769,
+            ],
+        ),
+        Timing::of(
+            Route::F32,
+            &[
+                8.895999751985073,
+                7.903999648988247,
+                7.679999805986881,
+                7.903999648988247,
+            ],
+        ),
+    ];
+    assert_eq!(times[0].median, times[1].median);
+    assert!(tied(&times[0], &times[2], tick) && !tied(&times[1], &times[2], tick));
+    let route = choose(&e, &times, tick);
+    assert_eq!(route, Route::Q81);
+    follows_the_rule("q4_k, 1 rows", &e, &Decision { route, times, tick });
 }
 
 /// The weights of one block type and shape share one measurement, and another shape has its own.
