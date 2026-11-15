@@ -10,6 +10,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Fixed
 
+- Serving: weigh a lone request's prompt on both decode paths, whatever its length.
 - Generation: end on every end token a checkpoint declares, whatever its format.
 - Speculation: keep a drafter from taking the card room its target needs.
 - API: leave a stored draft out of the model lists and serve its model when asked for it.

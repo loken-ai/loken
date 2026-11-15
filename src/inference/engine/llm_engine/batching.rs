@@ -47,14 +47,14 @@ pub struct LoneDecode {
     pub prompt_tokens: usize,
     /// Those tokens per second, from the start of the prompt to the first generated token.
     /// A hand-over from a prefill peer is inside that time.
-    /// `None` when the request read less than a prefill chunk: a short read says nothing.
+    /// `None` when the request read no prompt token.
     pub prompt_rate: Option<f64>,
 }
 
 impl LoneDecode {
-    /// The prompt rate of `tokens` read in `secs`, when they make at least a prefill `chunk`.
-    pub fn prompt_rate(tokens: usize, chunk: usize, secs: f64) -> Option<f64> {
-        (tokens >= chunk.max(1) && secs > 0.0 && secs.is_finite()).then(|| tokens as f64 / secs)
+    /// The prompt rate of `tokens` read in `secs`, whatever their number.
+    pub fn prompt_rate(tokens: usize, secs: f64) -> Option<f64> {
+        (tokens > 0 && secs > 0.0 && secs.is_finite()).then(|| tokens as f64 / secs)
     }
 }
 
@@ -67,9 +67,9 @@ pub struct PathRates {
     pub latest_lookup: Option<f64>,
     /// Generated tokens of the latest lone request, on either path.
     pub latest_tokens: usize,
-    /// Prompt rate of the last lone request on the serial path that read a prefill chunk.
+    /// Prompt rate of the last lone request on the serial path that read a prompt token.
     pub serial_prompt_rate: Option<f64>,
-    /// Prompt rate of the last lone request in the worker that read a prefill chunk.
+    /// Prompt rate of the last lone request in the worker that read a prompt token.
     pub batched_prompt_rate: Option<f64>,
     /// Prompt tokens the latest lone request had to read, on either path.
     pub latest_prompt_tokens: usize,
@@ -89,7 +89,9 @@ impl PathRates {
     /// `serial_charge` seconds are added to the serial path.
     ///
     /// A path without a measure is taken first, the worker before the serial path.
-    /// A path without a prompt rate counts no time for the prompt.
+    /// Each path is charged the prompt at its own prompt rate.
+    /// A path without a prompt rate is taken to read at the other path's rate.
+    /// The prompt then weighs the same on both paths and the decode rates decide.
     /// The serial rate is turned into a rate per forward with the share its drafts gave.
     /// That share scales with the prompt lookup share of the latest lone request.
     pub fn choose(&self, serial_charge: f64) -> LonePath {
@@ -100,12 +102,15 @@ impl PathRates {
             return LonePath::Serial;
         };
         let tokens = self.latest_tokens.max(1) as f64;
-        let prompt_s =
-            |rate: Option<f64>| rate.map_or(0.0, |r| self.latest_prompt_tokens as f64 / r);
-        let serial_s = prompt_s(self.serial_prompt_rate)
-            + tokens / self.expected_serial_rate(&serial)
-            + serial_charge;
-        let batched_s = prompt_s(self.batched_prompt_rate) + tokens / batched.rate;
+        let prompt = self.latest_prompt_tokens as f64;
+        let (serial_prompt_s, batched_prompt_s) =
+            match (self.serial_prompt_rate, self.batched_prompt_rate) {
+                (Some(s), Some(b)) => (prompt / s, prompt / b),
+                _ => (0.0, 0.0),
+            };
+        let serial_s =
+            serial_prompt_s + tokens / self.expected_serial_rate(&serial) + serial_charge;
+        let batched_s = batched_prompt_s + tokens / batched.rate;
         if serial_s < batched_s {
             LonePath::Serial
         } else {
@@ -441,7 +446,7 @@ mod tests {
         s.record(LonePath::Batched, request(120.0, 8000, 2000.0));
         s.record(LonePath::Serial, request(100.0, 8000, 20000.0));
         assert_eq!(s.arrive(0, true), Switch::ToSerial);
-        // A short prompt reads no chunk: it keeps the rates and moves only the size.
+        // A request that read no prompt token keeps the rates and moves only the size.
         s.record(
             LonePath::Serial,
             LoneDecode {
@@ -452,8 +457,8 @@ mod tests {
         assert_eq!(s.arrive(0, false), Switch::ToBatched);
     }
 
-    /// Equal prompt rates give the choice of the decode rates alone, and so does a path whose
-    /// prompt rate is not measured yet.
+    /// Equal prompt rates give the choice of the decode rates alone, and so do prompt rates
+    /// known on one path only.
     #[test]
     fn equal_prompt_rates_leave_the_decode_choice() {
         for (serial, batched) in [(180.0, 100.0), (90.0, 100.0)] {
@@ -463,28 +468,79 @@ mod tests {
             let mut by_request = BatchingSignal::default();
             by_request.record(LonePath::Batched, request(batched, 4000, 3000.0));
             by_request.record(LonePath::Serial, request(serial, 4000, 3000.0));
-            let mut unmeasured = BatchingSignal::default();
-            unmeasured.record(LonePath::Batched, decode(batched, 0.0, 0.0));
-            unmeasured.record(LonePath::Serial, request(serial, 4000, 3000.0));
+            let mut one_side = BatchingSignal::default();
+            one_side.record(LonePath::Batched, decode(batched, 0.0, 0.0));
+            one_side.record(LonePath::Serial, request(serial, 4000, 3000.0));
+            let decoded = by_decode.rates.choose(0.0);
             assert_eq!(
                 by_request.rates.choose(0.0),
-                by_decode.rates.choose(0.0),
+                decoded,
                 "{serial} against {batched}"
             );
             assert_eq!(
-                unmeasured.rates.choose(0.0),
-                LonePath::Batched,
-                "a path that counts no prompt time is the sooner"
+                one_side.rates.choose(0.0),
+                decoded,
+                "{serial} against {batched}"
             );
         }
     }
 
-    /// Only a read of at least a chunk gives a prompt rate.
+    /// A read of any size gives a prompt rate, and a read of nothing gives none.
     #[test]
-    fn a_short_read_gives_no_prompt_rate() {
-        assert_eq!(LoneDecode::prompt_rate(100, 512, 1.0), None);
-        assert_eq!(LoneDecode::prompt_rate(1024, 512, 2.0), Some(512.0));
-        assert_eq!(LoneDecode::prompt_rate(1024, 512, 0.0), None);
+    fn any_read_gives_a_prompt_rate() {
+        assert_eq!(LoneDecode::prompt_rate(100, 0.5), Some(200.0));
+        assert_eq!(LoneDecode::prompt_rate(1024, 2.0), Some(512.0));
+        assert_eq!(LoneDecode::prompt_rate(1024, 0.0), None);
+        assert_eq!(LoneDecode::prompt_rate(0, 0.1), None);
+    }
+
+    /// A worker that decodes faster and a serial path that reads the long prompt slower.
+    fn long_prompt(serial_prompt_rate: Option<f64>, batched_prompt_rate: Option<f64>) -> PathRates {
+        let with = |rate: f64, prompt_rate: Option<f64>| LoneDecode {
+            tokens: 128,
+            prompt_tokens: 1008,
+            prompt_rate,
+            ..decode(rate, 0.0, 0.0)
+        };
+        PathRates {
+            serial: Some(with(122.0, serial_prompt_rate)),
+            batched: Some(with(134.0, batched_prompt_rate)),
+            latest_lookup: Some(0.0),
+            latest_tokens: 128,
+            serial_prompt_rate,
+            batched_prompt_rate,
+            latest_prompt_tokens: 1008,
+        }
+    }
+
+    /// The worker's prompt rate alone is not charged to the worker alone: the decode rates
+    /// decide, and the worker decodes faster.
+    #[test]
+    fn a_long_prompt_with_the_worker_prompt_rate_alone_goes_by_the_decode() {
+        assert_eq!(
+            long_prompt(None, Some(1008.0 / 0.18)).choose(0.0),
+            LonePath::Batched
+        );
+    }
+
+    /// With both prompt rates the worker reads and decodes faster, and wins.
+    #[test]
+    fn a_long_prompt_with_both_prompt_rates_counts_both() {
+        assert_eq!(
+            long_prompt(Some(1008.0 / 0.212), Some(1008.0 / 0.18)).choose(0.0),
+            LonePath::Batched
+        );
+        // A serial path that reads much faster wins the same prompt.
+        assert_eq!(
+            long_prompt(Some(1008.0 / 0.01), Some(1008.0 / 0.18)).choose(0.0),
+            LonePath::Serial
+        );
+    }
+
+    /// Without any prompt rate the decode rates decide.
+    #[test]
+    fn a_long_prompt_without_prompt_rates_goes_by_the_decode() {
+        assert_eq!(long_prompt(None, None).choose(0.0), LonePath::Batched);
     }
 
     #[test]

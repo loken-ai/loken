@@ -486,10 +486,8 @@ impl LlmEngine {
                         drafted: 0.0,
                         lookup: super::batching::lookup_share(&prompt_tokens, &gen),
                         prompt_tokens: prompt_read,
-                        // The worker reads a prompt a chunk of this size at a time.
                         prompt_rate: super::batching::LoneDecode::prompt_rate(
                             prompt_read,
-                            super::PREFILL_CHUNK_TOKENS,
                             prompt_s,
                         ),
                     };
@@ -711,9 +709,8 @@ impl LlmEngine {
             let mut reused_prompt_tokens: usize;
             // A prompt a prefill peer handed over, recorded once the local read after it ends.
             let mut landed: Option<super::handover::Landed> = None;
-            // The prompt tokens the request had to read when it arrived, and the model's
-            // prefill chunk.
-            let mut arrival_read = (0usize, usize::MAX);
+            // The prompt tokens the request had to read when it arrived.
+            let mut arrival_read = 0usize;
             // What the decode takes of a card beyond the request's start: the snapshots
             // leave that much room at the next request.
             let decode_free_start: Option<u64>;
@@ -1406,9 +1403,8 @@ impl LlmEngine {
                             true,
                         ),
                     }
-                    let at_arrival =
+                    arrival_read =
                         landed.map_or(read, |l| prompt_tokens.len().saturating_sub(l.held));
-                    arrival_read = (at_arrival, chunk);
                 }
                 // The first compute window is NOT opened here. Sampling the first token and
                 // reaching the loop happen before that token reaches the client, so charging
@@ -3649,10 +3645,9 @@ impl LlmEngine {
                                 &prompt_tokens,
                                 &generated_token_ids,
                             ),
-                            prompt_tokens: arrival_read.0,
+                            prompt_tokens: arrival_read,
                             prompt_rate: super::batching::LoneDecode::prompt_rate(
-                                arrival_read.0,
-                                arrival_read.1,
+                                arrival_read,
                                 prompt_s,
                             ),
                         };
