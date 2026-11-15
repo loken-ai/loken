@@ -33,13 +33,11 @@ fn cache() -> &'static Mutex<HashMap<String, Entry>> {
 ///
 /// A share of the machine rather than a figure. It was 8 GiB flat, which is half of a 16 GB
 /// host and a rounding error on a 256 GB one: the same number cannot mean "comfortable" on
-/// both. An eighth of total RAM, and no floor or cap - those were two more hand-written sizes,
+/// both. An eighth of the memory the process may take, its control group included, and no
+/// floor or cap - those were two more hand-written sizes,
 /// and a floor at 2 GiB reserves an eighth of an 8 GB machine twice over.
 fn insert_headroom() -> u64 {
-    use sysinfo::System;
-    let mut sys = System::new();
-    sys.refresh_memory();
-    sys.total_memory() / 8
+    crate::inference::place::layer_executor::host_burst_headroom_bytes()
 }
 
 fn file_mtime(path: &std::path::Path) -> Option<SystemTime> {
@@ -47,10 +45,7 @@ fn file_mtime(path: &std::path::Path) -> Option<SystemTime> {
 }
 
 fn available_ram() -> u64 {
-    use sysinfo::System;
-    let mut sys = System::new();
-    sys.refresh_memory();
-    sys.available_memory()
+    crate::inference::place::layer_executor::available_host_ram_bytes()
 }
 
 /// `QVarBuilder::from_gguf` behind the host cache. Same result, but a repeat load of an

@@ -1595,14 +1595,10 @@ fn fill_slab(slab: &'static Slab, spans: Vec<(usize, usize)>, readers: usize) ->
         use std::os::unix::fs::FileExt;
         // PLACEMENT-EXEMPT: sizes a host staging area, not a device placement. What the kernel
         // calls available counts the page cache it can give back, which free pages do not.
-        let avail = std::fs::read_to_string("/proc/meminfo")
-            .ok()
-            .and_then(|m| {
-                m.lines()
-                    .find_map(|l| l.strip_prefix("MemAvailable:"))
-                    .and_then(|v| v.split_whitespace().next()?.parse::<usize>().ok())
-            })
-            .map_or(0, |kb| kb * 1024);
+        // The memory this process may take, its control group included.
+        let avail =
+            usize::try_from(crate::inference::place::layer_executor::available_host_ram_bytes())
+                .unwrap_or(usize::MAX);
         let budget = avail / 4;
         // Each weight is read with direct I/O, around the page-cache, when its file allows it:
         // the read then starts and ends on a page, which the slab leaves room for, and the

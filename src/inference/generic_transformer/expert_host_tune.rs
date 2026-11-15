@@ -135,11 +135,9 @@ fn stall_total_us() -> Option<u64> {
         .ok()
 }
 
-/// Bytes of memory the host can still give, as the system reports it.
+/// Bytes of memory the host can still give this process, its control group included.
 pub(crate) fn available_bytes() -> u64 {
-    let mut sys = sysinfo::System::new();
-    sys.refresh_memory();
-    sys.available_memory()
+    crate::inference::place::layer_executor::available_host_ram_bytes()
 }
 
 #[cfg(test)]

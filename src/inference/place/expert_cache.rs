@@ -20,37 +20,9 @@ pub fn free_now(dev: &Device) -> u64 {
 /// quarters of what the kernel still has to give, taking the cap of the process's control group
 /// into account. Locked pages cannot be reclaimed, so the quarter left is what everything else
 /// the process does draws on.
+/// The page cache the group holds counts as free: the kernel gives it back.
 pub fn host_pin_budget() -> u64 {
-    let kb = |text: &str, key: &str| -> Option<u64> {
-        text.lines()
-            .find_map(|l| l.strip_prefix(key))
-            .and_then(|v| v.split_whitespace().next()?.parse::<u64>().ok())
-            .map(|v| v * 1024)
-    };
-    let available = std::fs::read_to_string("/proc/meminfo")
-        .ok()
-        .and_then(|m| kb(&m, "MemAvailable:"))
-        .unwrap_or(0);
-    // The control group this process runs in, when it has a cap.
-    let cgroup = std::fs::read_to_string("/proc/self/cgroup")
-        .ok()
-        .and_then(|c| {
-            c.lines()
-                .find_map(|l| l.strip_prefix("0::").map(str::to_string))
-        })
-        .and_then(|path| {
-            let dir = format!("/sys/fs/cgroup{}", path.trim());
-            let read = |f: &str| {
-                std::fs::read_to_string(format!("{dir}/{f}"))
-                    .ok()?
-                    .trim()
-                    .parse::<u64>()
-                    .ok()
-            };
-            Some(read("memory.max")?.saturating_sub(read("memory.current")?))
-        })
-        .unwrap_or(u64::MAX);
-    available.min(cgroup) / 4 * 3
+    super::layer_executor::available_host_ram_bytes() / 4 * 3
 }
 
 /// Experts each of `layers` cached layers may hold: the budget the plan gave the card, less what

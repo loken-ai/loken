@@ -69,11 +69,10 @@ pub fn rows_to_keep(
     let bytes_all = tokens
         .saturating_mul(per_token)
         .saturating_mul(std::mem::size_of::<f32>());
-    let budget = {
-        let mut sys = sysinfo::System::new();
-        sys.refresh_memory();
-        sys.available_memory() as usize / 2
-    };
+    let budget =
+        usize::try_from(crate::inference::place::layer_executor::available_host_ram_bytes())
+            .unwrap_or(usize::MAX)
+            / 2;
     if bytes_all <= budget {
         return usize::MAX;
     }

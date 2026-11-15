@@ -519,9 +519,8 @@ impl MappedGguf {
 /// not each file's: every part of a large split model can fit on its own.
 pub fn advise_if_it_fits(maps: &[&memmap2::Mmap]) {
     let total: u64 = maps.iter().map(|m| m.len() as u64).sum();
-    let mut sys = sysinfo::System::new();
-    sys.refresh_memory();
-    if total <= sys.available_memory() {
+    // The memory this process may take, its control group included.
+    if total <= crate::inference::place::layer_executor::available_host_ram_bytes() {
         for m in maps {
             let _ = m.advise(memmap2::Advice::WillNeed);
         }

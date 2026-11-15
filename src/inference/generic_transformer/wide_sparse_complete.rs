@@ -292,9 +292,7 @@ fn range(src: &MappedGguf, name: &str) -> Result<(usize, usize)> {
 
 /// The bytes written between 2 page-cache releases: a sixteenth of the memory available now.
 fn release_every() -> u64 {
-    let mut sys = sysinfo::System::new();
-    sys.refresh_memory();
-    (sys.available_memory() / 16).max(1)
+    (crate::inference::place::layer_executor::available_host_ram_bytes() / 16).max(1)
 }
 
 /// Writes `out`: every tensor and key of `src`, carried byte for byte and laid out by `layout`.
