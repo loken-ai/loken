@@ -60,7 +60,7 @@ Unpacked over the light archive, the second one runs on a machine that has only 
 
 | Variable | Effect |
 |---|---|
-| `FEATURES` | The cargo features. Default: the crate's defaults, plus `rocm` when `hipcc` is found |
+| `FEATURES` | The cargo features. Default: the crate's defaults and `vulkan`, plus `rocm` when `hipcc` is found |
 | `CPU_BASELINE` | The `-C target-cpu` of the CPU kernels. Default `x86-64-v3` |
 | `MAX_GLIBC` | The highest glibc symbol version the binaries may need. Default 2.34 |
 | `DIST` | The output directory. Default `dist` |
@@ -122,6 +122,8 @@ A driver that does not answer when asked what it has counts as no device.
 A card that CUDA or ROCm drives is told by its PCI address and is not offered for OpenCL layers.
 A card is theirs only while `--backends` keeps their runtime.
 Devices of Mesa's OpenCL platform are not offered for layers.
+The layers need atomics at device scope.
+They are built in OpenCL C 3.0 where the device declares those features, else in OpenCL C 2.0.
 The layers of a language model and the blocks of Z-Image run through Intel's OpenCL runtime on an Intel GPU, see [Status](STATUS.md#opencl).
 A GPU that shares the host's memory offers what the host can spare at load.
 `/api/distributed/devices` reports that figure as the device's free memory.

@@ -12,6 +12,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 - Serving: log and report every runtime and media feature the build has.
 - OpenCL: offer a card when the backends leave its native runtime out.
 - Vulkan: offer a GPU when the backends leave its native runtime out.
+- OpenCL: build the layers in the OpenCL C version the device declares.
 
 ## [0.5.0] - 2026-11-15
 

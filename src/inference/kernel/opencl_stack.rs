@@ -21,7 +21,29 @@ use opencl3::{
 use std::collections::HashMap;
 use std::ptr::null_mut;
 
+use super::opencl_probe::{device_language_option, LanguageNeed};
 use crate::tensor::quantized::GgmlDType;
+
+/// Build `source` for the device of `ctx` in the OpenCL C that `need` asks of it, with `options`
+/// after the language option.
+///
+/// The error names the device and carries the compiler's build log.
+fn build_for(ctx: &Context, source: &str, need: LanguageNeed, options: &str) -> Result<Program> {
+    let dev = Device::new(
+        *ctx.devices()
+            .first()
+            .ok_or_else(|| anyhow!("an OpenCL context without a device"))?,
+    );
+    let name = dev.name().unwrap_or_default();
+    let Some(language) = device_language_option(&dev, need) else {
+        bail!(
+            "{name} declares neither OpenCL C 2.0 nor the OpenCL C 3.0 features of device-scope \
+             atomics"
+        );
+    };
+    Program::create_and_build_from_source(ctx, source, &format!("{language} {options}"))
+        .map_err(|log| anyhow!("{name} ({language}): {log}"))
+}
 
 /// Rows a prompt chunk holds: the row count the wide kernels are built for.
 pub const CHUNK: usize = 32;
@@ -221,12 +243,16 @@ impl Kernels {
         row_block: usize,
     ) -> Result<Self> {
         let defines = format!("-DR={rows} -DSLICES={slices} -DRB={row_block}");
-        // OpenCL C 3.0 exposes the integer dot product where the device has it; a compiler that
-        // does not know the option builds the same source with the scalar fallback.
-        let program =
-            Program::create_and_build_from_source(ctx, source, &format!("-cl-std=CL3.0 {defines}"))
-                .or_else(|_| Program::create_and_build_from_source(ctx, source, &defines))
-                .map_err(|e| anyhow!("OpenCL program build error: {e}"))?;
+        // OpenCL C 3.0 exposes the integer dot product where the device has it.
+        // A build that fails in it is built again in the compiler's default, with the scalar
+        // fallback.
+        let program = build_for(ctx, source, LanguageNeed::Default, &defines)
+            .or_else(|e| {
+                tracing::warn!("OpenCL program built again in the default language: {e:#}");
+                Program::create_and_build_from_source(ctx, source, &defines)
+                    .map_err(|log| anyhow!("{log}"))
+            })
+            .map_err(|e| anyhow!("OpenCL program build error: {e:#}"))?;
         let mut by_name = HashMap::new();
         for name in KERNELS {
             by_name.insert(name, Kernel::create(&program, name)?);
@@ -398,15 +424,15 @@ impl Mega {
         // Local memory holds the codes of the hidden state or of the attention output whole.
         // The FFN activation goes through it in pieces of that size.
         let held = spec.hidden.max(q_dim).div_ceil(256) * 256;
-        let program = Program::create_and_build_from_source(
+        let program = build_for(
             ctx,
             &source,
+            LanguageNeed::DeviceAtomics,
             &format!(
-                "-cl-std=CL3.0 -DMEGA -DR=1 -DSLICES={SLICES} -DRB=1 -DMAXP={held} -DMAXH={}",
+                "-DMEGA -DR=1 -DSLICES={SLICES} -DRB=1 -DMAXP={held} -DMAXH={}",
                 spec.hidden
             ),
-        )
-        .map_err(|e| anyhow!("{e}"))?;
+        )?;
         Ok(Self {
             layer: Kernel::create(&program, "layer_step")?,
             head: Kernel::create(&program, "head_step")?,
@@ -1713,16 +1739,17 @@ fn barrier_probe_holds(device: cl_device_id) -> bool {
     {
         return held;
     }
+    let name = Device::new(device).name().unwrap_or_default();
     let held = match probe_grid_barrier(device) {
         Ok(held) => held,
         Err(e) => {
-            tracing::warn!("an OpenCL device cannot run the barrier probe: {e:#}");
+            tracing::warn!("OpenCL device {name} cannot run the barrier probe: {e:#}");
             false
         }
     };
     if !held {
         tracing::warn!(
-            "an OpenCL device fails the device-wide barrier the layers rely on; it is not used for layers"
+            "OpenCL device {name} fails the device-wide barrier the layers rely on; it is not used for layers"
         );
     }
     known
@@ -1737,8 +1764,7 @@ fn probe_grid_barrier(device: cl_device_id) -> Result<bool> {
     let ctx = Context::from_device(&dev)?;
     #[allow(deprecated)]
     let queue = CommandQueue::create_default(&ctx, 0)?;
-    let program = Program::create_and_build_from_source(&ctx, GRID_BARRIER_SRC, "-cl-std=CL3.0")
-        .map_err(|e| anyhow!("{e}"))?;
+    let program = build_for(&ctx, GRID_BARRIER_SRC, LanguageNeed::DeviceAtomics, "")?;
     let kernel = Kernel::create(&program, "sync_test")?;
     for (nwg, wgs) in [(32usize, 64usize), (64, 256)] {
         let (mut ctr, data, mut fail) = (
@@ -2399,10 +2425,12 @@ mod tests {
             #[allow(deprecated)]
             let queue = CommandQueue::create_default(&ctx, 0).unwrap();
             let src = GRID_BARRIER_SRC;
-            let Ok(program) = Program::create_and_build_from_source(&ctx, src, "-cl-std=CL3.0")
-            else {
-                println!("device {i}: no device-scope atomics");
-                continue;
+            let program = match build_for(&ctx, src, LanguageNeed::DeviceAtomics, "") {
+                Ok(program) => program,
+                Err(e) => {
+                    println!("device {i}: {e:#}");
+                    continue;
+                }
             };
             let kernel = Kernel::create(&program, "sync_test").unwrap();
             for (nwg, wgs) in [

@@ -128,6 +128,106 @@ pub fn opencl_address(device: &opencl3::device::Device) -> Option<PciAddress> {
     None
 }
 
+/// What a program asks of the OpenCL C a device compiles it in.
+#[cfg(any(feature = "opencl", test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LanguageNeed {
+    /// Nothing beyond the compiler's default.
+    /// OpenCL C 3.0 is taken where the device declares it.
+    Default,
+    /// Atomics of acquire and release order at device scope.
+    DeviceAtomics,
+}
+
+/// The OpenCL C 3.0 features that atomics of acquire and release order at device scope need.
+#[cfg(any(feature = "opencl", test))]
+const DEVICE_ATOMIC_FEATURES: [&str; 2] = [
+    "__opencl_c_atomic_order_acq_rel",
+    "__opencl_c_atomic_scope_device",
+];
+
+/// The `(major, minor)` of an `OpenCL C <major>.<minor>` string, as a device reports it.
+#[cfg(any(feature = "opencl", test))]
+pub fn c_version(text: &str) -> Option<(u32, u32)> {
+    let number = text
+        .trim()
+        .strip_prefix("OpenCL C ")?
+        .split_whitespace()
+        .next()?;
+    let (major, minor) = number.split_once('.')?;
+    Some((major.parse().ok()?, minor.parse().ok()?))
+}
+
+/// The build option that selects the OpenCL C a program asking `need` compiles in.
+///
+/// `c_version` is the device's `CL_DEVICE_OPENCL_C_VERSION`.
+/// `all_versions` are the versions of `CL_DEVICE_OPENCL_C_ALL_VERSIONS`, empty before OpenCL 3.0.
+/// `features` are the names of `CL_DEVICE_OPENCL_C_FEATURES`, empty before OpenCL 3.0.
+///
+/// OpenCL C 3.0 is taken when the device declares it and every feature `need` asks.
+/// For device atomics OpenCL C 2.0 is taken otherwise, where they are core.
+/// An empty option keeps the compiler's default.
+/// `None` when the device declares no OpenCL C that gives `need`.
+#[cfg(any(feature = "opencl", test))]
+pub fn language_option(
+    c_version_text: &str,
+    all_versions: &[(u32, u32)],
+    features: &[String],
+    need: LanguageNeed,
+) -> Option<&'static str> {
+    let declared: Vec<(u32, u32)> = all_versions
+        .iter()
+        .copied()
+        .chain(c_version(c_version_text))
+        .collect();
+    let has_major = |major: u32| declared.iter().any(|v| v.0 == major);
+    let has_feature = |f: &str| features.iter().any(|d| d == f);
+    match need {
+        LanguageNeed::Default if has_major(3) => Some("-cl-std=CL3.0"),
+        LanguageNeed::Default => Some(""),
+        LanguageNeed::DeviceAtomics
+            if has_major(3) && DEVICE_ATOMIC_FEATURES.iter().all(|f| has_feature(f)) =>
+        {
+            Some("-cl-std=CL3.0")
+        }
+        LanguageNeed::DeviceAtomics if has_major(2) => Some("-cl-std=CL2.0"),
+        LanguageNeed::DeviceAtomics => None,
+    }
+}
+
+/// The build option [`language_option`] gives for `need` on `device`, from what the device
+/// reports.
+/// A query the device does not answer counts as nothing declared.
+#[cfg(feature = "opencl")]
+pub fn device_language_option(
+    device: &opencl3::device::Device,
+    need: LanguageNeed,
+) -> Option<&'static str> {
+    use opencl3::device::{
+        CL_VERSION_MAJOR_MASK, CL_VERSION_MINOR_BITS, CL_VERSION_MINOR_MASK, CL_VERSION_PATCH_BITS,
+    };
+    let major =
+        |v: u32| (v >> (CL_VERSION_MINOR_BITS + CL_VERSION_PATCH_BITS)) & CL_VERSION_MAJOR_MASK;
+    let minor = |v: u32| (v >> CL_VERSION_PATCH_BITS) & CL_VERSION_MINOR_MASK;
+    let all: Vec<(u32, u32)> = device
+        .opencl_c_all_versions()
+        .unwrap_or_default()
+        .iter()
+        .map(|v| (major(v.version), minor(v.version)))
+        .collect();
+    let features: Vec<String> = device
+        .opencl_c_features()
+        .unwrap_or_default()
+        .iter()
+        .map(|f| {
+            let end = f.name.iter().position(|&c| c == 0).unwrap_or(f.name.len());
+            String::from_utf8_lossy(&f.name[..end]).into_owned()
+        })
+        .collect();
+    let version = device.opencl_c_version().unwrap_or_default();
+    language_option(&version, &all, &features, need)
+}
+
 /// The cards a native runtime claims: those `read` gives when the runtime is `allowed`, none
 /// otherwise.
 /// `read` runs only for an allowed runtime.
@@ -271,6 +371,64 @@ mod tests {
         assert!(!at("0001:05:00.0").same_slot(&a));
         assert!(!at("0000:06:00.0").same_slot(&a));
         assert!(PciAddress::parse("card").is_none());
+    }
+
+    use super::{c_version, language_option, LanguageNeed};
+
+    fn names(features: &[&str]) -> Vec<String> {
+        features.iter().map(|f| f.to_string()).collect()
+    }
+
+    /// The version a device reports reads with or without the vendor's suffix.
+    #[test]
+    fn a_c_version_reads_as_reported() {
+        assert_eq!(c_version("OpenCL C 2.0 "), Some((2, 0)));
+        assert_eq!(c_version("OpenCL C 1.2 AMD-APP"), Some((1, 2)));
+        assert_eq!(c_version("OpenCL C 3.0"), Some((3, 0)));
+        assert_eq!(c_version("OpenCL 3.0"), None);
+    }
+
+    /// Device atomics take OpenCL C 3.0 where its features are declared, 2.0 where only 2.0 is,
+    /// and no build where neither is.
+    #[test]
+    fn device_atomics_take_the_language_that_declares_them() {
+        let atomics = LanguageNeed::DeviceAtomics;
+        let both = names(&super::DEVICE_ATOMIC_FEATURES);
+        // A device of OpenCL 2.0 lists no versions and no features.
+        assert_eq!(
+            language_option("OpenCL C 2.0 ", &[], &[], atomics),
+            Some("-cl-std=CL2.0")
+        );
+        // A device of OpenCL 3.0 names 1.2 as its version and lists 3.0 with the features.
+        let three = [(1, 0), (1, 1), (1, 2), (3, 0)];
+        assert_eq!(
+            language_option("OpenCL C 1.2 ", &three, &both, atomics),
+            Some("-cl-std=CL3.0")
+        );
+        let one = names(&super::DEVICE_ATOMIC_FEATURES[..1]);
+        assert_eq!(
+            language_option("OpenCL C 1.2 ", &three, &one, atomics),
+            None
+        );
+        let two_and_three = [(1, 2), (2, 0), (3, 0)];
+        assert_eq!(
+            language_option("OpenCL C 1.2 ", &two_and_three, &one, atomics),
+            Some("-cl-std=CL2.0")
+        );
+        assert_eq!(language_option("OpenCL C 1.2 ", &[], &[], atomics), None);
+    }
+
+    /// A program that asks nothing takes OpenCL C 3.0 where the device declares it, and the
+    /// compiler's default elsewhere.
+    #[test]
+    fn a_plain_program_takes_3_0_only_where_declared() {
+        let plain = LanguageNeed::Default;
+        assert_eq!(
+            language_option("OpenCL C 1.2 ", &[(1, 2), (3, 0)], &[], plain),
+            Some("-cl-std=CL3.0")
+        );
+        assert_eq!(language_option("OpenCL C 2.0 ", &[], &[], plain), Some(""));
+        assert_eq!(language_option("", &[], &[], plain), Some(""));
     }
 
     /// A card whose native runtime is not allowed is claimed by none: OpenCL is offered it.
