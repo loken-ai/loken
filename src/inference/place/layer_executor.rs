@@ -248,9 +248,9 @@ impl HeteroPlan {
     pub fn calculate(
         total_layers: usize,
         model_size_bytes: u64,
-        cuda_devices: &[(usize, u64)], // (index, free_bytes)
-        wgpu_devices: &[(usize, u64)], // (index, free_bytes) - approximate
-        dequant_expansion_wgpu: f64,   // wgpu uses dequantized (3.5x for Q4->F16)
+        cuda_devices: &[(usize, u64)],      // (index, free_bytes)
+        wgpu_devices: &[(DeviceKind, u64)], // (device, free_bytes) - approximate
+        dequant_expansion_wgpu: f64,        // wgpu uses dequantized (3.5x for Q4->F16)
     ) -> Self {
         Self::calculate_with_kv(
             total_layers,
@@ -276,7 +276,7 @@ impl HeteroPlan {
         total_layers: usize,
         model_size_bytes: u64,
         cuda_devices: &[(usize, u64)],
-        wgpu_devices: &[(usize, u64)],
+        wgpu_devices: &[(DeviceKind, u64)],
         dequant_expansion_wgpu: f64,
         kv_bytes_per_layer: u64,
     ) -> Self {
@@ -603,7 +603,7 @@ impl HeteroPlan {
         total_layers: usize,
         model_size_bytes: u64,
         cuda_devices: &[(usize, u64)],
-        wgpu_devices: &[(usize, u64)],
+        wgpu_devices: &[(DeviceKind, u64)],
         dequant_expansion_wgpu: f64,
         kv_bytes_per_layer: u64,
         gpu_runtime_reserve_bytes: u64,
@@ -630,17 +630,16 @@ impl HeteroPlan {
             devices.push((DeviceKind::Cuda(*idx), budget, *free_mem));
         }
 
-        // OpenCL devices use dequantized weights (expansion = ~3.5)
-        for (idx, free_mem) in wgpu_devices {
+        // The Vulkan and OpenCL devices, each named by its own backend.
+        for (kind, free_mem) in wgpu_devices {
             // Effective memory reduced by dequant expansion
             let effective_mem = (*free_mem as f64 / dequant_expansion_wgpu) as u64;
             info!(
-                "  OpenCL device {}: {} GB (effective {} GB after dequant expansion)",
-                idx,
+                "  {kind}: {} GB (effective {} GB after dequant expansion)",
                 *free_mem as f64 / 1e9,
                 effective_mem as f64 / 1e9
             );
-            devices.push((DeviceKind::OpenCL(*idx), effective_mem, effective_mem));
+            devices.push((*kind, effective_mem, effective_mem));
         }
 
         // Sort by performance priority: CUDA first (fastest class), then OpenCL (slower).
@@ -682,7 +681,7 @@ impl HeteroPlan {
         let single_gpu_required = model_size_bytes.saturating_add(total_kv_bytes);
         if let Some(&(best_kind, best_mem, _)) = devices.first() {
             if single_gpu_required > 0 && best_mem >= single_gpu_required {
-                info!("  Pack-first: {:?} has {:.1} GB budget >= model {:.1} GB, placing all {} layers on one device",
+                info!("  Pack-first: {} has {:.1} GB budget >= model {:.1} GB, placing all {} layers on one device",
                     best_kind, best_mem as f64 / 1e9,
                     model_size_bytes as f64 / 1e9, total_layers);
                 let segments = vec![HeteroSegment {

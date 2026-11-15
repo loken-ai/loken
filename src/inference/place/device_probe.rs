@@ -70,6 +70,28 @@ fn pcie_lane_gbs(generation: u32) -> f64 {
 /// generic LLM engine and ACE-Step consume it. Returns empty (-> CPU placement)
 /// when NVML init fails - never panics.
 ///
+/// Side of the square matrices a timed product multiplies, on every runtime.
+#[cfg(any(feature = "gpu", feature = "vulkan"))]
+pub(crate) const PRODUCT_SIDE: usize = 1536;
+/// Products a timing runs after its warm-up, on every runtime.
+#[cfg(any(feature = "gpu", feature = "vulkan"))]
+pub(crate) const PRODUCT_REPS: u32 = 4;
+
+/// Free bytes a device needs for a timed product: 3 square matrices of 4-byte values, with the
+/// same again for the workspace, and room for the runtime beside them.
+#[cfg(any(feature = "gpu", feature = "vulkan"))]
+pub(crate) fn product_room_bytes() -> u64 {
+    6 * (PRODUCT_SIDE * PRODUCT_SIDE * 4) as u64 + (256 << 20)
+}
+
+/// GFLOP/s of [`PRODUCT_REPS`] square products of side [`PRODUCT_SIDE`] that took `seconds`:
+/// the scale every device is ranked on.
+#[cfg(any(feature = "gpu", feature = "vulkan"))]
+pub(crate) fn product_gflops(seconds: f64) -> Option<u64> {
+    let flops = 2.0 * (PRODUCT_SIDE as f64).powi(3) * PRODUCT_REPS as f64;
+    (seconds > 0.0).then(|| (flops / seconds / 1e9) as u64)
+}
+
 /// Half-precision matrix throughput of device `ordinal` in GFLOP/s, timed once per process on
 /// a matrix product. Cores times clock cannot rank cards of different makers: a core is not
 /// the same unit on every runtime, and the card with the larger count of smaller units came out
@@ -84,10 +106,9 @@ fn measured_gflops(ordinal: usize, free_bytes: u64) -> Option<u64> {
     if let Some(known) = table.lock().ok()?.get(&ordinal) {
         return *known;
     }
-    // Three square matrices of f16, with the same again for the workspace.
-    const SIDE: usize = 1536;
-    const REPS: u32 = 4;
-    if free_bytes < 6 * (SIDE * SIDE * 4) as u64 + (256 << 20) {
+    const SIDE: usize = PRODUCT_SIDE;
+    const REPS: u32 = PRODUCT_REPS;
+    if free_bytes < product_room_bytes() {
         return None;
     }
     let timed = (|| -> Option<u64> {
@@ -102,7 +123,7 @@ fn measured_gflops(ordinal: usize, free_bytes: u64) -> Option<u64> {
         }
         device.synchronize().ok()?;
         let seconds = start.elapsed().as_secs_f64();
-        (seconds > 0.0).then(|| (2.0 * (SIDE as f64).powi(3) * REPS as f64 / seconds / 1e9) as u64)
+        product_gflops(seconds)
     })();
     table.lock().ok()?.insert(ordinal, timed);
     timed

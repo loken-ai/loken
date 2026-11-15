@@ -140,6 +140,9 @@ The server opens the Vulkan loader when it starts, and compiles the kernels for 
 
 Placement offers the Vulkan GPUs that no other runtime of the build drives.  
 They come after the CUDA or HIP cards and before the host.  
+They are filled fastest first.
+Each is timed once per process on the product its layers run, with f16 weights, at the size the CUDA cards are timed at, in GFLOP/s as they are.
+A GPU that could not be timed comes after the timed ones.
 The build above has no other runtime, so every GPU is offered.
 A runtime that `--backends` leaves out drives no card, so its GPUs are offered too.
 `--features vulkan` on the default build adds Vulkan beside CUDA and OpenCL, and needs the CUDA toolkit.

@@ -1682,6 +1682,19 @@ pub(super) fn matvec_probe(
     tokens: usize,
     coop: bool,
 ) -> anyhow::Result<(Vec<f32>, usize)> {
+    product_run(device, w, x, tokens, coop, 1).map(|(ys, shared, _)| (ys, shared))
+}
+
+/// [`matvec_probe`] with the products run `reps` times in one submission, and the seconds
+/// that submission took.
+pub(super) fn product_run(
+    device: usize,
+    w: &RawTensor,
+    x: &[f32],
+    tokens: usize,
+    coop: bool,
+    reps: u32,
+) -> anyhow::Result<(Vec<f32>, usize, f64)> {
     let ctx = super::context(device)?;
     let m = Matrix::upload(&ctx, w, coop && ctx.coop())?;
     let xb = ctx.upload(&f32_bytes(x))?;
@@ -1773,6 +1786,7 @@ pub(super) fn matvec_probe(
                 .collect()
         }
     };
+    let started = std::time::Instant::now();
     ctx.submit_once(|cmd| unsafe {
         let run = |pipe: vk::Pipeline, set: vk::DescriptorSet, imm: &[u8], g: [u32; 3]| {
             dev.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipe);
@@ -1812,8 +1826,17 @@ pub(super) fn matvec_probe(
             vk::AccessFlags::SHADER_READ,
             vk::PipelineStageFlags::COMPUTE_SHADER,
         );
-        for (pipeline, imm, groups) in &dispatches {
-            run(*pipeline, sets[1], imm, *groups);
+        for rep in 0..reps {
+            // Each run writes the same output: it waits for the run before it.
+            if rep > 0 {
+                barrier(
+                    vk::AccessFlags::SHADER_WRITE,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                );
+            }
+            for (pipeline, imm, groups) in &dispatches {
+                run(*pipeline, sets[1], imm, *groups);
+            }
         }
         barrier(
             vk::AccessFlags::TRANSFER_READ,
@@ -1822,6 +1845,7 @@ pub(super) fn matvec_probe(
         let region = [vk::BufferCopy::default().size(yb.size)];
         dev.cmd_copy_buffer(cmd, yb.buf, out.buf, &region);
     })?;
+    let seconds = started.elapsed().as_secs_f64();
     unsafe { dev.destroy_descriptor_pool(pool, None) };
     let mut bytes = vec![0u8; tokens * m.rows * 4];
     out.read(0, &mut bytes);
@@ -1834,7 +1858,7 @@ pub(super) fn matvec_probe(
         .chunks_exact(4)
         .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
         .collect();
-    Ok((ys, shared))
+    Ok((ys, shared, seconds))
 }
 
 /// The products of the experts of `w`, `experts` matrices stacked by rows, on routed pairs:

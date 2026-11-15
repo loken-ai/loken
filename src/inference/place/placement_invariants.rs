@@ -490,8 +490,13 @@ fn a_non_cuda_accelerator_is_filled_before_the_host_too() {
     for free in [4 * GB, 8 * GB, 16 * GB] {
         for total_layers in [8usize, 30] {
             for model_bytes in [4 * GB, 12 * GB] {
-                let plan =
-                    HeteroPlan::calculate(total_layers, model_bytes, &[], &[(0, free)], EXPANSION);
+                let plan = HeteroPlan::calculate(
+                    total_layers,
+                    model_bytes,
+                    &[],
+                    &[(DeviceKind::OpenCL(0), free)],
+                    EXPANSION,
+                );
                 let capacity = (free as f64 / EXPANSION) as u64;
                 let bpl = model_bytes / total_layers as u64;
                 let held = blocks_on(&plan, DeviceKind::OpenCL(0)) as u64 * bpl;

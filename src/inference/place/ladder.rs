@@ -490,25 +490,45 @@ pub fn accelerators(reserve: u64) -> Vec<(DeviceKind, u64)> {
 }
 
 /// The Vulkan devices placement may use, with the bytes each offers once `reserve` is kept
-/// free on it: those no other runtime of the build drives.
+/// free on it: those no other runtime of the build drives, fastest first by their timed
+/// product.
 /// Empty in a build without Vulkan.
 pub fn vulkan_devices(reserve: u64) -> Vec<(DeviceKind, u64)> {
     #[cfg(feature = "vulkan")]
     {
-        crate::inference::kernel::vulkan::offered()
+        use crate::inference::kernel::vulkan;
+        let offered: Vec<(DeviceKind, u64)> = vulkan::offered()
             .into_iter()
             .map(|d| {
-                let free = crate::inference::kernel::vulkan::free_bytes(d.index);
+                let free = vulkan::free_bytes(d.index);
                 (DeviceKind::Vulkan(d.index), free.saturating_sub(reserve))
             })
             .filter(|(_, free)| *free > 0)
-            .collect()
+            .collect();
+        fastest_accelerators_first(offered, |kind| match kind {
+            DeviceKind::Vulkan(index) => vulkan::measured_gflops(index),
+            _ => None,
+        })
     }
     #[cfg(not(feature = "vulkan"))]
     {
         let _ = reserve;
         Vec::new()
     }
+}
+
+/// `devices` ranked by `gflops`, the fastest first.
+/// A device without a timing follows the timed ones, in the order given.
+#[cfg_attr(not(feature = "vulkan"), allow(dead_code))]
+fn fastest_accelerators_first(
+    devices: Vec<(DeviceKind, u64)>,
+    gflops: impl Fn(DeviceKind) -> Option<u64>,
+) -> Vec<(DeviceKind, u64)> {
+    let mut ranked: Vec<(Option<u64>, (DeviceKind, u64))> =
+        devices.into_iter().map(|d| (gflops(d.0), d)).collect();
+    // A stable sort keeps the given order among equal timings and among the untimed.
+    ranked.sort_by_key(|d| std::cmp::Reverse(d.0));
+    ranked.into_iter().map(|(_, d)| d).collect()
 }
 
 /// The Vulkan and OpenCL devices a plan may give layers to, with the bytes each offers once
@@ -741,8 +761,8 @@ fn leaves_the_cards(name: &str) -> bool {
     name == HOST_RUNG || name == HOST_ALONE_RUNG
 }
 
-/// `plan` with the blocks it leaves on the host offered to `accelerators` first, each block
-/// costing its weights and its cache there.
+/// `plan` with the blocks it leaves on the host offered to `accelerators` first, in their
+/// order, each block costing its weights and its cache there.
 fn beside_host(
     plan: HeteroPlan,
     demand: &Demand,
@@ -752,17 +772,6 @@ fn beside_host(
         return plan;
     }
     let per_block = demand.block_bytes / demand.layers as u64;
-    // The planner fills accelerators by their place in this list; each place is mapped back
-    // to the device it stands for.
-    let listed: Vec<(usize, u64)> = accelerators
-        .iter()
-        .enumerate()
-        .map(|(i, &(_, free))| (i, free))
-        .collect();
-    let kind_of = |k: DeviceKind| match k {
-        DeviceKind::OpenCL(i) => accelerators.get(i).map_or(k, |a| a.0),
-        other => other,
-    };
     let mut segments = Vec::with_capacity(plan.segments.len());
     for seg in plan.segments {
         if !matches!(seg.kind, DeviceKind::Cpu) {
@@ -774,12 +783,11 @@ fn beside_host(
             blocks,
             per_block.saturating_mul(blocks as u64),
             &[],
-            &listed,
+            accelerators,
             1.0,
             demand.kv_bytes_per_layer,
         );
         segments.extend(host.segments.into_iter().map(|s| HeteroSegment {
-            kind: kind_of(s.kind),
             layer_start: s.layer_start + seg.layer_start,
             layer_end: s.layer_end + seg.layer_start,
             ..s
@@ -1646,6 +1654,50 @@ mod tests {
         );
         assert_eq!(plan.segments[1].layer_start, 4);
         assert_eq!(plan.segments[1].layer_end, 10);
+    }
+
+    /// A timed device comes before an untimed one, the faster first.
+    #[test]
+    fn accelerators_are_filled_fastest_first() {
+        let devices = vec![
+            (DeviceKind::Vulkan(0), GB),
+            (DeviceKind::Vulkan(1), GB),
+            (DeviceKind::Vulkan(2), GB),
+        ];
+        let gflops = |k: DeviceKind| match k {
+            DeviceKind::Vulkan(0) => Some(40_000),
+            DeviceKind::Vulkan(1) => Some(70_000),
+            _ => None,
+        };
+        let kinds: Vec<DeviceKind> = fastest_accelerators_first(devices, gflops)
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                DeviceKind::Vulkan(1),
+                DeviceKind::Vulkan(0),
+                DeviceKind::Vulkan(2)
+            ]
+        );
+    }
+
+    /// A host block given to an accelerator is planned on that device by its own name.
+    #[test]
+    fn host_blocks_are_planned_on_the_accelerator_by_its_kind() {
+        let plan = beside_host(
+            HeteroPlan::calculate(4, 4 * GB, &[], &[], 1.0),
+            &demand(4, 4),
+            &[
+                (DeviceKind::Vulkan(1), 100 * GB),
+                (DeviceKind::Vulkan(0), 100 * GB),
+            ],
+        );
+        assert!(plan
+            .segments
+            .iter()
+            .all(|s| s.kind == DeviceKind::Vulkan(1)));
     }
 
     #[test]

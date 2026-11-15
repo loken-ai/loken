@@ -149,6 +149,46 @@ pub fn offered() -> Vec<DeviceInfo> {
         .collect()
 }
 
+/// Matrix throughput of device `index` in GFLOP/s, timed once per process on the product the
+/// layers run, at the size and on the scale of the CUDA cards' timing.
+///
+/// The weights are f16, as the CUDA timing's are.
+/// `None` when the device has too little free memory to time, or cannot run the product.
+pub fn measured_gflops(index: usize) -> Option<u64> {
+    use crate::inference::place::device_probe::{
+        product_gflops, product_room_bytes, PRODUCT_REPS, PRODUCT_SIDE,
+    };
+    static MEASURED: OnceLock<Mutex<HashMap<usize, Option<u64>>>> = OnceLock::new();
+    let table = MEASURED.get_or_init(Default::default);
+    if let Some(known) = table.lock().ok()?.get(&index) {
+        return *known;
+    }
+    let timed = (|| -> Option<u64> {
+        if free_bytes(index) < product_room_bytes() {
+            return None;
+        }
+        let one = half::f16::ONE.to_bits().to_le_bytes();
+        let w = stack::RawTensor {
+            dtype: crate::tensor::quantized::GgmlDType::F16,
+            rows: PRODUCT_SIDE,
+            cols: PRODUCT_SIDE,
+            bytes: one.repeat(PRODUCT_SIDE * PRODUCT_SIDE).into(),
+        };
+        let x = vec![1.0f32; PRODUCT_SIDE * PRODUCT_SIDE];
+        let coop = context(index).ok()?.coop();
+        stack::product_run(index, &w, &x, PRODUCT_SIDE, coop, 1).ok()?;
+        let (_, _, seconds) =
+            stack::product_run(index, &w, &x, PRODUCT_SIDE, coop, PRODUCT_REPS).ok()?;
+        product_gflops(seconds)
+    })();
+    match timed {
+        Some(g) => tracing::info!("vulkan({index}): {g} GFLOP/s on the timed product"),
+        None => tracing::info!("vulkan({index}): the product could not be timed"),
+    }
+    table.lock().ok()?.insert(index, timed);
+    timed
+}
+
 /// Free bytes on device `index`: the driver's budget less its usage when it reports one,
 /// else the largest device-local heap.
 pub fn free_bytes(index: usize) -> u64 {
@@ -698,7 +738,6 @@ impl Buffer {
     }
 
     /// Reads `out.len()` bytes at byte `offset` of a host-mapped buffer.
-    #[cfg(any(test, not(target_endian = "little")))]
     pub(crate) fn read(&self, offset: usize, out: &mut [u8]) {
         let p = self.mapped.expect("a host-mapped buffer");
         assert!(offset + out.len() <= self.size as usize);
