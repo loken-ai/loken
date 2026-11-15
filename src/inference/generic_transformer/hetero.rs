@@ -3393,6 +3393,10 @@ impl GenericHeteroTransformer {
                     )?;
                 }
                 note_if_non_finite(&format!("layer {layer_idx}"), &hidden);
+                // A host layer's freed buffers go back to the kernel past the burst headroom.
+                if hidden.device().is_cpu() {
+                    crate::inference::place::heap::release_retained();
+                }
                 if reports {
                     crate::request_metrics::note_layers(seq_len, layer_idx + 1, upto);
                 }

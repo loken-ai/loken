@@ -642,6 +642,24 @@ impl Mixer {
         }
     }
 
+    /// The bytes of the mixer's state held in host memory: what a snapshot copies there.
+    pub fn state_host_bytes(&self) -> u64 {
+        let floats = |v: &Vec<f32>| (v.len() * std::mem::size_of::<f32>()) as u64;
+        match self {
+            Mixer::ShortConv(m) => match &m.state {
+                Some(ConvState::Host(v)) => floats(v),
+                _ => 0,
+            },
+            Mixer::Ssm(Mamba2 { state, .. }) | Mixer::DeltaNet(GatedDeltaNet { state, .. }) => {
+                match state {
+                    Some(SsmState::Host { conv, h }) => floats(conv) + floats(h),
+                    _ => 0,
+                }
+            }
+            _ => 0,
+        }
+    }
+
     /// Makes `state` the mixer's state; the copy stays reusable.
     pub fn restore(&mut self, state: &MixerState) -> Result<()> {
         match (self, state) {

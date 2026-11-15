@@ -1501,6 +1501,10 @@ impl GenericHeteroTransformer {
                         continue;
                     }
                     hidden = self.layers[li].forward_graph(&hidden)?;
+                    // A host layer's freed buffers go back to the kernel past the burst headroom.
+                    if hidden.device().is_cpu() {
+                        crate::inference::place::heap::release_retained();
+                    }
                 }
                 self.tp_forget()?;
                 if head {
@@ -1876,12 +1880,20 @@ impl GenericHeteroTransformer {
     /// host can spare.
     fn room_for_snapshot(&mut self, tokens: &[u32]) -> bool {
         let need: u64 = self.layers.iter().map(layer_snapshot_bytes).sum();
+        // The layers on the host copy their cache and states in host memory too.
         let host_need: u64 = self
             .layers
             .iter()
             .filter_map(|l| l.context.as_ref())
             .map(|c| c.len() as u64 * c.position_bytes())
-            .sum();
+            .sum::<u64>()
+            + self
+                .layers
+                .iter()
+                .zip(&self.layer_devs)
+                .filter(|(_, d)| matches!(d, super::LayerDevice::Cpu))
+                .map(|(l, _)| layer_snapshot_bytes(l) + l.mixer.state_host_bytes())
+                .sum::<u64>();
         let reserve = self.snapshot_reserve();
         loop {
             let free = self.free_device_memory();
