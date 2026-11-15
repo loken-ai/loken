@@ -8,7 +8,7 @@
 //! between two kernels, which is what a recorded graph needs and what an eager decode pays a
 //! round trip for.
 
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::tensor::gpu_runtime::driver::sys::{self, CUresult};
@@ -346,6 +346,8 @@ struct WorkerStats {
     /// Experts queued a layer ahead, and those the layer's request used.
     ahead_queued: std::sync::atomic::AtomicU64,
     ahead_used: std::sync::atomic::AtomicU64,
+    /// Requests whose transit copies did not land within their bound.
+    copies_late: std::sync::atomic::AtomicU64,
 }
 
 /// What the one-row requests have shown of the experts fetched a layer ahead.
@@ -403,6 +405,7 @@ static WORKER: WorkerStats = WorkerStats {
     ahead_right: std::sync::atomic::AtomicU64::new(0),
     ahead_queued: std::sync::atomic::AtomicU64::new(0),
     ahead_used: std::sync::atomic::AtomicU64::new(0),
+    copies_late: std::sync::atomic::AtomicU64::new(0),
 };
 
 /// The steps of a request the worker names in its heartbeat, by index.
@@ -450,12 +453,19 @@ pub(super) struct Health {
     /// Each recorded layer's place in the worker's list, its mailbox and the request the
     /// worker last answered there.
     mails: Vec<(usize, Arc<Mailbox>, Arc<AtomicU32>)>,
-    /// The watchdog's thread, woken once the worker has a measured request.
-    watchdog: OnceLock<std::thread::Thread>,
+    /// Nanoseconds the widest request takes at the host's pace for one expert, timed as the
+    /// worker started; zero where the layers' paces were known then.
+    probed: u64,
+    /// The thread that queues the worker's copies and waits for them.
+    copies: CopyThread,
 }
 
 impl Health {
-    fn new(mails: Vec<(usize, Arc<Mailbox>, Arc<AtomicU32>)>) -> Self {
+    fn new(
+        mails: Vec<(usize, Arc<Mailbox>, Arc<AtomicU32>)>,
+        probed: u64,
+        copies: CopyThread,
+    ) -> Self {
         Self {
             epoch: std::time::Instant::now(),
             beat: AtomicU64::new(0),
@@ -465,7 +475,8 @@ impl Health {
             failure: Mutex::new(None),
             exited: AtomicBool::new(false),
             mails,
-            watchdog: OnceLock::new(),
+            probed,
+            copies,
         }
     }
 
@@ -482,11 +493,7 @@ impl Health {
 
     /// A request of `ns` was answered.
     fn answered(&self, ns: u64) {
-        if self.longest.fetch_max(ns, Ordering::Relaxed) == 0 {
-            if let Some(t) = self.watchdog.get() {
-                t.unpark();
-            }
-        }
+        self.longest.fetch_max(ns, Ordering::Relaxed);
     }
 
     /// The first layer with a request posted and not answered: its place in the worker's list,
@@ -548,21 +555,86 @@ impl Health {
     }
 
     /// Nanoseconds a request may go unanswered while the worker does not move: [`STALL_MARGIN`]
-    /// times the longest request it answered or the longest any of `tiers` takes at the paces
-    /// measured.
-    /// None before the worker answered a request: the paces of the probes leave out what a
-    /// first request does once.
-    fn bound(&self, tiers: &[(String, Arc<LayerTier>)]) -> Option<u64> {
-        let longest = self.longest.load(Ordering::Relaxed);
-        if longest == 0 {
-            return None;
-        }
+    /// times the longest of the longest request it answered, the longest any of `tiers` takes
+    /// at the paces measured, and the widest request at the pace timed as the worker started.
+    /// The bound holds from the first request on: one of the three is measured by then.
+    fn bound(&self, tiers: &[(String, Arc<LayerTier>)]) -> u64 {
         let paced = tiers
             .iter()
             .map(|(_, t)| t.longest_request_ns())
             .fold(0, u64::max);
-        Some(longest.max(paced).saturating_mul(STALL_MARGIN))
+        self.longest
+            .load(Ordering::Relaxed)
+            .max(paced)
+            .max(self.probed)
+            .max(1)
+            .saturating_mul(STALL_MARGIN)
     }
+
+    /// Nanoseconds a request of `tier` may wait for its copies to `count` places of the
+    /// transit room before the host computes those experts: [`STALL_MARGIN`] times their time
+    /// at the slower of the copy and host paces measured for requests of `rows`.
+    /// Where neither pace is known, the bound of a whole request of `tier`.
+    fn copy_bound(&self, tier: &LayerTier, count: usize, rows: usize) -> u64 {
+        let host = f64::from_bits(tier.host_us[super::pace_class(rows)].load(Ordering::Relaxed));
+        let copy = tier.transit_room().1;
+        let us = copy.max(host) * count as f64;
+        if us > 0.0 {
+            return ((us * 1e3) as u64).max(1).saturating_mul(STALL_MARGIN);
+        }
+        tier.longest_request_ns()
+            .max(self.longest.load(Ordering::Relaxed))
+            .max(self.probed)
+            .max(1)
+            .saturating_mul(STALL_MARGIN)
+    }
+}
+
+/// What selects the kernels a recorded request of a layer launches.
+///
+/// The fields are the values the launch sites branch on.
+/// A launch site that branches on another value adds it here.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct GraphKernels {
+    /// The formats of the card's stacks and of the transit room's, gate, up and down.
+    card: [crate::tensor::quantized::GgmlDType; 3],
+    transit: Option<[crate::tensor::quantized::GgmlDType; 3]>,
+    /// The formats the exact kernels read, gate and down.
+    exact: Option<(super::exact::Fmt, super::exact::Fmt)>,
+    /// Whether the extra slots are read through the tier's table.
+    extra: bool,
+    hidden: usize,
+    inner: usize,
+    k: usize,
+    rows_max: usize,
+}
+
+/// The kinds of recorded requests whose kernels are loaded, for each live context.
+static LOADED: Mutex<
+    Vec<(
+        std::sync::Weak<crate::tensor::gpu_runtime::driver::CudaContext>,
+        std::collections::HashSet<GraphKernels>,
+    )>,
+> = Mutex::new(Vec::new());
+
+/// `f` over the kinds loaded on `ctx`.
+fn loaded_on<T>(
+    ctx: &Arc<crate::tensor::gpu_runtime::driver::CudaContext>,
+    f: impl FnOnce(&mut std::collections::HashSet<GraphKernels>) -> T,
+) -> T {
+    let mut loaded = LOADED.lock().unwrap_or_else(|e| e.into_inner());
+    loaded.retain(|(c, _)| c.strong_count() > 0);
+    let at = match loaded
+        .iter()
+        .position(|(c, _)| c.upgrade().is_some_and(|c| Arc::ptr_eq(&c, ctx)))
+    {
+        Some(at) => at,
+        None => {
+            loaded.push((Arc::downgrade(ctx), Default::default()));
+            loaded.len() - 1
+        }
+    };
+    f(&mut loaded[at].1)
 }
 
 /// A layer's decoded rows between the post of their request and the wait for the answer.
@@ -636,6 +708,27 @@ impl LayerTier {
         ))
     }
 
+    /// Nanoseconds the widest request of this layer takes when every pair misses, at the pace
+    /// of one expert computed on the host now. Zero for a layer without a recorded decode.
+    fn probe_request_ns(&self) -> Result<u64> {
+        let Some(g) = self.graph.get() else {
+            return Ok(0);
+        };
+        let x = vec![0f32; g.mail.hidden];
+        let pair = [(0usize, 0u32, 0f32)];
+        let t = std::time::Instant::now();
+        match &self.exact {
+            Some(exact) => {
+                super::exact::host_pairs(exact, &self.host, &x, &pair)?;
+            }
+            None => {
+                self.host_product(&x, 1, &pair)?;
+            }
+        }
+        let one = (t.elapsed().as_nanos() as u64).max(1);
+        Ok(one.saturating_mul((g.rows_max * g.mail.k) as u64))
+    }
+
     /// Nanoseconds the widest request of this layer takes when every pair misses, at the slower
     /// of the paces measured for a host product and a copy of an expert, the copy at the card's
     /// measured rate while no copy is timed. Zero before any is known.
@@ -667,9 +760,11 @@ impl LayerTier {
         }
     }
 
-    /// Let this layer's decoded token, and the rows of a verify up to `rows_max`, run as kernels
-    /// alone, served by a [`TierWorker`].
-    pub(super) fn enable_graph(&self, hidden: usize, k: usize, rows_max: usize) -> Result<()> {
+    /// Let the decoded token of `moe`, this layer's experts, and the rows of a verify up to
+    /// `rows_max`, run as kernels alone, served by a [`TierWorker`].
+    pub(super) fn enable_graph(&self, moe: &MoeWeights, rows_max: usize) -> Result<()> {
+        let hidden = self.host[0].shape().dims()[2];
+        let k = moe.n_experts_used;
         // The plan kernel looks the choices up with one thread per routed pair.
         let rows_max = rows_max.max(1);
         if self.graph.get().is_some()
@@ -686,10 +781,7 @@ impl LayerTier {
         drop(st);
         let pairs = rows_max * k;
         let exact = match &self.exact {
-            Some(e) => {
-                super::exact::preload(dev, e)?;
-                Some(super::exact::GraphRooms::new(dev, e, rows_max, k)?)
-            }
+            Some(e) => Some(super::exact::GraphRooms::new(dev, e, rows_max, k)?),
             None => None,
         };
         let products = if exact.is_some() { pairs } else { rows_max };
@@ -707,7 +799,63 @@ impl LayerTier {
             exact,
         };
         let _ = self.graph.set(side);
+        self.load_graph_kernels(moe)
+    }
+
+    /// Run a request of every row count up to `rows_max` through the kernels of the recorded
+    /// decode, with the mailbox released and no worker yet: each kernel a request launches is
+    /// loaded while the card waits on no one.
+    ///
+    /// A kernel loaded at its first launch while the card waits on the worker holds every copy
+    /// queued after it, on every stream, until the wait ends.
+    /// The worker's answer can wait on such a copy, so the wait would never end.
+    /// A layer whose requests launch the kernels of a layer already run on the same card is
+    /// left as it is.
+    fn load_graph_kernels(&self, moe: &MoeWeights) -> Result<()> {
+        let g = self.graph.get().expect("a graph layer is enabled");
+        let (k, hidden, dev) = (g.mail.k, g.mail.hidden, &self.dev);
+        let experts = self.host[0].shape().dims()[0].max(1);
+        let kind = self.graph_kernels(moe, g.rows_max);
+        let ctx = dev.as_cuda_device()?.0.context().clone();
+        if loaded_on(&ctx, |kinds| kinds.contains(&kind)) {
+            return Ok(());
+        }
+        g.mail.abort();
+        let run = (|| -> Result<()> {
+            for rows in 1..=g.rows_max {
+                let x = Tensor::zeros_on((rows, hidden), crate::tensor::DType::F32, dev)?;
+                let ids: Vec<u32> = (0..rows * k).map(|i| ((i % k) % experts) as u32).collect();
+                let ids = Tensor::from_vec(ids, (rows, k), dev)?;
+                let weights = Tensor::zeros_on((rows, k), crate::tensor::DType::F32, dev)?;
+                let pending = self.graph_begin(moe, &x, &ids, &weights)?;
+                self.graph_end(pending)?;
+            }
+            dev.synchronize()
+        })();
+        // The requests posted here stand answered, and the card waits for its answers again.
+        g.done.store(g.mail.request(), Ordering::Relaxed);
+        g.mail.clear_abort();
+        run?;
+        loaded_on(&ctx, |kinds| kinds.insert(kind));
         Ok(())
+    }
+
+    /// What selects the kernels a recorded request of this layer launches, for requests of up
+    /// to `rows_max` rows: the values `graph_begin` and `graph_end` branch on.
+    fn graph_kernels(&self, moe: &MoeWeights, rows_max: usize) -> GraphKernels {
+        let dims = self.host[0].shape().dims();
+        GraphKernels {
+            card: [0, 1, 2].map(|i| self.card[i].dtype()),
+            transit: self
+                .transit_stacks()
+                .map(|stacks| [0, 1, 2].map(|i| stacks[i].dtype())),
+            exact: self.exact.as_ref().map(|e| (e.gate, e.down)),
+            extra: self.extra_table_at(0).is_some(),
+            hidden: dims[2],
+            inner: dims[1],
+            k: moe.n_experts_used,
+            rows_max,
+        }
     }
 
     /// Rows of a verify a recorded decode can run through this layer at once.
@@ -766,6 +914,26 @@ impl LayerTier {
     pub(super) fn hand_late_for_test(&self, late: &[(u32, u32, f32)]) {
         if let Some(g) = self.graph.get() {
             g.mail.hand_late(late);
+        }
+    }
+
+    /// Wait until the card has posted a request the worker has not answered.
+    #[cfg(test)]
+    pub(super) fn wait_posted(&self) {
+        if let Some(g) = self.graph.get() {
+            while g.done.load(Ordering::Relaxed) == g.mail.request() {
+                std::thread::sleep(std::time::Duration::from_micros(50));
+            }
+        }
+    }
+
+    /// Wait until the worker has answered the last request the card posted.
+    #[cfg(test)]
+    pub(super) fn wait_answered(&self) {
+        if let Some(g) = self.graph.get() {
+            while g.done.load(Ordering::Relaxed) != g.mail.request() {
+                std::thread::sleep(std::time::Duration::from_micros(50));
+            }
         }
     }
 
@@ -1221,7 +1389,7 @@ impl LayerTier {
         // the card runs the copied ones once the answer says they landed.
         if miss_pairs.is_empty() {
             g.mail.hand_late(&[]);
-            self.fetch_ahead(req.rows)?;
+            self.fetch_ahead_on_copy_thread(req.rows);
             g.mail.raise(req.seq);
             self.note_lead_start();
         } else {
@@ -1254,9 +1422,20 @@ impl LayerTier {
             let (transit, host_experts) = rest.split_at(to_transit);
             let puts = super::super::expert_ahead::assign(&plan.free, transit);
             let (puts_len, hits_used) = (puts.len(), plan.hits.len());
+            // The copy thread queues the copies and waits for them: the worker makes no call
+            // into the card's driver before it answers.
+            let copies = Arc::new(AtomicU8::new(COPIES_PENDING));
+            let copies_from = std::time::Instant::now();
             if !puts.is_empty() {
                 beat(TO_TRANSIT);
-                self.copy_to_places(&g.upload_start, &g.upload_end, &puts)?;
+                let (tier, puts, copies) = (self.clone(), puts.clone(), copies.clone());
+                self.on_copy_thread(Box::new(move || {
+                    let g = tier.graph.get().expect("a graph layer is enabled");
+                    if let Err(e) = tier.copy_to_places(&g.upload_start, &g.upload_end, &puts) {
+                        tracing::warn!("expert tier: transit copy: {e}");
+                        copies.store(COPIES_FAILED, Ordering::Release);
+                    }
+                }));
             }
             let placed: Vec<(u32, usize)> = plan.hits.iter().copied().chain(puts).collect();
             if let Some(stage) = self.stage.as_ref().filter(|_| !placed.is_empty()) {
@@ -1265,14 +1444,30 @@ impl LayerTier {
                     .unwrap_or_else(|e| e.into_inner())
                     .set(key, &placed);
             }
-            self.fetch_ahead(req.rows)?;
-            let (host_at, host_pairs): (Vec<usize>, Vec<(usize, u32, f32)>) = miss_at
+            self.fetch_ahead_on_copy_thread(req.rows);
+            if !placed.is_empty() {
+                let (tier, copies, rows) = (self.clone(), copies.clone(), req.rows);
+                self.on_copy_thread(Box::new(move || {
+                    if copies.load(Ordering::Acquire) == COPIES_FAILED {
+                        return;
+                    }
+                    let outcome = match tier.land_copies(hits_used, puts_len, rows) {
+                        Ok(()) => COPIES_LANDED,
+                        Err(e) => {
+                            tracing::warn!("expert tier: transit copy: {e}");
+                            COPIES_FAILED
+                        }
+                    };
+                    copies.store(outcome, Ordering::Release);
+                }));
+            }
+            let (mut host_at, host_pairs): (Vec<usize>, Vec<(usize, u32, f32)>) = miss_at
                 .iter()
                 .zip(&miss_pairs)
                 .filter(|(_, p)| host_experts.contains(&p.1))
                 .map(|(&at, &p)| (at, p))
                 .unzip();
-            let late: Vec<(u32, u32, f32)> = miss_pairs
+            let mut late: Vec<(u32, u32, f32)> = miss_pairs
                 .iter()
                 .filter_map(|&(row, e, w)| {
                     let place = placed.iter().find(|p| p.0 == e)?.1;
@@ -1286,7 +1481,7 @@ impl LayerTier {
                 .collect();
             let t = std::time::Instant::now();
             beat(ON_HOST);
-            let product = match (&self.exact, host_pairs.is_empty()) {
+            let mut product = match (&self.exact, host_pairs.is_empty()) {
                 (Some(_), true) => Vec::new(),
                 (None, true) => vec![0f32; req.rows * req.x.len() / req.rows.max(1)],
                 (Some(exact), false) => {
@@ -1309,27 +1504,63 @@ impl LayerTier {
                 .fetch_add(missing.len() as u64, Ordering::Relaxed);
             if !placed.is_empty() {
                 beat(LANDING);
-                if hits_used > 0 {
-                    g.ahead_end
-                        .synchronize()
-                        .map_err(|e| crate::tensor::Error::msg(format!("fetch ahead: {e:?}")))?;
+                let bound = g
+                    .health
+                    .get()
+                    .map_or(u64::MAX, |h| h.copy_bound(self, placed.len(), req.rows));
+                if landed_within(&copies, copies_from, bound) {
                     self.used_ahead
                         .fetch_add(hits_used as u64, Ordering::Relaxed);
                     WORKER
                         .ahead_used
                         .fetch_add(hits_used as u64, Ordering::Relaxed);
-                }
-                if puts_len > 0 {
-                    g.upload_end
-                        .synchronize()
-                        .map_err(|e| crate::tensor::Error::msg(format!("transit copy: {e:?}")))?;
-                    if let Ok(ms) = g.upload_start.elapsed_ms(&g.upload_end) {
-                        self.note_upload_us(ms as f64 * 1e3 / puts_len as f64, req.rows);
+                    WORKER
+                        .transit
+                        .fetch_add(placed.len() as u64, Ordering::Relaxed);
+                } else {
+                    // The host computes the experts of the transit room, and the card runs no
+                    // late pair: the room's copies land later, and the buffer holds nothing
+                    // the next request may count on.
+                    beat(ON_HOST);
+                    if let Some(stage) = self.stage.as_ref() {
+                        stage.stager.held[stage.buffer]
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .clear();
+                    }
+                    let (late_at, late_pairs): (Vec<usize>, Vec<(usize, u32, f32)>) = miss_at
+                        .iter()
+                        .zip(&miss_pairs)
+                        .filter(|(_, p)| !host_experts.contains(&p.1))
+                        .map(|(&at, &p)| (at, p))
+                        .unzip();
+                    match &self.exact {
+                        Some(exact) => {
+                            product.extend(super::exact::host_pairs(
+                                exact,
+                                &self.host,
+                                &req.x,
+                                &late_pairs,
+                            )?);
+                            host_at.extend(late_at);
+                        }
+                        None => {
+                            let more = self.host_product(&req.x, req.rows, &late_pairs)?;
+                            for (sum, v) in product.iter_mut().zip(more) {
+                                *sum += v;
+                            }
+                        }
+                    }
+                    late.clear();
+                    let n = WORKER.copies_late.fetch_add(1, Ordering::Relaxed) + 1;
+                    if n.is_power_of_two() {
+                        tracing::warn!(
+                            "expert tier: the copies of {} experts to the card did not land within {:.3} s; the host computed them ({n} requests so far)",
+                            placed.len(),
+                            bound as f64 * 1e-9
+                        );
                     }
                 }
-                WORKER
-                    .transit
-                    .fetch_add(placed.len() as u64, Ordering::Relaxed);
             }
             self.note_lead_start();
             laps.mark("tier worker: transit landed");
@@ -1415,6 +1646,112 @@ impl LayerTier {
     }
 }
 
+impl LayerTier {
+    /// Run `job` on the copy thread of this layer's worker, in the order given.
+    fn on_copy_thread(&self, job: Box<dyn FnOnce() + Send>) {
+        match self.graph.get().and_then(|g| g.health.get()) {
+            Some(h) => h.copies.run(job),
+            None => job(),
+        }
+    }
+
+    /// [`Self::fetch_ahead`] on the copy thread.
+    fn fetch_ahead_on_copy_thread(self: &Arc<Self>, rows: usize) {
+        let tier = self.clone();
+        self.on_copy_thread(Box::new(move || {
+            if let Err(e) = tier.fetch_ahead(rows) {
+                tracing::warn!("expert tier: fetch ahead: {e}");
+            }
+        }));
+    }
+
+    /// Wait for the copies a request counts on: the `hits` experts fetched ahead and the `puts`
+    /// copied for it, and time the copies for requests of `rows`.
+    fn land_copies(&self, hits: usize, puts: usize, rows: usize) -> Result<()> {
+        let g = self.graph.get().expect("a graph layer is enabled");
+        if hits > 0 {
+            g.ahead_end
+                .synchronize()
+                .map_err(|e| crate::tensor::Error::msg(format!("fetch ahead: {e:?}")))?;
+        }
+        if puts > 0 {
+            g.upload_end
+                .synchronize()
+                .map_err(|e| crate::tensor::Error::msg(format!("transit copy: {e:?}")))?;
+            if let Ok(ms) = g.upload_start.elapsed_ms(&g.upload_end) {
+                self.note_upload_us(ms as f64 * 1e3 / puts as f64, rows);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A request's copies are queued or in flight.
+const COPIES_PENDING: u8 = 0;
+/// A request's copies landed.
+const COPIES_LANDED: u8 = 1;
+/// A request's copies could not be queued or waited for.
+const COPIES_FAILED: u8 = 2;
+
+/// Whether the copies `state` follows landed within `bound` nanoseconds of `from`.
+fn landed_within(state: &AtomicU8, from: std::time::Instant, bound: u64) -> bool {
+    loop {
+        match state.load(Ordering::Acquire) {
+            COPIES_PENDING => {}
+            outcome => return outcome == COPIES_LANDED,
+        }
+        if from.elapsed().as_nanos() as u64 > bound {
+            return false;
+        }
+        std::hint::spin_loop();
+    }
+}
+
+/// The thread that queues a tier worker's copies to the card and waits for them, one job
+/// after the other.
+///
+/// A call into the card's driver can block until the card is idle, while the card waits on
+/// the worker: the worker makes none before it answers.
+pub(super) struct CopyThread {
+    jobs: Mutex<Option<std::sync::mpsc::Sender<Box<dyn FnOnce() + Send>>>>,
+    thread: Mutex<Option<std::thread::JoinHandle<()>>>,
+}
+
+impl CopyThread {
+    fn start(dev: &Device) -> Result<Self> {
+        let ctx = dev.as_cuda_device()?.0.context().clone();
+        let (tx, rx) = std::sync::mpsc::channel::<Box<dyn FnOnce() + Send>>();
+        let thread = std::thread::Builder::new()
+            .name("tier-copies".into())
+            .spawn(move || {
+                let _ = ctx.bind_to_thread();
+                for job in rx {
+                    job();
+                }
+            })
+            .map_err(|e| crate::tensor::Error::msg(format!("tier copies: {e}")))?;
+        Ok(Self {
+            jobs: Mutex::new(Some(tx)),
+            thread: Mutex::new(Some(thread)),
+        })
+    }
+
+    /// Queue `job`; a stopped thread drops it.
+    fn run(&self, job: Box<dyn FnOnce() + Send>) {
+        if let Some(tx) = self.jobs.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+            let _ = tx.send(job);
+        }
+    }
+
+    /// Let the jobs queued so far run, then end the thread.
+    fn stop(&self) {
+        self.jobs.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(h) = self.thread.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            let _ = h.join();
+        }
+    }
+}
+
 /// Holds the tier worker of a test at the start of its next request until cleared.
 #[cfg(test)]
 pub(super) static STALL_FOR_TEST: AtomicBool = AtomicBool::new(false);
@@ -1445,7 +1782,19 @@ impl TierWorker {
         for pair in tiers.windows(2) {
             let _ = pair[0].1.ahead_next.set(Arc::downgrade(&pair[1].1));
         }
-        let health = Arc::new(Health::new(mails));
+        // Where no layer's pace is known yet, the host's time for one expert, timed now, bounds
+        // the first requests.
+        let probed = if tiers.iter().all(|(_, t)| t.longest_request_ns() == 0) {
+            tiers
+                .iter()
+                .map(|(_, t)| t.probe_request_ns())
+                .collect::<Result<Vec<u64>>>()?
+                .into_iter()
+                .fold(0, u64::max)
+        } else {
+            0
+        };
+        let health = Arc::new(Health::new(mails, probed, CopyThread::start(dev)?));
         for (_, t) in &tiers {
             if let Some(g) = t.graph.get() {
                 let _ = g.health.set(health.clone());
@@ -1466,7 +1815,6 @@ impl TierWorker {
             .name("tier-watchdog".into())
             .spawn(move || watch(&tiers, &flag, &watched))
             .map_err(|e| crate::tensor::Error::msg(format!("tier watchdog: {e}")))?;
-        let _ = health.watchdog.set(watchdog.thread().clone());
         Ok(Self {
             stop,
             thread: Some(thread),
@@ -1490,7 +1838,7 @@ impl TierWorker {
 
     /// The stall bound as it stands.
     #[cfg(test)]
-    pub(super) fn stall_bound(&self, tiers: &[(String, Arc<LayerTier>)]) -> Option<u64> {
+    pub(super) fn stall_bound(&self, tiers: &[(String, Arc<LayerTier>)]) -> u64 {
         self.health.bound(tiers)
     }
 }
@@ -1570,13 +1918,10 @@ fn scheduling_slowdown(cpu: std::time::Duration) -> f64 {
 
 /// Watch the worker of `tiers`: a request left unanswered while the worker has not moved for
 /// longer than [`Health::bound`] releases every card waiting on the worker, and the decode
-/// fails on it. The watchdog sleeps until the worker has a measured request.
+/// fails on it.
 fn watch(tiers: &[(String, Arc<LayerTier>)], stop: &AtomicBool, health: &Health) {
     while !stop.load(Ordering::Acquire) {
-        let Some(bound) = health.bound(tiers) else {
-            std::thread::park();
-            continue;
-        };
+        let bound = health.bound(tiers);
         std::thread::park_timeout(std::time::Duration::from_nanos(
             bound / u64::from(LOOKS_A_BOUND),
         ));
@@ -1632,5 +1977,6 @@ impl Drop for TierWorker {
         if let Some(h) = self.thread.take() {
             let _ = h.join();
         }
+        self.health.copies.stop();
     }
 }

@@ -920,12 +920,7 @@ impl super::GenericHeteroTransformer {
                     .as_ref()
                     .expect("a tiered layer has experts");
                 if let Some(t) = &moe.tier {
-                    let hidden = t.host[0].shape().dims()[2];
-                    t.enable_graph(
-                        hidden,
-                        moe.n_experts_used,
-                        crate::inference::engine::decode_step::VERIFY_ROWS,
-                    )?;
+                    t.enable_graph(moe, crate::inference::engine::decode_step::VERIFY_ROWS)?;
                 }
             }
             self.tier_workers.push(TierWorker::start(dev, arcs)?);
@@ -4434,7 +4429,7 @@ mod tests {
         let built = LayerTier::new(&tiered, &card, slots).unwrap();
         tiered.tier = Some(Arc::new(built));
         let tier = tiered.tier.clone().unwrap();
-        tier.enable_graph(hidden, used, 4).unwrap();
+        tier.enable_graph(&tiered, 4).unwrap();
         let worker = TierWorker::start(&card, vec![("layer 0".into(), tier.clone())]).unwrap();
         GRAPH_WITHOUT_CAPTURE.store(true, Ordering::Relaxed);
         let inputs: Vec<Vec<f32>> = (0..3).map(|s| values(hidden, 100 + s, 1.0)).collect();
@@ -4535,7 +4530,7 @@ mod tests {
                     .unwrap();
                 l.tier = Some(Arc::new(built));
                 let tier = l.tier.clone().unwrap();
-                tier.enable_graph(hidden, used, 1).unwrap();
+                tier.enable_graph(l, 1).unwrap();
                 named.push((format!("layer {i}"), tier));
             }
             let worker = TierWorker::start(&card, named.clone()).unwrap();
@@ -4586,7 +4581,7 @@ mod tests {
         let mut tiered = layer(&card, experts, used, hidden, ffn);
         tiered.tier = Some(Arc::new(LayerTier::new(&tiered, &card, 2).unwrap()));
         let tier = tiered.tier.clone().unwrap();
-        tier.enable_graph(hidden, used, 1).unwrap();
+        tier.enable_graph(&tiered, 1).unwrap();
         let named = vec![("layer 0".to_string(), tier.clone())];
         let worker = TierWorker::start(&card, named.clone()).unwrap();
         GRAPH_WITHOUT_CAPTURE.store(true, Ordering::Relaxed);
@@ -4598,7 +4593,7 @@ mod tests {
                 .and_then(|t| t.to_vec1::<f32>())
         };
         run().unwrap();
-        let bound = std::time::Duration::from_nanos(worker.stall_bound(&named).unwrap());
+        let bound = std::time::Duration::from_nanos(worker.stall_bound(&named));
         graph::STALL_FOR_TEST.store(true, Ordering::Release);
         let started = std::time::Instant::now();
         let released = run();
@@ -4627,6 +4622,123 @@ mod tests {
         assert!(again.iter().all(|v| v.is_finite()));
     }
 
+    /// A kernel another thread loads for the first time while the card waits on the worker
+    /// holds every call and copy to the card until the card is idle. The worker still answers
+    /// a request whose experts go through the transit room: the host computes them past the
+    /// copies' bound, and the token is the host's.
+    #[test]
+    fn a_kernel_loaded_while_the_card_waits_leaves_the_request_answered() {
+        use crate::tensor::gpu_runtime::driver::{LaunchConfig, PushKernelArg};
+        let _pool = LENT_POOL.lock().unwrap_or_else(|e| e.into_inner());
+        let Ok(card) = Device::new_cuda(0) else {
+            eprintln!("skipping: no usable CUDA device");
+            return;
+        };
+        let (experts, used, hidden, ffn) = (32usize, 4usize, 64usize, 64usize);
+        let reference = layer(&Device::Cpu, experts, used, hidden, ffn);
+        let mut tiered = layer(&card, experts, used, hidden, ffn);
+        let widest = [0, 1, 2].map(|i| {
+            [
+                tiered.gate_exps_sep.as_ref().unwrap(),
+                tiered.up_exps_sep.as_ref().unwrap(),
+                &tiered.down_exps,
+            ][i]
+                .native_qtensor()
+                .data()
+                .len()
+        });
+        let stager = CardStager::new(&card, widest, experts).unwrap();
+        let built = LayerTier::new(&tiered, &card, 2)
+            .unwrap()
+            .with_stage(&stager, 0, false)
+            .unwrap();
+        tiered.tier = Some(Arc::new(built));
+        let tier = tiered.tier.clone().unwrap();
+        tier.enable_graph(&tiered, 1).unwrap();
+        let worker = TierWorker::start(&card, vec![("layer 0".into(), tier.clone())]).unwrap();
+        GRAPH_WITHOUT_CAPTURE.store(true, Ordering::Relaxed);
+        let x = values(hidden, 100, 1.0);
+        let on_host = Tensor::from_vec(x.clone(), (1, 1, hidden), &Device::Cpu).unwrap();
+        let on_card = Tensor::from_vec(x, (1, 1, hidden), &card).unwrap();
+        let want = reference
+            .forward(&on_host, &on_host, hidden, 1e-5, false)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        // A first token, answered, then paces that send every missing expert to the transit
+        // room, and a room that holds none of them.
+        tiered
+            .forward(&on_card, &on_card, hidden, 1e-5, false)
+            .and_then(|t| t.flatten_all())
+            .and_then(|t| t.to_vec1::<f32>())
+            .unwrap();
+        tier.wait_answered();
+        tier.settle();
+        for class in 0..2 {
+            tier.host_us[class].store(1e3f64.to_bits(), Ordering::Relaxed);
+            tier.upload_us[class].store(1f64.to_bits(), Ordering::Relaxed);
+        }
+        for held in &stager.held {
+            held.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        }
+        // A module this process never loaded, and the stream it runs on, made while the card
+        // is idle.
+        let ptx = crate::tensor::gpu_runtime::nvrtc::compile_ptx(
+            "extern \"C\" __global__ void loken_tier_test_touch(float *x, int n) { \
+             if (threadIdx.x < n) x[threadIdx.x] += 1.0f; }",
+        )
+        .unwrap();
+        let ctx = card.as_cuda_device().unwrap().0.context().clone();
+        let side = ctx.new_stream().unwrap();
+        // The launch rounds its threads up to a whole block: the kernel touches these alone.
+        let touched_len = 32i32;
+        let touched = side.alloc_zeros::<f32>(touched_len as usize).unwrap();
+        graph::STALL_FOR_TEST.store(true, Ordering::Release);
+        let pending = tiered
+            .forward(&on_card, &on_card, hidden, 1e-5, false)
+            .unwrap();
+        tier.wait_posted();
+        let (started, starting) = std::sync::mpsc::channel();
+        let loader = std::thread::spawn(move || -> std::result::Result<(), String> {
+            ctx.bind_to_thread().map_err(|e| format!("{e:?}"))?;
+            started.send(()).map_err(|e| e.to_string())?;
+            let module = ctx.load_module(ptx).map_err(|e| format!("{e:?}"))?;
+            let f = module
+                .load_function("loken_tier_test_touch")
+                .map_err(|e| format!("{e:?}"))?;
+            let mut launch = side.launch_builder(&f);
+            launch.arg(&touched);
+            launch.arg(&touched_len);
+            unsafe { launch.launch(LaunchConfig::for_num_elems(touched_len as u32)) }
+                .map_err(|e| format!("{e:?}"))?;
+            side.synchronize().map_err(|e| format!("{e:?}"))
+        });
+        starting.recv().unwrap();
+        // The loader is in its load when the worker reads the request.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        graph::STALL_FOR_TEST.store(false, Ordering::Release);
+        let got = pending
+            .flatten_all()
+            .and_then(|t| t.to_vec1::<f32>())
+            .unwrap();
+        let loaded = loader.join().unwrap();
+        tier.settle();
+        GRAPH_WITHOUT_CAPTURE.store(false, Ordering::Relaxed);
+        let failure = worker.failure();
+        drop(worker);
+        assert!(failure.is_none(), "the worker stalled: {failure:?}");
+        loaded.expect("the kernel loaded and ran once the card was idle");
+        let peak = want.iter().map(|v| v.abs()).fold(0f32, f32::max);
+        let worst = got
+            .iter()
+            .zip(&want)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        assert!(worst <= 2e-2 * peak, "max diff {worst} of {peak}");
+    }
+
     /// A decoded token recorded in a graph while the extra slots hold experts replays what the
     /// same kernels give run eagerly, to the bit, after the extra slots were lent and came back
     /// at other addresses: the recording reads the extra stacks through the tier's table.
@@ -4646,7 +4758,7 @@ mod tests {
             .unwrap();
         tiered.tier = Some(Arc::new(built));
         let tier = tiered.tier.clone().unwrap();
-        tier.enable_graph(hidden, used, 1).unwrap();
+        tier.enable_graph(&tiered, 1).unwrap();
         let worker = TierWorker::start(&card, vec![("layer 0".into(), tier.clone())]).unwrap();
         let stream = card.as_cuda_device().unwrap().0.stream().clone();
         let x = Tensor::from_vec(values(hidden, 7, 1.0), (1, 1, hidden), &card).unwrap();
@@ -4787,7 +4899,7 @@ mod tests {
             .unwrap();
         tiered.tier = Some(Arc::new(built));
         let tier = tiered.tier.clone().unwrap();
-        tier.enable_graph(hidden, used, 6).unwrap();
+        tier.enable_graph(&tiered, 6).unwrap();
         let worker = TierWorker::start(&card, vec![("layer 0".into(), tier.clone())]).unwrap();
         GRAPH_WITHOUT_CAPTURE.store(true, Ordering::Relaxed);
         let _order = crate::tensor::quantized::DecodeOrder::enter();
@@ -4875,7 +4987,7 @@ mod tests {
             .unwrap();
         tiered.tier = Some(Arc::new(built));
         let tier = tiered.tier.clone().unwrap();
-        tier.enable_graph(hidden, used, 4).unwrap();
+        tier.enable_graph(&tiered, 4).unwrap();
         let worker = TierWorker::start(&card, vec![("layer 0".into(), tier.clone())]).unwrap();
         GRAPH_WITHOUT_CAPTURE.store(true, Ordering::Relaxed);
         let x = values(hidden, 100, 1.0);
@@ -4896,6 +5008,9 @@ mod tests {
             let _ = tiered
                 .forward(&on_card, &on_card, hidden, 1e-5, false)
                 .unwrap();
+            // The card has posted the request, and the worker has counted and answered it.
+            card.synchronize().unwrap();
+            tier.wait_answered();
             tier.settle();
             let (routed_after, hits_after, _) = tier.counters();
             if routed_after - routed == hits_after - hits {
@@ -4951,7 +5066,7 @@ mod tests {
             .unwrap();
         tiered.tier = Some(Arc::new(built));
         let tier = tiered.tier.clone().unwrap();
-        tier.enable_graph(hidden, used, 6).unwrap();
+        tier.enable_graph(&tiered, 6).unwrap();
         let worker = TierWorker::start(&card, vec![("layer 0".into(), tier.clone())]).unwrap();
         GRAPH_WITHOUT_CAPTURE.store(true, Ordering::Relaxed);
         let _order = crate::tensor::quantized::DecodeOrder::enter();
@@ -5515,7 +5630,7 @@ mod tests {
                             tiered.tier = Some(Arc::new(built));
                             let tier = tiered.tier.clone().unwrap();
                             let worker = if recorded {
-                                tier.enable_graph(hidden, used, 4).unwrap();
+                                tier.enable_graph(&tiered, 4).unwrap();
                                 let w =
                                     TierWorker::start(&card, vec![("layer".into(), tier.clone())])
                                         .unwrap();

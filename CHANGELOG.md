@@ -11,6 +11,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 ### Fixed
 
 - Serving: answer lone requests serially until a burst has measured the worker.
+- Experts: keep a token from hanging while another request loads kernels on its card.
 - Serving: weigh a lone request's prompt on both decode paths, whatever its length.
 - Generation: end on every end token a checkpoint declares, whatever its format.
 - Speculation: keep a drafter from taking the card room its target needs.

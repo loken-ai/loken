@@ -11,7 +11,7 @@ use crate::tensor::gpu_runtime::driver::{LaunchConfig, PushKernelArg};
 use crate::tensor::quant_cpu::{BlockFormat, BlockQ2K, BlockQ4K, BlockQ6K, BlockQ8K, ExactDot};
 
 /// A format the exact kernels read.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub(super) enum Fmt {
     Q2K,
     Q4K,
@@ -114,24 +114,6 @@ fn warps(grid: (u32, u32)) -> LaunchConfig {
         block_dim: (32, 1, 1),
         shared_mem_bytes: 0,
     }
-}
-
-/// Load the kernels of `exact` on `dev` before a recorded decode can wait on the host: a kernel
-/// loaded at its first launch, while the card waits on the tier worker, holds the driver until the
-/// card is idle, and the worker's copies queue behind it.
-pub(super) fn preload(dev: &Device, exact: &Exact) -> Result<()> {
-    let cd = dev.as_cuda_device()?;
-    for name in [
-        "cx_quantize_q8_k".to_string(),
-        format!("tx_h_{}", exact.gate.name()),
-        "tx_quantize_h".to_string(),
-        format!("tx_down_{}", exact.down.name()),
-        "tx_sources".to_string(),
-        "tx_sum".to_string(),
-    ] {
-        cd.0.quantized_fn(&name)?;
-    }
-    Ok(())
 }
 
 /// The rows `[rows, dim]` f32 at `x` as q8_K rows at `xq`.
