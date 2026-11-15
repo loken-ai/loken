@@ -606,10 +606,17 @@ fn awq_generation_config(dir: &str) -> Option<serde_json::Value> {
     read("generation_config.json").or_else(|| read("config.json"))
 }
 
+/// What `config` declares under `key`, at its top level or in its `text_config`.
+/// A checkpoint that wraps a text model in a multimodal one declares its tokens there.
+fn declared<'a>(config: &'a serde_json::Value, key: &str) -> Option<&'a serde_json::Value> {
+    config
+        .get(key)
+        .or_else(|| config.get("text_config")?.get(key))
+}
+
 /// A scalar token id an AWQ checkpoint's generation config declares under `key`.
 fn awq_token_id(dir: &str, key: &str) -> Option<u32> {
-    awq_generation_config(dir)?
-        .get(key)?
+    declared(&awq_generation_config(dir)?, key)?
         .as_u64()
         .map(|i| i as u32)
 }
@@ -620,7 +627,7 @@ fn awq_token_id(dir: &str, key: &str) -> Option<u32> {
 pub(super) fn awq_eos_tokens(dir: &str) -> Option<(u32, Vec<u32>)> {
     let mut ids: Vec<u32> = Vec::new();
     if let Some(v) = awq_generation_config(dir) {
-        match v.get("eos_token_id") {
+        match declared(&v, "eos_token_id") {
             Some(serde_json::Value::Number(n)) => {
                 if let Some(i) = n.as_u64() {
                     ids.push(i as u32);
@@ -1734,6 +1741,32 @@ pub(crate) fn reusable_prefix(cached: &[u32], prompt: &[u32], kv_len: usize) -> 
         .take_while(|(a, b)| a == b)
         .count()
         .min(kv_len)
+}
+
+#[cfg(test)]
+mod declared_token_tests {
+    use super::declared;
+
+    /// A token id at the top level of a configuration is read there.
+    #[test]
+    fn a_top_level_token_is_read_there() {
+        let c = serde_json::json!({"eos_token_id": 7, "text_config": {"eos_token_id": 9}});
+        assert_eq!(
+            declared(&c, "eos_token_id").and_then(|v| v.as_u64()),
+            Some(7)
+        );
+    }
+
+    /// A multimodal configuration declares the text model's tokens in its `text_config`.
+    #[test]
+    fn a_wrapped_text_model_declares_its_tokens_in_its_text_config() {
+        let c = serde_json::json!({"image_token_id": 5, "text_config": {"eos_token_id": 9}});
+        assert_eq!(
+            declared(&c, "eos_token_id").and_then(|v| v.as_u64()),
+            Some(9)
+        );
+        assert!(declared(&c, "bos_token_id").is_none());
+    }
 }
 
 #[cfg(test)]
