@@ -8,7 +8,6 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Added
 
-- Speech: speak English and French with Qwen3-TTS from its published checkpoint.
 - Serving: batch mixtures, attention sinks and stretched rotations on a card.
 - Serving: keep an idle model in host memory instead of unloading it, and load it from there on the next request.
 - Experts: favour experts in memory at the fast level.
@@ -17,28 +16,25 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 - Serving: hand a prompt's cache over for a model split or cut across cards.
 - Speculation: cut a recurrent drafter back to the tokens its target kept.
 - Speculation: draft DeepSeek V4.1 tokens with the model's own draft head when its files carry one.
-- Microbench: time a decode through a few layers and the mechanisms of a model at its shapes.
 - Metrics: count the expert bytes missing from memory by asker, and the experts a token shares with the last.
-- Inference: run a decode layer whole on the card that keeps its weights, routed experts apart.
 - Metrics: publish each request's queue, prefill, decode and cache figures.
-- API: report a chat answer's own times, energy and cache place, also when it gathers several generations.
 - Serving: batch the image and speech requests queued behind a running one.
 - API: take a completion's prompt as embeddings, in loken's checksummed format or as torch.save tensors.
 - API: take vLLM's request fields and serve its extra routes.
-- API: tell a request refused for lack of a slot when to retry.
+- API: tell a client refused by the rate limit or for lack of a slot when to retry.
 - API: close a reasoning at its token budget on chat completions and Messages.
-- Models: embed texts and images in one space with CLIP and SigLIP checkpoints, on the embeddings routes.
-- Config: list several model directories, on several disks, as one catalogue read in the order listed.
+- Models: embed texts and images in 1 space with CLIP and SigLIP checkpoints, on the embeddings routes.
+- Config: list several model directories, on several disks, as 1 catalogue read in the order listed.
 - Models: serve a float checkpoint in its stored format when it fits.
 - API: answer use_beam_search with the n best beams, scored as transformers does.
 - Serving: log the pace of batched steps once a second.
 - Vision: read the Qwen3.5 vision tower from a separate projector file.
 - Vision: answer about a video clip sent as a video_url part.
-- API: report each chat answer's times, energy share, cache place and drafts.
+- API: report each chat answer's times, energy share, cache place and drafts, summed over its generations.
 - API: stream the reading of a long prompt as comment lines.
 - Models: convert DeepSeek V4.1 and its draft into files ollama and llama.cpp load.
-- Docs: explain how lokend works in 7 pages, and map its code for contributors.
-- Config: choose fidelity to the published model or speed with one setting.
+- Docs: map the code of lokend for contributors.
+- Config: choose fidelity to the published model or speed with 1 setting.
 - API: show the progress of a model load in the process list.
 - Cluster: read a prompt here when that is faster than taking its cache from a peer.
 - API: answer speech in FLAC, Opus and AAC.
@@ -62,17 +58,15 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 - Speech: hold the Parler-TTS decoder in F16 on a card unless fidelity is reference.
 - Tokenizer: follow the file's add_bos_token on a bare prompt, as the reference does.
 - Experts: keep more of them in host memory, sized while serving, with read-ahead taken only when it runs faster.
-- Experts: read only the experts a prompt routes to, and run them on the cards.
-- Experts: copy a decode's experts to the cards beside the token, not inside it.
 - API: leave the stop sequence out of the text returned by every route unless asked to keep it.
-- Serving: decode and prefill more requests in one batch, sharing the cache and fusing the attention.
+- Serving: decode and prefill more requests in 1 batch, sharing the cache and fusing the attention.
 - Inference: run the host attention of a long prompt over tiles of keys and rows.
-- Inference: read each weight and each row's activation once for all the rows of a small batch.
+- Inference: read a q4_K or q5_K weight once for all the rows of a small batch on a card.
 - Speculative decoding: record the draft verify and the drafter step as graphs, and cost a cycle by its replays.
 - Speech: speak faster with pocket-tts by keeping its cache across frames.
 - DeepSeek V4.1: serve it through the generic route, on the host and the cards.
-- API: count the experts of the generic tiers on the stage endpoint.
 - Sampling: allocate nothing on the card for a sampled token.
+- Sampling: build and upload no repeat penalty list when the penalty is 1.0.
 
 ### Fixed
 
@@ -83,7 +77,6 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 - OpenCL: offer no card that CUDA or ROCm already drives.
 - OpenCL: load and render Z-Image on an Intel GPU without host copies or a stalled queue.
 - Image and video: hold SDXL, Z-Image and Wan projections in their narrowest exact form.
-- ACE-Step: declare the F16 rounding of the audio decoder's kernels on a card.
 - Z-Image: build the caption encoder on the host only for a prompt it reads.
 - OpenCL: build the image kernels with Intel's OpenCL runtime.
 - Cluster: let 2 instances each be the prefill peer of the other.
@@ -101,17 +94,14 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 - API: open the window a load request's num_ctx asks for.
 - Speech: decode Parler with its checkpoint's sampling, length limit, end rule and 1 seed.
 - Delete: unload a model after releasing the table of loaded models.
-- Chat: return one log probability per token, streamed or not, and on the Responses route.
+- API: return 1 log-probability per token, streamed, drafted or batched, to its own request.
 - Embeddings: scale a vector cut to fewer dimensions back to unit length.
-- Sampling: build and upload no repeat penalty list when the penalty is 1.0.
-- Matmul: dequantise on the card for one call when its workspace is short, keeping no copy.
+- Matmul: dequantise on the card for 1 call when its workspace is short, keeping no copy.
 - API: keep the prompt caches, stored responses, files, batches and renders of each API key to itself.
 - Renders: stop a render by its X-Request-Id, a transcription or separation sooner, a cancelled SDXL row at once.
-- Offload: say what a card keeps and has free when it declines a step.
 - Memory: give the allocator's free memory back to the host once it passes the headroom.
 - Sessions: keep no token list for each session id, and count the resident conversation.
 - Loaded models: list them without holding the table through each engine's wait.
-- Rate limit: tell a refused client how long to wait in Retry-After.
 - Chat: accept a turn with media or a tool result and no text.
 - Responses: report a stream cut upstream as incomplete.
 - Streams: end a failed OpenAI stream with an error frame, not as text.
@@ -127,24 +117,20 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 - Serving: send the requests queued at the gate to the batch worker together.
 - Serving: continue a preempted request where it stopped.
 - Loading: give the loader's worker threads the main thread's stack.
-- Serving: keep serving when many prompts arrive at once on a card.
-- Serving: prefill no more prompt tokens in a step than the reserve holds.
 - Speculative decoding: prefill the drafter in chunks, as its target is.
 - Speculative decoding: accept a drafter whose vocabulary is padded to fewer rows.
-- Speculative decoding: draft one token first and lengthen drafts a row at a time.
+- Speculative decoding: draft 1 token first and lengthen drafts a row at a time.
 - Speculative decoding: verify a Qwen3 draft's rows exactly as their decode steps.
 - Serving: go on from the failed chunk when a long prompt runs out of card memory.
 - Inference: size the attention scores of a prompt on a card from its free memory.
 - Vision: place the text after a tall image as the reference does.
 - Models: load the model of an Ollama manifest that lists its projector first.
 - Serving: keep the images of a vision model when requests arrive together.
-- Inference: attend over the full-width cache on the host when kv_quant is off.
+- Inference: attend over the full-width cache on the host when the cache is not quantised.
 - Models: list a released checkpoint that loken serves in place.
-- DeepSeek V4.1: size a prompt's chunk for the residual copies each token keeps.
 - API: end a chat stream on an engine error with the error alone.
 - Serving: answer with a model split over several cards.
 - OpenCL: offer a GPU that shares the host's memory only what the host can spare.
-- API: give every token its log-probability, drafted or batched, to its own request only.
 - Placement: plan no card when the driver sees none, though the machine has some.
 - Speculation: try a waiting prompt lookup again when the answer copies the prompt.
 - Speculation: cut a hybrid model's recurrent state back to the drafted tokens it kept.
@@ -159,7 +145,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 - Kernels: refuse the inputs and launches that failed without an error.
 - State cache: load when the disk probe measures no rate.
 - MoE: drop and read ahead the expert pages of a model loaded from 1 file.
-- Vulkan: give each block of 32 activations of a product its own scale.
+- Vulkan: give each block of 32 activations its own scale, the K-quant mat-mat apart.
 - Serving: read a long prompt on the serial path in the rows the cards afford.
 - Speculation: judge a prompt lookup trial after a hold on its own cost.
 - Hub: pull the merges file of a tokenizer that ships no tokenizer.json.
@@ -171,7 +157,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 ### Removed
 
 - API: derive window, cache format and priority instead of loken headers and options.
-- Config: stop reading 18 keys and the [cpu] table, which loken decides itself.
+- Config: stop reading 17 keys and the [cpu] table, which loken decides itself.
 
 ## [0.4.2] - 2026-10-28
 

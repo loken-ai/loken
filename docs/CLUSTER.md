@@ -84,56 +84,6 @@ flowchart TD
   P -->|fails before it answers| L3
 ```
 
-```scenes
-figure = "anatomy/routing.svg"
-program = "anatomy/routing.scenes"
-style = ["anatomy/figures.css", "anatomy/routing.css"]
-soundtheme = "soft"
-eyebrow = "lokend anatomy"
-title = "Routing"
-caption = "Routing"
-hint = "A train is a request. Each lamp of the signal box is 1 test, in order."
-legendLabel = "Key:"
-legend = [["rt-k-req", "request"], ["rt-k-batch", "batch request"], ["rt-k-rtt", "round trip"], ["rt-k-work", "predicted work"], ["rt-k-stop", "refused or failed"]]
-
-[sounds]
-routing1 = "/loken/narration/inside/cluster-routing-1.mp3"
-routing2 = "/loken/narration/inside/cluster-routing-2.mp3"
-routing3 = "/loken/narration/inside/cluster-routing-3.mp3"
-routing4 = "/loken/narration/inside/cluster-routing-4.mp3"
-routing5 = "/loken/narration/inside/cluster-routing-5.mp3"
-routing6 = "/loken/narration/inside/cluster-routing-6.mp3"
-routing7 = "/loken/narration/inside/cluster-routing-7.mp3"
-
-[inlay]
-pad = [0, 270]
-below = 700
-title = [[1004, 0, 1270, 300]]
-step = [[1004, 0, 1270, 300]]
-now = [[1004, 300, 1270, 620]]
-note = [[1004, 300, 1270, 620]]
-
-[[scene]]
-key = "decide"
-name = "Decide"
-title = "Where a request runs"
-about = "A node that receives a request runs it here, or sends it whole to 1 peer. The signal box tests the rules in order, and the first test that decides sets the points."
-steps = [
-  "With `join` empty, or with the forwarded marker on the request, the node serves it locally. A request moves at most once.",
-  "A request at the batch priority yields to the nearest alive peer that can serve it, even a slower one. With no such peer and a conversation resident, the node answers `409`.",
-  "A node with no measured rate for the model serves the request first, when it can serve it. That request becomes its meter.",
-  "Every candidate gets a predicted completion time, round trip included, from what each node measured and reports. The lowest estimate wins.",
-  "The best peer must beat the local estimate by `min_speedup`, 1.15 by default, unless this node cannot serve the model. A peer only a little faster leaves the request here.",
-  "A peer that clears the margin gets the request whole. Its stream is relayed back unchanged.",
-  "A peer that fails before it answers leaves the request here. It is out of the running for 10 gossip intervals.",
-]
-now = ["Forwarded once: it stays here", "Batch work yields", "No price yet: served here first", "Every station times the request", "Too close to the margin", "Node B clears the gauge", "Node B fails before it answers"]
-narration = ["routing1", "routing2", "routing3", "routing4", "routing5", "routing6", "routing7"]
-done = "Decided"
-rows = [{label = "Verdict"}]
-notes = ["A verdict that keeps the request logs `cluster: serving locally: <reason>`."]
-```
-
 1. `join` is empty: serve locally, `single node`.
 2. The request carries the forwarded marker: serve locally, `already forwarded once - a second hop would risk a loop`.
    A request moves at most once.

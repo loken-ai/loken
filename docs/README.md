@@ -33,7 +33,5 @@ The same pages are served at <https://loken-ai.github.io/loken/>.
 | [`dev/layer-bench.md`](dev/layer-bench.md) | Measure a decode on a few layers of a large model |
 | [`dev/microbench.md`](dev/microbench.md) | Time one mechanism at a model's shapes, variants side by side |
 | [`dev/code-map.md`](dev/code-map.md) | Find the code behind each part of lokend and the plan levels it reads |
-| [`inside/engines.md`](inside/engines.md) | Compare how loken, vLLM and Ollama place a model, cards, machines and requests |
-| [`inside/streamed.md`](inside/streamed.md) | Follow a mixture larger than the server from the disk to the card |
 
 The [benchmarks](https://github.com/loken-ai/benchmarks) repository holds the campaign, its method and its results, published at <https://loken-ai.github.io/benchmarks/>.
