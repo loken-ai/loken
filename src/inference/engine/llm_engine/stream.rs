@@ -380,6 +380,8 @@ impl LlmEngine {
             };
             let mut stopped_early = false;
             let (mut admitted, mut first_token) = (None, None);
+            // When this request became the only one in the worker, and its token count then.
+            let mut alone_since: Option<(std::time::Instant, usize)> = None;
             loop {
                 let t = match cb_rx.recv() {
                     Ok(CbToken::Tok(t)) => t,
@@ -419,6 +421,13 @@ impl LlmEngine {
                     break;
                 }
                 gen.push(t);
+                // A request that shares the worker again starts its alone stretch over.
+                let alone = active.load(std::sync::atomic::Ordering::Acquire) == 1;
+                match (alone, alone_since.is_some()) {
+                    (true, false) => alone_since = Some((std::time::Instant::now(), gen.len())),
+                    (false, true) => alone_since = None,
+                    _ => {}
+                }
                 if let Some(p) = probe.as_deref() {
                     p.note_decoded(gen.len() as u64);
                 }
@@ -461,6 +470,27 @@ impl LlmEngine {
                 }
             }
             let done = std::time::Instant::now();
+            // The last request of a burst decoded alone once the others ended: the worker's
+            // rate alone.
+            let alone_to_end = active.load(std::sync::atomic::Ordering::Acquire) == 1;
+            if let Some((at, from)) = alone_since.filter(|_| alone_to_end && !lone_at_submit) {
+                let tail = gen.len() - from;
+                if let Some(rate) =
+                    lone_rate(tail + 1, done.saturating_duration_since(at).as_secs_f64())
+                {
+                    batching
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .record_worker_tail(super::batching::LoneDecode {
+                            tokens: tail,
+                            rate,
+                            drafted: 0.0,
+                            lookup: super::batching::lookup_share(&prompt_tokens, &gen),
+                            prompt_tokens: 0,
+                            prompt_rate: None,
+                        });
+                }
+            }
             // A moved request reports its serial part and the worker's part together.
             if let Some(SerialPart { moved, mut outcome }) = serial {
                 outcome.figures.decode_s += done.saturating_duration_since(moved).as_secs_f64();

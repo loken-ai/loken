@@ -8,8 +8,10 @@
 //! from a prefill peer.
 //! The batch worker does neither.
 //!
-//! A path without a measure for the loaded model takes the next lone request, the worker first,
-//! so each path is measured by real requests.
+//! The serial path takes every lone request until the worker has a measure.
+//! A lone request is never sent to an unmeasured worker to measure it.
+//! The worker is measured on a request it decodes alone: one alone from its submission, or the
+//! last request of a burst once the others have ended.
 //! A request that arrives while a lone request decodes serially moves that request into the
 //! worker at its next step, so the burst is batched at once.
 //! The model keeps the worker's paged pool while it serves serially, so a move takes no new
@@ -88,17 +90,17 @@ impl PathRates {
     /// request did.
     /// `serial_charge` seconds are added to the serial path.
     ///
-    /// A path without a measure is taken first, the worker before the serial path.
+    /// The serial path is taken while either path has no measure.
     /// Each path is charged the prompt at its own prompt rate.
     /// A path without a prompt rate is taken to read at the other path's rate.
     /// The prompt then weighs the same on both paths and the decode rates decide.
     /// The serial rate is turned into a rate per forward with the share its drafts gave.
     /// That share scales with the prompt lookup share of the latest lone request.
     pub fn choose(&self, serial_charge: f64) -> LonePath {
-        let Some(batched) = self.batched else {
-            return LonePath::Batched;
-        };
         let Some(serial) = self.serial else {
+            return LonePath::Serial;
+        };
+        let Some(batched) = self.batched else {
             return LonePath::Serial;
         };
         let tokens = self.latest_tokens.max(1) as f64;
@@ -216,6 +218,14 @@ impl BatchingSignal {
         self.rates.latest_lookup = Some(decode.lookup);
         self.rates.latest_tokens = decode.tokens;
         self.rates.latest_prompt_tokens = decode.prompt_tokens;
+    }
+
+    /// Records the decode of the last request of a burst, from the moment the others ended.
+    ///
+    /// It gives the worker's decode rate alone.
+    /// The size of the latest lone request and the prompt rates stay as they were.
+    pub fn record_worker_tail(&mut self, decode: LoneDecode) {
+        self.rates.batched = Some(decode);
     }
 
     /// Records a lone serial request moved into the worker.
@@ -543,14 +553,138 @@ mod tests {
         assert_eq!(long_prompt(None, None).choose(0.0), LonePath::Batched);
     }
 
+    /// A lone request never goes to a worker without a measure.
+    /// The tail of a burst measures the worker, and then the rates choose.
     #[test]
-    fn each_path_is_measured_before_the_rates_choose() {
+    fn a_lone_request_waits_for_the_worker_measure_of_a_burst() {
         let mut s = BatchingSignal::default();
-        assert_eq!(s.arrive(0, false), Switch::ToBatched);
-        s.record(LonePath::Batched, decode(110.0, 0.0, 0.0));
-        assert_eq!(s.arrive(0, true), Switch::ToSerial);
+        assert_eq!(s.arrive(0, false), Switch::Stay);
         s.record(LonePath::Serial, decode(100.0, 0.0, 0.0));
-        assert_eq!(s.arrive(0, false), Switch::ToBatched);
+        for _ in 0..3 {
+            assert_eq!(s.arrive(0, false), Switch::Stay);
+            s.record(LonePath::Serial, decode(100.0, 0.0, 0.0));
+        }
+        assert_eq!(s.arrive(2, false), Switch::ToBatched);
+        s.record_worker_tail(LoneDecode {
+            tokens: 40,
+            ..decode(110.0, 0.0, 0.0)
+        });
+        assert_eq!(
+            s.rates.latest_tokens, 200,
+            "the tail does not size the next request"
+        );
+        assert_eq!(s.arrive(0, true), Switch::Stay);
+    }
+
+    /// A model a burst left in its worker goes back to the serial path while the worker has
+    /// no measure.
+    #[test]
+    fn an_unmeasured_worker_gives_the_lone_request_back_to_the_serial_path() {
+        let mut s = BatchingSignal::default();
+        s.record(LonePath::Serial, decode(100.0, 0.0, 0.0));
+        assert_eq!(s.arrive(1, false), Switch::ToBatched);
+        assert_eq!(s.arrive(0, true), Switch::ToSerial);
+    }
+
+    /// The first lone request of a model is served serially, where the load leaves it.
+    /// A model a burst left in its worker goes back to the serial path for it.
+    #[test]
+    fn the_first_lone_request_is_served_serially() {
+        let s = BatchingSignal::default();
+        assert_eq!(s.rates.choose(0.0), LonePath::Serial);
+        let mut fresh = BatchingSignal::default();
+        assert_eq!(fresh.arrive(0, false), Switch::Stay);
+        let mut after_burst = BatchingSignal::default();
+        assert_eq!(after_burst.arrive(1, false), Switch::ToBatched);
+        assert_eq!(after_burst.arrive(0, true), Switch::ToSerial);
+    }
+
+    /// The paths of 3 lone requests in a row, each recorded on the path it took.
+    fn three_lone_requests(serial: LoneDecode, batched: LoneDecode) -> Vec<LonePath> {
+        let mut s = BatchingSignal::default();
+        let mut in_worker = false;
+        let mut paths = Vec::new();
+        for _ in 0..3 {
+            match s.arrive(0, in_worker) {
+                Switch::ToBatched => in_worker = true,
+                Switch::ToSerial => in_worker = false,
+                Switch::Stay => {}
+            }
+            let path = if in_worker {
+                LonePath::Batched
+            } else {
+                LonePath::Serial
+            };
+            s.record(
+                path,
+                match path {
+                    LonePath::Serial => serial,
+                    LonePath::Batched => batched,
+                },
+            );
+            paths.push(path);
+        }
+        paths
+    }
+
+    /// Lone requests stay serial while no burst has measured the worker, whatever it would do.
+    #[test]
+    fn lone_requests_stay_serial_without_a_worker_measure() {
+        use LonePath::Serial;
+        assert_eq!(
+            three_lone_requests(request(122.0, 1008, 4750.0), request(134.0, 1008, 5600.0)),
+            [Serial, Serial, Serial]
+        );
+        assert_eq!(
+            three_lone_requests(request(640.0, 110, 9000.0), request(340.0, 110, 6000.0)),
+            [Serial, Serial, Serial]
+        );
+    }
+
+    /// Once a burst measured the worker, a worker that serves faster takes the lone requests
+    /// and a slower one does not.
+    #[test]
+    fn a_worker_measured_by_a_burst_takes_the_lone_requests_it_serves_faster() {
+        let measured = |serial: LoneDecode, tail: f64| {
+            let mut s = BatchingSignal::default();
+            s.record(LonePath::Serial, serial);
+            s.record_worker_tail(decode(tail, 0.0, 0.0));
+            s.rates.choose(0.0)
+        };
+        assert_eq!(
+            measured(request(122.0, 1008, 4750.0), 134.0),
+            LonePath::Batched
+        );
+        assert_eq!(
+            measured(request(640.0, 110, 9000.0), 340.0),
+            LonePath::Serial
+        );
+    }
+
+    /// A request that arrives while a lone request is served batches, whatever the rates and
+    /// whichever path the lone request took.
+    #[test]
+    fn a_request_beside_a_lone_one_batches() {
+        let mut fresh = BatchingSignal::default();
+        assert_eq!(fresh.arrive(0, false), Switch::Stay);
+        assert_eq!(fresh.arrive(1, false), Switch::ToBatched);
+        let mut measured = BatchingSignal::default();
+        measured.record(LonePath::Serial, decode(500.0, 0.0, 0.0));
+        assert_eq!(measured.arrive(1, false), Switch::ToBatched);
+        assert_eq!(measured.arrive(1, true), Switch::Stay);
+    }
+
+    /// A model that cannot batch is offered the worker once, at its first overlap.
+    #[test]
+    fn a_model_that_cannot_batch_stays_serial_after_one_offer() {
+        let mut s = BatchingSignal::default();
+        assert_eq!(s.arrive(0, false), Switch::Stay);
+        s.record(LonePath::Serial, decode(100.0, 0.0, 0.0));
+        assert_eq!(s.arrive(1, false), Switch::ToBatched);
+        s.mark_cannot_batch();
+        for others in [0, 1, 3] {
+            assert_eq!(s.arrive(others, false), Switch::Stay);
+        }
     }
 
     #[test]
@@ -653,6 +787,8 @@ mod tests {
                 }
             );
             batched = true;
+            // The last request of the burst decodes alone in the worker once the others end.
+            s.record_worker_tail(decode(100.0, 0.0, 0.0));
         }
         assert!(moves <= 2, "{moves} moves");
         assert_eq!(
