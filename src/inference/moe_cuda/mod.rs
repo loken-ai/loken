@@ -252,6 +252,7 @@ cuda_launchers! {
         mail_request: *mut u32, mail_live: *mut u32, rows: i32, k: i32, hidden: i32);
     loken_tier_wait(counter: *const u32, reply: *mut u32, abort_word: *mut u32);
     loken_tier_merge(card: *const f32, late: *const f32, product: *const f32, counter: *const u32, out: *mut f32, n: i32, k: i32, hidden: i32);
+    loken_tier_merge_pairs(card: *const f32, late: *const f32, card_slots: *const u32, product: *const f32, counter: *const u32, out: *mut f32, n: i32, k: i32, hidden: i32);
 }
 /// The launchers of a cached layer's decode recorded in a graph (see `expert_tier::graph`).
 ///
@@ -324,6 +325,24 @@ pub(crate) mod tier_graph {
         stream: i64,
     ) {
         super::loken_tier_merge(card, late, product, counter, out, n, k, hidden, stream);
+    }
+    /// Each row's pairs summed in the router's order, each from `late` where `card_slots` is all
+    /// ones and from `card` otherwise, then the host's product where it is not zero.
+    pub unsafe fn merge_pairs(
+        card: *const f32,
+        late: *const f32,
+        card_slots: *const u32,
+        product: *const f32,
+        counter: *const u32,
+        out: *mut f32,
+        n: i32,
+        k: i32,
+        hidden: i32,
+        stream: i64,
+    ) {
+        super::loken_tier_merge_pairs(
+            card, late, card_slots, product, counter, out, n, k, hidden, stream,
+        );
     }
 }
 cuda_launchers! {

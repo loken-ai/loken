@@ -1521,6 +1521,7 @@ impl LlmEngine {
                                     .map_err(|e| anyhow!("{model_id_clone}: {e}"))?;
                             }
                             model.place_wide_experts(expert_variants);
+                            model.set_expert_quality(quality);
                             if quality != QualityLevel::Exact && layer_share.is_none() {
                                 let bos = get_gguf_u32(&content, "tokenizer.ggml.bos_token_id");
                                 let file_len = std::fs::metadata(&model_file).map_or(0, |m| m.len());

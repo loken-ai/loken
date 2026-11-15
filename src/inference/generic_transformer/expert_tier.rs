@@ -12,6 +12,11 @@
 //! copied from the host into the card's transit room and run there with the others, or computed
 //! on the host. The two proceed together and the split leaves neither waiting on the other.
 //!
+//! The split holds for the formats with exact kernels, where a pair gives the same bits on the
+//! card and on the host. A layer in another format runs every missing expert through the
+//! transit room, with the kernels its slots run: a pair's row is the same bits wherever its
+//! expert sits, and a row's pairs are summed in the router's order.
+//!
 //! A card with room for every expert of its layers holds them all: the layer is resident, and the
 //! tier is the stacks the kernels read, with no host in the token.
 //!
@@ -222,6 +227,9 @@ pub struct LayerTier {
     readahead: std::sync::OnceLock<Arc<super::expert_readahead::ReadAhead>>,
     /// The last cached layer of the card: a one-row request here ends the token's span.
     closer: std::sync::atomic::AtomicBool,
+    /// The level gives up the same bits for every cache: a layer without exact kernels splits
+    /// its missing experts between the transit room and the host by their paces.
+    splits_misses: std::sync::atomic::AtomicBool,
 }
 
 /// What one decoded token moves between the card and the host, in page-locked memory and in
@@ -817,7 +825,23 @@ impl super::GenericHeteroTransformer {
             // The card's free memory as the load left it, before the stager takes its rooms:
             // those are counted once, in what the slots leave free.
             let free_at_tier = expert_cache::free_now(dev);
-            let stager = CardStager::new(dev, widest, widest_mixture)?;
+            // A layer without exact kernels runs every missing expert of a token through the
+            // transit room below the fast level: the room holds a token's pairs.
+            let least = tiered
+                .iter()
+                .filter_map(|&l| self.layers[l].moe.as_ref())
+                .filter(|m| {
+                    let stacks = [
+                        m.gate_exps_sep.clone().expect("separate stacks"),
+                        m.up_exps_sep.clone().expect("separate stacks"),
+                        m.down_exps.clone(),
+                    ];
+                    exact::Exact::of(&stacks, m.swiglu_limit.unwrap_or(0.0)).is_none()
+                })
+                .map(|m| m.n_experts_used)
+                .max()
+                .unwrap_or(0);
+            let stager = CardStager::holding(dev, widest, widest_mixture, least)?;
             let held: u64 = stager.full_bytes()
                 + stager.transit_bytes()
                 + chunk_bytes.saturating_sub(before.saturating_sub(budget));
@@ -976,6 +1000,24 @@ impl super::GenericHeteroTransformer {
     pub fn note_graphs_recorded(&self) {
         for s in self.card_stagers() {
             s.note_recorded();
+        }
+    }
+
+    /// What the caches of the experts may give up at the level `quality`: below the fast level a
+    /// layer without exact kernels runs every routed pair through the card's kernels, so that
+    /// its output is the same bits whatever its cache holds.
+    pub fn set_expert_quality(
+        &mut self,
+        quality: crate::inference::engine::llm_engine::QualityLevel,
+    ) {
+        use crate::inference::engine::llm_engine::QualityLevel;
+        let splits = quality != QualityLevel::Exact;
+        for tier in self
+            .layers
+            .iter()
+            .filter_map(|l| l.moe.as_ref().and_then(|m| m.tier.as_ref()))
+        {
+            tier.splits_misses.store(splits, Ordering::Relaxed);
         }
     }
 
@@ -1497,6 +1539,7 @@ impl LayerTier {
             admission: std::sync::OnceLock::new(),
             readahead: std::sync::OnceLock::new(),
             closer: std::sync::atomic::AtomicBool::new(false),
+            splits_misses: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -2084,6 +2127,28 @@ impl LayerTier {
             return Ok(out);
         }
 
+        // Without exact kernels and below the fast level, every pair runs on the card, its
+        // missing experts through transit. A layer without a transit room runs them all on the
+        // host, and the cache still learns from the misses.
+        if !self.splits_misses.load(Ordering::Relaxed) && self.stage.is_none() {
+            drop(guard);
+            let x = xs.to_device(&host)?;
+            let out = moe.forward_cpu(&x, &ids_card, &w_card, 1, hidden)?;
+            self.promote(&miss_ids, &in_use);
+            laps.mark("tier token: finish");
+            return out.to_device(&dev);
+        }
+        if !self.splits_misses.load(Ordering::Relaxed) {
+            let slots: Vec<Option<u32>> =
+                (0..k).map(|i| is_hit[i].then_some(slot_ids[i])).collect();
+            let (out, rounds) =
+                self.pairs_on_card(moe, scratch, xs, &ids_h, &w_card, &slots, &mut laps)?;
+            drop(guard);
+            self.keep_rounds(&rounds, &mut in_use, &stream, ADAPT_SWAPS_A_REQUEST)?;
+            laps.mark("tier token: finish");
+            return Ok(out);
+        }
+
         // The card's share is launched first, and runs while the host does its own. A routed pair
         // whose expert is missing reads a slot that is in use and weighs zero.
         let card_out = if hits > 0 {
@@ -2383,6 +2448,35 @@ impl LayerTier {
             let host_experts: Vec<u32> = missing[to_transit..].to_vec();
             self.keep_in_transit(&transit_experts, None, &mut in_use, &stream)?;
             self.promote_up_to(&host_experts, &in_use, rows.max(ADAPT_SWAPS_A_REQUEST));
+            laps.mark("tier rows: finish");
+            return Ok(out);
+        }
+        // Without exact kernels and below the fast level, every pair runs as a decoded token's
+        // does: on the card, its missing experts through transit. A layer without a transit room
+        // runs them all on the host.
+        if !self.splits_misses.load(Ordering::Relaxed) {
+            let w_card = weights.to_dtype(crate::tensor::DType::F32)?.contiguous()?;
+            if self.stage.is_none() {
+                drop(guard);
+                let ids_card = ids.to_dtype(crate::tensor::DType::U32)?.contiguous()?;
+                let out =
+                    moe.forward_cpu(&xs.to_device(&host)?, &ids_card, &w_card, rows, hidden)?;
+                self.promote_up_to(&missing, &in_use, rows.max(ADAPT_SWAPS_A_REQUEST));
+                laps.mark("tier rows: finish");
+                return out.to_device(&dev);
+            }
+            let slots: Vec<Option<u32>> = (0..pairs)
+                .map(|p| is_hit[p].then_some(slot_ids[p]))
+                .collect();
+            let (out, rounds) =
+                self.pairs_on_card(moe, scratch, xs, &ids_h, &w_card, &slots, &mut laps)?;
+            drop(guard);
+            self.keep_rounds(
+                &rounds,
+                &mut in_use,
+                &stream,
+                rows.max(ADAPT_SWAPS_A_REQUEST),
+            )?;
             laps.mark("tier rows: finish");
             return Ok(out);
         }
@@ -2724,6 +2818,158 @@ impl LayerTier {
         (0..=missing.min(room))
             .min_by(|&a, &b| finish(a).total_cmp(&finish(b)))
             .unwrap_or(0)
+    }
+
+    /// The expert block of the rows `xs` whose pairs route to `ids` (router order) at the weights
+    /// `w_card` (on the card, in pair order), for a layer whose formats have no exact kernels.
+    ///
+    /// Every pair's row is computed on the card by the same kernels: from its slot `slots[p]`,
+    /// or, for a missing expert, from the transit room.
+    /// The missing experts pass through the room in rounds of what it holds.
+    /// Each row's pairs are summed in the router's order.
+    ///
+    /// Returns the rows `[rows, hidden]` and the experts of each round, in their room order.
+    #[allow(clippy::too_many_arguments)]
+    fn pairs_on_card(
+        &self,
+        moe: &MoeWeights,
+        scratch: &Scratch,
+        xs: &Tensor,
+        ids: &[u32],
+        w_card: &Tensor,
+        slots: &[Option<u32>],
+        laps: &mut Laps,
+    ) -> Result<(Tensor, Vec<Vec<u32>>)> {
+        use crate::inference::moe_cuda::MoreExperts;
+        let stage = self.stage.as_ref().expect("a layer with a transit room");
+        let host = Device::Cpu;
+        let dev = xs.device().clone();
+        let stream = dev.as_cuda_device()?.0.stream().clone();
+        let k = moe.n_experts_used;
+        let pairs = ids.len();
+        let rows = pairs / k.max(1);
+        let hidden = xs.dim(crate::tensor::D::Minus1)?;
+        let x = xs.reshape((rows, hidden))?;
+        let w = w_card.flatten_all()?;
+        let on_card = |v: Vec<u32>| Tensor::from_vec(v, pairs, &host)?.to_device(&dev);
+        // Pair p reads row p / k and writes row p: every pair is computed on its own.
+        let order = on_card((0..pairs as u32).collect())?;
+        let card_rows = if slots.iter().any(Option::is_some) {
+            let routing = ExpertRouting {
+                slots: order.clone(),
+                experts: on_card(slots.iter().map(|s| s.unwrap_or(u32::MAX)).collect())?,
+                topk: k,
+            };
+            let extra = self.extra.lock().unwrap_or_else(|e| e.into_inner());
+            let more = extra.as_ref();
+            let h = routing.gate_up_silu_over(
+                &x,
+                &self.card[0],
+                &self.card[1],
+                more.map(|m| MoreExperts::Stacks((&m[0], &m[1]))),
+            )?;
+            Some(routing.down_pairs_over(
+                &h,
+                &self.card[2],
+                more.map(|m| MoreExperts::Stacks(&m[2])),
+                &w,
+            )?)
+        } else {
+            None
+        };
+        laps.mark("tier pairs: card launch");
+        let mut missing: Vec<u32> = (0..pairs)
+            .filter(|&p| slots[p].is_none())
+            .map(|p| ids[p])
+            .collect();
+        missing.sort_unstable();
+        missing.dedup();
+        // Where each pair's row is read from: the card's rows (all ones), or a row of the rounds'.
+        let mut src = vec![u32::MAX; pairs];
+        let mut rounds = Vec::new();
+        let mut late = Vec::new();
+        for (r, round) in missing.chunks(stage.stager.transit.max(1)).enumerate() {
+            // The room's next copies wait for the kernels of the round before to have read it.
+            if r > 0 {
+                let read = stream
+                    .record_event(None)
+                    .map_err(|e| crate::tensor::Error::msg(format!("record: {e:?}")))?;
+                stage
+                    .stager
+                    .copy
+                    .wait(&read)
+                    .map_err(|e| crate::tensor::Error::msg(format!("wait: {e:?}")))?;
+            }
+            self.copy_to_transit(scratch, round)?;
+            stream
+                .wait(&scratch.upload_end)
+                .map_err(|e| crate::tensor::Error::msg(format!("wait: {e:?}")))?;
+            let places: Vec<u32> = (0..pairs)
+                .map(|p| match slots[p] {
+                    Some(_) => u32::MAX,
+                    None => round
+                        .iter()
+                        .position(|&e| e == ids[p])
+                        .map_or(u32::MAX, |at| at as u32),
+                })
+                .collect();
+            for (p, &at) in places.iter().enumerate() {
+                if at != u32::MAX {
+                    src[p] = (r * pairs + p) as u32;
+                }
+            }
+            let routing = ExpertRouting {
+                slots: order.clone(),
+                experts: on_card(places)?,
+                topk: k,
+            };
+            let h = routing.gate_up_silu(&x, &stage.compact[0], &stage.compact[1])?;
+            late.push(routing.down_pairs_over(&h, &stage.compact[2], None, &w)?);
+            rounds.push(round.to_vec());
+        }
+        laps.mark("tier pairs: transit");
+        let late = match late.len() {
+            0 => None,
+            1 => late.pop(),
+            _ => Some(Tensor::cat(&late.iter().collect::<Vec<_>>(), 0)?),
+        };
+        let first = card_rows
+            .as_ref()
+            .or(late.as_ref())
+            .expect("a row routes to at least one expert");
+        let src = on_card(src)?;
+        let out = Tensor::zeros_on(rows * hidden, crate::tensor::DType::F32, &dev)?;
+        exact::sum(
+            &dev,
+            address_of::<f32>(first)?,
+            late.as_ref().map_or(Ok(0), address_of::<f32>)?,
+            address_of::<u32>(&src)?,
+            address_of::<f32>(&out)?,
+            rows,
+            k,
+            hidden,
+        )?;
+        // The buffers the launches read live until the launches are queued behind them.
+        drop((card_rows, late, src, order));
+        Ok((out.reshape((rows, hidden))?, rounds))
+    }
+
+    /// After a request whose missing experts passed through the transit room in `rounds`: those
+    /// of the last round, still in the room, keep a slot where they are hotter than what it holds;
+    /// up to `most` of those of the rounds before go to the worker.
+    fn keep_rounds(
+        self: &Arc<Self>,
+        rounds: &[Vec<u32>],
+        in_use: &mut [bool],
+        stream: &Arc<crate::tensor::gpu_runtime::driver::CudaStream>,
+        most: usize,
+    ) -> Result<()> {
+        let Some((last, before)) = rounds.split_last() else {
+            return Ok(());
+        };
+        self.keep_in_transit(last, None, in_use, stream)?;
+        self.promote_up_to(&before.concat(), in_use, most);
+        Ok(())
     }
 
     /// Queue the copies of `experts` from the host into the transit room, one after the other
@@ -3119,6 +3365,17 @@ impl CardStager {
     /// rooms of a wide batch are made when a prefill runs, see
     /// [`Self::ensure_full`].
     pub fn new(dev: &Device, widest: [usize; 3], experts: usize) -> Result<Arc<Self>> {
+        Self::holding(dev, widest, experts, 0)
+    }
+
+    /// [`Self::new`] with a transit room of at least `least` experts: the pairs of a token of a
+    /// layer that runs every missing expert there.
+    pub fn holding(
+        dev: &Device,
+        widest: [usize; 3],
+        experts: usize,
+        least: usize,
+    ) -> Result<Arc<Self>> {
         let cd = dev.as_cuda_device()?;
         let copy =
             cd.0.context()
@@ -3132,7 +3389,9 @@ impl CardStager {
                 .map_err(|e| crate::tensor::Error::msg(e.to_string()))?;
             measure_upload_bandwidth(dev, &probe, bytes)?
         };
-        let transit = transit_experts(experts, bandwidth, host_read_bandwidth(widest[0]));
+        let transit = transit_experts(experts, bandwidth, host_read_bandwidth(widest[0]))
+            .max(least)
+            .min(experts);
         let buffer = || -> Result<StageBuffer> {
             let arena = |i: usize| {
                 QCudaStorage::arena(&cd, per_expert[i] * transit)
@@ -4386,7 +4645,7 @@ mod tests {
                     .data()
                     .len()
             });
-            let stager = CardStager::new(&card, widest, experts).unwrap();
+            let stager = CardStager::holding(&card, widest, experts, used).unwrap();
             poison(&stager);
             built = built.with_stage(&stager, 0, false).unwrap();
         }
@@ -4562,7 +4821,7 @@ mod tests {
                     .data()
                     .len()
             });
-            let stager = CardStager::new(&card, widest, experts).unwrap();
+            let stager = CardStager::holding(&card, widest, experts, used).unwrap();
             poison(&stager);
             let mut named = Vec::new();
             for (i, l) in layers.iter_mut().enumerate() {
@@ -4670,15 +4929,33 @@ mod tests {
     /// copies' bound, and the token is the host's.
     #[test]
     fn a_kernel_loaded_while_the_card_waits_leaves_the_request_answered() {
-        use crate::tensor::gpu_runtime::driver::{LaunchConfig, PushKernelArg};
         let _pool = LENT_POOL.lock().unwrap_or_else(|e| e.into_inner());
         let Ok(card) = Device::new_cuda(0) else {
             eprintln!("skipping: no usable CUDA device");
             return;
         };
-        let (experts, used, hidden, ffn) = (32usize, 4usize, 64usize, 64usize);
-        let reference = layer(&Device::Cpu, experts, used, hidden, ffn);
-        let mut tiered = layer(&card, experts, used, hidden, ffn);
+        // A format without exact kernels, whose misses all go to transit below the fast level,
+        // and one with them.
+        kernel_loaded_while_the_card_waits(&card, (32, 4, 64, 64), [GgmlDType::Q5_1; 2], false);
+        kernel_loaded_while_the_card_waits(
+            &card,
+            (32, 4, 512, 256),
+            [GgmlDType::Q4K, GgmlDType::Q6K],
+            true,
+        );
+    }
+
+    /// The test above over a layer of `formats`, which takes the exact kernels when `exact`.
+    fn kernel_loaded_while_the_card_waits(
+        card: &Device,
+        (experts, used, hidden, ffn): (usize, usize, usize, usize),
+        formats: [GgmlDType; 2],
+        exact: bool,
+    ) {
+        use crate::tensor::gpu_runtime::driver::{LaunchConfig, PushKernelArg};
+        let card = card.clone();
+        let reference = layer_of(&Device::Cpu, experts, used, hidden, ffn, formats);
+        let mut tiered = layer_of(&card, experts, used, hidden, ffn, formats);
         let widest = [0, 1, 2].map(|i| {
             [
                 tiered.gate_exps_sep.as_ref().unwrap(),
@@ -4689,11 +4966,16 @@ mod tests {
                 .data()
                 .len()
         });
-        let stager = CardStager::new(&card, widest, experts).unwrap();
+        let stager = CardStager::holding(&card, widest, experts, used).unwrap();
         let built = LayerTier::new(&tiered, &card, 2)
             .unwrap()
             .with_stage(&stager, 0, false)
             .unwrap();
+        assert_eq!(
+            built.exact.is_some(),
+            exact,
+            "{formats:?}: the exact kernels"
+        );
         tiered.tier = Some(Arc::new(built));
         let tier = tiered.tier.clone().unwrap();
         tier.enable_graph(&tiered, 1).unwrap();
@@ -4770,7 +5052,10 @@ mod tests {
         GRAPH_WITHOUT_CAPTURE.store(false, Ordering::Relaxed);
         let failure = worker.failure();
         drop(worker);
-        assert!(failure.is_none(), "the worker stalled: {failure:?}");
+        assert!(
+            failure.is_none(),
+            "{formats:?}: the worker stalled: {failure:?}"
+        );
         loaded.expect("the kernel loaded and ran once the card was idle");
         let peak = want.iter().map(|v| v.abs()).fold(0f32, f32::max);
         let worst = got
@@ -4778,7 +5063,10 @@ mod tests {
             .zip(&want)
             .map(|(a, b)| (a - b).abs())
             .fold(0f32, f32::max);
-        assert!(worst <= 2e-2 * peak, "max diff {worst} of {peak}");
+        assert!(
+            worst <= 2e-2 * peak,
+            "{formats:?}: max diff {worst} of {peak}"
+        );
     }
 
     /// A decoded token recorded in a graph while the extra slots hold experts replays what the
@@ -5022,7 +5310,7 @@ mod tests {
                 .data()
                 .len()
         });
-        let stager = CardStager::new(&card, widest, experts).unwrap();
+        let stager = CardStager::holding(&card, widest, experts, used).unwrap();
         let built = LayerTier::new(&tiered, &card, 6)
             .unwrap()
             .with_stage(&stager, 0, false)
@@ -5101,7 +5389,7 @@ mod tests {
                 .data()
                 .len()
         });
-        let stager = CardStager::new(&card, widest, experts).unwrap();
+        let stager = CardStager::holding(&card, widest, experts, used).unwrap();
         let built = LayerTier::new(&tiered, &card, 6)
             .unwrap()
             .with_stage(&stager, 0, false)
@@ -5201,7 +5489,7 @@ mod tests {
                     .data()
                     .len()
             });
-            let stager = CardStager::new(&card, widest, experts).unwrap();
+            let stager = CardStager::holding(&card, widest, experts, used).unwrap();
             built = built.with_stage(&stager, 0, false).unwrap();
         }
         tiered.tier = Some(Arc::new(built));
@@ -5403,7 +5691,7 @@ mod tests {
                 ][i];
                 t.native_qtensor().data().len()
             });
-            let stager = CardStager::new(&card, widest, experts).unwrap();
+            let stager = CardStager::holding(&card, widest, experts, used).unwrap();
             // What an earlier layer left in the arenas: bytes whose f16 scales are not finite.
             poison(&stager);
             // Some experts on the card, the rest to come from the host.
@@ -5462,7 +5750,7 @@ mod tests {
                 .data()
                 .len()
         });
-        let stager = CardStager::new(&card, widest, experts).unwrap();
+        let stager = CardStager::holding(&card, widest, experts, used).unwrap();
         let slots = 6;
         let tier = LayerTier::new(&tiered, &card, slots)
             .unwrap()
@@ -5544,7 +5832,7 @@ mod tests {
                 ][i];
                 t.native_qtensor().data().len()
             });
-            let stager = CardStager::new(&card, widest, experts).unwrap();
+            let stager = CardStager::holding(&card, widest, experts, used).unwrap();
             poison(&stager);
             let tier = LayerTier::new(&tiered, &card, 10)
                 .unwrap()
@@ -5626,7 +5914,7 @@ mod tests {
                 .data()
                 .len()
         });
-        CardStager::new(card, widest, experts).unwrap()
+        CardStager::holding(card, widest, experts, moe.n_experts_used).unwrap()
     }
 
     /// The flattened output of `moe` for the rows `x` of a prompt.
@@ -6003,7 +6291,7 @@ mod tests {
             ];
             let exact = exact::Exact::of(&stacks, limit).expect("a format with exact kernels");
             let widest = [0, 1, 2].map(|i| stacks[i].native_qtensor().data().len());
-            let stager = CardStager::new(card, widest, experts).unwrap();
+            let stager = CardStager::holding(card, widest, experts, used).unwrap();
             for rows in [1usize, 3] {
                 let ids: Vec<u32> = (0..rows)
                     .flat_map(|r| [1u32, 6, 9, 14].map(|e| (e + r as u32) % experts as u32))
@@ -6109,17 +6397,39 @@ mod tests {
     /// to, hidden width, expert width.
     const PLACE_SHAPE: (usize, usize, usize, usize) = (16, 4, 256, 512);
 
+    /// Where a test request finds its experts: `slots` slots holding the first experts, the
+    /// misses split between the transit room and the host in `eighths` of eight to the room
+    /// where the level splits them (`splits`), a transit room of `room` experts (`0`: as the
+    /// card's rates size it), and the recorded decode when `recorded`.
+    #[derive(Clone, Copy, Debug)]
+    struct Place {
+        slots: usize,
+        eighths: u64,
+        recorded: bool,
+        room: usize,
+        splits: bool,
+    }
+
+    impl Place {
+        /// `slots` slots, the misses even between the room and the host, eager, below fast.
+        fn slots(slots: usize) -> Self {
+            Self {
+                slots,
+                eighths: 4,
+                recorded: false,
+                room: 0,
+                splits: false,
+            }
+        }
+    }
+
     /// The rows `x` routed to `ids` with weights `w`, through a fresh tier over a layer of
-    /// `formats` whose `slots` slots hold the first experts, the misses split between the
-    /// transit room and the host in `eighths` of eight to the room, through the recorded decode
-    /// when `recorded`. `run` makes the request; the output comes back as bits.
+    /// `formats` placed as `place` says. `run` makes the request; the output comes back as bits.
     #[allow(clippy::too_many_arguments)]
     fn bits_through_tier(
         card: &Device,
         formats: [GgmlDType; 2],
-        slots: usize,
-        eighths: u64,
-        recorded: bool,
+        place: Place,
         x: &[f32],
         ids: &[u32],
         w: &[f32],
@@ -6139,22 +6449,39 @@ mod tests {
             &tiered.down_exps,
         ]
         .map(|t| t.native_qtensor().data().len());
-        let stager = CardStager::new(card, widest, experts).unwrap();
+        // The room holds the request's pairs: a token's, as the load sizes it for these formats,
+        // and those of the rows of a verify recorded whole.
+        let mut stager = CardStager::holding(card, widest, experts, rows * used).unwrap();
+        assert!(
+            stager.transit >= (rows * used).min(experts),
+            "the room holds fewer than the request's pairs"
+        );
+        if place.room > 0 {
+            Arc::get_mut(&mut stager).unwrap().transit = place.room;
+        }
         // The stacks page-locked: a copy from pageable memory waits for a card that waits on the
         // worker.
-        let built = LayerTier::new(&tiered, card, slots)
+        let built = LayerTier::new(&tiered, card, place.slots)
             .unwrap()
             .with_stage(&stager, 0, true)
             .unwrap();
+        let eighths = place.eighths;
         for class in 0..2 {
             built.host_us[class].store((1e3 * eighths as f64).to_bits(), Ordering::Relaxed);
             built.upload_us[class].store((1e3 * (8 - eighths) as f64).to_bits(), Ordering::Relaxed);
             built.paced[class].store(TRANSIT_PACE_SAMPLES, Ordering::Relaxed);
         }
+        built.splits_misses.store(place.splits, Ordering::Relaxed);
         tiered.tier = Some(Arc::new(built));
         let tier = tiered.tier.clone().unwrap();
-        let worker = if recorded {
+        let worker = if place.recorded {
             tier.enable_graph(&tiered, 4).unwrap();
+            // A room short of a token's pairs leaves the token to the eager decode.
+            assert_eq!(
+                tier.graph_rows() > 0,
+                place.room == 0 || place.room >= used || place.splits || tier.exact.is_some(),
+                "{place:?}: the recorded decode runs where the room holds a token"
+            );
             let w = TierWorker::start(card, vec![("layer".into(), tier.clone())]).unwrap();
             GRAPH_WITHOUT_CAPTURE.store(true, Ordering::Relaxed);
             Some(w)
@@ -6196,10 +6523,15 @@ mod tests {
         out.flatten_all().unwrap().to_vec1::<f32>().unwrap()
     }
 
-    /// One token whose routed pairs all hit the cache, whose one missing pair runs on the host,
-    /// and whose one missing pair runs in the transit room, eager and recorded: the places where
-    /// the output's bits differ from those of the eager token that hits every pair.
-    fn pair_places_that_move_the_bits(card: &Device, formats: [GgmlDType; 2]) -> Vec<String> {
+    /// One token whose routed pairs all hit the cache, whose one missing pair goes by the paces
+    /// to the host or to the transit room, and whose 2 missing pairs pass a room of 1 expert in
+    /// 2 rounds, through the eager decode or the recorded one as `recorded` says: the places
+    /// where the output's bits differ from those of the eager token that hits every pair.
+    fn pair_places_that_move_the_bits(
+        card: &Device,
+        formats: [GgmlDType; 2],
+        recorded: bool,
+    ) -> Vec<String> {
         let (experts, used, hidden, _) = PLACE_SHAPE;
         let ids: Vec<u32> = vec![1, 6, 9, 14];
         let w: Vec<f32> = (0..used).map(|i| 0.1 + 0.05 * i as f32).collect();
@@ -6208,21 +6540,39 @@ mod tests {
             |tier: &Arc<LayerTier>, moe: &MoeWeights, xs: &Tensor, ids: &Tensor, w: &Tensor| {
                 request_rows(card, tier.decode(moe, xs, ids, w))
             };
-        // The first experts are in the slots: with all but the last 2 there, expert 14 misses.
+        // The first experts are in the slots: with all but the last 2 there, expert 14 misses;
+        // with 8 there, experts 9 and 14 do.
         let cases = [
-            ("every pair hits", experts, 4u64),
-            ("1 pair on the host", experts - 2, 1),
-            ("1 pair in transit", experts - 2, 7),
+            ("every pair hits", Place::slots(experts)),
+            (
+                "1 missing pair the paces give the host",
+                Place {
+                    eighths: 1,
+                    ..Place::slots(experts - 2)
+                },
+            ),
+            (
+                "1 missing pair the paces give the transit room",
+                Place {
+                    eighths: 7,
+                    ..Place::slots(experts - 2)
+                },
+            ),
+            (
+                "2 missing pairs through a room of 1",
+                Place {
+                    eighths: 7,
+                    room: 1,
+                    ..Place::slots(8)
+                },
+            ),
         ];
-        let want = bits_through_tier(card, formats, experts, 4, false, &x, &ids, &w, token);
+        let want = bits_through_tier(card, formats, Place::slots(experts), &x, &ids, &w, token);
         let mut moved = Vec::new();
-        for recorded in [false, true] {
-            for (what, slots, eighths) in cases {
-                let got =
-                    bits_through_tier(card, formats, slots, eighths, recorded, &x, &ids, &w, token);
-                if got != want {
-                    moved.push(format!("{what}, recorded {recorded}"));
-                }
+        for (what, place) in cases {
+            let place = Place { recorded, ..place };
+            if bits_through_tier(card, formats, place, &x, &ids, &w, token) != want {
+                moved.push(format!("{what}, recorded {recorded}"));
             }
         }
         moved
@@ -6249,14 +6599,16 @@ mod tests {
                     })
                     .collect::<Vec<f32>>()
             };
-        let want = bits_through_tier(card, formats, slots, 4, true, &x, &ids, &w, steps);
+        let recorded = Place {
+            recorded: true,
+            ..Place::slots(slots)
+        };
+        let want = bits_through_tier(card, formats, recorded, &x, &ids, &w, steps);
         let mut differ = Vec::new();
         let eager = bits_through_tier(
             card,
             formats,
-            slots,
-            4,
-            false,
+            Place::slots(slots),
             &x,
             &ids,
             &w,
@@ -6268,9 +6620,7 @@ mod tests {
         let recorded = bits_through_tier(
             card,
             formats,
-            slots,
-            4,
-            true,
+            recorded,
             &x,
             &ids,
             &w,
@@ -6295,22 +6645,148 @@ mod tests {
         [GgmlDType::Q4K, GgmlDType::Q5_0],
     ];
 
+    /// Expert formats the tier serves without exact kernels, gate and up, down: a gate, up or
+    /// down stack in a format they do not read sends the whole layer to the fallback.
+    const FORMATS_WITHOUT_EXACT_KERNELS: [[GgmlDType; 2]; 5] = [
+        [GgmlDType::Q5K, GgmlDType::Q5K],
+        [GgmlDType::Q3K, GgmlDType::Q5_1],
+        [GgmlDType::Iq4Xs, GgmlDType::Q5_1],
+        [GgmlDType::Q5_1, GgmlDType::Q5_1],
+        [GgmlDType::Q4K, GgmlDType::Q5K],
+    ];
+
+    /// Whether a layer of `formats` at the test shape takes the exact kernels: a test meant for
+    /// one side fails when its layer takes the other.
+    fn takes_exact_kernels(formats: [GgmlDType; 2]) -> bool {
+        let (experts, used, hidden, ffn) = PLACE_SHAPE;
+        let moe = layer_of(&Device::Cpu, experts, used, hidden, ffn, formats);
+        let stacks = [
+            moe.gate_exps_sep.clone().unwrap(),
+            moe.up_exps_sep.clone().unwrap(),
+            moe.down_exps.clone(),
+        ];
+        exact::Exact::of(&stacks, 0.0).is_some()
+    }
+
+    /// The places of [`pair_places_that_move_the_bits`] that move the bits, for every format of
+    /// `formats`, through the eager decode or the recorded one.
+    fn places_that_move_the_bits(formats: &[[GgmlDType; 2]], recorded: bool) -> Vec<String> {
+        let Ok(card) = Device::new_cuda(0) else {
+            eprintln!("skipping: no usable CUDA device");
+            return Vec::new();
+        };
+        formats
+            .iter()
+            .filter_map(|&f| {
+                let moved = pair_places_that_move_the_bits(&card, f, recorded);
+                (!moved.is_empty()).then(|| format!("{f:?}: {moved:?}"))
+            })
+            .collect()
+    }
+
     /// A routed pair gives the same bits wherever it runs, in the formats with exact kernels:
     /// a slot, the host or the transit room, eager or recorded.
     #[test]
     fn a_pair_gives_the_same_bits_wherever_it_runs_in_formats_with_exact_kernels() {
         let _pool = LENT_POOL.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(FORMATS_WITH_EXACT_KERNELS
+            .iter()
+            .all(|&f| takes_exact_kernels(f)));
+        let mut moved = places_that_move_the_bits(&FORMATS_WITH_EXACT_KERNELS, false);
+        moved.extend(places_that_move_the_bits(&FORMATS_WITH_EXACT_KERNELS, true));
+        assert!(moved.is_empty(), "the bits moved with the place: {moved:?}");
+    }
+
+    /// The same in the formats without exact kernels, through the eager decode: a missing pair
+    /// runs through the transit room with the kernels of the slots, never on the host.
+    #[test]
+    fn a_pair_gives_the_same_bits_wherever_it_runs_eagerly_in_formats_without_exact_kernels() {
+        let _pool = LENT_POOL.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(!FORMATS_WITHOUT_EXACT_KERNELS
+            .iter()
+            .any(|&f| takes_exact_kernels(f)));
+        let moved = places_that_move_the_bits(&FORMATS_WITHOUT_EXACT_KERNELS, false);
+        assert!(
+            moved.is_empty(),
+            "the bits moved with the place:\n{}",
+            moved.join("\n")
+        );
+    }
+
+    /// The same through the recorded decode.
+    #[test]
+    fn a_pair_gives_the_same_bits_wherever_it_runs_recorded_in_formats_without_exact_kernels() {
+        let _pool = LENT_POOL.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(!FORMATS_WITHOUT_EXACT_KERNELS
+            .iter()
+            .any(|&f| takes_exact_kernels(f)));
+        let moved = places_that_move_the_bits(&FORMATS_WITHOUT_EXACT_KERNELS, true);
+        assert!(
+            moved.is_empty(),
+            "the bits moved with the place:\n{}",
+            moved.join("\n")
+        );
+    }
+
+    /// The host time and the transit copies of one token whose missing pairs the paces give the
+    /// host, at a level that splits them or not: `(host time before, after, copies to transit)`.
+    fn host_and_transit_of_a_token(splits: bool) -> Option<(u64, u64, u64)> {
         let Ok(card) = Device::new_cuda(0) else {
             eprintln!("skipping: no usable CUDA device");
+            return None;
+        };
+        let (experts, used, hidden, _) = PLACE_SHAPE;
+        let ids: Vec<u32> = vec![1, 6, 9, 14];
+        let w: Vec<f32> = (0..used).map(|i| 0.1 + 0.05 * i as f32).collect();
+        let x = values(hidden, 77, 1.0);
+        let seen = std::cell::Cell::new((0u64, 0u64, 0u64));
+        let place = Place {
+            eighths: 1,
+            splits,
+            ..Place::slots(experts - 8)
+        };
+        let formats = FORMATS_WITHOUT_EXACT_KERNELS[0];
+        assert!(!takes_exact_kernels(formats));
+        bits_through_tier(
+            &card,
+            formats,
+            place,
+            &x,
+            &ids,
+            &w,
+            |tier, moe, xs, ids, w| {
+                let host = || tier.host_us[0].load(Ordering::Relaxed);
+                let (before, copied) = (host(), tier.uploaded.load(Ordering::Relaxed));
+                let out = request_rows(&card, tier.decode(moe, xs, ids, w));
+                let copied = tier.uploaded.load(Ordering::Relaxed) - copied;
+                seen.set((before, host(), copied));
+                out
+            },
+        );
+        Some(seen.get())
+    }
+
+    /// Below the fast level a layer without exact kernels runs no pair on the host, whatever
+    /// the paces say: its 2 missing experts go through the transit room.
+    #[test]
+    fn a_layer_without_exact_kernels_runs_no_pair_on_the_host_below_fast() {
+        let _pool = LENT_POOL.lock().unwrap_or_else(|e| e.into_inner());
+        let Some((before, after, copied)) = host_and_transit_of_a_token(false) else {
             return;
         };
-        for formats in FORMATS_WITH_EXACT_KERNELS {
-            let moved = pair_places_that_move_the_bits(&card, formats);
-            assert!(
-                moved.is_empty(),
-                "{formats:?}: the bits moved with the place: {moved:?}"
-            );
-        }
+        assert_eq!(before, after, "the host computed a pair");
+        assert_eq!(copied, 2, "{copied} experts went through the transit room");
+    }
+
+    /// At the fast level the paces split the missing experts: the host takes its share.
+    #[test]
+    fn a_layer_without_exact_kernels_splits_its_misses_at_fast() {
+        let _pool = LENT_POOL.lock().unwrap_or_else(|e| e.into_inner());
+        let Some((before, after, copied)) = host_and_transit_of_a_token(true) else {
+            return;
+        };
+        assert_ne!(before, after, "the host computed no pair");
+        assert!(copied < 2, "{copied} experts went through the transit room");
     }
 
     /// A verify of 3 rows gives the bits of the same rows as 3 plain recorded steps, in the
@@ -6323,6 +6799,26 @@ mod tests {
             return;
         };
         for formats in FORMATS_WITH_EXACT_KERNELS {
+            let differ = verifies_that_differ_from_the_steps(&card, formats);
+            assert!(
+                differ.is_empty(),
+                "{formats:?}: not the bits of the steps: {differ:?}"
+            );
+        }
+    }
+
+    /// The same in the formats without exact kernels.
+    #[test]
+    fn a_verify_gives_the_bits_of_plain_steps_in_formats_without_exact_kernels() {
+        let _pool = LENT_POOL.lock().unwrap_or_else(|e| e.into_inner());
+        let Ok(card) = Device::new_cuda(0) else {
+            eprintln!("skipping: no usable CUDA device");
+            return;
+        };
+        assert!(!FORMATS_WITHOUT_EXACT_KERNELS
+            .iter()
+            .any(|&f| takes_exact_kernels(f)));
+        for formats in FORMATS_WITHOUT_EXACT_KERNELS {
             let differ = verifies_that_differ_from_the_steps(&card, formats);
             assert!(
                 differ.is_empty(),

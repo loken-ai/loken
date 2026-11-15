@@ -2234,7 +2234,7 @@ impl MoeWeights {
     /// each expert, then scatter back into [num_tokens, hidden]. Slow,
     /// but only used for layers the heterogeneous planner offloaded to
     /// CPU. Expects `gate_up_exps_f32` and `down_exps_f32` populated.
-    fn forward_cpu(
+    pub(super) fn forward_cpu(
         &self,
         xs: &Tensor,
         topk_ids: &Tensor,

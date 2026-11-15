@@ -603,6 +603,8 @@ struct GraphKernels {
     exact: Option<(super::exact::Fmt, super::exact::Fmt)>,
     /// Whether the extra slots are read through the tier's table.
     extra: bool,
+    /// Whether the missing experts are split between the transit room and the host.
+    splits: bool,
     hidden: usize,
     inner: usize,
     k: usize,
@@ -670,6 +672,10 @@ pub(super) struct GraphSide {
     ahead_end: crate::tensor::gpu_runtime::driver::CudaEvent,
     /// The buffers of the exact launches, for a layer that has them.
     exact: Option<super::exact::GraphRooms>,
+    /// For a layer without exact kernels: the slot each pair reads, all ones for a missing
+    /// expert, and the pairs in the router's order, `0..` the most a request carries.
+    card_slots: Option<Tensor>,
+    order: Option<Tensor>,
 }
 
 impl LayerTier {
@@ -785,6 +791,16 @@ impl LayerTier {
             None => None,
         };
         let products = if exact.is_some() { pairs } else { rows_max };
+        let (card_slots, order) = match exact {
+            Some(_) => (None, None),
+            None => (
+                Some(Tensor::from_vec(vec![0u32; pairs], (pairs,), &host)?.to_device(dev)?),
+                Some(
+                    Tensor::from_vec((0..pairs as u32).collect::<Vec<_>>(), (pairs,), &host)?
+                        .to_device(dev)?,
+                ),
+            ),
+        };
         let side = GraphSide {
             mail: Arc::new(Mailbox::new(dev, k, hidden, rows_max, products)?),
             counter: Tensor::from_vec(vec![0u32; 2], (2,), &host)?.to_device(dev)?,
@@ -797,8 +813,19 @@ impl LayerTier {
             upload_end: super::timed_event(dev)?,
             ahead_end: super::timed_event(dev)?,
             exact,
+            card_slots,
+            order,
         };
         let _ = self.graph.set(side);
+        // A layer without exact kernels launches other kernels at the fast level, which the
+        // load sets later: both kinds load now, while no card waits.
+        if self.exact.is_none() {
+            let level = self.splits_misses.load(Ordering::Relaxed);
+            self.splits_misses.store(!level, Ordering::Relaxed);
+            let other = self.load_graph_kernels(moe);
+            self.splits_misses.store(level, Ordering::Relaxed);
+            other?;
+        }
         self.load_graph_kernels(moe)
     }
 
@@ -822,7 +849,7 @@ impl LayerTier {
         }
         g.mail.abort();
         let run = (|| -> Result<()> {
-            for rows in 1..=g.rows_max {
+            for rows in 1..=self.graph_rows() {
                 let x = Tensor::zeros_on((rows, hidden), crate::tensor::DType::F32, dev)?;
                 let ids: Vec<u32> = (0..rows * k).map(|i| ((i % k) % experts) as u32).collect();
                 let ids = Tensor::from_vec(ids, (rows, k), dev)?;
@@ -851,6 +878,7 @@ impl LayerTier {
                 .map(|stacks| [0, 1, 2].map(|i| stacks[i].dtype())),
             exact: self.exact.as_ref().map(|e| (e.gate, e.down)),
             extra: self.extra_table_at(0).is_some(),
+            splits: self.exact.is_none() && self.splits_misses.load(Ordering::Relaxed),
             hidden: dims[2],
             inner: dims[1],
             k: moe.n_experts_used,
@@ -860,13 +888,29 @@ impl LayerTier {
 
     /// Rows of a verify a recorded decode can run through this layer at once.
     pub(crate) fn graph_rows(&self) -> usize {
-        self.graph.get().map_or(0, |g| g.rows_max)
+        let Some(g) = self.graph.get() else {
+            return 0;
+        };
+        match self.pairs_on_card_room() {
+            Some(room) => g.rows_max.min(room / g.mail.k.max(1)),
+            None => g.rows_max,
+        }
+    }
+
+    /// The pairs the transit room holds, for a layer whose recorded request runs every missing
+    /// expert there: one without exact kernels, below the fast level. A recorded request of
+    /// such a layer carries at most these pairs, so its misses pass in one round.
+    fn pairs_on_card_room(&self) -> Option<usize> {
+        let stage = self.stage.as_ref()?;
+        (self.exact.is_none() && !self.splits_misses.load(Ordering::Relaxed))
+            .then_some(stage.stager.transit)
     }
 
     /// Whether a token on `dev` goes through the kernels of a recorded decode: one is being
     /// recorded, or a test runs them without.
     pub(crate) fn records(&self, dev: &Device) -> bool {
         self.graph_ready()
+            && self.graph_rows() > 0
             && (crate::tensor::cuda_ext::capture_active(dev)
                 || GRAPH_WITHOUT_CAPTURE.load(Ordering::Relaxed))
     }
@@ -954,10 +998,10 @@ impl LayerTier {
         let x = xs.to_dtype(crate::tensor::DType::F32)?.contiguous()?;
         let rows = ids.elem_count() / k.max(1);
         let hidden = x.elem_count() / rows.max(1);
-        if rows == 0 || rows > g.rows_max {
+        if rows == 0 || rows > self.graph_rows() {
             crate::tensor::bail!(
                 "a recorded expert block of {rows} rows, with room for {}",
-                g.rows_max
+                self.graph_rows()
             );
         }
         let ids = ids.to_dtype(crate::tensor::DType::U32)?.contiguous()?;
@@ -978,9 +1022,10 @@ impl LayerTier {
                 address_of::<u32>(&g.counter)? as *mut u32,
                 address_of::<u32>(&g.slots)? as *mut u32,
                 address_of::<f32>(&g.weights)? as *mut f32,
-                match &g.exact {
-                    Some(rooms) => address_of::<u32>(&rooms.card_slots)? as *mut u32,
-                    None => std::ptr::null_mut(),
+                match (&g.exact, &g.card_slots) {
+                    (Some(rooms), _) => address_of::<u32>(&rooms.card_slots)? as *mut u32,
+                    (None, Some(slots)) => address_of::<u32>(slots)? as *mut u32,
+                    (None, None) => std::ptr::null_mut(),
                 },
                 g.mail.dptr(g.mail.ids) as *mut u32,
                 g.mail.dptr(g.mail.weights) as *mut f32,
@@ -1010,9 +1055,23 @@ impl LayerTier {
         }
         let slots = g.slots.narrow(0, 0, pairs)?;
         let weights = g.weights.narrow(1, 0, pairs)?;
-        // One token's pairs are read as the router listed them; the rows of a verify are
-        // grouped by slot, as the batched kernels read them.
-        let routing = if rows == 1 {
+        // Below the fast level, every pair is its own: a missing expert's pair is skipped here
+        // and computed from the transit room. Otherwise one token's pairs are read as the router
+        // listed them, and the rows of a verify are grouped by slot, as the batched kernels read
+        // them.
+        let on_card = match (&g.card_slots, &g.order) {
+            (Some(card_slots), Some(order)) if self.pairs_on_card_room().is_some() => {
+                Some(ExpertRouting {
+                    slots: order.narrow(0, 0, pairs)?,
+                    experts: card_slots.narrow(0, 0, pairs)?,
+                    topk: k,
+                })
+            }
+            _ => None,
+        };
+        let routing = if let Some(routing) = on_card {
+            routing
+        } else if rows == 1 {
             ExpertRouting {
                 slots: moe.decode_slots.clone().expect("a tier layer is on a card"),
                 experts: slots,
@@ -1113,6 +1172,28 @@ impl LayerTier {
             }
             None => None,
         };
+        if let (Some(card_slots), Some(_)) = (&g.card_slots, self.pairs_on_card_room()) {
+            use crate::tensor::gpu_runtime::driver::DevicePtr;
+            let late_ptr = match &late {
+                Some(t) => address_of::<f32>(t)? as *const f32,
+                None => std::ptr::null(),
+            };
+            unsafe {
+                moe_cuda::tier_graph::merge_pairs(
+                    address_of::<f32>(&card)? as *const f32,
+                    late_ptr,
+                    address_of::<u32>(card_slots)? as *const u32,
+                    g.mail.dptr(g.mail.product) as *const f32,
+                    address_of::<u32>(&g.counter)? as *const u32,
+                    out.device_ptr(out.stream()).0 as *mut f32,
+                    (rows * hidden) as i32,
+                    k as i32,
+                    hidden as i32,
+                    stream,
+                );
+            }
+            return crate::tensor::cuda_ext::tensor_from_f32_slice(out, (rows, hidden), &dev);
+        }
         unsafe {
             use crate::tensor::gpu_runtime::driver::DevicePtr;
             let late_ptr = match &late {
@@ -1416,9 +1497,13 @@ impl LayerTier {
                 .copied()
                 .filter(|e| !plan.hits.iter().any(|h| h.0 == *e))
                 .collect();
-            let to_transit = self
-                .transit_share_of(rest.len(), req.rows)
-                .min(plan.free.len());
+            // Below the fast level, a layer without exact kernels sends every missing expert to
+            // the transit room: the host computes none unless the copies cannot land.
+            let to_transit = match self.pairs_on_card_room() {
+                Some(_) => rest.len(),
+                None => self.transit_share_of(rest.len(), req.rows),
+            }
+            .min(plan.free.len());
             let (transit, host_experts) = rest.split_at(to_transit);
             let puts = super::super::expert_ahead::assign(&plan.free, transit);
             let (puts_len, hits_used) = (puts.len(), plan.hits.len());
@@ -1554,8 +1639,14 @@ impl LayerTier {
                     late.clear();
                     let n = WORKER.copies_late.fetch_add(1, Ordering::Relaxed) + 1;
                     if n.is_power_of_two() {
+                        // Without exact kernels, the host's bits are not the card's.
+                        let differ = if self.exact.is_none() {
+                            ", and the layer's output for those tokens may differ in its last bits from the card's"
+                        } else {
+                            ""
+                        };
                         tracing::warn!(
-                            "expert tier: the copies of {} experts to the card did not land within {:.3} s; the host computed them ({n} requests so far)",
+                            "expert tier: the copies of {} experts to the card did not land within {:.3} s; the host computed them ({n} requests so far){differ}",
                             placed.len(),
                             bound as f64 * 1e-9
                         );

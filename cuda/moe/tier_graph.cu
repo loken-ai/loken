@@ -140,6 +140,46 @@ extern "C" __global__ void loken_tier_merge_kernel(
     }
 }
 
+// `card` and `late` hold a weighted row per routed pair, `k` pairs a row of `hidden`: a row's
+// value is the sum of its pairs' rows from -0, in the router's order, each read from `late` when
+// the card served the pair from no slot (`card_slots` all ones) and from `card` otherwise. A null
+// `late` reads as zero rows. The host's product, when one is due, joins where it is not zero, so
+// a request the host computed nothing for keeps the sum of its pairs.
+extern "C" __global__ void loken_tier_merge_pairs_kernel(
+        const float * __restrict__ card,
+        const float * __restrict__ late,
+        const unsigned int * __restrict__ card_slots,
+        const volatile float * product,
+        const unsigned int * __restrict__ counter,
+        float * __restrict__ out,
+        int n, int k, int hidden) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        const int row = i / hidden, col = i % hidden;
+        float sum = -0.0f;
+        for (int j = 0; j < k; ++j) {
+            const size_t p = (size_t) (row * k + j);
+            const float v = card_slots[p] != 0xFFFFFFFFu ? card[p * hidden + col]
+                          : (late != nullptr ? late[p * hidden + col] : 0.0f);
+            sum = __fadd_rn(sum, v);
+        }
+        if (counter[1] != 0u) {
+            const float h = product[i];
+            if (h != 0.0f) sum = __fadd_rn(sum, h);
+        }
+        out[i] = sum;
+    }
+}
+
+extern "C" void loken_tier_merge_pairs(
+        const float * card, const float * late, const unsigned int * card_slots,
+        const float * product, const unsigned int * counter, float * out, int n, int k, int hidden,
+        cudaStream_t stream) {
+    const int threads = 256;
+    loken_tier_merge_pairs_kernel<<<(n + threads - 1) / threads, threads, 0, stream>>>(
+        card, late, card_slots, product, counter, out, n, k, hidden);
+}
+
 extern "C" void loken_tier_plan(
         const unsigned int * ids, const float * weights, const float * x, const int * table,
         unsigned int * counter, unsigned int * slot_out, float * weight_out, unsigned int * exact_out,
