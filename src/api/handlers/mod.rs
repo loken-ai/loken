@@ -63,6 +63,7 @@ mod anthropic_api;
 pub(crate) mod audio;
 mod catalogue;
 mod chat_prompt;
+pub(crate) use chat_prompt::path_chat_format;
 mod media_catalogue;
 pub(crate) use media_catalogue::*;
 mod cluster_catalogue;

@@ -401,6 +401,13 @@ A part the server cannot take, such as a document block, is refused with the rea
 
 ## How a request ends
 
+- An answer ends on any of the model's end tokens, with `done_reason` `stop` and the token left out of the text.
+  The end tokens are those the files declare:
+  - the end-of-sequence id, and every id of `tokenizer.ggml.eos_token_ids` or of the `eos_token_id` list of `generation_config.json`
+  - the ids of `tokenizer.ggml.eot_token_id`, `tokenizer.ggml.eom_token_id` and the FIM pad, repeat and separator keys
+  - the padding token, when the vocabulary marks it as a control token
+  - the control token the chat template writes right after the content of an assistant turn that ends a conversation
+  - a stop sequence of the model's parameters that is the whole text of a control token
 - The stop sequence an answer ends on is left out of the text.
   `include_stop_str_in_output` keeps it on the OpenAI routes.
 - `logprobs` carry 1 entry per token written, in a streamed answer and in a whole one.

@@ -514,6 +514,64 @@ fn render_jinja_template_with(
     thinking_off: bool,
     variables: &serde_json::Map<String, serde_json::Value>,
 ) -> Option<String> {
+    render_jinja(
+        tmpl,
+        messages,
+        add_generation_prompt,
+        tools,
+        thinking_off,
+        variables,
+    )
+    .map_err(|why| tracing::warn!("{}", why.warning))
+    .ok()
+}
+
+/// The text after the content of an assistant turn that ends a conversation, as a Jinja
+/// template renders it: the markers the model writes to close its turn.
+///
+/// A render that fails after the content keeps the text written up to the failure.
+/// `None` when the template is not Jinja or never writes the content.
+pub(crate) fn assistant_turn_close(tmpl: &str) -> Option<String> {
+    const REPLY: &str = "Reply of the probe.";
+    if !tmpl.contains("{%") {
+        return None;
+    }
+    let messages = [
+        Message::new("user".to_string(), "Question of the probe.".to_string()),
+        Message::new("assistant".to_string(), REPLY.to_string()),
+    ];
+    let rendered = render_jinja(tmpl, &messages, false, None, true, &serde_json::Map::new())
+        .unwrap_or_else(|unrendered| unrendered.partial);
+    let (_, after) = rendered.rsplit_once(REPLY)?;
+    Some(after.to_string())
+}
+
+/// A render that failed.
+struct Unrendered {
+    /// What a caller that falls back logs.
+    warning: String,
+    /// The text written before the failure.
+    partial: String,
+}
+
+impl Unrendered {
+    fn before_any_text(warning: String) -> Self {
+        Self {
+            warning,
+            partial: String::new(),
+        }
+    }
+}
+
+/// Renders `tmpl` over `messages`.
+fn render_jinja(
+    tmpl: &str,
+    messages: &[Message],
+    add_generation_prompt: bool,
+    tools: Option<&[Tool]>,
+    thinking_off: bool,
+    variables: &serde_json::Map<String, serde_json::Value>,
+) -> Result<String, Unrendered> {
     use minijinja::{context, Environment, Value};
     let lifted;
     let messages = if has_late_system(messages) {
@@ -637,17 +695,17 @@ fn render_jinja_template_with(
         },
     );
     if let Err(e) = env.add_template("chat", tmpl) {
-        tracing::warn!(
+        return Err(Unrendered::before_any_text(format!(
             "chat template does not parse ({e}); falling back to a reconstructed \
                         format, which is an approximation of what the model asked for"
-        );
-        return None;
+        )));
     }
     let t = match env.get_template("chat") {
         Ok(t) => t,
         Err(e) => {
-            tracing::warn!("chat template vanished after parsing ({e}); falling back");
-            return None;
+            return Err(Unrendered::before_any_text(format!(
+                "chat template vanished after parsing ({e}); falling back"
+            )));
         }
     };
     // Undefined rather than none when there are no tools. Every template guards with
@@ -663,25 +721,33 @@ fn render_jinja_template_with(
     } else {
         Value::UNDEFINED
     };
-    match t.render(context! {
-        messages => msgs,
-        add_generation_prompt => add_generation_prompt,
-        tools => tools_value,
-        enable_thinking => enable_thinking,
-        ..Value::from_serialize(variables)
-    }) {
-        Ok(r) => Some(r),
+    let mut written: Vec<u8> = Vec::new();
+    let rendered = t.render_captured_to(
+        context! {
+            messages => msgs,
+            add_generation_prompt => add_generation_prompt,
+            tools => tools_value,
+            enable_thinking => enable_thinking,
+            ..Value::from_serialize(variables)
+        },
+        &mut written,
+    );
+    let text = String::from_utf8_lossy(&written).into_owned();
+    match rendered {
+        Ok(_) => Ok(text),
         Err(e) => {
             // Silence here is the defect this reports. A template that fails to
             // render sends the model a hand-rolled approximation instead of the
             // format it declared, and the only visible symptom is an answer that
             // stops after a few tokens - which reads as a model quirk, not a bug.
-            tracing::warn!(
-                "chat template failed to render ({e}); falling back to a \
+            Err(Unrendered {
+                warning: format!(
+                    "chat template failed to render ({e}); falling back to a \
                             reconstructed format - the model will receive something \
                             other than the format it declares"
-            );
-            None
+                ),
+                partial: text,
+            })
         }
     }
 }

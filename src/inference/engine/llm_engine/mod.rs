@@ -1853,6 +1853,7 @@ mod beam;
 pub use beam::{BeamAnswer, BeamOutcome, BeamSearch, EarlyStopping};
 pub(crate) mod discover;
 mod embed;
+mod end_tokens;
 mod generate;
 pub(crate) mod generation_defaults;
 mod handover;

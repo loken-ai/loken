@@ -475,15 +475,15 @@ impl LlmEngine {
 
             // --- 0a. A checkpoint directory of a wide-residual family ---
             if crate::inference::generic_transformer::wide_sparse_config::WideSparseMeta::claims_checkpoint(&model_file) {
-                let mut state = load_wide_checkpoint(
+                let state = load_wide_checkpoint(
                     &model_file,
                     &model_id_clone,
                     user_context_length,
                     quality,
                     kv_quant,
                     state_cache.clone(),
+                    generation_defaults.clone(),
                 )?;
-                state.generation_defaults = generation_defaults.clone();
                 let fsz = state.file_size;
                 let mut guard = model_state.blocking_lock();
                 crate::inference::place::vram_manager::residency_changed();
@@ -841,6 +841,21 @@ impl LlmEngine {
             };
 
             debug!("✓ Tokenizer loaded");
+
+            // The other tokens the files declare as ending a turn or a sequence end it too.
+            // A checkpoint directory declares its chat template beside its weights.
+            let template = get_gguf_string(&content, "tokenizer.chat_template").or_else(|| {
+                let (dir, _) = awq.as_ref()?;
+                crate::api::handlers::path_chat_format(std::path::Path::new(dir)).template
+            });
+            let eos_token_ids_extra = super::end_tokens::end_ids(
+                eos_token_id,
+                eos_token_ids_extra,
+                Some(&content),
+                &tokenizer,
+                template.as_deref(),
+                &generation_defaults.stop,
+            );
 
             // --- 4. The cards the placement offers this model ---
             //

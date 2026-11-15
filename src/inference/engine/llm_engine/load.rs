@@ -406,6 +406,7 @@ pub(super) fn load_wide_checkpoint(
     quality: QualityLevel,
     kv_quant: KvQuant,
     state_cache: Option<std::sync::Arc<crate::inference::cache::state_disk::StateStore>>,
+    generation_defaults: super::generation_defaults::GenerationDefaults,
 ) -> AnyResult<LoadedModelState> {
     use crate::inference::generic_transformer::wide_sparse_config::WideSparseMeta;
     use crate::inference::generic_transformer::BlockScaledCheckpoint;
@@ -421,6 +422,8 @@ pub(super) fn load_wide_checkpoint(
     let file_size = checkpoint_bytes(dir)?;
     let eos_token_id = super::gguf::sidecar_token_id(&dir.join("config.json"), "eos_token")
         .ok_or_else(|| anyhow!("{}: no eos_token in tokenizer_config.json", dir.display()))?;
+    let eos_token_ids_extra =
+        checkpoint_end_ids(dir, eos_token_id, &tokenizer, &generation_defaults.stop);
     let context_length = if user_context_length > 0 {
         user_context_length
     } else {
@@ -501,7 +504,7 @@ pub(super) fn load_wide_checkpoint(
         draft_primed: false,
         draft_mark: None,
         exact_prefill: None,
-        eos_token_ids_extra: Vec::new(),
+        eos_token_ids_extra,
         file_size,
         model: backend,
         tokenizer: std::sync::Arc::new(tokenizer),
@@ -511,8 +514,25 @@ pub(super) fn load_wide_checkpoint(
         qwen35_vision: Vec::new(),
         image_embed_cache: None,
         grammar_factory: std::sync::OnceLock::new(),
-        generation_defaults: Default::default(),
+        generation_defaults,
     })
+}
+
+/// The ids besides `eos` that end a generation of the checkpoint in `dir`: the end-of-sequence
+/// ids its generation config lists, then the ends its files declare.
+///
+/// `stops` are the stop sequences of the model's parameters.
+pub(super) fn checkpoint_end_ids(
+    dir: &std::path::Path,
+    eos: u32,
+    tokenizer: &Tokenizer,
+    stops: &[String],
+) -> Vec<u32> {
+    let listed = awq_eos_tokens(&dir.to_string_lossy())
+        .map(|(first, rest)| std::iter::once(first).chain(rest).collect())
+        .unwrap_or_default();
+    let template = crate::api::handlers::path_chat_format(dir).template;
+    super::end_tokens::end_ids(eos, listed, None, tokenizer, template.as_deref(), stops)
 }
 
 /// Bytes of the safetensors shards of the checkpoint in `dir`.
