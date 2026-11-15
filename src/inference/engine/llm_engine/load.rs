@@ -576,6 +576,11 @@ pub(crate) fn place_wide_checkpoint(
 /// The context a checkpoint directory declares (`max_position_embeddings` of its
 /// `config.json`), else the working window a cache is built for.
 pub(super) fn declared_context(dir: &std::path::Path) -> usize {
+    checkpoint_context(dir).unwrap_or(crate::inference::cache::KV_WORKING_WINDOW_TOKENS)
+}
+
+/// The context a checkpoint directory's `config.json` declares, `None` when it declares none.
+pub(crate) fn checkpoint_context(dir: &std::path::Path) -> Option<usize> {
     std::fs::read_to_string(dir.join("config.json"))
         .ok()
         .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
@@ -589,10 +594,6 @@ pub(super) fn declared_context(dir: &std::path::Path) -> usize {
                     "n_positions",
                 ],
             )
-            .map(|x| x as u64)
-        })
-        .map_or(crate::inference::cache::KV_WORKING_WINDOW_TOKENS, |c| {
-            c as usize
         })
 }
 

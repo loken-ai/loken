@@ -68,73 +68,14 @@ pub(crate) async fn ollama_list_models(
                 .map(|m| {
                     let size_mb = m.size / (1024 * 1024);
                     info!("   • {} ({} MB, source: {})", m.id, size_mb, m.source);
-                    let source = match m.source.as_str() {
-                        "huggingface" => ModelSource::HuggingFace,
-                        _ => ModelSource::Ollama,
-                    };
-                    // What the checkpoint says about itself: the media pipeline its files
-                    // declare, else the text model its header or configuration declares.
-                    let hf = state.huggingface_models_dir.as_str();
-                    let media = match source {
-                        ModelSource::Ollama => None,
-                        _ => media_facts(hf, &m.id),
-                    };
-                    // The format follows the file, not the store it sits in: a GGUF in a
-                    // repository's snapshot is a GGUF.
-                    let gguf = match source {
-                        ModelSource::Ollama => None,
-                        ModelSource::HuggingFace => hf_gguf(hf, &m.id),
-                    };
-                    let format_str = match (&gguf, source) {
-                        (Some(_), _) => "gguf",
-                        (None, ModelSource::HuggingFace) => "safetensors",
-                        (None, ModelSource::Ollama) => "gguf",
-                    };
-                    let weights = match source {
-                        ModelSource::Ollama => state.manifest_layer_path(&m.id, "model"),
-                        _ if media.is_some() => None,
-                        _ => crate::inference::load::huggingface_manager::HuggingFaceManager::new(
-                            std::path::PathBuf::from(hf),
-                        )
-                        .get_model_path(&m.id),
-                    };
-                    let (arch, quant, declared, pools) = match (&gguf, &weights) {
-                        (Some(g), _) => header_facts(g),
-                        (None, Some(w)) if w.is_dir() => checkpoint_facts(w),
-                        (None, Some(w)) => header_facts(w),
-                        (None, None) => (None, None, None, false),
-                    };
-                    // An Ollama-store model is a text GGUF whether or not its header reads.
-                    let text = match source {
-                        ModelSource::Ollama => Some(pools),
-                        _ => arch.as_ref().map(|_| pools),
-                    };
-                    let mut capabilities = capabilities_of(media.as_ref(), text);
-                    if capabilities.iter().any(|c| c == "completion")
-                        && state.model_has_audio(&m.id)
-                    {
-                        capabilities.push("audio".to_string());
-                    }
-                    let family = reported_family(media.as_ref(), arch, || None);
-                    let details = OllamaModelDetails {
-                        format: format_str.to_string(),
-                        families: Some(vec![family.clone()]),
-                        family,
-                        parameter_size: declared
-                            .map(format_parameter_count)
-                            .unwrap_or_else(|| estimate_parameter_size(m.size, format_str)),
-                        quantization_level: quant,
-                        running_format: None,
-                    };
-                    {
-                        let mut om = OllamaModel::new(m.id.clone(), m.size, m.downloaded_at)
-                            .with_source(source)
-                            .with_digest(m.digest)
-                            .with_details(details);
-                        om.capabilities = capabilities;
-                        om.defaults = media.as_ref().and_then(media_model_defaults);
-                        om
-                    }
+                    let facts = listed_facts(&state, &m);
+                    let mut om = OllamaModel::new(m.id.clone(), m.size, m.downloaded_at)
+                        .with_source(facts.source)
+                        .with_digest(m.digest)
+                        .with_details(facts.details);
+                    om.capabilities = facts.capabilities;
+                    om.defaults = facts.media.as_ref().and_then(media_model_defaults);
+                    om
                 })
                 .collect();
 
@@ -150,6 +91,87 @@ pub(crate) async fn ollama_list_models(
             error!("   ❌ Failed to list models: {}", e);
             Err(ApiError::Internal(format!("Failed to list models: {}", e)))
         }
+    }
+}
+
+/// What the catalogue lists for a model, read from its files without loading it.
+pub(crate) struct ListedFacts {
+    pub source: ModelSource,
+    pub details: OllamaModelDetails,
+    pub capabilities: Vec<String>,
+    pub media: Option<crate::inference::media_facts::MediaFacts>,
+    /// The file or checkpoint directory the facts were read from.
+    /// `None` for a media pipeline.
+    pub weights: Option<std::path::PathBuf>,
+}
+
+/// The facts `/api/tags` lists for `m` and `/api/show` reports for an entry it does not load.
+pub(crate) fn listed_facts(
+    state: &APIServer,
+    m: &crate::inference::load::model_manager::ModelMetadata,
+) -> ListedFacts {
+    let source = match m.source.as_str() {
+        "huggingface" => ModelSource::HuggingFace,
+        _ => ModelSource::Ollama,
+    };
+    // What the checkpoint says about itself: the media pipeline its files
+    // declare, else the text model its header or configuration declares.
+    let hf = state.huggingface_models_dir.as_str();
+    let media = match source {
+        ModelSource::Ollama => None,
+        _ => media_facts(hf, &m.id),
+    };
+    // The format follows the file, not the store it sits in: a GGUF in a
+    // repository's snapshot is a GGUF.
+    let gguf = match source {
+        ModelSource::Ollama => None,
+        ModelSource::HuggingFace => hf_gguf(hf, &m.id),
+    };
+    let format_str = match (&gguf, source) {
+        (Some(_), _) => "gguf",
+        (None, ModelSource::HuggingFace) => "safetensors",
+        (None, ModelSource::Ollama) => "gguf",
+    };
+    let weights = match source {
+        ModelSource::Ollama => state.manifest_layer_path(&m.id, "model"),
+        _ if media.is_some() => None,
+        _ => crate::inference::load::huggingface_manager::HuggingFaceManager::new(
+            std::path::PathBuf::from(hf),
+        )
+        .get_model_path(&m.id),
+    };
+    let (arch, quant, declared, pools) = match (&gguf, &weights) {
+        (Some(g), _) => header_facts(g),
+        (None, Some(w)) if w.is_dir() => checkpoint_facts(w),
+        (None, Some(w)) => header_facts(w),
+        (None, None) => (None, None, None, false),
+    };
+    // An Ollama-store model is a text GGUF whether or not its header reads.
+    let text = match source {
+        ModelSource::Ollama => Some(pools),
+        _ => arch.as_ref().map(|_| pools),
+    };
+    let mut capabilities = capabilities_of(media.as_ref(), text);
+    if capabilities.iter().any(|c| c == "completion") && state.model_has_audio(&m.id) {
+        capabilities.push("audio".to_string());
+    }
+    let family = reported_family(media.as_ref(), arch, || None);
+    let details = OllamaModelDetails {
+        format: format_str.to_string(),
+        families: Some(vec![family.clone()]),
+        family,
+        parameter_size: declared
+            .map(format_parameter_count)
+            .unwrap_or_else(|| estimate_parameter_size(m.size, format_str)),
+        quantization_level: quant,
+        running_format: None,
+    };
+    ListedFacts {
+        source,
+        details,
+        capabilities,
+        media,
+        weights: gguf.or(weights),
     }
 }
 
@@ -875,16 +897,7 @@ fn show_hub_model(
         caps.push("vision".to_string());
     }
     let template = state.read_chat_format(model_name).effective_template();
-    if let Some(t) = template.as_deref() {
-        if caps.iter().any(|c| c == "completion") {
-            if t.contains(".Tools") || t.contains("tools") {
-                caps.push("tools".to_string());
-            }
-            if crate::api::handlers::prompt_format::template_has_thinking(t) {
-                caps.push("thinking".to_string());
-            }
-        }
-    }
+    template_capabilities(&mut caps, template.as_deref());
     let model_info = model_info.map(|mut m| {
         m.retain(|k, v| !(k.starts_with("tokenizer.ggml.") && v.is_array()));
         m
@@ -907,6 +920,75 @@ fn show_hub_model(
         model_info,
         capabilities: Some(caps),
     }
+}
+
+/// Add the capabilities a text model's chat template gives: tool calling and a separate
+/// reasoning channel, when the template has somewhere to put them.
+fn template_capabilities(caps: &mut Vec<String>, template: Option<&str>) {
+    let Some(t) = template else {
+        return;
+    };
+    if caps.iter().any(|c| c == "completion") {
+        if t.contains(".Tools") || t.contains("tools") {
+            caps.push("tools".to_string());
+        }
+        if crate::api::handlers::prompt_format::template_has_thinking(t) {
+            caps.push("thinking".to_string());
+        }
+    }
+}
+
+/// What `/api/show` reports for a catalogue entry outside the Ollama store that is no GGUF:
+/// the facts the listing reads, the window its configuration declares and its chat template.
+///
+/// `None` when the catalogue lists no such entry under `model_name`.
+async fn show_listed_model(state: &APIServer, model_name: &str) -> Option<OllamaShowResponse> {
+    let mut models = state.model_manager.list_models().await.ok()?;
+    #[cfg(feature = "media")]
+    inject_local_media(state, &mut models);
+    let normalized = normalize_model_id(model_name);
+    let m = models.into_iter().find(|m| {
+        m.source == "huggingface"
+            && (m.id == model_name || m.id == normalized)
+            && state.serves_weights(m)
+    })?;
+    let facts = listed_facts(state, &m);
+    let mut caps = facts.capabilities;
+    let completion = caps.iter().any(|c| c == "completion");
+    if completion && state.model_has_vision(&m.id) {
+        caps.push("vision".to_string());
+    }
+    let template = match completion {
+        true => state.read_chat_format(&m.id).effective_template(),
+        false => None,
+    };
+    template_capabilities(&mut caps, template.as_deref());
+    // The keys a GGUF header would carry: its architecture and the window it declares.
+    let model_info = facts
+        .weights
+        .as_ref()
+        .filter(|w| w.is_dir())
+        .and_then(|dir| {
+            let arch = file_architecture(dir)?;
+            let mut info = serde_json::Map::new();
+            if let Some(window) = crate::inference::engine::llm_engine::checkpoint_context(dir) {
+                info.insert(format!("{arch}.context_length"), window.into());
+            }
+            info.insert("general.architecture".to_string(), arch.into());
+            Some(info)
+        });
+    Some(OllamaShowResponse {
+        license: None,
+        modelfile: facts
+            .weights
+            .as_ref()
+            .map(|w| format!("FROM {}\n", w.display())),
+        parameters: None,
+        template,
+        details: Some(facts.details),
+        model_info,
+        capabilities: Some(caps),
+    })
 }
 
 /// Show model info (POST /api/show) - Ollama format
@@ -1098,6 +1180,9 @@ pub(crate) async fn ollama_show_model(
             Ok(Json(show_hub_model(&state, &model_name, &weights)))
         }
         Err(e) => {
+            if let Some(shown) = show_listed_model(&state, &model_name).await {
+                return Ok(Json(shown));
+            }
             error!("   ❌ Resolution failed for '{}': {}", model_name, e);
             error!("   📁 Searching in: {}", state.ollama_models_dir);
             debug!("   💡 Model format: 'name:tag' or 'publisher/name:tag'");
@@ -1233,6 +1318,64 @@ mod catalogue_tests {
         let info = shown.model_info.expect("the header's keys");
         assert_eq!(info["llama.context_length"], 4096);
         assert_eq!(shown.details.unwrap().family, "llama");
+        assert!(shown
+            .capabilities
+            .unwrap()
+            .contains(&"completion".to_string()));
+    }
+
+    /// A safetensors checkpoint the catalogue lists is shown with what its files declare:
+    /// the window, the format, the family and the capabilities.
+    #[tokio::test]
+    async fn show_answers_for_a_listed_safetensors_checkpoint() {
+        let dir = scratch("hubckpt");
+        let repo = dir.join("hub/models--org--ckpt");
+        let rev = "0123456789abcdef0123456789abcdef01234567";
+        let snap = repo.join("snapshots").join(rev);
+        std::fs::create_dir_all(&snap).unwrap();
+        std::fs::create_dir_all(repo.join("refs")).unwrap();
+        std::fs::write(repo.join("refs/main"), rev).unwrap();
+        std::fs::write(
+            snap.join("config.json"),
+            r#"{"architectures": ["TestForCausalLM"], "model_type": "test",
+                "max_position_embeddings": 8192}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            snap.join("model.safetensors.index.json"),
+            r#"{"weight_map": {"layers.0.hc_attn_fn": "model-00001.safetensors"}}"#,
+        )
+        .unwrap();
+        std::fs::write(snap.join("model-00001.safetensors"), b"").unwrap();
+        let state = APIServer::new(
+            "/nonexistent-ollama-models".to_string(),
+            dir.to_string_lossy().to_string(),
+        );
+        let listed = ollama_list_models(
+            axum::extract::State(state.clone()),
+            axum::http::HeaderMap::new(),
+        )
+        .await;
+        let request: OllamaShowRequest =
+            serde_json::from_value(serde_json::json!({"model": "org/ckpt"})).unwrap();
+        let shown = ollama_show_model(axum::extract::State(state), OllamaJson(request)).await;
+        let _ = std::fs::remove_dir_all(&dir);
+        // The media checkpoints of this process's stores are listed beside the checkpoint.
+        let names: Vec<String> = listed
+            .expect("a listing")
+            .0
+            .models
+            .into_iter()
+            .map(|m| m.name)
+            .collect();
+        assert!(names.contains(&"org/ckpt".to_string()), "{names:?}");
+        let shown = shown.expect("a listed checkpoint is shown").0;
+        let info = shown.model_info.expect("the declared keys");
+        assert_eq!(info["general.architecture"], "test");
+        assert_eq!(info["test.context_length"], 8192);
+        let details = shown.details.unwrap();
+        assert_eq!(details.format, "safetensors");
+        assert_eq!(details.family, "test");
         assert!(shown
             .capabilities
             .unwrap()
