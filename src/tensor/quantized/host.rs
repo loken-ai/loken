@@ -205,6 +205,20 @@ impl QHostTensor {
         matches!(self.storage, QHostStorage::OnCard { .. })
     }
 
+    /// A weight of `dtype` and `dims` whose blocks live on a card only, written there by its
+    /// caller.
+    pub(crate) fn on_card(dtype: GgmlDType, dims: Vec<usize>) -> Self {
+        let elems: usize = dims.iter().product();
+        Self {
+            storage: QHostStorage::OnCard {
+                len: elems / dtype.block_size() * dtype.type_size(),
+            },
+            dtype,
+            dims,
+            id: next_tensor_id(),
+        }
+    }
+
     /// The same weight with its host bytes let go: dtype, shape and identity kept, the blocks
     /// known to live on a card. The bytes are freed once every other holder of them drops.
     pub(crate) fn card_only(&self) -> Self {

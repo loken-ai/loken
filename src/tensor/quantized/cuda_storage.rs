@@ -51,6 +51,29 @@ impl QCudaStorage {
         )
     }
 
+    /// Padded upload of the block bytes of `parts`, one after the other, with no host copy of
+    /// the whole. The copies have landed when it returns.
+    pub(crate) fn upload_parts(
+        device: &CudaDevice,
+        parts: &[&[u8]],
+        dtype: GgmlDType,
+    ) -> Result<Self> {
+        let len: usize = parts.iter().map(|p| p.len()).sum();
+        let mut blob = padded_blob(device, "QCudaStorage upload by parts", len)?;
+        let stream = device.0.stream();
+        let mut at = 0;
+        for p in parts {
+            stream
+                .memcpy_htod(*p, &mut blob.slice_mut(at..at + p.len()))
+                .map_err(|e| Error::msg(format!("QCudaStorage upload by parts: {e}")))?;
+            at += p.len();
+        }
+        stream
+            .synchronize()
+            .map_err(|e| Error::msg(format!("QCudaStorage upload by parts: {e}")))?;
+        Self::over(blob, len, dtype, device)
+    }
+
     /// Padded upload of host block bytes (weights).
     pub(crate) fn upload(device: &CudaDevice, data: &[u8], dtype: GgmlDType) -> Result<Self> {
         let mut blob = padded_blob(device, "QCudaStorage upload", data.len())?;

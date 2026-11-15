@@ -700,18 +700,13 @@ fn qtensor_from_bytes(
     cols: usize,
     device: &Device,
 ) -> crate::tensor::Result<QTensor> {
-    // The storage reads the bytes as blocks, so they sit in a word-aligned buffer.
-    let mut buf = vec![0u32; bytes.len().div_ceil(4)];
-    let aligned: &mut [u8] =
-        unsafe { std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut u8, buf.len() * 4) };
-    aligned[..bytes.len()].copy_from_slice(bytes);
     // CONVERSION: the q projection is split into its q and gate halves, each a weight of its own.
-    let storage = crate::tensor::quantized::QStorage::from_data(
-        std::borrow::Cow::Borrowed(&aligned[..bytes.len()]),
-        device,
-        dtype,
-    )?;
-    QTensor::new(storage, crate::tensor::Shape::from((rows, cols)))
+    // A card receives the bytes with no host copy.
+    if let Some(t) = QTensor::rows_onto_card(&[bytes], dtype, rows, cols, device)? {
+        return Ok(t);
+    }
+    // The host holds them once, in aligned storage.
+    QTensor::from_ggml_bytes(dtype, bytes, vec![rows, cols], device)
 }
 
 /// The rows of `a` in `row_bytes`-sized rows.
@@ -794,13 +789,19 @@ fn concat_rows(parts: &[QTensor], device: &Device) -> crate::tensor::Result<Opti
     if !same || !crate::inference::moe_cuda::gemm::expert_kernels_serve(dtype) {
         return Ok(None);
     }
-    let mut bytes = Vec::new();
-    let mut rows = 0;
-    for p in parts {
-        bytes.extend_from_slice(&p.data()?);
-        rows += p.shape().dims()[0];
+    let rows = parts.iter().map(|p| p.shape().dims()[0]).sum();
+    let data = parts
+        .iter()
+        .map(|p| p.data())
+        .collect::<crate::tensor::Result<Vec<_>>>()?;
+    let slices: Vec<&[u8]> = data.iter().map(|d| d.as_ref()).collect();
+    // A card receives each part at its place in the joined weight.
+    if let Some(joined) = QTensor::rows_onto_card(&slices, dtype, rows, cols, device)? {
+        return Ok(Some(joined));
     }
-    qtensor_from_bytes(&bytes, dtype, rows, cols, device).map(Some)
+    // The host holds the joined rows once.
+    let bytes = slices.concat();
+    QTensor::from_ggml_bytes(dtype, &bytes, vec![rows, cols], device).map(Some)
 }
 
 /// Build a `GenericTransformerLayer` from a raw loaded layer.

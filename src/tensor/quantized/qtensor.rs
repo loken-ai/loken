@@ -397,6 +397,26 @@ impl QTensor {
         Tensor::from_cuda_storage(out, dev.clone(), self.shape.clone())
     }
 
+    /// The rows of `parts`, one after the other, as one `[rows, cols]` weight on the card
+    /// `device`, written there part by part with no host copy of the whole.
+    /// `None` off a card.
+    pub fn rows_onto_card(
+        parts: &[&[u8]],
+        dtype: GgmlDType,
+        rows: usize,
+        cols: usize,
+        device: &Device,
+    ) -> Result<Option<Self>> {
+        #[cfg(feature = "gpu")]
+        if let tensor::Device::Cuda(d) = device {
+            let storage = QCudaStorage::upload_parts(&CudaDevice(d.clone()), parts, dtype)?;
+            let inner = Arc::new(QHostTensor::on_card(dtype, vec![rows, cols]));
+            return Ok(Some(Self::over_card(inner, device, storage)));
+        }
+        let _ = (parts, dtype, rows, cols, device);
+        Ok(None)
+    }
+
     /// The production-kernel matmul over this tensor's shared blob
     /// (built once; QMatMul::forward delegates here).
     pub(crate) fn native_qmm(&self) -> Result<&QKernelMatMul> {
