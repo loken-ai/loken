@@ -4011,25 +4011,14 @@ impl GenericHeteroTransformer {
         // A checkpoint whose layout reads no head gives the model none.
         // Its forward gives the normed rows and no logits.
         let headless = source.dense.is_some_and(|ck| !ck.has_head);
-        let (output_proj, output_weight_name) = if headless {
-            (None, None)
-        } else {
-            let (output_qt, name) = match source.read("output.weight", &Device::Cpu) {
-                Ok(qt) => (qt, "output.weight"),
-                Err(_) => {
-                    // Tied embeddings (weight sharing)
-                    (
-                        source.read("token_embd.weight", &Device::Cpu)?,
-                        "token_embd.weight",
-                    )
-                }
-            };
-            (
-                Some(crate::tensor::quantized::QMatMul::from_qtensor(output_qt)?),
-                Some(name),
-            )
+        // A file without `output.weight` ties its head to the embedding table.
+        // The head is read once the card copy is decided, and the host copy only if needed.
+        let output_weight_name = match (headless, source.info("output.weight").is_some()) {
+            (true, _) => None,
+            (false, true) => Some("output.weight"),
+            (false, false) => Some("token_embd.weight"),
         };
-        info!("✅ Loaded output norm and projection on CPU");
+        info!("✅ Loaded output norm on CPU");
 
         // -- 2b. Load PLE globals (Gemma4) - optional ---------------------
         // Per-layer input embeddings are a model-wide table plus a projection. A file whose
@@ -5204,6 +5193,21 @@ impl GenericHeteroTransformer {
                 Err(e) => warn!("  Output projection on CUDA:{idx} failed ({e}); using the host"),
             }
         }
+        // The host copy of the head, built only where the card copy does not serve every row.
+        let card_head = card_serves_head(
+            output_proj_cuda.is_some() || output_proj_cuda_qmm.is_some(),
+            matches!(layer_devs.last(), Some(LayerDevice::Cuda(_))),
+        );
+        let output_proj = match output_weight_name {
+            Some(name)
+                if host_head_needed(card_head, config.hyper.is_some(), draft_built.is_some()) =>
+            {
+                let qt = source.read(name, &Device::Cpu)?;
+                info!("✅ Loaded output projection on CPU");
+                Some(crate::tensor::quantized::QMatMul::from_qtensor(qt)?)
+            }
+            _ => None,
+        };
 
         // The output projection's share of the bytes a decoded token reads: every tensor but
         // the row-gathered embedding tables, the routed experts in the share a token routes to.
@@ -6064,6 +6068,14 @@ fn host_head_needed(card_copy: bool, output_mixer: bool, draft_head: bool) -> bo
     !card_copy || output_mixer || draft_head
 }
 
+/// Whether a card copy of the output head serves every row the head reads.
+///
+/// The forward takes the card copy only for rows that leave the last layer on a card.
+/// Rows that leave it on the host read the host copy.
+fn card_serves_head(card_copy: bool, last_layer_on_card: bool) -> bool {
+    card_copy && last_layer_on_card
+}
+
 /// Whether a host spill of `want` bytes fits the budget the planner measured.
 ///
 /// Separated from the loader so the REFUSING side can be tested: exercising it
@@ -6105,6 +6117,17 @@ mod host_head_tests {
     #[test]
     fn a_host_head_stays_built_whatever_else_is_present() {
         assert!(host_head_needed(false, true, true));
+    }
+
+    #[test]
+    fn a_card_copy_serves_the_head_when_the_last_layer_runs_on_a_card() {
+        assert!(super::card_serves_head(true, true));
+    }
+
+    #[test]
+    fn rows_that_leave_the_last_layer_on_the_host_read_the_host_copy() {
+        assert!(!super::card_serves_head(true, false));
+        assert!(!super::card_serves_head(false, true));
     }
 }
 
