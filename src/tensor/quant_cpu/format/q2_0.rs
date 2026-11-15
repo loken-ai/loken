@@ -126,6 +126,48 @@ impl BlockFormat for BlockQ2_0 {
     }
 }
 
+impl ExactDot for BlockQ2_0 {
+    type Act = BlockQ8K32;
+    fn dot_exact(xs: &[Self], ys: &[BlockQ8K32]) -> f32 {
+        #[cfg(target_arch = "x86_64")]
+        if crate::cpu::dispatch_avx2() {
+            // SAFETY: dispatch_avx2 implies the CPU has every feature `dot_q2_0` enables.
+            return unsafe { super::exact_runs::dot_q2_0(xs, ys) };
+        }
+        dot_exact_scalar(xs, ys)
+    }
+}
+
+/// [`ExactDot::dot_exact`] one value at a time: the steps the vector kernel is held to.
+/// Runs `2b` and `2b + 1` of an activation block are the halves of weight block `b` of its 4,
+/// fewer in a row's last block.
+pub(super) fn dot_exact_scalar(xs: &[BlockQ2_0], ys: &[BlockQ8K32]) -> f32 {
+    let mut total = -0.0f32;
+    for (x4, y) in xs.chunks(QK_K / QK2_0).zip(ys) {
+        total += exact_block_share(y, 2 * x4.len(), |r| {
+            let x = &x4[r / 2];
+            (
+                x.d.to_f32(),
+                exact_run_sum(x, r % 2, &y.qs[32 * r..32 * r + 32]),
+            )
+        });
+    }
+    total
+}
+
+/// Half `half` of a block's integer sum against its 32 activation codes: the levels `code - 1`
+/// against the codes.
+fn exact_run_sum(x: &BlockQ2_0, half: usize, acts: &[i8]) -> i32 {
+    acts.iter()
+        .enumerate()
+        .map(|(j, &a)| {
+            let v = 32 * half + j;
+            let code = ((x.qs[v / 4] >> (2 * (v % 4))) & 3) as i32;
+            (code - 1) * a as i32
+        })
+        .sum()
+}
+
 /// The dot of whole blocks with the four codes of each byte unpacked into the activation's order
 /// and multiplied as unsigned codes by signed bytes; the offset of one level is taken off with
 /// the activation's own sum.
@@ -181,7 +223,7 @@ unsafe fn dot_blocks(xs: &[BlockQ2_0], ys: &[BlockQ8_64]) -> f32 {
 /// to a group.
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
-unsafe fn unpack_codes(x: &BlockQ2_0) -> [std::arch::x86_64::__m128i; 4] {
+pub(super) unsafe fn unpack_codes(x: &BlockQ2_0) -> [std::arch::x86_64::__m128i; 4] {
     use std::arch::x86_64::*;
     let mask = _mm_set1_epi8(3);
     let bytes = _mm_loadu_si128(x.qs.as_ptr() as *const __m128i);

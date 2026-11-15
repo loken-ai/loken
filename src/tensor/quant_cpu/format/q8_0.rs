@@ -96,3 +96,33 @@ impl BlockFormat for BlockQ8_0 {
             .sum()
     }
 }
+
+impl ExactDot for BlockQ8_0 {
+    type Act = BlockQ8K32;
+    fn dot_exact(xs: &[Self], ys: &[BlockQ8K32]) -> f32 {
+        #[cfg(target_arch = "x86_64")]
+        if crate::cpu::dispatch_avx2() {
+            // SAFETY: dispatch_avx2 implies the CPU has every feature `dot_q8_0` enables.
+            return unsafe { super::exact_runs::dot_q8_0(xs, ys) };
+        }
+        dot_exact_scalar(xs, ys)
+    }
+}
+
+/// [`ExactDot::dot_exact`] one value at a time: the steps the vector kernel is held to.
+/// Run `r` of an activation block is weight block `r` of its 8, fewer in a row's last block.
+pub(super) fn dot_exact_scalar(xs: &[BlockQ8_0], ys: &[BlockQ8K32]) -> f32 {
+    let mut total = -0.0f32;
+    for (x8, y) in xs.chunks(QK_K / QK8_0).zip(ys) {
+        total += exact_block_share(y, x8.len(), |r| {
+            let dot: i32 = x8[r]
+                .qs
+                .iter()
+                .zip(&y.qs[QK8_0 * r..QK8_0 * (r + 1)])
+                .map(|(&a, &b)| a as i32 * b as i32)
+                .sum();
+            (x8[r].d.to_f32(), dot)
+        });
+    }
+    total
+}

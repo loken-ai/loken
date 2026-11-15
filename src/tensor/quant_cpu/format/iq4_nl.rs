@@ -112,6 +112,46 @@ impl BlockFormat for BlockIq4Nl {
     }
 }
 
+impl ExactDot for BlockIq4Nl {
+    type Act = BlockQ8K32;
+    fn dot_exact(xs: &[Self], ys: &[BlockQ8K32]) -> f32 {
+        #[cfg(target_arch = "x86_64")]
+        if crate::cpu::dispatch_avx2() {
+            // SAFETY: dispatch_avx2 implies the CPU has every feature `dot_iq4_nl` enables.
+            return unsafe { super::exact_runs::dot_iq4_nl(xs, ys) };
+        }
+        dot_exact_scalar(xs, ys)
+    }
+}
+
+/// [`ExactDot::dot_exact`] one value at a time: the steps the vector kernel is held to.
+/// Run `r` of an activation block is weight block `r` of its 8, fewer in a row's last block.
+pub(super) fn dot_exact_scalar(xs: &[BlockIq4Nl], ys: &[BlockQ8K32]) -> f32 {
+    let mut total = -0.0f32;
+    for (x8, y) in xs.chunks(QK_K / QK4_NL).zip(ys) {
+        total += exact_block_share(y, x8.len(), |r| {
+            (
+                x8[r].d.to_f32(),
+                exact_run_sum(&x8[r], &y.qs[QK4_NL * r..QK4_NL * (r + 1)]),
+            )
+        });
+    }
+    total
+}
+
+/// A block's integer sum against its 32 activation codes: the table levels against the codes.
+fn exact_run_sum(x: &BlockIq4Nl, acts: &[i8]) -> i32 {
+    let (low, high) = acts.split_at(QK4_NL / 2);
+    x.qs.iter()
+        .zip(low)
+        .zip(high)
+        .map(|((&packed, &a), &b)| {
+            LEVELS[(packed & 0x0F) as usize] as i32 * a as i32
+                + LEVELS[(packed >> 4) as usize] as i32 * b as i32
+        })
+        .sum()
+}
+
 #[cfg(all(test, target_arch = "x86_64"))]
 #[target_feature(enable = "avx2,fma,f16c,bmi2")]
 pub(super) unsafe fn reference_dot_many_avx2(

@@ -10,8 +10,8 @@
 use super::*;
 use crate::tensor::gpu_runtime::driver::{LaunchConfig, PushKernelArg};
 use crate::tensor::quant_cpu::{
-    BlockFormat, BlockIq2S, BlockIq3S, BlockIq3Xxs, BlockQ2K, BlockQ4K, BlockQ6K, BlockQ8K,
-    BlockQ8K32, ExactDot,
+    BlockFormat, BlockIq2S, BlockIq3S, BlockIq3Xxs, BlockIq4Nl, BlockQ2K, BlockQ2_0, BlockQ4K,
+    BlockQ5_0, BlockQ6K, BlockQ8K, BlockQ8K32, BlockQ8_0, ExactDot,
 };
 
 /// A format the exact kernels read.
@@ -23,6 +23,10 @@ pub(super) enum Fmt {
     Iq2S,
     Iq3Xxs,
     Iq3S,
+    Iq4Nl,
+    Q2_0,
+    Q8_0,
+    Q5_0,
 }
 
 impl Fmt {
@@ -34,6 +38,10 @@ impl Fmt {
             GgmlDType::Iq2S => Some(Self::Iq2S),
             GgmlDType::Iq3Xxs => Some(Self::Iq3Xxs),
             GgmlDType::Iq3S => Some(Self::Iq3S),
+            GgmlDType::Iq4Nl => Some(Self::Iq4Nl),
+            GgmlDType::Q2_0 => Some(Self::Q2_0),
+            GgmlDType::Q8_0 => Some(Self::Q8_0),
+            GgmlDType::Q5_0 => Some(Self::Q5_0),
             _ => None,
         }
     }
@@ -47,13 +55,26 @@ impl Fmt {
             Self::Iq2S => "iq2_s",
             Self::Iq3Xxs => "iq3_xxs",
             Self::Iq3S => "iq3_s",
+            Self::Iq4Nl => "iq4_nl",
+            Self::Q2_0 => "q2_0",
+            Self::Q8_0 => "q8_0",
+            Self::Q5_0 => "q5_0",
         }
     }
 
     /// Whether the format's dot reads q8_K32 rows and folds a block run by run, rather than
     /// reading q8_K rows.
     fn runs(self) -> bool {
-        matches!(self, Self::Iq2S | Self::Iq3Xxs | Self::Iq3S)
+        matches!(
+            self,
+            Self::Iq2S
+                | Self::Iq3Xxs
+                | Self::Iq3S
+                | Self::Iq4Nl
+                | Self::Q2_0
+                | Self::Q8_0
+                | Self::Q5_0
+        )
     }
 
     /// Bytes of an activation block the format's dot reads.
@@ -65,15 +86,20 @@ impl Fmt {
         }
     }
 
-    /// The entry point quantising rows to the activation blocks the format's dot reads.
-    fn quantizer(self) -> &'static str {
-        if self.runs() {
-            "tx_quantize_q8_k32"
+    /// Whether a weight row of `len` values in format `dtype` can be read: whole blocks of 256
+    /// values for a q8_K format, whole runs of 32 and whole blocks of the format for a run format.
+    fn reads_rows_of(self, dtype: GgmlDType, len: usize) -> bool {
+        let unit = if self.runs() {
+            RUN.max(dtype.block_size())
         } else {
-            "cx_quantize_q8_k"
-        }
+            BLOCK
+        };
+        len > 0 && len.is_multiple_of(unit)
     }
 }
+
+/// Values of a run: the unit a run format's row is counted in.
+const RUN: usize = 32;
 
 /// The formats and widths of a layer whose experts the exact kernels serve.
 #[derive(Clone, Copy, Debug)]
@@ -91,8 +117,8 @@ const BLOCK: usize = crate::tensor::quant_cpu::QK_K;
 
 impl Exact {
     /// The exact form of the stacks `[gate, up, down]` under the SwiGLU bound `limit`, `None`
-    /// when a format has no exact kernel, its blocks do not divide an activation block or a width
-    /// is not whole activation blocks.
+    /// when a format has no exact kernel, its blocks do not divide an activation block or a row
+    /// is not whole units of its format (see `Fmt::reads_rows_of`).
     pub(super) fn of(host: &[Arc<QTensor>; 3], limit: f32) -> Option<Self> {
         let gate = Fmt::of(host[0].dtype())?;
         if host[1].dtype() != host[0].dtype() {
@@ -110,7 +136,9 @@ impl Exact {
             ([_, i, h], [_, h2, i2]) if h == h2 && i == i2 => (*i, *h),
             _ => return None,
         };
-        (dim % BLOCK == 0 && inter % BLOCK == 0).then_some(Self {
+        let rows_read =
+            gate.reads_rows_of(host[0].dtype(), dim) && down.reads_rows_of(host[2].dtype(), inter);
+        rows_read.then_some(Self {
             gate,
             down,
             dim,
@@ -119,9 +147,10 @@ impl Exact {
         })
     }
 
-    /// Bytes of `rows` rows of `len` values as the activation blocks `fmt`'s dot reads.
+    /// Bytes of `rows` rows of `len` values as the activation blocks `fmt`'s dot reads, the last
+    /// block of a row padded.
     pub(super) fn act_bytes(fmt: Fmt, rows: usize, len: usize) -> usize {
-        rows * (len / BLOCK) * fmt.act_block_bytes()
+        rows * len.div_ceil(BLOCK) * fmt.act_block_bytes()
     }
 }
 
@@ -170,14 +199,22 @@ pub(super) fn quantize_rows(
     dim: usize,
 ) -> Result<()> {
     let cd = dev.as_cuda_device()?;
-    let name = fmt.quantizer();
-    let f = cd.0.quantized_fn(name)?;
     let stream = cd.0.stream();
-    let blocks = (rows * dim / BLOCK) as i64;
+    let blocks = (rows * dim.div_ceil(BLOCK)) as i64;
+    let name = if fmt.runs() {
+        "tx_quantize_q8_k32"
+    } else {
+        "cx_quantize_q8_k"
+    };
+    let f = cd.0.quantized_fn(name)?;
+    let len = dim as i32;
     let mut b = stream.launch_builder(&f);
     b.arg(&x);
     b.arg(&xq);
     b.arg(&blocks);
+    if fmt.runs() {
+        b.arg(&len);
+    }
     launched(name, unsafe { b.launch(warps((blocks as u32, 1))) })
 }
 
@@ -235,7 +272,7 @@ pub(super) fn run_pairs(
     b.arg(&rooms.hq);
     b.arg(&inter);
     launched(name, unsafe {
-        b.launch(warps(((exact.inter / BLOCK) as u32, n as u32)))
+        b.launch(warps((exact.inter.div_ceil(BLOCK) as u32, n as u32)))
     })?;
     let name = format!("tx_down_{}", exact.down.name());
     let f = cd.0.quantized_fn(&name)?;
@@ -368,6 +405,10 @@ pub(super) fn host_pairs(
             Fmt::Iq2S => run::<G, BlockIq2S>(exact, host, x, pairs),
             Fmt::Iq3Xxs => run::<G, BlockIq3Xxs>(exact, host, x, pairs),
             Fmt::Iq3S => run::<G, BlockIq3S>(exact, host, x, pairs),
+            Fmt::Iq4Nl => run::<G, BlockIq4Nl>(exact, host, x, pairs),
+            Fmt::Q2_0 => run::<G, BlockQ2_0>(exact, host, x, pairs),
+            Fmt::Q8_0 => run::<G, BlockQ8_0>(exact, host, x, pairs),
+            Fmt::Q5_0 => run::<G, BlockQ5_0>(exact, host, x, pairs),
         }
     }
     Ok(match exact.gate {
@@ -377,6 +418,10 @@ pub(super) fn host_pairs(
         Fmt::Iq2S => with_down::<BlockIq2S>(exact, host, x, pairs),
         Fmt::Iq3Xxs => with_down::<BlockIq3Xxs>(exact, host, x, pairs),
         Fmt::Iq3S => with_down::<BlockIq3S>(exact, host, x, pairs),
+        Fmt::Iq4Nl => with_down::<BlockIq4Nl>(exact, host, x, pairs),
+        Fmt::Q2_0 => with_down::<BlockQ2_0>(exact, host, x, pairs),
+        Fmt::Q8_0 => with_down::<BlockQ8_0>(exact, host, x, pairs),
+        Fmt::Q5_0 => with_down::<BlockQ5_0>(exact, host, x, pairs),
     })
 }
 
@@ -392,14 +437,14 @@ fn host_rows<G: ExactDot, D: ExactDot>(
 ) -> Vec<f32> {
     let (dim, inter, limit) = (exact.dim, exact.inter, exact.limit);
     // The activation blocks of an input row and of a row entering the down projection.
-    let (nb, nbi) = (dim / BLOCK, inter / BLOCK);
+    let (nb, nbi) = (dim.div_ceil(BLOCK), inter.div_ceil(BLOCK));
     // The weight blocks of a gate or up row and of a down row.
     let (gb, db) = (dim / G::BLOCK_LEN, inter / D::BLOCK_LEN);
     let rows = x.len() / dim;
     let mut xq = vec![G::Act::zeros(); rows * nb];
     for (r, q) in xq.chunks_exact_mut(nb).enumerate() {
         if pairs.iter().any(|p| p.0 == r) {
-            G::Act::quantize(&x[r * dim..(r + 1) * dim], q);
+            quantize_padded(&x[r * dim..(r + 1) * dim], q);
         }
     }
     let n = pairs.len();
@@ -455,7 +500,7 @@ fn host_rows<G: ExactDot, D: ExactDot>(
     }
     let mut hq = vec![D::Act::zeros(); n * nbi];
     for (p, q) in hq.chunks_exact_mut(nbi).enumerate() {
-        D::Act::quantize(&h[p * inter..(p + 1) * inter], q);
+        quantize_padded(&h[p * inter..(p + 1) * inter], q);
     }
     let mut y = vec![0f32; n * dim];
     {
@@ -479,6 +524,17 @@ fn host_rows<G: ExactDot, D: ExactDot>(
         });
     }
     y
+}
+
+/// `row` as the activation blocks `out`, the last block padded with zeros as the card pads it.
+fn quantize_padded<A: BlockFormat>(row: &[f32], out: &mut [A]) {
+    if row.len() == out.len() * A::BLOCK_LEN {
+        A::quantize(row, out);
+    } else {
+        let mut padded = row.to_vec();
+        padded.resize(out.len() * A::BLOCK_LEN, 0.0);
+        A::quantize(&padded, out);
+    }
 }
 
 /// Weight rows of one expert a unit of [`host_rows`] takes.
@@ -1086,7 +1142,15 @@ mod tests {
     #[test]
     fn the_exact_steps_are_as_accurate_as_the_formats_own_dots() {
         fn compare<G: ExactDot, D: ExactDot>(gate_dt: GgmlDType, down_dt: GgmlDType) {
-            let (experts, used, dim, inter, rows) = (8usize, 4usize, 512usize, 512usize, 8usize);
+            compare_at::<G, D>(gate_dt, down_dt, 512, 512);
+        }
+        fn compare_at<G: ExactDot, D: ExactDot>(
+            gate_dt: GgmlDType,
+            down_dt: GgmlDType,
+            dim: usize,
+            inter: usize,
+        ) {
+            let (experts, used, rows) = (8usize, 4usize, 8usize);
             let host = [
                 stack(experts, inter, dim, 1, gate_dt),
                 stack(experts, inter, dim, 2, gate_dt),
@@ -1114,8 +1178,8 @@ mod tests {
             let (exact_off, exact_rms, peak) = distance(&exact_rows, &reference);
             let (own_off, own_rms, _) = distance(&own, &reference);
             eprintln!(
-                "{gate_dt:?} / {down_dt:?}: peak {peak:.4e}, exact steps off by {:.4}% \
-                 (rms {:.4}%), own dots off by {:.4}% (rms {:.4}%)",
+                "{gate_dt:?} / {down_dt:?} at {dim} by {inter}: peak {peak:.4e}, exact steps off by \
+                 {:.4}% (rms {:.4}%), own dots off by {:.4}% (rms {:.4}%)",
                 100.0 * exact_off / peak,
                 100.0 * exact_rms / peak,
                 100.0 * own_off / peak,
@@ -1134,6 +1198,20 @@ mod tests {
         compare::<BlockQ6K, BlockIq3Xxs>(GgmlDType::Q6K, GgmlDType::Iq3Xxs);
         compare::<BlockIq3S, BlockQ6K>(GgmlDType::Iq3S, GgmlDType::Q6K);
         compare::<BlockQ6K, BlockIq3S>(GgmlDType::Q6K, GgmlDType::Iq3S);
+        compare::<BlockIq4Nl, BlockQ6K>(GgmlDType::Iq4Nl, GgmlDType::Q6K);
+        compare::<BlockQ6K, BlockIq4Nl>(GgmlDType::Q6K, GgmlDType::Iq4Nl);
+        compare::<BlockIq2S, BlockIq4Nl>(GgmlDType::Iq2S, GgmlDType::Iq4Nl);
+        compare::<BlockIq3S, BlockIq4Nl>(GgmlDType::Iq3S, GgmlDType::Iq4Nl);
+        compare::<BlockQ2_0, BlockQ6K>(GgmlDType::Q2_0, GgmlDType::Q6K);
+        compare::<BlockQ6K, BlockQ2_0>(GgmlDType::Q6K, GgmlDType::Q2_0);
+        compare::<BlockIq3Xxs, BlockQ2_0>(GgmlDType::Iq3Xxs, GgmlDType::Q2_0);
+        compare::<BlockQ8_0, BlockQ8_0>(GgmlDType::Q8_0, GgmlDType::Q8_0);
+        compare::<BlockQ4K, BlockQ8_0>(GgmlDType::Q4K, GgmlDType::Q8_0);
+        compare::<BlockQ5_0, BlockQ5_0>(GgmlDType::Q5_0, GgmlDType::Q5_0);
+        compare::<BlockQ4K, BlockQ5_0>(GgmlDType::Q4K, GgmlDType::Q5_0);
+        // The widths of a released file whose expert width is whole runs, not whole blocks.
+        compare_at::<BlockQ4K, BlockQ8_0>(GgmlDType::Q4K, GgmlDType::Q8_0, 2560, 640);
+        compare_at::<BlockQ4K, BlockQ5_0>(GgmlDType::Q4K, GgmlDType::Q5_0, 2560, 640);
     }
 
     /// The card's q8_K32 rows are the bytes of the host's, zeros, ties and extremes included.
@@ -1183,6 +1261,39 @@ mod tests {
             .flat_map(|f| f.to_le_bytes())
             .collect();
         assert_eq!(got, want);
+        // Rows of 640 values: 2 whole blocks and a last block of 4 runs, padded with zeros.
+        let (rows, len) = (3usize, 640usize);
+        let x: Vec<f32> = (0..rows * len)
+            .map(|i| ((i * 7919 % 1000) as f32 / 1000.0 - 0.5) * 3.0)
+            .collect();
+        let per_row = len.div_ceil(BLOCK);
+        let mut want = vec![BlockQ8K32::zeros(); rows * per_row];
+        for (r, q) in want.chunks_exact_mut(per_row).enumerate() {
+            quantize_padded(&x[r * len..(r + 1) * len], q);
+        }
+        // Safety: the blocks are `repr(C)` plain data, read as the bytes they occupy.
+        let want = unsafe {
+            std::slice::from_raw_parts(want.as_ptr() as *const u8, std::mem::size_of_val(&want[..]))
+        }
+        .to_vec();
+        let xs = Tensor::from_vec(x, rows * len, &card).unwrap();
+        let out = Tensor::zeros_on(want.len() / 4, crate::tensor::DType::F32, &card).unwrap();
+        quantize_rows(
+            &card,
+            fmt,
+            address_of::<f32>(&xs).unwrap(),
+            address_of::<f32>(&out).unwrap(),
+            rows,
+            len,
+        )
+        .unwrap();
+        let got: Vec<u8> = out
+            .to_vec1::<f32>()
+            .unwrap()
+            .iter()
+            .flat_map(|f| f.to_le_bytes())
+            .collect();
+        assert_eq!(got, want, "rows of {len} values");
     }
 
     /// The card's time per pair of `run_pairs` for formats of about the same size, read through
@@ -1200,6 +1311,10 @@ mod tests {
             GgmlDType::Iq2S,
             GgmlDType::Iq3Xxs,
             GgmlDType::Iq3S,
+            GgmlDType::Iq4Nl,
+            GgmlDType::Q2_0,
+            GgmlDType::Q8_0,
+            GgmlDType::Q5_0,
         ] {
             let host = [
                 stack(experts, inter, dim, 1, dt),

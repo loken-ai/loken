@@ -95,13 +95,14 @@ pub trait ExactDot: BlockFormat {
 }
 
 /// A block's share of an exact dot against a q8_K32 block: the fold from -0, in run order, of
-/// each run's `(ws * s) * da`.
+/// each of its first `runs` runs' `(ws * s) * da`.
 /// `run(r)` gives run `r`'s float weight scale `ws` and its integer sum `s`.
 /// `da` is the run's activation scale.
+/// The last block of a row that is not whole blocks holds fewer than 8 runs.
 #[inline(always)]
-pub fn exact_block_share(y: &BlockQ8K32, run: impl Fn(usize) -> (f32, i32)) -> f32 {
+pub fn exact_block_share(y: &BlockQ8K32, runs: usize, run: impl Fn(usize) -> (f32, i32)) -> f32 {
     let mut share = -0.0f32;
-    for (r, da) in y.d.iter().enumerate() {
+    for (r, da) in y.d.iter().enumerate().take(runs) {
         let (ws, s) = run(r);
         share += ws * s as f32 * da.to_f32();
     }

@@ -156,7 +156,7 @@ pub(super) fn dot_exact_scalar(xs: &[BlockIq2S], ys: &[BlockQ8K32]) -> f32 {
     let mut total = -0.0f32;
     for (x, y) in xs.iter().zip(ys) {
         let ws = x.d.to_f32() * 0.125;
-        total += exact_block_share(y, |r| (ws, exact_run_sum(x, y, r)));
+        total += exact_block_share(y, Q8K32_RUNS, |r| (ws, exact_run_sum(x, y, r)));
     }
     total
 }

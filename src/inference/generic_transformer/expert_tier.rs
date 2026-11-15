@@ -3961,17 +3961,17 @@ mod tests {
     /// A SwiGLU bound below the gate and up products of the test layers: the clamp moves some.
     const BOUNDED_SWIGLU_LIMIT: f32 = 0.5;
 
-    /// A bounded SwiGLU is served only in a format the exact kernels read.
+    /// A bounded SwiGLU is served only in a layer the exact kernels read.
     #[test]
     fn a_bounded_swiglu_is_served_only_through_the_exact_kernels() {
         let Ok(card) = Device::new_cuda(0) else {
             eprintln!("skipping: no usable CUDA device");
             return;
         };
-        let mut plain = layer(&card, 8, 2, 512, 256);
-        assert!(serves(&plain), "a Q8_0 layer is served unbounded");
+        let mut plain = layer_of(&card, 8, 2, 512, 256, [GgmlDType::Q5_1; 2]);
+        assert!(serves(&plain), "a Q5_1 layer is served unbounded");
         plain.swiglu_limit = Some(BOUNDED_SWIGLU_LIMIT);
-        assert!(!serves(&plain), "Q8_0 has no exact kernel");
+        assert!(!serves(&plain), "Q5_1 has no exact kernel");
         let mut k_quants = layer_of(&card, 8, 2, 512, 256, [GgmlDType::Q4K, GgmlDType::Q6K]);
         k_quants.swiglu_limit = Some(BOUNDED_SWIGLU_LIMIT);
         assert!(serves(&k_quants));
@@ -5940,9 +5940,7 @@ mod tests {
             eprintln!("skipping: no usable CUDA device");
             return;
         };
-        let host = Device::Cpu;
-        let (experts, used, hidden, ffn) = (16usize, 4usize, 512usize, 256usize);
-        for formats in [
+        let formats = [
             [GgmlDType::Q4K, GgmlDType::Q6K],
             [GgmlDType::Q4K, GgmlDType::Q4K],
             [GgmlDType::Q6K, GgmlDType::Q6K],
@@ -5951,16 +5949,50 @@ mod tests {
             [GgmlDType::Iq2S, GgmlDType::Iq2S],
             [GgmlDType::Iq3Xxs, GgmlDType::Iq3Xxs],
             [GgmlDType::Iq3S, GgmlDType::Iq3S],
-        ]
-        .into_iter()
-        .flat_map(|f| [(f, 0.0f32), (f, BOUNDED_SWIGLU_LIMIT)])
+            [GgmlDType::Iq4Nl, GgmlDType::Iq4Nl],
+            [GgmlDType::Q2_0, GgmlDType::Q2_0],
+            [GgmlDType::Q8_0, GgmlDType::Q8_0],
+            [GgmlDType::Q5_0, GgmlDType::Q5_0],
+        ];
+        same_bits_wherever_pairs_run(&card, (16, 4, 512, 256), &formats);
+    }
+
+    /// The same at the widths of a released file whose expert width is whole runs of 32 values
+    /// and not whole blocks of 256, its down projections in 32-value formats.
+    #[test]
+    fn the_same_bits_wherever_pairs_run_at_an_expert_width_of_whole_runs() {
+        let _pool = LENT_POOL.lock().unwrap_or_else(|e| e.into_inner());
+        let Ok(card) = Device::new_cuda(0) else {
+            eprintln!("skipping: no usable CUDA device");
+            return;
+        };
+        let formats = [
+            [GgmlDType::Q4K, GgmlDType::Q8_0],
+            [GgmlDType::Q4K, GgmlDType::Q5_0],
+        ];
+        same_bits_wherever_pairs_run(&card, (16, 4, 2560, 640), &formats);
+    }
+
+    /// A routed pair's row is the same bits whether its expert sits in a slot of the cache, in the
+    /// transit room or on the host, through an eager decode and a recorded one, for a token and
+    /// for the rows of a verify, in a layer of `shape` (experts, experts a row routes to, hidden
+    /// width, expert width) in each of `formats` (gate and up, down), unbounded and bounded.
+    fn same_bits_wherever_pairs_run(
+        card: &Device,
+        (experts, used, hidden, ffn): (usize, usize, usize, usize),
+        formats: &[[GgmlDType; 2]],
+    ) {
+        let host = Device::Cpu;
+        for (formats, limit) in formats
+            .iter()
+            .copied()
+            .flat_map(|f| [(f, 0.0f32), (f, BOUNDED_SWIGLU_LIMIT)])
         {
-            let (formats, limit) = formats;
             let bounded = |mut m: MoeWeights| {
                 m.swiglu_limit = (limit > 0.0).then_some(limit);
                 m
             };
-            let moe = bounded(layer_of(&card, experts, used, hidden, ffn, formats));
+            let moe = bounded(layer_of(card, experts, used, hidden, ffn, formats));
             assert!(serves(&moe), "{formats:?} bounded at {limit}");
             let stacks = [
                 moe.gate_exps_sep.clone().unwrap(),
@@ -5969,7 +6001,7 @@ mod tests {
             ];
             let exact = exact::Exact::of(&stacks, limit).expect("a format with exact kernels");
             let widest = [0, 1, 2].map(|i| stacks[i].native_qtensor().data().len());
-            let stager = CardStager::new(&card, widest, experts).unwrap();
+            let stager = CardStager::new(card, widest, experts).unwrap();
             for rows in [1usize, 3] {
                 let ids: Vec<u32> = (0..rows)
                     .flat_map(|r| [1u32, 6, 9, 14].map(|e| (e + r as u32) % experts as u32))
@@ -5990,10 +6022,10 @@ mod tests {
                     for eighths in [1u64, 4, 7] {
                         for recorded in [false, true] {
                             let mut tiered =
-                                bounded(layer_of(&card, experts, used, hidden, ffn, formats));
+                                bounded(layer_of(card, experts, used, hidden, ffn, formats));
                             // The stacks page-locked: a copy from pageable memory waits for a
                             // card that waits on the worker.
-                            let built = LayerTier::new(&tiered, &card, slots)
+                            let built = LayerTier::new(&tiered, card, slots)
                                 .unwrap()
                                 .with_stage(&stager, 0, true)
                                 .unwrap();
@@ -6013,21 +6045,21 @@ mod tests {
                             let worker = if recorded {
                                 tier.enable_graph(&tiered, 4).unwrap();
                                 let w =
-                                    TierWorker::start(&card, vec![("layer".into(), tier.clone())])
+                                    TierWorker::start(card, vec![("layer".into(), tier.clone())])
                                         .unwrap();
                                 GRAPH_WITHOUT_CAPTURE.store(true, Ordering::Relaxed);
                                 Some(w)
                             } else {
                                 None
                             };
-                            let xs = Tensor::from_vec(x.clone(), (rows, hidden), &card).unwrap();
+                            let xs = Tensor::from_vec(x.clone(), (rows, hidden), card).unwrap();
                             let ids_t = Tensor::from_vec(ids.clone(), (rows, used), &host)
                                 .unwrap()
-                                .to_device(&card)
+                                .to_device(card)
                                 .unwrap();
                             let w_t = Tensor::from_vec(w.clone(), (rows, used), &host)
                                 .unwrap()
-                                .to_device(&card)
+                                .to_device(card)
                                 .unwrap();
                             let got = match (recorded, rows) {
                                 (_, 1) => tier.decode(&tiered, &xs, &ids_t, &w_t),
@@ -6249,18 +6281,16 @@ mod tests {
     }
 
     /// Expert formats with exact kernels: gate and up, down.
-    const FORMATS_WITH_EXACT_KERNELS: [[GgmlDType; 2]; 4] = [
+    const FORMATS_WITH_EXACT_KERNELS: [[GgmlDType; 2]; 9] = [
         [GgmlDType::Q4K, GgmlDType::Q6K],
         [GgmlDType::Iq2S, GgmlDType::Q6K],
         [GgmlDType::Iq3Xxs, GgmlDType::Q6K],
         [GgmlDType::Iq3S, GgmlDType::Q6K],
-    ];
-
-    /// The expert formats of a served file whose experts have no exact kernels: gate and up, down.
-    const FORMATS_WITHOUT_EXACT_KERNELS: [[GgmlDType; 2]; 3] = [
         [GgmlDType::Iq2S, GgmlDType::Iq4Nl],
-        [GgmlDType::Iq3Xxs, GgmlDType::Q2_0],
         [GgmlDType::Iq3S, GgmlDType::Iq4Nl],
+        [GgmlDType::Iq3Xxs, GgmlDType::Q2_0],
+        [GgmlDType::Q4K, GgmlDType::Q8_0],
+        [GgmlDType::Q4K, GgmlDType::Q5_0],
     ];
 
     /// A routed pair gives the same bits wherever it runs, in the formats with exact kernels:
@@ -6281,29 +6311,6 @@ mod tests {
         }
     }
 
-    /// The same in the formats without exact kernels.
-    #[test]
-    #[ignore = "a known gap: a pair in a format without exact kernels gives other bits on the host or in transit than in a slot"]
-    fn a_pair_gives_the_same_bits_wherever_it_runs_in_formats_without_exact_kernels() {
-        let _pool = LENT_POOL.lock().unwrap_or_else(|e| e.into_inner());
-        let Ok(card) = Device::new_cuda(0) else {
-            eprintln!("skipping: no usable CUDA device");
-            return;
-        };
-        let mut failures = Vec::new();
-        for formats in FORMATS_WITHOUT_EXACT_KERNELS {
-            let moved = pair_places_that_move_the_bits(&card, formats);
-            if !moved.is_empty() {
-                failures.push(format!("{formats:?}: {moved:?}"));
-            }
-        }
-        assert!(
-            failures.is_empty(),
-            "the bits moved with the place:\n{}",
-            failures.join("\n")
-        );
-    }
-
     /// A verify of 3 rows gives the bits of the same rows as 3 plain recorded steps, in the
     /// formats with exact kernels.
     #[test]
@@ -6320,29 +6327,6 @@ mod tests {
                 "{formats:?}: not the bits of the steps: {differ:?}"
             );
         }
-    }
-
-    /// The same in the formats without exact kernels.
-    #[test]
-    #[ignore = "a known gap: a verify in a format without exact kernels gives other bits than the plain steps"]
-    fn a_verify_gives_the_bits_of_plain_steps_in_formats_without_exact_kernels() {
-        let _pool = LENT_POOL.lock().unwrap_or_else(|e| e.into_inner());
-        let Ok(card) = Device::new_cuda(0) else {
-            eprintln!("skipping: no usable CUDA device");
-            return;
-        };
-        let mut failures = Vec::new();
-        for formats in FORMATS_WITHOUT_EXACT_KERNELS {
-            let differ = verifies_that_differ_from_the_steps(&card, formats);
-            if !differ.is_empty() {
-                failures.push(format!("{formats:?}: {differ:?}"));
-            }
-        }
-        assert!(
-            failures.is_empty(),
-            "not the bits of the steps:\n{}",
-            failures.join("\n")
-        );
     }
 }
 

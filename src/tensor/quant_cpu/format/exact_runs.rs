@@ -39,6 +39,15 @@ unsafe fn block_share(ws: __m256, sums: __m256i, da: &[f16; Q8K32_RUNS], runs: u
     share
 }
 
+/// Eight i32 lanes whose sum is the dot of the signed bytes `w` and `a`.
+#[inline(always)]
+unsafe fn signed_lanes(w: __m256i, a: __m256i) -> __m256i {
+    _mm256_madd_epi16(
+        _mm256_maddubs_epi16(_mm256_sign_epi8(w, w), _mm256_sign_epi8(a, w)),
+        _mm256_set1_epi16(1),
+    )
+}
+
 /// The 32 activation codes of run `r` of `y`.
 #[inline(always)]
 unsafe fn run_acts(y: &BlockQ8K32, r: usize) -> __m256i {
@@ -120,6 +129,115 @@ pub(super) unsafe fn dot_iq3_s(xs: &[BlockIq3S], ys: &[BlockQ8K32]) -> f32 {
     total
 }
 
+/// The exact dot of a format of 32-value blocks, block `r` of each 8 against run `r` of an
+/// activation block, fewer in a row's last block: `scale` gives a block's scale, `weights` its
+/// 32 signed weights.
+#[inline(always)]
+unsafe fn dot_blocks32<X>(
+    xs: &[X],
+    ys: &[BlockQ8K32],
+    scale: impl Fn(&X) -> f16,
+    weights: impl Fn(&X) -> __m256i,
+) -> f32 {
+    let mut total = -0.0f32;
+    for (x8, y) in xs.chunks(Q8K32_RUNS).zip(ys) {
+        let mut lanes = [_mm256_setzero_si256(); Q8K32_RUNS];
+        let mut ws = [f16::ZERO; Q8K32_RUNS];
+        for (r, x) in x8.iter().enumerate() {
+            lanes[r] = signed_lanes(weights(x), run_acts(y, r));
+            ws[r] = scale(x);
+        }
+        let ws = _mm256_cvtph_ps(_mm_loadu_si128(ws.as_ptr() as *const __m128i));
+        total += block_share(ws, run_sums(lanes), &y.d, x8.len());
+    }
+    total
+}
+
+/// The exact dot of IQ4_NL.
+///
+/// # Safety
+/// The caller runs with AVX2, FMA, F16C and BMI2 enabled.
+#[target_feature(enable = "avx2,fma,f16c,bmi2")]
+pub(super) unsafe fn dot_iq4_nl(xs: &[BlockIq4Nl], ys: &[BlockQ8K32]) -> f32 {
+    dot_blocks32(
+        xs,
+        ys,
+        |x| x.d,
+        |x| super::iq_read::iq4_run_weights(&x.qs).0,
+    )
+}
+
+/// The exact dot of Q8_0.
+///
+/// # Safety
+/// The caller runs with AVX2, FMA, F16C and BMI2 enabled.
+#[target_feature(enable = "avx2,fma,f16c,bmi2")]
+pub(super) unsafe fn dot_q8_0(xs: &[BlockQ8_0], ys: &[BlockQ8K32]) -> f32 {
+    dot_blocks32(
+        xs,
+        ys,
+        |x| x.d,
+        |x| _mm256_loadu_si256(x.qs.as_ptr() as *const __m256i),
+    )
+}
+
+/// The exact dot of Q5_0.
+///
+/// # Safety
+/// The caller runs with AVX2, FMA, F16C and BMI2 enabled.
+#[target_feature(enable = "avx2,fma,f16c,bmi2")]
+pub(super) unsafe fn dot_q5_0(xs: &[BlockQ5_0], ys: &[BlockQ8K32]) -> f32 {
+    use crate::tensor::quant_cpu::avx::{mask_from_bits, split_nibbles};
+    // A 5-bit code less its bias of 16 is its nibble with 0xF0 above it where the fifth bit is
+    // clear.
+    let fill = _mm256_set1_epi8(0xF0u8 as i8);
+    dot_blocks32(
+        xs,
+        ys,
+        |x| x.d,
+        |x| {
+            _mm256_or_si256(
+                split_nibbles(x.qs.as_ptr()),
+                _mm256_andnot_si256(mask_from_bits(&x.qh), fill),
+            )
+        },
+    )
+}
+
+/// The exact dot of Q2_0: runs `2b` and `2b + 1` of an activation block are the halves of
+/// block `b` of its 4, fewer in a row's last block.
+///
+/// # Safety
+/// The caller runs with AVX2, FMA, F16C and BMI2 enabled.
+#[target_feature(enable = "avx2,fma,f16c,bmi2")]
+pub(super) unsafe fn dot_q2_0(xs: &[BlockQ2_0], ys: &[BlockQ8K32]) -> f32 {
+    let (ones8, ones16) = (_mm256_set1_epi8(1), _mm256_set1_epi16(1));
+    let mut total = -0.0f32;
+    for (x4, y) in xs.chunks(QK_K / QK2_0).zip(ys) {
+        let mut lanes = [_mm256_setzero_si256(); Q8K32_RUNS];
+        let mut ws = [f16::ZERO; Q8K32_RUNS];
+        for (b, x) in x4.iter().enumerate() {
+            let codes = super::q2_0::unpack_codes(x);
+            for h in 0..2 {
+                let r = 2 * b + h;
+                let a = run_acts(y, r);
+                // The codes 0 to 3 against the activations, less the activations' own sum: the
+                // levels `code - 1`.
+                let coded = _mm256_madd_epi16(
+                    _mm256_maddubs_epi16(_mm256_set_m128i(codes[2 * h + 1], codes[2 * h]), a),
+                    ones16,
+                );
+                let offset = _mm256_madd_epi16(_mm256_maddubs_epi16(ones8, a), ones16);
+                lanes[r] = _mm256_sub_epi32(coded, offset);
+                ws[r] = x.d;
+            }
+        }
+        let ws = _mm256_cvtph_ps(_mm_loadu_si128(ws.as_ptr() as *const __m128i));
+        total += block_share(ws, run_sums(lanes), &y.d, 2 * x4.len());
+    }
+    total
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -179,6 +297,8 @@ mod tests {
         }
     }
 
+    /// Widths of whole activation blocks, and of a last block holding 4 runs of its 8.
+    const RUN_WIDTHS: [usize; 2] = [2560, 640];
     /// Widths of whole activation blocks, for formats of 256-value blocks.
     const BLOCK_WIDTHS: [usize; 2] = [2560, 512];
 
@@ -187,5 +307,9 @@ mod tests {
         same_bits::<BlockIq2S>(&BLOCK_WIDTHS, super::super::iq2_s::dot_exact_scalar);
         same_bits::<BlockIq3Xxs>(&BLOCK_WIDTHS, super::super::iq3_xxs::dot_exact_scalar);
         same_bits::<BlockIq3S>(&BLOCK_WIDTHS, super::super::iq3_s::dot_exact_scalar);
+        same_bits::<BlockIq4Nl>(&RUN_WIDTHS, super::super::iq4_nl::dot_exact_scalar);
+        same_bits::<BlockQ2_0>(&RUN_WIDTHS, super::super::q2_0::dot_exact_scalar);
+        same_bits::<BlockQ8_0>(&RUN_WIDTHS, super::super::q8_0::dot_exact_scalar);
+        same_bits::<BlockQ5_0>(&RUN_WIDTHS, super::super::q5_0::dot_exact_scalar);
     }
 }
