@@ -516,6 +516,82 @@ async fn keep_alive_zero_does_not_claim_an_unload_it_did_not_do() {
     );
 }
 
+/// A request with nothing to generate unloads its model on a keep-alive of 0.
+/// It loads the model on any other keep-alive, a negative one included.
+#[test]
+fn an_empty_request_unloads_on_zero_and_loads_otherwise() {
+    let state = APIServer::new(
+        "/nonexistent-ollama-models".to_string(),
+        "/nonexistent-hf-models".to_string(),
+    );
+    let action =
+        |keep_alive: &str| EmptyRequest::of(state.get_effective_keep_alive(Some(keep_alive)));
+    for unload in ["0", "0s", "0m"] {
+        assert_eq!(action(unload), EmptyRequest::Unload, "keep_alive {unload}");
+    }
+    for load in ["-1", "-5m", "-2h", "-10s", "5m", "30s", "10"] {
+        assert_eq!(action(load), EmptyRequest::Load, "keep_alive {load}");
+    }
+}
+
+/// An empty prompt with a negative keep-alive takes the load path of `/api/generate`.
+/// It answers in the shape of a load, as a positive keep-alive does.
+/// The model is missing here, so the load reports its failure in that answer.
+#[tokio::test]
+async fn an_empty_prompt_kept_forever_is_a_load() {
+    for keep_alive in ["-1", "5m"] {
+        let state = APIServer::new(
+            "/nonexistent-ollama-models".to_string(),
+            "/nonexistent-hf-models".to_string(),
+        );
+        let mut request = OllamaGenerateRequest::new("no-such-model".to_string(), String::new());
+        request.keep_alive = Some(keep_alive.to_string());
+        let resp = ollama_generate(
+            axum::extract::State(state),
+            axum::http::HeaderMap::new(),
+            OllamaJson(request),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("keep_alive {keep_alive}: a load answers, got {e:?}"));
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["done"], true, "keep_alive {keep_alive}: {json}");
+        assert_eq!(
+            json["done_reason"], "error",
+            "keep_alive {keep_alive}: the load of a missing model reports its failure: {json}"
+        );
+    }
+}
+
+/// A chat request with no messages and a negative keep-alive takes the load path of
+/// `/api/chat`, as a positive keep-alive does.
+#[tokio::test]
+async fn an_empty_chat_kept_forever_is_a_load() {
+    for keep_alive in ["-1", "5m"] {
+        let state = APIServer::new(
+            "/nonexistent-ollama-models".to_string(),
+            "/nonexistent-hf-models".to_string(),
+        );
+        let mut request = OllamaChatRequest::new("no-such-model".to_string(), Vec::new());
+        request.keep_alive = Some(keep_alive.to_string());
+        let error = ollama_chat(
+            axum::extract::State(state),
+            axum::http::HeaderMap::new(),
+            OllamaJson(request),
+        )
+        .await
+        .err()
+        .map(|e| format!("{e:?}"))
+        .unwrap_or_default();
+        assert!(
+            error.contains("load no-such-model"),
+            "keep_alive {keep_alive}: the load of a missing model reports its failure: {error}"
+        );
+    }
+}
+
 /// A store holding one package.
 /// Its manifest names a model blob and, when `template` is given, a template layer.
 fn store_with_package(name: &str, template: Option<&str>) -> std::path::PathBuf {

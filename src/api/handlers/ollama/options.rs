@@ -22,6 +22,29 @@ pub(super) fn ollama_load_request(
     }
 }
 
+/// What a request with nothing to generate asks of its model.
+///
+/// Such a request is a generate request with an empty prompt or a chat request with no messages.
+/// A keep-alive of 0 unloads the model.
+/// Any other keep-alive loads it.
+/// A positive keep-alive keeps it loaded for that many minutes.
+/// A negative keep-alive keeps it loaded with no expiry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum EmptyRequest {
+    Load,
+    Unload,
+}
+
+impl EmptyRequest {
+    pub(super) fn of(keep_alive_minutes: i64) -> Self {
+        if keep_alive_minutes == 0 {
+            Self::Unload
+        } else {
+            Self::Load
+        }
+    }
+}
+
 /// Range-validate the Ollama options bag with the bounds every dialect shares.
 #[cfg(test)]
 pub(super) fn validate_ollama_options(options: Option<&serde_json::Value>) -> Result<(), ApiError> {
@@ -171,7 +194,7 @@ pub(crate) async fn ollama_chat(
     if request.messages.is_empty() {
         let keep_alive_minutes = state.get_effective_keep_alive(request.keep_alive.as_deref());
 
-        if keep_alive_minutes == 0 {
+        if EmptyRequest::of(keep_alive_minutes) == EmptyRequest::Unload {
             // UNLOAD. The outcome is REPORTED, not assumed: answering "unload" whatever
             // happened makes a name nothing recognised read as freed VRAM.
             let outcome = state.unload_model(&model_name).await?;
@@ -185,7 +208,7 @@ pub(crate) async fn ollama_chat(
             response.done = true;
             response.done_reason = Some(outcome.done_reason().to_string());
             return Ok(Json(response).into_response());
-        } else if keep_alive_minutes > 0 {
+        } else {
             // LOAD - model load via the dedup'd loader (per-model lock,
             // re-check after acquire, no double-engine on race).
             // The window `options.num_ctx` asks for is the one the load opens.
@@ -1000,7 +1023,7 @@ pub(crate) async fn ollama_generate(
     if request.prompt.is_empty() {
         let keep_alive_minutes = state.get_effective_keep_alive(request.keep_alive.as_deref());
 
-        if keep_alive_minutes == 0 {
+        if EmptyRequest::of(keep_alive_minutes) == EmptyRequest::Unload {
             // UNLOAD. The result is REPORTED, not swallowed: `.ok()` here answered
             // "unload" with a 200 even when nothing matched and the weights stayed in
             // VRAM, so the one way to free a card looked like it worked while the card
@@ -1015,7 +1038,7 @@ pub(crate) async fn ollama_generate(
             response.done = true;
             response.done_reason = Some(outcome.done_reason().to_string());
             return Ok(Json(response).into_response());
-        } else if keep_alive_minutes > 0 {
+        } else {
             // Image models (Flux, Z-Image) don't use the GGUF engine path.
             // Return a "load" response and let the actual generation call handle loading.
             #[cfg(feature = "image")]
