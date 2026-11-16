@@ -1830,6 +1830,8 @@ mod kept_pool_tests;
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) mod quality;
 #[cfg(test)]
+mod rerun_tests;
+#[cfg(test)]
 mod sampling_tests;
 #[cfg(test)]
 mod vision_count_tests;

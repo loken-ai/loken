@@ -144,7 +144,7 @@ mod segment;
 mod speculate;
 mod splice;
 #[cfg(test)]
-mod state_cache_tests;
+pub(crate) mod state_cache_tests;
 #[cfg(test)]
 pub(crate) mod tiny_model;
 mod tp_forward;
@@ -615,6 +615,9 @@ pub struct GenericHeteroTransformer {
     hot_locks: Option<Arc<expert_tier::HotLocks>>,
     /// The graph generation of the graphs the engine keeps for the next request.
     kept_graphs_at: Option<u64>,
+    /// Copies of the recurrent states that fail before one succeeds, for a test.
+    #[cfg(test)]
+    pub(crate) failing_checkpoints: std::sync::atomic::AtomicUsize,
     /// The paged pool of the batch worker, kept while the model serves serially.
     #[cfg(feature = "gpu")]
     parked_pool: std::sync::Mutex<Option<crate::inference::serve::continuous_serve::ParkedPool>>,

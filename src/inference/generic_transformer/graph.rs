@@ -1987,6 +1987,16 @@ impl GenericHeteroTransformer {
         if !self.is_recurrent() {
             return Ok(Vec::new());
         }
+        #[cfg(test)]
+        {
+            use std::sync::atomic::Ordering;
+            let failing = self.failing_checkpoints.load(Ordering::Acquire);
+            if failing > 0 {
+                self.failing_checkpoints
+                    .store(failing - 1, Ordering::Release);
+                crate::tensor::bail!("the recurrent states were not copied, as the test asks");
+            }
+        }
         self.layers.iter().map(|l| l.state_checkpoint()).collect()
     }
 

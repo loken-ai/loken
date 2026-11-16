@@ -26,6 +26,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 - Release: carry the Vulkan backend in the Linux archive.
 - Experts: give the same greedy tokens whatever a card's cache holds, in every format.
 - CUDA: decode Q4_0, Q4_1, Q5_0 and Q5_1 weights as precisely as the host does.
+- Generation: never advance a recurrent state twice when a card runs out of memory.
 
 ## [0.5.0] - 2026-11-15
 

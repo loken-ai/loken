@@ -1271,6 +1271,29 @@ impl LlmEngine {
                             }
                         }
                     }
+                    // A recurrent state advances with the replay, so the probation below, which
+                    // runs the same step again, starts from a copy of it.
+                    // Without that copy the step runs once, eagerly, and the request records
+                    // no graph again.
+                    #[cfg(feature = "gpu")]
+                    let rerun = if graph_enabled
+                        && cuda_graph.is_some()
+                        && graph_logits.is_some()
+                        && graph_validations < super::decode::GRAPH_VALIDATIONS
+                    {
+                        let rerun = super::decode::Rerun::take(&*state.model, pos);
+                        if !rerun.allows_rerun() {
+                            cuda_graph = None;
+                            graph_logits = None;
+                            graph_kept = false;
+                            graph_disabled_this_request = true;
+                            state.model.invalidate_graph_state();
+                            verify_graphs.clear();
+                        }
+                        rerun
+                    } else {
+                        super::decode::Rerun::From(Vec::new())
+                    };
                     #[cfg(feature = "gpu")]
                     let graph_pair = match (cuda_graph.as_mut(), graph_logits.as_ref()) {
                         (Some(g), Some(l)) if graph_enabled => Some((g, l)),
@@ -1283,15 +1306,8 @@ impl LlmEngine {
                         if let Some(Some(ref stream)) = cuda_stream {
                             let _ = stream.synchronize();
                         }
-                        // A recurrent state advances with the replay, so the probation
-                        // below, which runs the same step again, starts from a copy of it.
                         use super::decode::GRAPH_VALIDATIONS;
                         let mut kept_unchecked = false;
-                        let recurrent_cp = if graph_validations < GRAPH_VALIDATIONS {
-                            state.model.recurrent_checkpoint().unwrap_or_default()
-                        } else {
-                            Vec::new()
-                        };
                         match graph.launch(&mut state.model) {
                             Ok(()) => {
                                 // Sync AFTER launch so subsequent gpu_sample
@@ -1322,7 +1338,7 @@ impl LlmEngine {
                                         .flatten_all().ok()
                                         .and_then(|t| t.argmax(0).ok())
                                         .and_then(|t| t.to_scalar::<u32>().ok());
-                                    state.model.recurrent_restore(&recurrent_cp)?;
+                                    rerun.restore(&mut *state.model)?;
                                     let eager = if needs_split {
                                         state.model.compute_all_from_kv_captured()
                                     } else {
@@ -1392,6 +1408,18 @@ impl LlmEngine {
                                         }
                                         Err(e) if graph_kept => {
                                             warn!("graph probation eager forward failed at pos={pos}: {e}; the kept graph is recorded again");
+                                            // The step runs again from the states it started from.
+                                            if rerun.holds_states() {
+                                                rerun.restore(&mut *state.model)?;
+                                            }
+                                            kept_unchecked = true;
+                                        }
+                                        // The failed eager step left the recurrent states neither
+                                        // before nor after the step: they go back to before it,
+                                        // and the step runs again eagerly.
+                                        Err(e) if rerun.holds_states() => {
+                                            warn!("graph probation eager forward failed at pos={pos}: {e}; the step runs again eagerly");
+                                            rerun.restore(&mut *state.model)?;
                                             kept_unchecked = true;
                                         }
                                         Err(e) => {
@@ -1459,6 +1487,11 @@ impl LlmEngine {
                             }
                             Err(e) => {
                                 warn!("Graph replay failed: {e}, falling back to normal forward");
+                                // A replay that failed part way goes back to the recurrent
+                                // states the step started from.
+                                if rerun.holds_states() {
+                                    rerun.restore(&mut *state.model)?;
+                                }
                                 cuda_graph = None;
                                 graph_logits = None;
                                 graph_disabled_this_request = !graph_kept;
@@ -1577,9 +1610,17 @@ impl LlmEngine {
                                     // capture token's forward actually executes,
                                     // then run probation validation #1 against an
                                     // eager forward at the same (token, pos).
-                                    let recurrent_cp =
-                                        state.model.recurrent_checkpoint().unwrap_or_default();
-                                    match g.launch(&mut state.model) {
+                                    // The probation runs the step a second time from the
+                                    // recurrent states it started from.
+                                    // Without a copy of them the graph is not run and the
+                                    // step runs once, eagerly.
+                                    let rerun = super::decode::Rerun::take(&*state.model, pos);
+                                    let launched = if rerun.allows_rerun() {
+                                        g.launch(&mut state.model)
+                                    } else {
+                                        Err(crate::tensor::Error::msg("the recurrent states were not copied"))
+                                    };
+                                    match launched {
                                         Ok(()) => {
                                             let _ = stream.synchronize();
                                             let rep_argmax: Option<u32> = logits
@@ -1589,7 +1630,7 @@ impl LlmEngine {
                                             let rep_logits: Option<Vec<f32>> = logits
                                                 .flatten_all().ok()
                                                 .and_then(|t| t.to_vec1::<f32>().ok());
-                                            state.model.recurrent_restore(&recurrent_cp)?;
+                                            rerun.restore(&mut *state.model)?;
                                             let eager = if needs_split {
                                                 state.model.compute_all_from_kv_captured()
                                             } else {
@@ -1658,6 +1699,30 @@ impl LlmEngine {
                                                 }
                                                 continue;
                                                 }
+                                                // The failed eager step left the recurrent states
+                                                // neither before nor after the step: they go back to
+                                                // before it, and the step runs once more, eagerly.
+                                                Err(e) if rerun.holds_states() => {
+                                                    warn!("graph probation eager forward failed at pos={pos}: {e}; eager decode for rest of request");
+                                                    rerun.restore(&mut *state.model)?;
+                                                    drop(g);
+                                                    graph_disabled_this_request = true;
+                                                    let logits = if needs_split {
+                                                        state.model.compute_all_from_kv_captured()?
+                                                    } else {
+                                                        state.model.forward_from_hidden()?
+                                                    };
+                                                    pos += 1;
+                                                    let logits_1d = logits.squeeze(0)?;
+                                                    next_token = gpu_sample(
+                                                        &logits_1d, &recent_tokens, repeat_penalty, repeat_last_n,
+                                                        &mut logits_processor,
+                                                    )?;
+                                                    record_logprobs(&state.tokenizer, &mut logits_processor, &mut logprob_acc);
+                                                    state.model.invalidate_graph_state();
+                                                    verify_graphs.clear();
+                                                    continue;
+                                                }
                                                 Err(e) => {
                                                     warn!("graph probation eager forward failed at pos={pos}: {e}; trusting captured graph");
                                                     graph_validations += 1;
@@ -1684,9 +1749,14 @@ impl LlmEngine {
                                             }
                                         }
                                         Err(e) => {
-                                            warn!("Captured graph first launch failed at pos={pos}: {e}; eager decode for rest of request");
+                                            warn!("Captured graph not run at pos={pos}: {e}; eager decode for rest of request");
                                             drop(g);
                                             graph_disabled_this_request = true;
+                                            // A launch that failed part way goes back to the
+                                            // recurrent states the step started from.
+                                            if rerun.holds_states() {
+                                                rerun.restore(&mut *state.model)?;
+                                            }
                                             let logits = if needs_split {
                                                 state.model.compute_all_from_kv_captured()?
                                             } else {

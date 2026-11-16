@@ -11,7 +11,7 @@ const HIDDEN: usize = 32;
 const HEADS: usize = 4;
 const KV_HEADS: usize = 2;
 const HEAD_DIM: usize = 32;
-pub(super) const VOCAB: usize = 96;
+pub(crate) const VOCAB: usize = 96;
 const WINDOW: usize = 16;
 /// Tokens per block of the store under test.
 const BLOCK: usize = 64;
@@ -41,7 +41,7 @@ fn values(n: usize, seed: u64, amp: f32) -> Vec<f32> {
 
 /// A hybrid file written to `path`: blocks 0 and 2 short convolutions, block 1 global attention,
 /// block 3 attention over a window.
-pub(super) fn write_hybrid(path: &std::path::Path) {
+pub(crate) fn write_hybrid(path: &std::path::Path) {
     let meta = vec![
         (
             "general.architecture".to_string(),
@@ -175,7 +175,7 @@ fn attach(model: &mut GenericHeteroTransformer, store: &Arc<StateStore>, salt: &
     assert!(model.attach_state_cache(store.clone(), identity));
 }
 
-pub(super) fn prompt(n: usize) -> Vec<u32> {
+pub(crate) fn prompt(n: usize) -> Vec<u32> {
     (0..n).map(|i| ((i * 7 + i / 5) % VOCAB) as u32).collect()
 }
 
@@ -191,7 +191,7 @@ pub(super) fn bits(t: &Tensor) -> Vec<u32> {
         .collect()
 }
 
-pub(super) fn floats(t: &Tensor) -> Vec<f32> {
+pub(crate) fn floats(t: &Tensor) -> Vec<f32> {
     t.flatten_all()
         .unwrap()
         .to_dtype(DType::F32)
@@ -200,7 +200,7 @@ pub(super) fn floats(t: &Tensor) -> Vec<f32> {
         .unwrap()
 }
 
-pub(super) fn argmax(v: &[f32]) -> usize {
+pub(crate) fn argmax(v: &[f32]) -> usize {
     v.iter()
         .enumerate()
         .max_by(|a, b| a.1.total_cmp(b.1))

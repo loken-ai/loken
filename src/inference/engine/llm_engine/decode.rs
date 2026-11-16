@@ -293,6 +293,58 @@ pub(super) fn capture_decode_graph(
 /// replays a step kept from an earlier one.
 pub(super) const GRAPH_VALIDATIONS: usize = 3;
 
+/// The recurrent states a decode step starts from, kept so that the step can run a second time.
+pub(crate) enum Rerun {
+    /// The states are copied: the step may run again from them.
+    /// Empty for a model without recurrent states.
+    From(Vec<Option<crate::inference::generic_transformer::mixer::MixerState>>),
+    /// The states could not be copied: the step runs once.
+    Once,
+}
+
+impl Rerun {
+    /// Copies the recurrent states of `model` before its step.
+    /// A copy that fails leaves a step that runs once.
+    pub(crate) fn take(
+        model: &dyn crate::inference::engine::model_backend::ModelBackend,
+        pos: usize,
+    ) -> Self {
+        match model.recurrent_checkpoint() {
+            Ok(states) => Self::From(states),
+            Err(e) => {
+                warn!(
+                    "the recurrent states at pos={pos} could not be copied: {e}; the step runs once, eagerly"
+                );
+                Self::Once
+            }
+        }
+    }
+
+    /// Whether the step may run a second time.
+    pub(crate) fn allows_rerun(&self) -> bool {
+        matches!(self, Self::From(_))
+    }
+
+    /// Whether the step changes a recurrent state that this copy can put back.
+    pub(crate) fn holds_states(&self) -> bool {
+        matches!(self, Self::From(states) if !states.is_empty())
+    }
+
+    /// Puts the copied states back into `model`.
+    /// A step that runs once has nothing to put back, which is an error.
+    pub(crate) fn restore(
+        &self,
+        model: &mut dyn crate::inference::engine::model_backend::ModelBackend,
+    ) -> crate::tensor::Result<()> {
+        match self {
+            Self::From(states) => model.recurrent_restore(states),
+            Self::Once => Err(crate::tensor::Error::msg(
+                "the recurrent states before this step were not copied",
+            )),
+        }
+    }
+}
+
 /// Recorded graphs a loaded model keeps between requests, with the model's
 /// `ModelBackend::graph_generation` they were recorded at: they are replayed again only
 /// while the model reports the same, and dropped otherwise.

@@ -1034,6 +1034,8 @@ impl GenericHeteroTransformer {
             #[cfg(feature = "gpu")]
             hot_locks: None,
             kept_graphs_at: None,
+            #[cfg(test)]
+            failing_checkpoints: Default::default(),
             #[cfg(feature = "gpu")]
             parked_pool: Default::default(),
             verify: Default::default(),

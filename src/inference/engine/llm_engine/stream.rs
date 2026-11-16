@@ -2453,17 +2453,32 @@ impl LlmEngine {
                         }
 
                         // -- Replay (tokens 3+) -------------------------
+                        // A recurrent state advances with the replay, so the probation below,
+                        // which runs the same step again, starts from a copy of it.
+                        // Without that copy the step runs once, eagerly, and the request
+                        // records no graph again.
+                        let rerun = if cuda_graph.is_some()
+                            && graph_logits.is_some()
+                            && graph_validations < graph_validations_needed
+                        {
+                            let rerun = super::decode::Rerun::take(&*state.model, pos);
+                            if !rerun.allows_rerun() {
+                                cuda_graph = None;
+                                graph_logits = None;
+                                graph_kept = false;
+                                graph_disabled_this_request = true;
+                                state.model.invalidate_graph_state();
+                                verify_graphs.clear();
+                                break 'graph_blk None;
+                            }
+                            rerun
+                        } else {
+                            super::decode::Rerun::From(Vec::new())
+                        };
                         if let (Some(graph), Some(logits_ref)) =
                             (cuda_graph.as_mut(), graph_logits.as_ref())
                         {
                             let _ = stream.synchronize();
-                            // A recurrent state advances with the replay, so the probation
-                            // below, which runs the same step again, starts from a copy of it.
-                            let recurrent_cp = if graph_validations < graph_validations_needed {
-                                state.model.recurrent_checkpoint().unwrap_or_default()
-                            } else {
-                                Vec::new()
-                            };
                             probation_step = graph_validations < graph_validations_needed;
                             let t_launch = std::time::Instant::now();
                             match graph.launch(&mut state.model) {
@@ -2488,11 +2503,17 @@ impl LlmEngine {
                                             .ok()
                                             .and_then(|t| t.argmax(0).ok())
                                             .and_then(|t| t.to_scalar::<u32>().ok());
-                                        let replay_cp =
-                                            state.model.recurrent_checkpoint().unwrap_or_default();
-                                        if let Err(e) = state.model.recurrent_restore(&recurrent_cp)
-                                        {
-                                            warn!("recurrent state restore before probation failed: {e}");
+                                        // The states the replay left, kept to go on from the
+                                        // replay when the eager step is not finite.
+                                        let replay_states =
+                                            super::decode::Rerun::take(&*state.model, pos);
+                                        // A step whose states cannot go back ends the request:
+                                        // no token comes from a state of unknown origin.
+                                        if let Err(e) = rerun.restore(&mut *state.model) {
+                                            let _ = tx.blocking_send(Err(format!(
+                                                "recurrent state restore before probation failed: {e}"
+                                            )));
+                                            return;
                                         }
                                         match state.model.forward_from_hidden() {
                                             Ok(eag) => {
@@ -2526,9 +2547,12 @@ impl LlmEngine {
                                                 } else if !eag_finite && rep_finite {
                                                     warn!("the eager probation step at pos={pos} is not finite; the finite replay is kept (argmax {:?})", rep_argmax);
                                                     if let Err(e) =
-                                                        state.model.recurrent_restore(&replay_cp)
+                                                        replay_states.restore(&mut *state.model)
                                                     {
-                                                        warn!("recurrent state restore after probation failed: {e}");
+                                                        let _ = tx.blocking_send(Err(format!(
+                                                            "recurrent state restore after probation failed: {e}"
+                                                        )));
+                                                        return;
                                                     }
                                                     graph_validations += 1;
                                                 } else {
@@ -2562,6 +2586,15 @@ impl LlmEngine {
                                                 // The step runs eagerly below from the state the
                                                 // replay started from, and is recorded anew.
                                                 warn!("graph probation eager forward failed at pos={pos}: {e}; the kept graph is recorded again");
+                                                if rerun.holds_states() {
+                                                    if let Err(e) = rerun.restore(&mut *state.model)
+                                                    {
+                                                        let _ = tx.blocking_send(Err(format!(
+                                                            "recurrent state restore after probation failed: {e}"
+                                                        )));
+                                                        return;
+                                                    }
+                                                }
                                                 cuda_graph = None;
                                                 graph_logits = None;
                                                 if std::mem::take(&mut graph_kept) {
@@ -2572,6 +2605,37 @@ impl LlmEngine {
                                                 state.model.invalidate_graph_state();
                                                 verify_graphs.clear();
                                                 break 'graph_blk None;
+                                            }
+                                            // The failed eager step left the recurrent states
+                                            // neither before nor after the step.
+                                            // They become the states the replay left, and the
+                                            // replay is kept.
+                                            // Without those, they go back to before the step,
+                                            // which then runs eagerly.
+                                            Err(e) if rerun.holds_states() => {
+                                                let back = if replay_states.allows_rerun() {
+                                                    warn!("graph probation eager forward failed at pos={pos}: {e}; trusting replay");
+                                                    replay_states.restore(&mut *state.model)
+                                                } else {
+                                                    warn!("graph probation eager forward failed at pos={pos}: {e}; eager decode for rest of request");
+                                                    rerun.restore(&mut *state.model)
+                                                };
+                                                if let Err(e) = back {
+                                                    let _ = tx.blocking_send(Err(format!(
+                                                        "recurrent state restore after probation failed: {e}"
+                                                    )));
+                                                    return;
+                                                }
+                                                if !replay_states.allows_rerun() {
+                                                    cuda_graph = None;
+                                                    graph_logits = None;
+                                                    graph_kept = false;
+                                                    graph_disabled_this_request = true;
+                                                    state.model.invalidate_graph_state();
+                                                    verify_graphs.clear();
+                                                    break 'graph_blk None;
+                                                }
+                                                graph_validations += 1;
                                             }
                                             Err(e) => {
                                                 warn!("graph probation eager forward failed at pos={pos}: {e}; trusting replay");
@@ -2588,6 +2652,16 @@ impl LlmEngine {
                                     warn!(
                                         "Graph replay failed: {e}, falling back to normal forward"
                                     );
+                                    // A replay that failed part way goes back to the recurrent
+                                    // states the step started from.
+                                    if rerun.holds_states() {
+                                        if let Err(e) = rerun.restore(&mut *state.model) {
+                                            let _ = tx.blocking_send(Err(format!(
+                                                "recurrent state restore after a failed replay: {e}"
+                                            )));
+                                            return;
+                                        }
+                                    }
                                     cuda_graph = None;
                                     graph_logits = None;
                                     graph_disabled_this_request = !graph_kept;
@@ -2652,9 +2726,19 @@ impl LlmEngine {
                                     // A capture only RECORDS - launch once so
                                     // this token's forward actually executes,
                                     // then probation #1 vs an eager forward.
-                                    let recurrent_cp =
-                                        state.model.recurrent_checkpoint().unwrap_or_default();
-                                    match g.launch(&mut state.model) {
+                                    // The probation runs the step a second time from the
+                                    // recurrent states it started from.
+                                    // Without a copy of them the graph is not run and the
+                                    // step runs once, eagerly.
+                                    let rerun = super::decode::Rerun::take(&*state.model, pos);
+                                    let launched = if rerun.allows_rerun() {
+                                        g.launch(&mut state.model)
+                                    } else {
+                                        Err(crate::tensor::Error::msg(
+                                            "the recurrent states were not copied",
+                                        ))
+                                    };
+                                    match launched {
                                         Ok(()) => {
                                             let _ = stream.synchronize();
                                             let rep_argmax: Option<u32> = logits
@@ -2666,10 +2750,14 @@ impl LlmEngine {
                                                 .flatten_all()
                                                 .ok()
                                                 .and_then(|t| t.to_vec1::<f32>().ok());
-                                            if let Err(e) =
-                                                state.model.recurrent_restore(&recurrent_cp)
-                                            {
-                                                warn!("recurrent state restore before probation failed: {e}");
+                                            // A step whose states cannot go back ends the
+                                            // request: no token comes from a state of unknown
+                                            // origin.
+                                            if let Err(e) = rerun.restore(&mut *state.model) {
+                                                let _ = tx.blocking_send(Err(format!(
+                                                    "recurrent state restore before probation failed: {e}"
+                                                )));
+                                                return;
                                             }
                                             match state.model.forward_from_hidden() {
                                                 Ok(eag) => {
@@ -2713,6 +2801,25 @@ impl LlmEngine {
                                                     pos += 1;
                                                     break 'graph_blk Some(sample_graph!(eag));
                                                 }
+                                                // The failed eager step left the recurrent
+                                                // states neither before nor after the step: they
+                                                // go back to before it, and the step runs once
+                                                // more, eagerly.
+                                                Err(e) if rerun.holds_states() => {
+                                                    warn!("graph probation eager forward failed at pos={pos}: {e}; eager decode for rest of request");
+                                                    if let Err(e) = rerun.restore(&mut *state.model)
+                                                    {
+                                                        let _ = tx.blocking_send(Err(format!(
+                                                            "recurrent state restore after probation failed: {e}"
+                                                        )));
+                                                        return;
+                                                    }
+                                                    drop(g);
+                                                    graph_disabled_this_request = true;
+                                                    state.model.invalidate_graph_state();
+                                                    verify_graphs.clear();
+                                                    break 'graph_blk None;
+                                                }
                                                 Err(e) => {
                                                     warn!("graph probation eager forward failed at pos={pos}: {e}; trusting captured graph");
                                                     graph_validations += 1;
@@ -2728,9 +2835,19 @@ impl LlmEngine {
                                             }
                                         }
                                         Err(e) => {
-                                            warn!("Captured graph first launch failed at pos={pos}: {e}; eager decode for rest of request");
+                                            warn!("Captured graph not run at pos={pos}: {e}; eager decode for rest of request");
                                             drop(g);
                                             graph_disabled_this_request = true;
+                                            // A launch that failed part way goes back to the
+                                            // recurrent states the step started from.
+                                            if rerun.holds_states() {
+                                                if let Err(e) = rerun.restore(&mut *state.model) {
+                                                    let _ = tx.blocking_send(Err(format!(
+                                                        "recurrent state restore after a failed launch: {e}"
+                                                    )));
+                                                    return;
+                                                }
+                                            }
                                             match state.model.forward_from_hidden() {
                                                 Ok(l) => {
                                                     pos += 1;
@@ -2740,6 +2857,18 @@ impl LlmEngine {
                                                 }
                                                 Err(e2) => {
                                                     warn!("eager forward after failed graph launch also failed: {e2}");
+                                                    // The eager path below starts from the states
+                                                    // the step started from.
+                                                    if rerun.holds_states() {
+                                                        if let Err(e) =
+                                                            rerun.restore(&mut *state.model)
+                                                        {
+                                                            let _ = tx.blocking_send(Err(format!(
+                                                                "recurrent state restore after a failed step: {e}"
+                                                            )));
+                                                            return;
+                                                        }
+                                                    }
                                                     state.model.invalidate_graph_state();
                                                     verify_graphs.clear();
                                                     break 'graph_blk None;
