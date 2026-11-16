@@ -816,8 +816,13 @@ impl CudaDevice {
         if r.blas.get().is_some() {
             return Ok(());
         }
+        // The handle's memory is what the card has less once it is made.
+        // PLACEMENT-EXEMPT: read only to measure the bytes of the handle made here.
+        let free = || self.ctx.mem_get_info().map_or(0, |(free, _)| free as u64);
+        let before = free();
         let b = crate::tensor::gpu_runtime::cublas::CudaBlas::new(r.stream.clone())
             .map_err(|e| cublas_err("init", e))?;
+        let mut took = before.saturating_sub(free());
         let pinned = *self
             .blas_workspace
             .lock()
@@ -833,10 +838,22 @@ impl CudaDevice {
                     .map_err(|e| Error(format!("recording cuBLAS workspace: {e}")))?;
                 set_blas_workspace(&b, ws.device_ptr(&self.stream).0, bytes)?;
                 let _ = r.workspace.set(ws);
+                took += bytes as u64;
             }
         }
         let _ = r.blas.set(b);
+        self.recording
+            .bytes
+            .fetch_max(took, std::sync::atomic::Ordering::Relaxed);
         Ok(())
+    }
+
+    /// The most card memory one graph recorder took when it was made, 0 before one was.
+    /// A recording made while recorded graphs hold every recorder of the card makes one more.
+    pub fn recorder_bytes(&self) -> u64 {
+        self.recording
+            .bytes
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// The bytes of the cuBLAS workspace pinned on the card, 0 when none is.

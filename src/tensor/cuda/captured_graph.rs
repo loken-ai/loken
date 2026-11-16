@@ -56,6 +56,9 @@ pub(super) struct Recording {
     pub(super) made: Mutex<Vec<Box<Recorder>>>,
     /// The recorder of the capture in progress, null when none.
     current: AtomicPtr<Recorder>,
+    /// The most card memory one recorder took when it was made: its cuBLAS handle and the
+    /// workspace it allocated, as the card reported them.
+    pub(super) bytes: AtomicU64,
 }
 
 /// Recordings in progress over all cards; zero lets a graph launch skip the lookup.

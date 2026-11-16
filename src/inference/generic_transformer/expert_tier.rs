@@ -405,6 +405,8 @@ pub struct CardStager {
     replay_need: Mutex<Option<u64>>,
     /// A graph was recorded since the slots came back.
     recorded_since_return: std::sync::atomic::AtomicBool,
+    /// The experts the card's cached layers had routed when the slots came back.
+    routed_at_return: std::sync::atomic::AtomicU64,
 }
 
 /// One of two sets of arenas, a stack each, that consecutive layers take turns over.
@@ -1122,9 +1124,19 @@ impl super::GenericHeteroTransformer {
         out
     }
 
+    /// The experts the cached layers on `stager`'s card have routed so far.
+    fn routed_on(&self, stager: &Arc<CardStager>) -> u64 {
+        self.layers
+            .iter()
+            .filter_map(|l| l.moe.as_ref().and_then(|m| m.tier.as_ref()))
+            .filter(|t| t.stager().is_some_and(|s| Arc::ptr_eq(&s, stager)))
+            .map(|t| t.counters().0)
+            .sum()
+    }
+
     /// Give the caches their extra slots again, filled with the experts the prefill found
-    /// hottest, within what the decode that follows was seen to need. How many experts were
-    /// copied.
+    /// hottest, while each card keeps free what the decode that follows was seen to need.
+    /// How many experts were copied.
     pub fn return_expert_cache(&mut self) -> Result<usize> {
         // A model with no expert tier lent nothing: the pools and the residency stay as they are.
         if !self
@@ -1134,22 +1146,17 @@ impl super::GenericHeteroTransformer {
         {
             return Ok(0);
         }
-        for stager in self.card_stagers() {
-            stager.note_decode();
+        let stagers = self.card_stagers();
+        for stager in &stagers {
+            stager.note_decode(self.routed_on(stager));
         }
         let mut copied = 0;
-        let mut stagers: Vec<Arc<CardStager>> = Vec::new();
         for tier in self
             .layers
             .iter()
             .filter_map(|l| l.moe.as_ref().and_then(|m| m.tier.as_ref()))
         {
             tier.detach_full();
-            if let Some(s) = tier.stager() {
-                if !stagers.iter().any(|t| Arc::ptr_eq(t, &s)) {
-                    stagers.push(s);
-                }
-            }
         }
         for stager in &stagers {
             stager.drop_full();
@@ -1157,44 +1164,54 @@ impl super::GenericHeteroTransformer {
         // What the prefill left in the pools goes back to the card before the slots take theirs.
         crate::inference::place::ladder::release_pools();
         let mut moved = false;
-        // What each card's slots may take back, spent layer by layer.
-        // The graphs kept for the next decode are still current: it records nothing.
-        let replay = self.kept_graphs_at == Some(self.graph_generation());
-        let mut room: Vec<(Arc<CardStager>, u64)> = self
-            .card_stagers()
-            .into_iter()
-            .map(|s| {
-                let r = s.room_for_extra(replay);
-                (s, r)
-            })
+        // What each card keeps free for the decode that follows.
+        // A card without a measured decode takes no slot back.
+        let kept = self.kept_graphs_at.is_some();
+        let reserves: Vec<(Arc<CardStager>, Option<u64>)> = stagers
+            .iter()
+            .map(|s| (s.clone(), s.decode_reserve(kept)))
             .collect();
         for tier in self
             .layers
             .iter()
             .filter_map(|l| l.moe.as_ref().and_then(|m| m.tier.as_ref()))
         {
-            let Some(left) = tier
-                .stager()
-                .and_then(|s| room.iter_mut().find(|(t, _)| Arc::ptr_eq(t, &s)))
-                .map(|(_, r)| r)
+            let Some(stager) = tier.stager() else {
+                continue;
+            };
+            let Some(reserve) = reserves
+                .iter()
+                .find(|(t, _)| Arc::ptr_eq(t, &stager))
+                .and_then(|(_, r)| *r)
             else {
                 continue;
             };
-            let had = tier.has_extra();
-            let slot = tier.expert_bytes.iter().sum::<usize>().max(1) as u64;
-            let asked = (*left / slot).min(tier.extra_slots() as u64);
-            // A layer that cannot take its slots back runs on without them.
-            match tier.restore_extra_within(*left) {
-                Ok(n) => copied += n,
-                Err(e) => tracing::warn!("expert tier: the extra slots did not come back: {e}"),
+            // The room is read from the card before each layer.
+            // The card reports what each restore took, its pool's rounding included.
+            let room = stager.free_after_queued_work().saturating_sub(reserve);
+            if room == 0 {
+                continue;
             }
-            if tier.has_extra() && !had {
-                *left = left.saturating_sub(slot * asked);
+            let had = tier.has_extra();
+            // A layer that cannot take its slots back runs on without them.
+            let asked = match tier.restore_extra_within(room) {
+                Ok(n) => n,
+                Err(e) => {
+                    tracing::warn!("expert tier: the extra slots did not come back: {e}");
+                    0
+                }
+            };
+            // A restore that took more than the room gives its slots back: the reserve stays
+            // free.
+            if tier.has_extra() && !had && stager.free_after_queued_work() < reserve {
+                tier.lend_extra();
+            } else {
+                copied += asked;
             }
             moved |= had != tier.has_extra();
         }
-        for (stager, _) in &room {
-            stager.note_return();
+        for stager in &stagers {
+            stager.note_return(self.routed_on(stager));
         }
         let (held, of): (usize, usize) = self
             .layers
@@ -1208,7 +1225,14 @@ impl super::GenericHeteroTransformer {
             })
             .fold((0, 0), |a, b| (a.0 + b.0, a.1 + b.1));
         if moved {
-            tracing::info!("expert tier: the extra slots back in {held} of {of} layer-slots");
+            let free: Vec<String> = stagers
+                .iter()
+                .map(|s| format!("{:.2}", s.free_after_queued_work() as f64 / 1e9))
+                .collect();
+            tracing::info!(
+                "expert tier: the extra slots back in {held} of {of} layer-slots, {} GB free on the cards",
+                free.join(" and ")
+            );
         }
         crate::inference::place::vram_manager::residency_changed();
         Ok(copied)
@@ -1571,7 +1595,7 @@ impl LayerTier {
 
     /// This tier with `extra` more slots that a prefill can take the card's memory back from.
     /// The extra slots start lent: they take their memory once a decode has shown what it
-    /// leaves (see [`CardStager::room_for_extra`]).
+    /// leaves (see [`CardStager::decode_reserve`]).
     pub fn with_extra(mut self, extra: usize) -> Result<Self> {
         let n = extra.min(self.n_experts.saturating_sub(self.base_slots));
         if n == 0 {
@@ -3416,20 +3440,26 @@ impl CardStager {
             lent_since_return: std::sync::atomic::AtomicBool::new(false),
             replay_need: Mutex::new(None),
             recorded_since_return: std::sync::atomic::AtomicBool::new(false),
+            routed_at_return: std::sync::atomic::AtomicU64::new(0),
         }))
     }
 
     /// Records what the decode since the last return took of the card: the free memory then,
     /// less the free memory now, its transients still in the pools. Called as the slots are to
-    /// come back; a span a prefill lent in is the prefill's, and is not counted.
-    pub fn note_decode(&self) {
+    /// come back, with the experts the card's cached layers have routed so far.
+    /// A span a prefill lent in is the prefill's, and is not counted.
+    /// A span in which the cached layers routed no expert ran no decode step, and is not
+    /// counted.
+    pub fn note_decode(&self, routed: u64) {
         let then = self
             .free_after_return
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .take();
         let lent = self.lent_since_return.swap(false, Ordering::AcqRel);
-        let Some((then, pool_then)) = then.filter(|_| !lent) else {
+        let decoded = self.routed_at_return.load(Ordering::Acquire) != routed;
+        let Some((then, pool_then)) = then.filter(|_| !lent && decoded) else {
+            self.recorded_since_return.store(false, Ordering::Release);
             return;
         };
         // What the card lost for good, or what the pool held at the decode's peak beyond what it
@@ -3465,25 +3495,29 @@ impl CardStager {
         self.recorded_since_return.store(true, Ordering::Release);
     }
 
-    /// The bytes the extra slots may take back now: the card's free memory less what a decode
-    /// was seen to take, a replaying one's when `replay` (the decode replays kept graphs and
-    /// one was measured), nothing before a decode has been measured. A replay also takes back
-    /// what the kept graphs reserved at their peak and gave back to the card since.
-    pub fn room_for_extra(&self, replay: bool) -> u64 {
-        let replayed = *self.replay_need.lock().unwrap_or_else(|e| e.into_inner());
-        let recorded = *self.decode_need.lock().unwrap_or_else(|e| e.into_inner());
-        let need = match replay {
-            true => replayed
-                .map(|n| n + self.graph_reserve_given_back())
-                .or(recorded),
-            false => recorded,
+    /// The card memory the extra slots leave free for the decode that follows them: the most a
+    /// decode was measured to take, whether it recorded its graphs or replayed kept ones.
+    /// A replay also takes back what the kept graphs reserved at their peak and gave back to
+    /// the card since.
+    /// While graphs are `kept`, they hold the card's recorder, so a decode that records again
+    /// makes one more, and its bytes are kept free too.
+    /// `None` before a decode that recorded its graphs has been measured: the slots then stay
+    /// lent.
+    pub fn decode_reserve(&self, kept: bool) -> Option<u64> {
+        let recorded = (*self.decode_need.lock().unwrap_or_else(|e| e.into_inner()))?;
+        let replayed = self
+            .replay_need
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .map_or(0, |n| n + self.graph_reserve_given_back());
+        let recorder = match kept {
+            true => self
+                .dev
+                .as_cuda_device()
+                .map_or(0, |d| d.0.recorder_bytes()),
+            false => 0,
         };
-        match need {
-            Some(need) => {
-                crate::inference::place::expert_cache::free_now(&self.dev).saturating_sub(need)
-            }
-            None => 0,
-        }
+        Some(recorded.max(replayed) + recorder)
     }
 
     /// The graph memory the card's recorded graphs reserved at their peak and no longer hold.
@@ -3495,13 +3529,24 @@ impl CardStager {
         peak.saturating_sub(reserved)
     }
 
+    /// The card's free memory once the work queued on its stream has run, the allocations it
+    /// queued included.
+    fn free_after_queued_work(&self) -> u64 {
+        if let Ok(cd) = self.dev.as_cuda_device() {
+            let _ = cd.0.stream().synchronize();
+        }
+        crate::inference::place::expert_cache::free_now(&self.dev)
+    }
+
     /// Marks the span since the last return as a prefill's.
     pub fn note_lend(&self) {
         self.lent_since_return.store(true, Ordering::Release);
     }
 
-    /// Records the card's free memory as a prefill ends and its decode is about to run.
-    pub fn note_return(&self) {
+    /// Records the card's free memory as a prefill ends and its decode is about to run, and
+    /// the experts the card's cached layers have routed so far.
+    pub fn note_return(&self, routed: u64) {
+        self.routed_at_return.store(routed, Ordering::Release);
         let pool = self
             .dev
             .as_cuda_device()
@@ -5208,6 +5253,82 @@ mod tests {
         assert!(tier.has_extra());
         assert_eq!(tier.extra_table_at(0), Some(table), "the table moved");
         assert_eq!(model.graph_generation(), at, "the generation moved");
+    }
+
+    /// The extra slots of many layers come back to a card with room for only part of them:
+    /// the card keeps free the reserve a decode was measured to need, whatever each restore
+    /// took of the card's pool.
+    #[test]
+    fn the_slots_that_come_back_leave_the_decode_its_reserve() {
+        use crate::inference::generic_transformer::tiny_model;
+        let _pool = LENT_POOL.lock().unwrap_or_else(|e| e.into_inner());
+        let Ok(card) = Device::new_cuda(0) else {
+            eprintln!("skipping: no usable CUDA device");
+            return;
+        };
+        let layers = 8usize;
+        let (experts, used, hidden, ffn) = (32usize, 4usize, 512usize, 512usize);
+        let (base, extra) = (4usize, 8usize);
+        let path = tiny_model::write_moe("tier-reserve", layers);
+        let mut model = tiny_model::load(&path, layers);
+        tiny_model::remove(&path);
+        let mut stager: Option<Arc<CardStager>> = None;
+        let mut tiers = Vec::new();
+        for i in 0..layers {
+            let moe = layer(&card, experts, used, hidden, ffn);
+            let s = stager
+                .get_or_insert_with(|| {
+                    let widest = [0, 1, 2].map(|i| {
+                        [
+                            moe.gate_exps_sep.as_ref().unwrap(),
+                            moe.up_exps_sep.as_ref().unwrap(),
+                            &moe.down_exps,
+                        ][i]
+                            .native_qtensor()
+                            .data()
+                            .len()
+                    });
+                    CardStager::holding(&card, widest, experts, used).unwrap()
+                })
+                .clone();
+            let tier = Arc::new(
+                LayerTier::new(&moe, &card, base)
+                    .unwrap()
+                    .with_extra(extra)
+                    .unwrap()
+                    .with_stage(&s, i % 2, false)
+                    .unwrap(),
+            );
+            model.layers[i].moe.as_mut().expect("a mixture layer").tier = Some(tier.clone());
+            tiers.push(tier);
+        }
+        let stager = stager.expect("a stager for the card");
+        // The decode is measured to need all but half of the extra slots' bytes of the card,
+        // read once the pools gave the card what they held, as the return does first.
+        crate::inference::place::ladder::release_pools();
+        let slot = tiers[0].expert_bytes.iter().sum::<usize>() as u64;
+        let all_extra = slot * (layers * extra) as u64;
+        let before = stager.free_after_queued_work();
+        let reserve = before.saturating_sub(all_extra / 2);
+        *stager.decode_need.lock().unwrap_or_else(|e| e.into_inner()) = Some(reserve);
+        model.return_expert_cache().unwrap();
+        for tier in &tiers {
+            tier.settle();
+        }
+        let free = stager.free_after_queued_work();
+        let held = tiers.iter().filter(|t| t.has_extra()).count();
+        eprintln!(
+            "reserve {reserve} B, free after the return {free} B, {held} of {layers} layers hold their extra slots"
+        );
+        assert!(held > 0, "no extra slot came back");
+        assert!(
+            before.saturating_sub(free) < all_extra,
+            "the card had room for every extra slot"
+        );
+        assert!(
+            free >= reserve,
+            "the return left {free} B free, under the reserve of {reserve} B"
+        );
     }
 
     /// The rows of a draft verify as the kernels of the recorded decode, the host answering
