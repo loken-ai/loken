@@ -862,10 +862,11 @@ mod tests {
     #[test]
     fn a_dropped_request_leaves_the_meter() {
         let dropped = RequestEnergy::open(None);
+        let gone = dropped.id;
         drop(dropped);
+        assert!(!meters().ledger.active.contains_key(&gone));
         let alone = RequestEnergy::open(None);
         let id = alone.id;
-        assert!(!meters().ledger.active.contains_key(&(id - 1)));
         let share = alone.close();
         assert!(!meters().ledger.active.contains_key(&id));
         assert!(share.duration_s >= 0.0);
