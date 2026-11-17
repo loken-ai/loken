@@ -21,6 +21,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 - Generation: keep a long answer going when a model's attention window slides.
 - Generation: answer a long prompt when a card runs out of room for its cache.
 - Loading: load a quantised checkpoint on the host without running out of memory.
+- Generation: keep a quantised key cache accurate on models with outlier channels.
 
 ## [0.5.1] - 2026-11-17
 

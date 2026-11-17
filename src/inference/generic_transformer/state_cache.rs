@@ -1120,8 +1120,16 @@ impl GenericHeteroTransformer {
             for width in probe.kinds[il].shape().into_iter().flatten() {
                 h.update((width as u64).to_le_bytes());
             }
+            // A layer that stores its keys scaled names the scale: its rows read right only
+            // under the same weights.
+            if l.key_scaled {
+                h.update(b"key scale");
+            }
         }
         h.update([self.draft.is_some() as u8]);
+        if self.draft.as_ref().is_some_and(|d| d.layer.key_scaled) {
+            h.update(b"draft key scale");
+        }
         let identity: [u8; 32] = h.finalize().into();
         // What one token adds to the blocks: both rows of every global layer, at the widest
         // element a cache holds, and a band layer's share of a compressed row and index key.

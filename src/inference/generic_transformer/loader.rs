@@ -3003,6 +3003,7 @@ fn build_generic_layer(
             };
             config.shared_kv_layers > 0 && raw.layer_idx < first_kv_shared
         },
+        key_scaled: false,
         // An unquantised cache on a card stores F16 when the architecture keeps its cache
         // unquantised: the half-width read stands in for the quantised one it cannot take.
         // A sink layer stores F16 too: its card decode attention reads F16 K/V.
@@ -3136,6 +3137,8 @@ fn build_generic_layer(
             }
         }
     }
+    // A layer of a model whose layers share their keys keeps its norm weights.
+    layer.fold_key_scale(config.shared_kv_layers > 0)?;
     Ok(layer)
 }
 
@@ -3573,7 +3576,7 @@ fn build_awq_layer(
         sin.to_device(device)?
     };
 
-    Ok(GenericTransformerLayer {
+    let mut layer = GenericTransformerLayer {
         tp_shards: Vec::new(),
         tp_comms: None,
         mixer: super::mixer::Mixer::Attention,
@@ -3654,6 +3657,7 @@ fn build_awq_layer(
             }
         },
         populate_dual_kv: false,
+        key_scaled: false,
         kv_f16: false,
         padded_mask: None,
         graph_q_buffer: None,
@@ -3718,7 +3722,9 @@ fn build_awq_layer(
         sparse: None,
         ngram: None,
         sinkhorn: None,
-    })
+    };
+    layer.fold_key_scale(false)?;
+    Ok(layer)
 }
 impl GenericHeteroTransformer {
     /// Load from GGUF with per-layer device assignment driven by `plan`.

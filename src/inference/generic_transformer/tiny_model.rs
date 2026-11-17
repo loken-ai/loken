@@ -273,6 +273,22 @@ pub(crate) fn load_on_cards(
     layers: usize,
     runs: &[(usize, usize)],
 ) -> super::GenericHeteroTransformer {
+    load_on_cards_with_kv(
+        path,
+        layers,
+        runs,
+        crate::inference::engine::llm_engine::KvQuant::Off,
+    )
+}
+
+/// [`load_on_cards`] with the cache format `kv_quant`.
+#[cfg(feature = "gpu")]
+pub(crate) fn load_on_cards_with_kv(
+    path: &std::path::Path,
+    layers: usize,
+    runs: &[(usize, usize)],
+    kv_quant: crate::inference::engine::llm_engine::KvQuant,
+) -> super::GenericHeteroTransformer {
     use crate::inference::place::layer_executor::{DeviceKind, HeteroPlan, HeteroSegment};
     let ends = runs.iter().skip(1).map(|r| r.1).chain([layers]);
     let segments = runs
@@ -302,7 +318,7 @@ pub(crate) fn load_on_cards(
         &bytes[..],
         &cards,
         &plan,
-        crate::inference::engine::llm_engine::KvQuant::Off,
+        kv_quant,
         None,
     )
     .unwrap()
@@ -371,6 +387,8 @@ pub(crate) struct QuantExtras {
     pub sinks: bool,
     /// Quantised experts, routed 2 of 8, in place of each feed-forward.
     pub routed: bool,
+    /// The K norm weight of every layer, one head of lanes, in place of ones.
+    pub key_norm: Option<Vec<f32>>,
 }
 
 /// [`write_quant`] with `extras`.
@@ -379,7 +397,12 @@ pub(crate) fn write_quant_with(
     layers: usize,
     extras: QuantExtras,
 ) -> std::path::PathBuf {
-    let (mut metadata, entries) = quant_model_with(layers, extras.sinks, extras.routed);
+    let (mut metadata, entries) = quant_model_with(
+        layers,
+        extras.sinks,
+        extras.routed,
+        extras.key_norm.as_deref(),
+    );
     metadata.extend(extras.keys);
     let path = scratch_dir(tag).join("m.gguf");
     write_gguf_with_metadata(&path, &metadata, &entries).unwrap();
@@ -515,15 +538,17 @@ fn scratch_dir(tag: &str) -> std::path::PathBuf {
 
 /// The metadata and tensors of the model [`write_quant`] writes.
 fn quant_model(layers: usize) -> (Vec<(String, Value)>, Vec<GgufEntry>) {
-    quant_model_with(layers, false, false)
+    quant_model_with(layers, false, false, None)
 }
 
-/// [`quant_model`], each layer with a sink logit per head when `sinks` is set, and with
-/// quantised experts in place of its feed-forward when `routed` is set.
+/// [`quant_model`], each layer with a sink logit per head when `sinks` is set, with
+/// quantised experts in place of its feed-forward when `routed` is set, and with `key_norm` as
+/// its K norm weight when given.
 fn quant_model_with(
     layers: usize,
     sinks: bool,
     routed: bool,
+    key_norm: Option<&[f32]>,
 ) -> (Vec<(String, Value)>, Vec<GgufEntry>) {
     let mut seed = 23u32;
     let mut values = |n: usize| -> Vec<f32> {
@@ -573,7 +598,15 @@ fn quant_model_with(
         entries.push(ones(format!("blk.{il}.attn_norm.weight"), QUANT_EMBD));
         entries.push(ones(format!("blk.{il}.ffn_norm.weight"), QUANT_EMBD));
         entries.push(ones(format!("blk.{il}.attn_q_norm.weight"), head_dim));
-        entries.push(ones(format!("blk.{il}.attn_k_norm.weight"), head_dim));
+        entries.push(match key_norm {
+            Some(w) => GgufEntry {
+                name: format!("blk.{il}.attn_k_norm.weight"),
+                dims: vec![head_dim],
+                dtype: GgmlDType::F32,
+                data: w.iter().flat_map(|v| v.to_le_bytes()).collect(),
+            },
+            None => ones(format!("blk.{il}.attn_k_norm.weight"), head_dim),
+        });
         for (n, d, t) in [
             ("attn_q", [QUANT_EMBD, QUANT_EMBD], GgmlDType::Q4K),
             ("attn_k", [kv, QUANT_EMBD], GgmlDType::Q4K),

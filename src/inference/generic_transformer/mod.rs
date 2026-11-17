@@ -112,6 +112,7 @@ mod embedding_step_tests;
 #[cfg(test)]
 mod hf_reference_tests;
 pub mod hyper;
+mod key_scale;
 #[cfg(test)]
 mod kv_handover_tests;
 pub mod latent_mqa;
@@ -377,6 +378,9 @@ pub struct GenericTransformerLayer {
     /// the standard attention path. Without this, consolidated-Q8 mode
     /// would leave F-dtype empty and shared layers would fail.
     pub populate_dual_kv: bool,
+    /// Whether the Q and K norm weights carry the key scale of `key_scale`: every key this
+    /// layer stores is divided by it, every query multiplied by it.
+    pub key_scaled: bool,
     /// Store the F-dtype KV cache in F16 rather than the F32 working dtype.
     /// Halves the dominant K+V decode read (the long-context lever) at
     /// ollama-parity precision - F16's 10-bit mantissa is far above the Q8/Q4

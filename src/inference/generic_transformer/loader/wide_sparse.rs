@@ -902,6 +902,7 @@ impl GenericHeteroTransformer {
                 #[cfg(feature = "gpu")]
                 quant_kv: None,
                 populate_dual_kv: false,
+                key_scaled: false,
                 kv_f16: false,
                 padded_mask: None,
                 graph_q_buffer: None,
