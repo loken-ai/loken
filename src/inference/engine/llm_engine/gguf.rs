@@ -429,7 +429,7 @@ pub fn build_tokenizer_from_gguf(content: &gguf_file::Content) -> AnyResult<Toke
     // A file that names no pre-tokenizer of its own is split the way its architecture was
     // trained, when the architecture's facts say how.
     let pre_id = match facts.default_pre_tokenizer {
-        Some(trained) if pre_id == "default" => trained.to_string(),
+        Some(trained) if pre_id.is_empty() || pre_id == "default" => trained.to_string(),
         _ => pre_id,
     };
     // What the file's pre-tokenizer name means, as the reference defines each type: the split
@@ -801,6 +801,100 @@ pub(crate) fn build_sampling_from(temperature: f32, top_p: f32, top_k: usize) ->
 #[cfg(test)]
 mod tokenizer_tests {
     use super::*;
+
+    /// A byte-level vocabulary of architecture `arch` naming the pre-tokenizer `pre`: a few
+    /// letters, the period, the newline and the period followed by 2 newlines, no merges
+    /// beyond the 2 newlines.
+    fn byte_level(arch: &str, pre: &str) -> Tokenizer {
+        use gguf_file::Value;
+        let pieces = ["a", "b", ".", "Ċ", "ĊĊ", ".ĊĊ"];
+        let mut metadata = std::collections::HashMap::new();
+        let mut put = |k: &str, v: Value| metadata.insert(k.to_string(), v);
+        put("general.architecture", Value::String(arch.into()));
+        put("tokenizer.ggml.model", Value::String("gpt2".into()));
+        put("tokenizer.ggml.pre", Value::String(pre.into()));
+        let tokens = pieces
+            .iter()
+            .map(|p| Value::String(p.to_string()))
+            .collect();
+        put("tokenizer.ggml.tokens", Value::Array(tokens));
+        put(
+            "tokenizer.ggml.token_type",
+            Value::Array(vec![Value::I32(1); pieces.len()]),
+        );
+        put(
+            "tokenizer.ggml.merges",
+            Value::Array(vec![Value::String("Ċ Ċ".into())]),
+        );
+        let content = gguf_file::Content {
+            magic: gguf_file::VersionedMagic::GgufV3,
+            metadata,
+            tensor_infos: std::collections::HashMap::new(),
+            tensor_data_offset: 0,
+            mmap_owner: None,
+        };
+        build_tokenizer_from_gguf(&content).unwrap()
+    }
+
+    fn pieces(t: &Tokenizer, text: &str) -> Vec<String> {
+        t.encode(text, false).unwrap().get_tokens().to_vec()
+    }
+
+    /// A mistral3 file naming the `default` pre-tokenizer, or none, keeps a period and the
+    /// newlines after it in one piece, as the tekken split does.
+    #[test]
+    fn a_mistral3_file_without_its_own_split_is_split_as_tekken() {
+        for pre in ["default", ""] {
+            let t = byte_level("mistral3", pre);
+            assert_eq!(pieces(&t, "a.\n\nb"), vec!["a", ".ĊĊ", "b"], "pre {pre:?}");
+        }
+    }
+
+    /// A file that names its pre-tokenizer keeps it, whatever its architecture's facts say.
+    #[test]
+    fn a_declared_pre_tokenizer_is_kept() {
+        let t = byte_level("mistral3", "gpt-2");
+        assert_eq!(pieces(&t, "a.\n\nb"), vec!["a", ".", "Ċ", "Ċ", "b"]);
+        let t = byte_level("llama", "default");
+        assert_eq!(pieces(&t, "a.\n\nb"), vec!["a", ".", "Ċ", "Ċ", "b"]);
+    }
+
+    /// The vocabulary of the mistral3 file in the store that names the `default` split gives
+    /// the tekken ids of a prompt holding a period and 2 newlines.
+    #[test]
+    #[ignore = "needs devstral-small-2:latest in the store"]
+    fn a_stored_mistral3_vocabulary_splits_as_tekken() {
+        let store = crate::config::Config::load_test().get_ollama_models_dir();
+        let m = crate::inference::load::ollama_manager::OllamaManager::new(store.clone());
+        let manifest = m
+            .read_manifest_json("devstral-small-2", "latest")
+            .expect("manifest in the store");
+        let digest = manifest["layers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|l| l["mediaType"] == "application/vnd.ollama.image.model")
+            .and_then(|l| l["digest"].as_str())
+            .expect("a model layer")
+            .replace(':', "-");
+        let file = gguf_file::open_mapped(store.join("blobs").join(digest)).unwrap();
+        let t = build_tokenizer_from_gguf(&file.content).unwrap();
+        let ids = t
+            .encode(
+                "Request 1 of a benchmark series.\n\nCall me Ishmael.",
+                false,
+            )
+            .unwrap()
+            .get_ids()
+            .to_vec();
+        assert_eq!(
+            ids,
+            vec![
+                4967, 1032, 1049, 1307, 1261, 54093, 5395, 1338, 9570, 1639, 52642, 1831, 1299,
+                1046
+            ]
+        );
+    }
 
     /// The joyai-llm splits compile in the regex engine the tokenizer uses and segment as the
     /// model's tokenizer.json does (the expected pieces are that tokenizer's own output): digits

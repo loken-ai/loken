@@ -152,7 +152,15 @@ const GEMMA: ArchFacts = ArchFacts {
 const FACTS: &[(&str, ArchFacts)] = &[
     ("llama", ADJACENT),
     ("mistral", ADJACENT),
-    ("mistral3", ADJACENT),
+    // The vocabulary was trained with the tekken split; a file naming the `default`
+    // pre-tokenizer is split that way.
+    (
+        "mistral3",
+        ArchFacts {
+            default_pre_tokenizer: Some("tekken"),
+            ..ADJACENT
+        },
+    ),
     // Every fourth layer skips RoPE; no converter writes the period.
     (
         "smollm3",
