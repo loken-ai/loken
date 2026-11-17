@@ -19,6 +19,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 - Tokenizer: split a file that names no pre-tokenizer as its architecture was trained.
 - Generation: give the same greedy tokens streamed or not when the host verifies drafts.
 - Generation: keep a long answer going when a model's attention window slides.
+- Generation: answer a long prompt when a card runs out of room for its cache.
 
 ## [0.5.1] - 2026-11-17
 

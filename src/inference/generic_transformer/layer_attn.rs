@@ -527,20 +527,14 @@ impl GenericTransformerLayer {
     /// history would decode from wrong logits.
     #[cfg(feature = "gpu")]
     fn demote_quant_kv(&mut self, dtype: crate::tensor::DType) -> Result<()> {
-        let Some(q) = self.quant_kv.take() else {
-            return Ok(());
-        };
-        if self.populate_dual_kv {
-            return Ok(());
-        }
-        self.kv_cache.reset();
-        if q.current_seq_len() > 0 {
-            let (k, v) = q.dequantize_kv(dtype).map_err(|e| {
-                crate::tensor::Error::msg(format!("quantised KV history unreadable: {e}"))
-            })?;
-            let _ = self.kv_cache.append(&k, &v)?;
-        }
-        Ok(())
+        let mirrored = self.populate_dual_kv;
+        demote_history(
+            &mut self.quant_kv,
+            &mut self.kv_cache,
+            mirrored,
+            |q| q.current_seq_len(),
+            |q| q.dequantize_kv(dtype),
+        )
     }
 
     #[cfg(feature = "gpu")]
@@ -2967,5 +2961,129 @@ fn splitk_serves(n_head: usize, n_kv_head: usize, head_dim: usize) -> bool {
         64 | 128 => group <= 16,
         256 => group <= 8,
         _ => false,
+    }
+}
+
+/// Moves a layer's history from its quantised store `held` to the F-dtype `cache`.
+///
+/// `rows` counts the positions the store holds and `read` gives them back as K and V.
+/// A store whose rows the F-dtype cache already mirrors is dropped without a read.
+/// The store leaves the layer only once the cache holds its rows.
+/// A read or an append that fails leaves the store in place and the error as it was:
+/// the history is never lost, and an out-of-memory error stays one.
+fn demote_history<Q, E: std::fmt::Display>(
+    held: &mut Option<Q>,
+    cache: &mut crate::inference::serve::spec_kv_cache::SpecKvCache,
+    mirrored: bool,
+    rows: impl Fn(&Q) -> usize,
+    read: impl FnOnce(&Q) -> std::result::Result<(Tensor, Tensor), E>,
+) -> Result<()> {
+    let Some(q) = held.as_ref() else {
+        return Ok(());
+    };
+    if !mirrored {
+        let history = match rows(q) {
+            0 => None,
+            _ => Some(read(q).map_err(|e| {
+                crate::tensor::Error::msg(format!("quantised KV history unreadable: {e}"))
+            })?),
+        };
+        cache.reset();
+        if let Some((k, v)) = history {
+            if let Err(e) = cache.append(&k, &v) {
+                cache.reset();
+                return Err(e);
+            }
+        }
+    }
+    *held = None;
+    Ok(())
+}
+
+#[cfg(test)]
+mod demote_history_tests {
+    use super::demote_history;
+    use crate::inference::place::ladder::is_out_of_memory;
+    use crate::inference::serve::spec_kv_cache::SpecKvCache;
+    use crate::tensor::{DType, Device, Tensor};
+
+    /// A store of `n` positions, `[1, 2, n, 4]` K and V on the host.
+    fn store(n: usize) -> (Tensor, Tensor) {
+        let k = Tensor::ones(&[1, 2, n, 4][..], DType::F32, &Device::Cpu).unwrap();
+        (k.clone(), k)
+    }
+
+    /// A read that cannot allocate keeps the store in the layer and stays an out-of-memory
+    /// error, so the prefill ladder and the request's re-plan go on with the history whole.
+    #[test]
+    fn a_demotion_that_cannot_allocate_keeps_the_history() {
+        let mut held = Some(store(8224));
+        let mut cache = SpecKvCache::new(64);
+        let failed = demote_history(
+            &mut held,
+            &mut cache,
+            false,
+            |s| s.0.dims()[2],
+            |_| Err::<(Tensor, Tensor), _>("[oom] cuda permute: out of memory"),
+        );
+        let err = failed.expect_err("the read failed");
+        assert!(
+            is_out_of_memory(&err),
+            "{err} is not an out-of-memory error"
+        );
+        assert_eq!(held.as_ref().map(|s| s.0.dims()[2]), Some(8224));
+        assert_eq!(cache.current_seq_len(), 0);
+    }
+
+    /// A read that succeeds moves every row to the F-dtype cache and drops the store.
+    #[test]
+    fn a_demotion_moves_the_history() {
+        let mut held = Some(store(6));
+        let mut cache = SpecKvCache::new(4);
+        demote_history(
+            &mut held,
+            &mut cache,
+            false,
+            |s| s.0.dims()[2],
+            |s| Ok::<_, String>((s.0.clone(), s.1.clone())),
+        )
+        .unwrap();
+        assert!(held.is_none());
+        assert_eq!(cache.current_seq_len(), 6);
+    }
+
+    /// The prefill ladder over a layer whose demotion fails until room is made: every rung keeps
+    /// the history, and the rung that runs once room is made attends the whole of it.
+    #[test]
+    fn the_prefill_ladder_ends_with_the_history_whole() {
+        let mut held = Some(store(8224));
+        let mut cache = SpecKvCache::new(64);
+        let room = std::cell::Cell::new(false);
+        let (seen, chunk) = crate::inference::place::recover::shrink_on_oom(
+            "prefill",
+            1024,
+            |c| (c > 32).then_some(c / 2),
+            |_| {
+                room.set(true);
+                true
+            },
+            |_| {
+                let free = room.get();
+                demote_history(
+                    &mut held,
+                    &mut cache,
+                    false,
+                    |s| s.0.dims()[2],
+                    |s| match free {
+                        true => Ok((s.0.clone(), s.1.clone())),
+                        false => Err("[oom] cuda permute: out of memory".to_string()),
+                    },
+                )
+                .map(|()| cache.current_seq_len())
+            },
+        )
+        .expect("the rung after the room was made runs");
+        assert_eq!(chunk, 32);
+        assert_eq!(seen, 8224, "the history reached the F-dtype cache whole");
     }
 }
