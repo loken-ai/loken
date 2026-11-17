@@ -491,7 +491,26 @@ impl CpuF16Kv {
         sinks: Option<&[f32]>,
         out: &mut [f32],
     ) -> Result<()> {
-        let (hd, seq, n_rep) = (self.head_dim, self.seq, self.n_head / self.n_kv_head);
+        self.attention_upto(q, scale, sinks, self.seq, out)
+    }
+
+    /// As [`Self::attention_sinks`] over the first `len` positions alone: the attention a decode
+    /// step made when the store held `len` positions.
+    pub fn attention_upto(
+        &self,
+        q: &[f32],
+        scale: f32,
+        sinks: Option<&[f32]>,
+        len: usize,
+        out: &mut [f32],
+    ) -> Result<()> {
+        if len > self.seq {
+            return Err(crate::tensor::Error::msg(format!(
+                "F16 store: attention over {len} positions of {}",
+                self.seq
+            )));
+        }
+        let (hd, seq, n_rep) = (self.head_dim, len, self.n_head / self.n_kv_head);
         debug_assert_eq!(q.len(), self.n_head * hd);
         debug_assert_eq!(out.len(), self.n_head * hd);
         if let Some(s) = sinks {

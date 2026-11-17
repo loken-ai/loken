@@ -276,7 +276,10 @@ fn handle(
     let hidden = from_frame(h, payload)?;
     match down {
         Some(down) => {
-            let out = model.segment_interior_forward(hidden, index_pos)?;
+            let out = match all_rows {
+                true => model.segment_interior_forward_all(hidden, index_pos)?,
+                false => model.segment_interior_forward(hidden, index_pos)?,
+            };
             let (dtype, shape, bytes) = to_frame(&out)?;
             let (rh, rp) = down.request(h.layer_id, dtype, shape, &bytes).map_err(io)?;
             Ok((rh, rp))
@@ -417,7 +420,7 @@ mod tests {
         // A verify batch: every token's logits come back through the whole chain.
         let batch = ids(&[5, 1]);
         let want = row(&whole.forward_all(&batch, 8).unwrap());
-        let boundary = head.segment_head_forward(&batch, 8).unwrap();
+        let boundary = head.segment_head_forward_all(&batch, 8).unwrap();
         let got = row(&link.boundary_all(&boundary, 8).unwrap());
         assert_eq!(got, want, "verify over cuts {cuts:?}");
         whole.trim_kv(8);

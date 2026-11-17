@@ -136,6 +136,11 @@ pub fn fused_rmsnorm_add_scale(
         (norm + residual)?.broadcast_mul(scale)
     };
 
+    // The host computes the norm as the unfused chain does, so a step and the rows of a verify
+    // that take the chain give the same bits.
+    if !x.device().runs_as_card() {
+        return (x.rms_norm(weight, eps)? + residual)?.broadcast_mul(scale);
+    }
     if !x.device().is_cuda() {
         return fallback();
     }

@@ -1300,6 +1300,43 @@ impl GenericTransformerLayer {
     /// Extracts the residual + this position's rope rows, runs `decode_layer_cpu`
     /// on the persistent arena, returns the updated residual as a Tensor.
     /// `Ok(None)` -> caller runs the normal Tensor `forward`.
+    /// The rows of `x`, `[1, rows, hidden]` at `index_pos..`, each through
+    /// [`Self::try_decode_layer_cpu`] at its own position with its own per-layer input.
+    /// `None`, with nothing done, when the executor does not take the first row.
+    fn decode_rows_one_by_one_cpu(
+        &mut self,
+        x: &Tensor,
+        index_pos: usize,
+        ple_layer_input: Option<&Tensor>,
+    ) -> Result<Option<Tensor>> {
+        let (b, rows, _) = x.dims3()?;
+        if b != 1 || rows < 2 {
+            return Ok(None);
+        }
+        // The per-layer input holds one row per token on its second to last axis.
+        let ple_row = |r: usize| -> Result<Option<Tensor>> {
+            match ple_layer_input {
+                Some(t) => {
+                    let axis = t.dims().len().saturating_sub(2);
+                    Ok(Some(t.narrow(axis, r, 1)?))
+                }
+                None => Ok(None),
+            }
+        };
+        let mut ys = Vec::with_capacity(rows);
+        for r in 0..rows {
+            let ple = ple_row(r)?;
+            match self.try_decode_layer_cpu(&x.narrow(1, r, 1)?, index_pos + r, ple.as_ref())? {
+                Some(y) => ys.push(y),
+                None if r == 0 => return Ok(None),
+                None => {
+                    crate::tensor::bail!("the host executor took row 0 of a verify, not row {r}")
+                }
+            }
+        }
+        Ok(Some(Tensor::cat(&ys.iter().collect::<Vec<_>>(), 1)?))
+    }
+
     fn try_decode_layer_cpu(
         &mut self,
         x: &Tensor,
@@ -1439,6 +1476,17 @@ impl GenericTransformerLayer {
             && crate::tensor::quantized::DecodeOrder::active()
         {
             if let Some(y) = self.try_decode_rows_cpu(x, index_pos)? {
+                return Ok(y);
+            }
+        }
+        // A draft verify on the host whose rows the batched executor does not take: each row
+        // runs the single-token executor its decode step ran, at its own position.
+        if matches!(x.device(), crate::tensor::Device::Cpu)
+            && mask.is_some()
+            && shared_kv.is_none()
+            && crate::tensor::quantized::DecodeOrder::active()
+        {
+            if let Some(y) = self.decode_rows_one_by_one_cpu(x, index_pos, ple_layer_input)? {
                 return Ok(y);
             }
         }

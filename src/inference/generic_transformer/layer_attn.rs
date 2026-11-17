@@ -671,8 +671,9 @@ impl GenericTransformerLayer {
 
     /// Whether a multi-row call runs each row as the one-token decode step it stands for.
     /// A draft verify asks for it (`DecodeOrder`); the rows then see exactly the arithmetic
-    /// of the steps they replace. Layers reading a donor's cache keep the batched path: the
-    /// donor has already appended every row, so a row alone would see the rows after it.
+    /// of the steps they replace, on a card and on the host. Layers reading a donor's cache
+    /// keep the batched path: the donor has already appended every row, so a row alone would
+    /// see the rows after it.
     fn attends_rows_as_decode(
         &self,
         x: &Tensor,
@@ -682,7 +683,6 @@ impl GenericTransformerLayer {
         Ok(seq > 1
             && b == 1
             && shared_kv.is_none()
-            && x.device().is_cuda()
             && crate::tensor::quantized::DecodeOrder::active())
     }
 

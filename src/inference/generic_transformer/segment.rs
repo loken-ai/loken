@@ -102,6 +102,23 @@ impl GenericHeteroTransformer {
         hidden.to_device(&Device::Cpu)
     }
 
+    /// [`Self::segment_head_forward`] for the rows of a verify: each row computes as the decode
+    /// step it stands for, as [`Self::forward_all`] computes it on the whole model.
+    pub fn segment_head_forward_all(&mut self, ids: &Tensor, index_pos: usize) -> Result<Tensor> {
+        let _order = super::hetero::verify_order(ids.dim(1)?, index_pos);
+        self.segment_head_forward(ids, index_pos)
+    }
+
+    /// [`Self::segment_interior_forward`] for the rows of a verify, each row as its decode step.
+    pub fn segment_interior_forward_all(
+        &mut self,
+        hidden: Tensor,
+        index_pos: usize,
+    ) -> Result<Tensor> {
+        let _order = super::hetero::verify_order(hidden.dim(1)?, index_pos);
+        self.segment_interior_forward(hidden, index_pos)
+    }
+
     /// The boundary an interior segment hands on: the boundary it received through every
     /// layer this model holds, on the host.
     pub fn segment_interior_forward(&mut self, hidden: Tensor, index_pos: usize) -> Result<Tensor> {
@@ -121,9 +138,10 @@ impl GenericHeteroTransformer {
     }
 
     /// [`Self::segment_tail_forward`] for a verify: the logits of every token of the boundary,
-    /// `[1, tokens, vocab]`.
+    /// `[1, tokens, vocab]`, each row computed as its decode step.
     pub fn segment_tail_forward_all(&mut self, hidden: Tensor, index_pos: usize) -> Result<Tensor> {
         let seq_len = hidden.dim(1)?;
+        let _order = super::hetero::verify_order(seq_len, index_pos);
         self.mark_prefill(seq_len);
         let (hidden, on_cuda) = self.run_layers(hidden, None, index_pos, seq_len)?;
         self.output_stage(hidden, on_cuda, seq_len, true)

@@ -2802,7 +2802,7 @@ impl GenericHeteroTransformer {
     /// emits. The rows still share each weight read where the decode kernels take several.
     pub fn forward_all(&mut self, input_ids: &Tensor, index_pos: usize) -> Result<Tensor> {
         let (_, seq_len) = input_ids.dims2()?;
-        let verify = index_pos > 0 && seq_len <= crate::inference::engine::decode_step::VERIFY_ROWS;
+        let verify = is_verify(seq_len, index_pos);
         let recording = verify && self.is_recurrent();
         if recording {
             self.spec_open(input_ids, index_pos)?;
@@ -2813,7 +2813,7 @@ impl GenericHeteroTransformer {
         let _in_place = recording.then(|| crate::inference::moe_cuda::in_place_state(true));
         // Every verified row runs the decode step it stands for, so greedy output does not
         // depend on how many tokens were drafted.
-        let _order = verify.then(crate::tensor::quantized::DecodeOrder::enter);
+        let _order = verify_order(seq_len, index_pos);
         let out = self.forward_inner(input_ids, index_pos, /*all_positions=*/ true);
         if recording {
             self.spec_close(out.is_ok());
@@ -4002,6 +4002,21 @@ impl GenericHeteroTransformer {
             })
             .collect()
     }
+}
+
+/// Whether `rows` that continue a cache at `index_pos` are a draft verify: they then compute as
+/// the decode steps they stand for, under [`crate::tensor::quantized::DecodeOrder`].
+pub(super) fn is_verify(rows: usize, index_pos: usize) -> bool {
+    index_pos > 0 && rows <= crate::inference::engine::decode_step::VERIFY_ROWS
+}
+
+/// The decode order a verify of `rows` at `index_pos` holds while it runs, `None` for any other
+/// forward.
+pub(super) fn verify_order(
+    rows: usize,
+    index_pos: usize,
+) -> Option<crate::tensor::quantized::DecodeOrder> {
+    is_verify(rows, index_pos).then(crate::tensor::quantized::DecodeOrder::enter)
 }
 
 /// Build the `[seq_q, bounded_len]` SWA prefill attention-mask data (1=masked) for

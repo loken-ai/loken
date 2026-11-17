@@ -333,7 +333,12 @@ impl GenericTransformerLayer {
         b: usize,
         mask: Option<&Tensor>,
     ) -> Result<Option<Tensor>> {
-        if !is_shared || b != 1 || seq != 1 || mask.is_some() {
+        // One row is a decode step over the whole store.
+        // The rows of a verify each attend the positions up to their own, as their steps did:
+        // the donor has already stored every row.
+        let verify =
+            seq > 1 && mask.is_some() && seq <= crate::inference::engine::decode_step::VERIFY_ROWS;
+        if !is_shared || b != 1 || (seq != 1 && !verify) || (seq == 1 && mask.is_some()) {
             return Ok(None);
         }
         if !matches!(q.device(), crate::tensor::Device::Cpu) {
@@ -350,16 +355,34 @@ impl GenericTransformerLayer {
         let scale = self
             .attention_scale
             .unwrap_or_else(|| 1.0 / (hd as f64).sqrt()) as f32;
-        let qf = q
-            .to_dtype(crate::tensor::DType::F32)?
-            .flatten_all()?
-            .to_vec1::<f32>()?;
-        if qf.len() != self.n_head * hd {
+        if cache.len() < seq || (verify && cache.len() == seq) {
             return Ok(None);
         }
-        let mut out = vec![0f32; self.n_head * hd];
-        cache.attention(&qf, scale, &mut out)?;
-        let t = Tensor::from_vec(out, (b, self.n_head, 1, hd), &crate::tensor::Device::Cpu)?;
+        let base = cache.len() - seq;
+        // `q` is `[1, n_head, seq, hd]`: row `s` takes its own heads.
+        let qf = q
+            .to_dtype(crate::tensor::DType::F32)?
+            .contiguous()?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        if qf.len() != self.n_head * seq * hd {
+            return Ok(None);
+        }
+        let mut out = vec![0f32; self.n_head * seq * hd];
+        let mut qs = vec![0f32; self.n_head * hd];
+        let mut os = vec![0f32; self.n_head * hd];
+        for s in 0..seq {
+            for h in 0..self.n_head {
+                let at = (h * seq + s) * hd;
+                qs[h * hd..(h + 1) * hd].copy_from_slice(&qf[at..at + hd]);
+            }
+            cache.attention_upto(&qs, scale, None, base + s + 1, &mut os)?;
+            for h in 0..self.n_head {
+                let at = (h * seq + s) * hd;
+                out[at..at + hd].copy_from_slice(&os[h * hd..(h + 1) * hd]);
+            }
+        }
+        let t = Tensor::from_vec(out, (b, self.n_head, seq, hd), &crate::tensor::Device::Cpu)?;
         Ok(Some(t))
     }
 

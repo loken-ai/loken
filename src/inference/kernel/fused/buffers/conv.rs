@@ -943,9 +943,10 @@ pub fn fused_rmsnorm_then_add(
     residual: &Tensor,
     eps: f32,
 ) -> Result<Tensor> {
+    // The host computes the norm as the unfused chain does, so a step and the rows of a verify
+    // that take the chain give the same bits.
     if !x.device().runs_as_card() {
-        let norm = crate::tensor::ops::rms_norm(x, weight, eps)?;
-        return norm + residual;
+        return x.rms_norm(weight, eps)? + residual;
     }
     if x.dtype() != DType::F32 || residual.dtype() != DType::F32 || weight.dtype() != DType::F32 {
         let norm = crate::tensor::ops::rms_norm(x, weight, eps)?;

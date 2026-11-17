@@ -109,7 +109,10 @@ impl PipelineHeadBackend {
             let b = self.model.wide_head_forward(x, index_pos, all_rows)?;
             self.link.wide_boundary(&b, all_rows)
         } else {
-            let hidden = self.model.segment_head_forward(x, index_pos)?;
+            let hidden = match all_rows {
+                true => self.model.segment_head_forward_all(x, index_pos)?,
+                false => self.model.segment_head_forward(x, index_pos)?,
+            };
             match all_rows {
                 true => self.link.boundary_all(&hidden, index_pos),
                 false => self.link.boundary(&hidden, index_pos),

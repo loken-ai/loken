@@ -724,3 +724,82 @@ fn a_card_at_reference_is_no_farther_from_the_reference_than_the_host() {
         );
     }
 }
+
+/// The rows of `t`, `[1, rows, vocab]`, as host vectors.
+fn logit_rows(t: &Tensor) -> Vec<Vec<f32>> {
+    let t = t
+        .to_device(&Device::Cpu)
+        .unwrap()
+        .to_dtype(DType::F32)
+        .unwrap();
+    let vocab = t.dims().last().copied().unwrap();
+    let flat = t.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+    flat.chunks(vocab).map(<[f32]>::to_vec).collect()
+}
+
+/// On the host, a verify of the gemma4 checkpoint gives each row the logits of the decode step
+/// it stands for, bit for bit, whatever its width: its shared layers read the donor's host store
+/// as a step reads it. A cut after a verify decodes on as the steps do.
+#[test]
+fn a_gemma4_verify_gives_its_decode_steps_on_the_host() {
+    gemma4_verify_gives_its_decode_steps(&HashMap::new());
+}
+
+/// Each row of a verify of every width on `cards` against the decode step it stands for, and
+/// the steps after a cut verify against the steps of a run that never verified.
+fn gemma4_verify_gives_its_decode_steps(cards: &HashMap<usize, Device>) {
+    use crate::inference::engine::decode_step::VERIFY_ROWS;
+    let name = "gemma4";
+    let reference = reference_of(name);
+    let (prompt, _) = prompt_and_next(&reference);
+    let next: Vec<u32> = (0..VERIFY_ROWS as u32)
+        .map(|i| (i * 37 + 5) % 128)
+        .collect();
+    let ids = |t: &[u32]| Tensor::from_vec(t.to_vec(), (1usize, t.len()), &Device::Cpu).unwrap();
+    let mut stepped = load_files_on(name, COMPOSITE, cards);
+    assert!(
+        stepped.config.shared_kv_layers > 0,
+        "{name}: no shared layer"
+    );
+    stepped.forward(&ids(&prompt), 0).unwrap();
+    let want: Vec<Vec<f32>> = next
+        .iter()
+        .enumerate()
+        .map(|(i, &t)| {
+            let l = stepped.forward(&ids(&[t]), prompt.len() + i).unwrap();
+            logit_rows(&l).remove(0)
+        })
+        .collect();
+    drop(stepped);
+    let mut verified = load_files_on(name, COMPOSITE, cards);
+    verified.forward(&ids(&prompt), 0).unwrap();
+    for width in 2..=VERIFY_ROWS {
+        let got = logit_rows(
+            &verified
+                .forward_all(&ids(&next[..width]), prompt.len())
+                .unwrap(),
+        );
+        for (r, row) in got.iter().enumerate() {
+            let gap = row
+                .iter()
+                .zip(&want[r])
+                .fold(0f32, |m, (a, b)| m.max((a - b).abs()));
+            assert!(
+                row == &want[r],
+                "{name}: row {r} of a {width}-row verify is {gap:e} off its decode step"
+            );
+        }
+        verified.trim_kv(prompt.len());
+    }
+    verified
+        .forward_all(&ids(&next[..5]), prompt.len())
+        .unwrap();
+    verified.trim_kv(prompt.len() + 2);
+    for (i, &t) in next.iter().enumerate().skip(2) {
+        let got = logit_rows(&verified.forward(&ids(&[t]), prompt.len() + i).unwrap()).remove(0);
+        assert!(
+            got == want[i],
+            "{name}: step {i} after a cut verify differs"
+        );
+    }
+}
