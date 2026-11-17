@@ -1455,6 +1455,55 @@ fn awq_host_layers_hold_their_codes_as_blocks() {
     }
 }
 
+/// An AWQ layer on a card holds its keys and values in the configured cache format.
+#[cfg(feature = "gpu")]
+#[test]
+fn an_awq_layer_on_a_card_takes_the_configured_cache_format() {
+    use crate::inference::cache::quant_kv::QuantKv;
+    use crate::inference::engine::llm_engine::KvQuant;
+    use crate::inference::load::awq_loader as awql;
+    use crate::inference::place::layer_executor::{DeviceKind, HeteroSegment};
+    let dir = scratch("awq_card_kv");
+    write_awq(&dir, "Qwen2ForCausalLM", true, false);
+    let dir_str = dir.to_string_lossy().to_string();
+    let (_, shards) = awql::checkpoint_shards(&dir).unwrap();
+    let layers = host_plan(2).total_layers;
+    let plan = HeteroPlan {
+        segments: vec![HeteroSegment {
+            kind: DeviceKind::Cuda(0),
+            layer_start: 0,
+            layer_end: layers,
+            free_memory_bytes: 1 << 30,
+        }],
+        tp_cards: None,
+        total_layers: layers,
+        host_experts_from: None,
+    };
+    let cards = HashMap::from([(0, Device::new_cuda(0).unwrap())]);
+    for (kv_quant, expected) in [
+        (KvQuant::Off, "none"),
+        (KvQuant::Q8, "q8"),
+        (KvQuant::Q4, "q4"),
+    ] {
+        let mut model = GenericWeights::Awq {
+            dir: &dir_str,
+            shards: &shards,
+        }
+        .build(&cards, &plan, kv_quant, None, false, false)
+        .unwrap_or_else(|e| panic!("{kv_quant:?}: load failed: {e}"));
+        for (i, layer) in model.layers.iter().enumerate() {
+            let held = match &layer.quant_kv {
+                None => "none",
+                Some(QuantKv::Q8(_)) => "q8",
+                Some(QuantKv::Q4(_)) => "q4",
+            };
+            assert_eq!(held, expected, "{kv_quant:?}: layer {i}");
+        }
+        assert_runs(&format!("awq on a card, {kv_quant:?}"), &mut model, VOCAB);
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // ---------------------------------------------------------------------------------------------
 // The checkpoints publishers ship. Each test writes the weights of an architecture's recipe in
 // the publisher's tensor names and layout, loads the directory as the server does, and compares

@@ -23,6 +23,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 - Loading: load a quantised checkpoint on the host without running out of memory.
 - Generation: keep a quantised key cache accurate on models with outlier channels.
 - Generation: give the same greedy tokens on a card whether drafts ran or not.
+- Generation: keep an AWQ model's key cache at the configured fidelity on a card.
 
 ## [0.5.1] - 2026-11-17
 

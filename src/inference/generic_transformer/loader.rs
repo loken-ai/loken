@@ -2937,60 +2937,16 @@ fn build_generic_layer(
         cpu_f16_kv: None,
         cpu_decode_arena: None,
         cpu_norm_cache: None,
+        // The quantised kernels have no sink term: a sink layer keeps its history in the
+        // F-dtype cache. The cache is sized with the per-layer key head count.
         #[cfg(feature = "gpu")]
-        quant_kv: {
-            use crate::inference::cache::quant_kv::QuantKv;
-            use crate::inference::engine::llm_engine::KvQuant;
-            // The layer's own head shape must be one the quantised kernels are instantiated
-            // for. The cache is sized with the PER-LAYER n_kv_head: gemma4 26B's model-level
-            // value is the worst case (16) while its SWA layers have 8, and the model-level
-            // value would over-reserve every SWA layer twice and OOM at load.
-            let shape_supported = crate::inference::cache::kv_core::kv_shape_supported(
-                head_dim,
-                config.n_head / n_kv_head_layer.max(1),
-            );
-            let max_seq = config.effective_max_context();
-            // The quantised attention kernels have no sink term: a sink layer keeps its
-            // history in the F-dtype cache.
-            let built = if device.is_cuda() && shape_supported && !has_sinks && attends {
-                match config.kv_quant {
-                    KvQuant::Q8 => Some(
-                        crate::inference::cache::q8_kv::Q8KvCache::new(
-                            max_seq,
-                            n_kv_head_layer,
-                            head_dim,
-                            device,
-                        )
-                        .map(QuantKv::Q8),
-                    ),
-                    KvQuant::Q4 => Some(
-                        crate::inference::cache::q4_kv::Q4KvCache::new(
-                            max_seq,
-                            n_kv_head_layer,
-                            head_dim,
-                            device,
-                        )
-                        .map(QuantKv::Q4),
-                    ),
-                    KvQuant::Off => None,
-                }
-            } else {
-                None
-            };
-            match built {
-                Some(Ok(c)) => Some(c),
-                Some(Err(e)) => {
-                    tracing::warn!(
-                        "{:?} KV cache alloc failed for layer (device={:?}): {e}; \
-                         decoding will fall back to the F-dtype KV cache",
-                        config.kv_quant,
-                        device
-                    );
-                    None
-                }
-                None => None,
-            }
-        },
+        quant_kv: quantised_kv_cache(
+            config,
+            device,
+            n_kv_head_layer,
+            head_dim,
+            !has_sinks && attends,
+        ),
         // Donor layer flag: true when this layer is in the non-shared
         // range and the model has shared_kv_layers > 0. Donors must
         // populate F-dtype kv_cache alongside Q8 so shared layers
@@ -3324,6 +3280,54 @@ fn host_awq_blocks(
     QMatMul::from_qtensor(blocks)
 }
 
+/// The quantised cache a card layer holds its keys and values in, in the configured format.
+///
+/// `None` on the host, for the `Off` format, for a layer that `eligible` excludes, and for a head
+/// shape the quantised kernels are not instantiated for.
+/// A failed allocation is `None` too: the layer then decodes from its F-dtype cache.
+#[cfg(feature = "gpu")]
+fn quantised_kv_cache(
+    config: &GenericTransformerConfig,
+    device: &Device,
+    n_kv_head: usize,
+    head_dim: usize,
+    eligible: bool,
+) -> Option<crate::inference::cache::quant_kv::QuantKv> {
+    use crate::inference::cache::quant_kv::QuantKv;
+    use crate::inference::engine::llm_engine::KvQuant;
+    let shape_supported = crate::inference::cache::kv_core::kv_shape_supported(
+        head_dim,
+        config.n_head / n_kv_head.max(1),
+    );
+    if !(device.is_cuda() && shape_supported && eligible) {
+        return None;
+    }
+    let max_seq = config.effective_max_context();
+    let built = match config.kv_quant {
+        KvQuant::Q8 => {
+            crate::inference::cache::q8_kv::Q8KvCache::new(max_seq, n_kv_head, head_dim, device)
+                .map(QuantKv::Q8)
+        }
+        KvQuant::Q4 => {
+            crate::inference::cache::q4_kv::Q4KvCache::new(max_seq, n_kv_head, head_dim, device)
+                .map(QuantKv::Q4)
+        }
+        KvQuant::Off => return None,
+    };
+    match built {
+        Ok(c) => Some(c),
+        Err(e) => {
+            tracing::warn!(
+                "{:?} KV cache alloc failed for layer (device={:?}): {e}; \
+                 decoding will fall back to the F-dtype KV cache",
+                config.kv_quant,
+                device
+            );
+            None
+        }
+    }
+}
+
 /// Build one `GenericTransformerLayer` from an AWQ checkpoint. Dense
 /// Qwen2/Qwen3/Mistral: separate q/k/v (so the GGUF-byte APQ fast path gates off
 /// and `standard_attention` - which works with any `QMatMul` - runs), f16 norms,
@@ -3638,24 +3642,7 @@ fn build_awq_layer(
         cpu_decode_arena: None,
         cpu_norm_cache: None,
         #[cfg(feature = "gpu")]
-        quant_kv: {
-            let head_dim_supported = crate::inference::cache::kv_core::kv_shape_supported(
-                head_dim,
-                config.n_head / config.n_kv_head.max(1),
-            );
-            if device.is_cuda() && head_dim_supported {
-                crate::inference::cache::q8_kv::Q8KvCache::new(
-                    config.effective_max_context(),
-                    config.n_kv_head,
-                    head_dim,
-                    device,
-                )
-                .ok()
-                .map(crate::inference::cache::quant_kv::QuantKv::Q8)
-            } else {
-                None
-            }
-        },
+        quant_kv: quantised_kv_cache(config, device, config.n_kv_head, head_dim, true),
         populate_dual_kv: false,
         key_scaled: false,
         kv_f16: false,
