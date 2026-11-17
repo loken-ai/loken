@@ -187,6 +187,8 @@ impl LlmEngine {
             let _ = self.take_last_stream_stats();
             let outcome = probe.outcome();
             let counts = WorkerCounts::of(outcome.as_ref(), chunks);
+            // The path that wrote the last token noted why the answer ended.
+            let finish_reason = probe.end().unwrap_or(FinishReason::Eos);
             // The request's own times, else the times its client saw.
             let (prompt_eval_duration, eval_duration) = match outcome {
                 Some(o) => (o.figures.prefill_ns(), o.figures.decode_ns()),
@@ -203,7 +205,7 @@ impl LlmEngine {
                 eval_count: counts.eval_count,
                 eval_duration,
                 cached_prompt_tokens: counts.cached_prompt_tokens,
-                finish_reason: FinishReason::Eos,
+                finish_reason,
                 logprobs: Vec::new(),
             });
         }

@@ -231,6 +231,8 @@ pub struct RequestProbe {
     /// Tokens generated so far.
     decoded: AtomicU64,
     outcome: Mutex<Option<RequestOutcome>>,
+    /// Why the answer ended, set by the path that wrote its last token.
+    ended: Mutex<Option<crate::inference::engine::llm_engine::FinishReason>>,
 }
 
 impl RequestProbe {
@@ -271,6 +273,17 @@ impl RequestProbe {
 
     pub fn outcome(&self) -> Option<RequestOutcome> {
         *self.outcome.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Records why the answer ended.
+    /// A later note replaces an earlier one: the path that wrote the last token notes last.
+    pub fn note_end(&self, reason: crate::inference::engine::llm_engine::FinishReason) {
+        *self.ended.lock().unwrap_or_else(|e| e.into_inner()) = Some(reason);
+    }
+
+    /// Why the answer ended; `None` before it ends.
+    pub fn end(&self) -> Option<crate::inference::engine::llm_engine::FinishReason> {
+        self.ended.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 }
 

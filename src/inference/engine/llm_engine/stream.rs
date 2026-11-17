@@ -245,6 +245,9 @@ impl LlmEngine {
             .unwrap_or_else(|e| e.into_inner())
             .record_handover();
         if remaining == 0 {
+            if let Some(p) = params.probe.as_deref() {
+                p.note_end(FinishReason::MaxTokens);
+            }
             crate::request_metrics::record_outcome(
                 &self.config.model_id,
                 params.probe.as_deref(),
@@ -379,6 +382,8 @@ impl LlmEngine {
                 tokenizer.decode(&gen[..keep], skip_special).ok()
             };
             let mut stopped_early = false;
+            // Why the answer ends: every way out of the loop below sets it.
+            let mut end: FinishReason;
             let (mut admitted, mut first_token) = (None, None);
             // When this request became the only one in the worker, and its token count then.
             let mut alone_since: Option<(std::time::Instant, usize)> = None;
@@ -402,7 +407,10 @@ impl LlmEngine {
                         }
                         continue;
                     }
-                    Ok(CbToken::Done(_)) => break,
+                    Ok(CbToken::Done(why)) => {
+                        end = worker_end(why);
+                        break;
+                    }
                     // An answer the worker cannot finish ends with an error, not as a
                     // finished answer.
                     Ok(CbToken::Failed(why)) => {
@@ -418,6 +426,7 @@ impl LlmEngine {
                 };
                 first_token.get_or_insert_with(std::time::Instant::now);
                 if eos_set.contains(&t) {
+                    end = FinishReason::Eos;
                     break;
                 }
                 gen.push(t);
@@ -436,21 +445,18 @@ impl LlmEngine {
                     continue;
                 }
                 // Stop sequence: emit text up to it, then finish.
-                if let Some(pos) = stops
-                    .iter()
-                    .filter(|s| !s.is_empty())
-                    .filter_map(|s| text.find(s.as_str()))
-                    .min()
-                {
+                if let Some((pos, stop)) = first_stop(&stops, &text) {
                     if pos > emitted.len() {
                         let _ = tx.blocking_send(Ok(text[emitted.len()..pos].to_string()));
                     }
+                    end = FinishReason::StopSequence(stop);
                     stopped_early = true;
                     break;
                 }
                 let delta = text[emitted.len()..].to_string();
                 emitted = text;
                 if tx.blocking_send(Ok(delta)).is_err() {
+                    end = FinishReason::Disconnect;
                     stopped_early = true;
                     break;
                 }
@@ -458,16 +464,18 @@ impl LlmEngine {
             // The token that was being held back, and anything the last decode reflowed.
             if !stopped_early {
                 if let Ok(full) = tokenizer.decode(&gen, skip_special) {
-                    let cut = stops
-                        .iter()
-                        .filter(|s| !s.is_empty())
-                        .filter_map(|s| full.find(s.as_str()))
-                        .min()
-                        .unwrap_or(full.len());
+                    let (cut, stop) = first_stop(&stops, &full).unzip();
+                    let cut = cut.unwrap_or(full.len());
                     if full.starts_with(&emitted) && cut > emitted.len() {
                         let _ = tx.blocking_send(Ok(full[emitted.len()..cut].to_string()));
                     }
+                    if let Some(stop) = stop {
+                        end = FinishReason::StopSequence(stop);
+                    }
                 }
+            }
+            if let Some(p) = probe.as_deref() {
+                p.note_end(end);
             }
             let done = std::time::Instant::now();
             // The last request of a burst decoded alone once the others ended: the worker's
@@ -3821,6 +3829,8 @@ impl LlmEngine {
                 // requests are.
                 if handed_over.is_some() {
                     return_stats = false;
+                } else if let Some(p) = probe.as_deref() {
+                    p.note_end(finish_reason.clone());
                 }
                 let stats = StreamStats {
                     eval_count: token_count as u64,
@@ -4044,6 +4054,25 @@ pub(super) struct SerialPart {
     pub(super) outcome: crate::request_metrics::RequestOutcome,
 }
 
+/// The engine's reason for an answer the batch worker ended.
+/// The worker ends an answer at its token budget or at an end token.
+fn worker_end(why: crate::inference::serve::scheduler::FinishReason) -> FinishReason {
+    use crate::inference::serve::scheduler::FinishReason as Worker;
+    match why {
+        Worker::Length => FinishReason::MaxTokens,
+        Worker::Eos | Worker::Stop => FinishReason::Eos,
+    }
+}
+
+/// The earliest of the non-empty `stops` in `text`: its byte position and the stop itself.
+fn first_stop(stops: &[String], text: &str) -> Option<(usize, String)> {
+    stops
+        .iter()
+        .filter(|s| !s.is_empty())
+        .filter_map(|s| text.find(s.as_str()).map(|pos| (pos, s.clone())))
+        .min_by_key(|(pos, _)| *pos)
+}
+
 /// Tokens per second after the first of `tokens` generated tokens, which took `seconds`.
 fn lone_rate(tokens: usize, seconds: f64) -> Option<f64> {
     (tokens >= 2 && seconds > 0.0).then(|| (tokens - 1) as f64 / seconds)
@@ -4078,6 +4107,114 @@ fn prepend_message(
 #[cfg(test)]
 mod tests {
     use super::{opens_out_of_memory, prepend_message};
+
+    use super::super::generation_defaults::GenerationDefaults;
+    use super::super::params::{FinishReason, GenerationParams};
+    use super::super::LlmEngine;
+    use crate::inference::engine::InferenceEngine;
+    use crate::inference::serve::continuous_batch::SamplingParams;
+    use crate::inference::serve::continuous_serve::{BatchedServer, CbToken};
+    use crate::inference::serve::scheduler::FinishReason as Worker;
+    use crate::request_metrics::RequestProbe;
+    use std::sync::Arc;
+
+    /// A batch worker that answers every request with `tokens`, then `end` when given.
+    struct Scripted {
+        tokens: Vec<u32>,
+        end: Option<Worker>,
+    }
+
+    impl BatchedServer for Scripted {
+        fn submit_cb(
+            &self,
+            _prompt: Vec<u32>,
+            _max_new: usize,
+            _sampling: SamplingParams,
+            _probe: Option<Arc<RequestProbe>>,
+        ) -> std::sync::mpsc::Receiver<CbToken> {
+            let (tx, rx) = std::sync::mpsc::channel();
+            for &t in &self.tokens {
+                tx.send(CbToken::Tok(t)).unwrap();
+            }
+            if let Some(end) = self.end {
+                tx.send(CbToken::Done(end)).unwrap();
+            }
+            rx
+        }
+
+        fn cache_tokens(&self) -> usize {
+            0
+        }
+    }
+
+    /// A vocabulary of the words `t0` to `t7`.
+    fn words() -> Arc<tokenizers::Tokenizer> {
+        let vocab: ahash::AHashMap<String, u32> = (0..8u32).map(|i| (format!("t{i}"), i)).collect();
+        let model = tokenizers::models::wordlevel::WordLevel::builder()
+            .vocab(vocab)
+            .unk_token("t0".into())
+            .build()
+            .unwrap();
+        Arc::new(tokenizers::Tokenizer::new(model))
+    }
+
+    /// The reason the worker's stream notes for a request that ends as `server` answers, with
+    /// `t7` as its end token, a budget of `max_tokens` and the stop sequences `stops`.
+    fn noted_end(server: Scripted, max_tokens: usize, stops: &[&str]) -> Option<FinishReason> {
+        let engine = <LlmEngine as InferenceEngine>::new();
+        let probe = Arc::new(RequestProbe::default());
+        let params = GenerationParams {
+            max_tokens: Some(max_tokens),
+            stop_sequences: stops.iter().map(|s| s.to_string()).collect(),
+            probe: Some(probe.clone()),
+            ..GenerationParams::default()
+        };
+        let mut rx = engine.stream_tokens_via_cb(
+            Arc::new(server),
+            words(),
+            vec![7],
+            64,
+            GenerationDefaults::default(),
+            vec![1, 2],
+            params,
+            None,
+        );
+        while rx.blocking_recv().is_some() {}
+        probe.end()
+    }
+
+    /// An answer the worker ends at its budget ends at the token cap.
+    #[test]
+    fn a_worker_answer_cut_by_its_budget_ends_at_the_token_cap() {
+        let server = Scripted {
+            tokens: vec![3, 4, 5],
+            end: Some(Worker::Length),
+        };
+        assert_eq!(noted_end(server, 3, &[]), Some(FinishReason::MaxTokens));
+    }
+
+    /// An answer that reaches an end token ends on it.
+    #[test]
+    fn a_worker_answer_that_meets_its_end_token_ends_on_it() {
+        let server = Scripted {
+            tokens: vec![3, 7, 4],
+            end: Some(Worker::Length),
+        };
+        assert_eq!(noted_end(server, 8, &[]), Some(FinishReason::Eos));
+    }
+
+    /// An answer whose text holds a stop sequence ends on that sequence.
+    #[test]
+    fn a_worker_answer_holding_a_stop_sequence_ends_on_it() {
+        let server = Scripted {
+            tokens: vec![3, 4, 5, 6],
+            end: Some(Worker::Length),
+        };
+        assert_eq!(
+            noted_end(server, 4, &["t9", "t5"]),
+            Some(FinishReason::StopSequence("t5".into()))
+        );
+    }
 
     #[test]
     fn only_an_out_of_memory_first_message_is_retried() {

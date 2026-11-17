@@ -11,6 +11,10 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 - Experts: compute a mixture's missing Q5_1 experts on the host.
 - Experts: compute a mixture's missing Q3_K experts on the host.
 
+### Fixed
+
+- API: say that a non-streamed answer ended on its token budget when it did.
+
 ## [0.5.1] - 2026-11-17
 
 ### Changed
