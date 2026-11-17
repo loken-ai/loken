@@ -37,6 +37,7 @@ pub mod media_overlap;
 pub mod parler_step;
 pub mod prefill_layer;
 pub mod schedule_host;
+pub mod shortconv_prompt;
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -348,6 +349,12 @@ pub fn benches() -> Vec<Bench> {
             about: "one routed expert's weights host to card: compute or copy stream, pageable or pinned, the card idle or busy",
             needs_card: true,
             run: expert_upload::run,
+        });
+        all.push(Bench {
+            name: "shortconv-prompt",
+            about: "the gated short convolution of one layer over a prompt chunk on a card: a launch per row against one launch for every row",
+            needs_card: true,
+            run: shortconv_prompt::run,
         });
         all.push(Bench {
             name: "prefill-layer",

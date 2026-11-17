@@ -276,3 +276,129 @@ pub fn lfm2_shortconv_f16io(
     };
     Ok(Some((y, new_state)))
 }
+
+/// The LFM2 gated short convolution over every row of a chunk in one launch: `bcx`
+/// `[b, seq, 3D]` F16 or F32, `state` `[b, D, L-1]` F32, `conv_w` `[D, L]` F32.
+/// Returns `y` `[b, seq, D]` in the dtype of `bcx` and the state after the last row.
+/// The rows and the state are those of `seq` calls of [`lfm2_shortconv_f16io`], bit for bit.
+/// `Ok(None)` when the kernel does not take the inputs: not on a card, another dtype, or a
+/// window longer than the kernel carries.
+pub fn lfm2_shortconv_rows(
+    bcx: &Tensor,
+    state: &Tensor,
+    conv_w: &Tensor,
+    d_model: usize,
+    l_cache: usize,
+) -> Result<Option<(Tensor, Tensor)>> {
+    use core::ffi::c_void;
+    if !bcx.device().is_cuda() || !matches!(bcx.dtype(), DType::F16 | DType::F32) {
+        return Ok(None);
+    }
+    if state.dtype() != DType::F32 || conv_w.dtype() != DType::F32 {
+        return Ok(None);
+    }
+    let (b, seq, width) = bcx.dims3()?;
+    if width != 3 * d_model || l_cache < 2 || seq == 0 {
+        return Ok(None);
+    }
+    if l_cache - 1 > unsafe { loken_lfm2_shortconv_rows_window() } as usize {
+        return Ok(None);
+    }
+    let dev = bcx.device().as_cuda_device()?;
+    let in_place = super::in_place_state_on();
+    // An in-place state is written where it lies, so it is used as it is, never a copy.
+    if in_place && !state.is_contiguous() {
+        crate::tensor::bail!("lfm2_shortconv_rows: an in-place state must be contiguous");
+    }
+    let in_f16 = bcx.dtype() == DType::F16;
+    let bcx = bcx.contiguous()?;
+    let state = state.contiguous()?;
+    let conv_w = conv_w.contiguous()?;
+    let (bs, bl) = bcx.storage_and_layout();
+    let (ss, sl) = state.storage_and_layout();
+    let (ws, wl) = conv_w.storage_and_layout();
+    let StorageView::Cuda(bc) = &*bs else {
+        return Ok(None);
+    };
+    let StorageView::Cuda(sc) = &*ss else {
+        return Ok(None);
+    };
+    let StorageView::Cuda(wc) = &*ws else {
+        return Ok(None);
+    };
+    let elem = bcx.dtype().size_in_bytes();
+    let bcx_p = if in_f16 {
+        let s = bc.as_cuda_slice::<half::f16>()?;
+        s.device_ptr(s.stream()).0
+    } else {
+        let s = bc.as_cuda_slice::<f32>()?;
+        s.device_ptr(s.stream()).0
+    } + (bl.start_offset() * elem) as u64;
+    let st_s = sc.as_cuda_slice::<f32>()?;
+    let st_p = (st_s.device_ptr(st_s.stream()).0 as *mut f32).wrapping_add(sl.start_offset());
+    let cw_s = wc.as_cuda_slice::<f32>()?;
+    let cw_p = (cw_s.device_ptr(cw_s.stream()).0 as *const f32).wrapping_add(wl.start_offset());
+    let n = b * seq * d_model;
+    let y_f16 = if in_f16 {
+        Some(unsafe { dev.alloc::<half::f16>(n) }?)
+    } else {
+        None
+    };
+    let y_f32 = if in_f16 {
+        None
+    } else {
+        Some(unsafe { dev.alloc::<f32>(n) }?)
+    };
+    let y_p = match (&y_f16, &y_f32) {
+        (Some(y), _) => y.device_ptr(y.stream()).0,
+        (_, Some(y)) => y.device_ptr(y.stream()).0,
+        _ => unreachable!("one output is allocated"),
+    };
+    let new_state = if in_place {
+        None
+    } else {
+        Some(unsafe { dev.alloc::<f32>(b * d_model * (l_cache - 1)) }?)
+    };
+    let out_p = match &new_state {
+        Some(n) => n.device_ptr(n.stream()).0 as *mut f32,
+        None => st_p,
+    };
+    let stream = dev.cuda_stream().cu_stream() as i64;
+    unsafe {
+        loken_lfm2_shortconv_rows(
+            bcx_p as *const c_void,
+            st_p,
+            cw_p,
+            y_p as *mut c_void,
+            out_p,
+            b as i32,
+            seq as i32,
+            d_model as i32,
+            l_cache as i32,
+            in_f16 as i32,
+            stream,
+        );
+    }
+    drop(bs);
+    drop(ss);
+    drop(ws);
+    let y = match (y_f16, y_f32) {
+        (Some(y), _) => tensor_from_cuda_storage(
+            CudaStorage::wrap_cuda_slice(y, dev.clone()),
+            (b, seq, d_model),
+        )?,
+        (_, Some(y)) => tensor_from_cuda_storage(
+            CudaStorage::wrap_cuda_slice(y, dev.clone()),
+            (b, seq, d_model),
+        )?,
+        _ => unreachable!("one output is allocated"),
+    };
+    let new_state = match new_state {
+        Some(n) => tensor_from_cuda_storage(
+            CudaStorage::wrap_cuda_slice(n, dev.clone()),
+            (b, d_model, l_cache - 1),
+        )?,
+        None => state.clone(),
+    };
+    Ok(Some((y, new_state)))
+}

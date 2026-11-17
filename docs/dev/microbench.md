@@ -22,6 +22,7 @@ cargo bench --features cuda,microbench --bench microbench -- expert-read --shape
 cargo bench --features cuda,microbench --bench microbench -- expert-pairs --shapes-from /models/large.gguf --layer 3 --block 1,9 --json results/expert-pairs.json
 cargo bench --features cuda,microbench --bench microbench -- host-pairs --shapes-from /models/large.gguf --layer 3 --block 1,9 --json results/host-pairs.json
 cargo bench --features cuda,microbench --bench microbench -- prefill-layer --shapes-from /models/dense.gguf --json results/prefill-layer.json
+cargo bench --features cuda,microbench --bench microbench -- shortconv-prompt --shapes-from /models/hybrid.gguf --rows 1000
 cargo bench --features cuda,microbench --bench microbench -- marlin-rows --json results/marlin-rows.json
 cargo bench --features cuda,microbench --bench microbench -- decode-inputs --batch 64 --context 512
 cargo bench --features cuda,microbench --bench microbench -- decode-layer --batch 64 --context 512 --json results/decode-layer.json
@@ -32,7 +33,7 @@ cargo bench --features microbench --bench microbench -- host-prompt --hidden 409
 ```
 
 A ROCm build takes `rocm` in place of `cuda`.  
-A build without a GPU runtime omits `crossing`, `decode-inputs`, `decode-layer`, `dequant-gemm`, `expert-ahead`, `expert-pairs`, `expert-upload`, `host-pairs`, `marlin-rows`, `media-overlap`, `prefill-layer` and `parler-step`.
+A build without a GPU runtime omits `crossing`, `decode-inputs`, `decode-layer`, `dequant-gemm`, `expert-ahead`, `expert-pairs`, `expert-upload`, `host-pairs`, `marlin-rows`, `media-overlap`, `prefill-layer`, `shortconv-prompt` and `parler-step`.
 `parler-step` also needs the `audio` feature, which `media` brings.
 
 Arguments after `--`:
@@ -52,7 +53,7 @@ Arguments after `--`:
 | `--projection-bytes` | The bytes of each projection, 1 value or 3, in place of `--inter` and `--weight-bits`. | derived |
 | `--gate-format` | The format of an expert's gate and up weights, without a file (`host-expert`, `expert-pairs`). | iq2_xxs |
 | `--down-format` | The format of an expert's down weights, without a file (`host-expert`, `expert-pairs`). | q2_k |
-| `--rows` | Rows of the prompt batch one layer of `prefill-layer` moves, or the prompt rows of `host-prompt`. | 130 |
+| `--rows` | Rows of the prompt batch one layer of `prefill-layer` moves, or the prompt rows of `host-prompt` and `shortconv-prompt`. | 130 |
 | `--heads` | Query heads, without a file (`prefill-layer`, `marlin-rows`, `decode-layer`). | the file's for `prefill-layer`, 32 for `marlin-rows` |
 | `--kv-heads` | Key-value heads, without a file (`prefill-layer`, `marlin-rows`, `decode-layer`). | the file's, else the heads for `prefill-layer`, 8 for `marlin-rows` |
 | `--head-dim` | Elements of one head, without a file. It sizes the rope rows of `schedule-host` and `decode-inputs`, and the heads of `decode-layer`. | the file's, else the hidden size over the heads for `prefill-layer`, 128 for the others |
@@ -363,6 +364,16 @@ Its variants:
 - The tiled Q8_0 GEMM over the same values held as Q8_0 blocks, which the served prompt runs.
 
 The note of the second variant counts the outputs that differ from the first's.
+
+### shortconv-prompt
+
+`shortconv-prompt` runs the gated short convolution of one layer over `--rows` prompt rows on a card.
+The width is the file's `embedding_length` and the taps its `shortconv.l_cache`, so it needs `--shapes-from`.
+The rows are F16, the card's activation format.
+Its variants:
+
+- The token steps: 1 launch of the token kernel per row, then the rows concatenated.
+- The whole sequence: 1 launch for every row, with the same rows and the same state after them.
 
 ### prefill-layer
 

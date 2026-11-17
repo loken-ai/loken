@@ -771,34 +771,9 @@ impl ShortConv {
             Some(ConvState::Card(t)) => t,
             _ => Tensor::zeros_on((b, self.d_model, self.l_cache - 1), DType::F32, &x.device())?,
         };
-        let mut state = state;
-        let mut rows = Vec::with_capacity(seq);
-        for t in 0..seq {
-            let bcx = proj.i((.., t, ..))?.contiguous()?;
-            let (y, next) = match crate::inference::moe_cuda::lfm2_shortconv_f16io(
-                &bcx,
-                &state,
-                &self.conv_w,
-                self.d_model,
-                self.l_cache,
-            )? {
-                Some(out) => out,
-                None => crate::inference::kernel::fused::fused_lfm2_shortconv(
-                    &bcx.to_dtype(DType::F32)?,
-                    &state,
-                    &self.conv_w,
-                    self.d_model,
-                    self.l_cache,
-                )?,
-            };
-            state = next;
-            rows.push(y.to_dtype(x.dtype())?.unsqueeze(1)?);
-        }
+        let (y, state) = short_conv_card(&proj, state, &self.conv_w, self.d_model, self.l_cache)?;
         hold_conv(&mut self.state, state, &mut self.moves)?;
-        if rows.len() == 1 {
-            return Ok(rows.pop().unwrap());
-        }
-        Tensor::cat(&rows.iter().collect::<Vec<_>>(), 1)
+        y.to_dtype(x.dtype())
     }
 
     /// The convolution over `proj` `[1, seq, 3 * d_model]` F32 on the host, advancing the
@@ -816,6 +791,64 @@ impl ShortConv {
         let rows = proj.f32_data()?;
         Ok(short_conv_host(rows, window, &self.conv_w_host, d, l, seq))
     }
+}
+
+/// The convolution over the rows of `proj` `[b, seq, 3 * d]` on a card, from `state`
+/// `[b, d, l - 1]`: every row in one launch where the kernel takes them, else row by row.
+/// Returns `y` `[b, seq, d]` and the state after the last row, both those of the row loop.
+pub fn short_conv_card(
+    proj: &Tensor,
+    state: Tensor,
+    taps: &Tensor,
+    d: usize,
+    l: usize,
+) -> Result<(Tensor, Tensor)> {
+    if proj.dim(1)? > 1 {
+        let rows = match proj.dtype() {
+            DType::F16 => proj.clone(),
+            _ => proj.to_dtype(DType::F32)?,
+        };
+        if let Some(out) =
+            crate::inference::moe_cuda::lfm2_shortconv_rows(&rows, &state, taps, d, l)?
+        {
+            return Ok(out);
+        }
+    }
+    short_conv_card_steps(proj, state, taps, d, l)
+}
+
+/// [`short_conv_card`] one row at a time: one launch of the token kernel per row.
+pub fn short_conv_card_steps(
+    proj: &Tensor,
+    state: Tensor,
+    taps: &Tensor,
+    d: usize,
+    l: usize,
+) -> Result<(Tensor, Tensor)> {
+    let seq = proj.dim(1)?;
+    let mut state = state;
+    let mut rows = Vec::with_capacity(seq);
+    for t in 0..seq {
+        let bcx = proj.i((.., t, ..))?.contiguous()?;
+        let (y, next) =
+            match crate::inference::moe_cuda::lfm2_shortconv_f16io(&bcx, &state, taps, d, l)? {
+                Some(out) => out,
+                None => crate::inference::kernel::fused::fused_lfm2_shortconv(
+                    &bcx.to_dtype(DType::F32)?,
+                    &state,
+                    taps,
+                    d,
+                    l,
+                )?,
+            };
+        state = next;
+        rows.push(y.unsqueeze(1)?);
+    }
+    let y = match rows.len() {
+        1 => rows.pop().expect("one row"),
+        _ => Tensor::cat(&rows.iter().collect::<Vec<_>>(), 1)?,
+    };
+    Ok((y, state))
 }
 
 /// [`ShortConv::host_steps`] over plain slices: `rows` `[seq, 3d]` as `B | C | x`,
@@ -2134,6 +2167,63 @@ mod tests {
         let v = |t: &Tensor| t.flatten_all().unwrap().to_vec1::<f32>().unwrap();
         assert_eq!(v(&tail_a), v(&tail_b));
         assert_eq!(v(&whole.narrow(1, 2, seq - 2).unwrap()), v(&tail_a));
+    }
+
+    /// The whole-sequence convolution on a card gives the rows and the state of its token
+    /// steps, bit for bit: in F16 and in F32, at 2 batch rows, over windows of 2 and 3 values,
+    /// over runs of rows that do and do not fill the kernel's, across 2 chunks that carry the
+    /// state from one to the next, and with the state advanced in place as a recorded step does.
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn the_card_short_conv_over_a_chunk_gives_the_rows_and_state_of_its_token_steps() {
+        let Ok(dev) = Device::new_cuda(0) else {
+            return;
+        };
+        let d = 300;
+        let cases = [
+            (DType::F16, 3, 1, 100, 37),
+            (DType::F16, 3, 2, 33, 32),
+            (DType::F16, 4, 1, 64, 2),
+            (DType::F32, 3, 1, 70, 1),
+            (DType::F32, 4, 2, 5, 3),
+        ];
+        for ((dtype, l, b, seq, cut), in_place) in
+            cases.into_iter().flat_map(|c| [(c, false), (c, true)])
+        {
+            let _mode = crate::inference::moe_cuda::in_place_state(in_place);
+            let proj = Tensor::from_vec(values(b * seq * 3 * d, 7, 1.0), (b, seq, 3 * d), &dev)
+                .unwrap()
+                .to_dtype(dtype)
+                .unwrap();
+            let taps = Tensor::from_vec(values(d * l, 8, 0.5), (d, l), &dev).unwrap();
+            let start =
+                Tensor::from_vec(values(b * d * (l - 1), 9, 1.0), (b, d, l - 1), &dev).unwrap();
+            let flat = |t: &Tensor| {
+                t.to_dtype(DType::F32)
+                    .unwrap()
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap()
+            };
+            let (y_steps, s_steps) =
+                short_conv_card_steps(&proj, start.affine(1.0, 0.0).unwrap(), &taps, d, l).unwrap();
+            let (y_rows, s_rows) =
+                short_conv_card(&proj, start.affine(1.0, 0.0).unwrap(), &taps, d, l).unwrap();
+            assert_eq!(y_rows.dtype(), y_steps.dtype());
+            assert_eq!(y_rows.dims(), y_steps.dims());
+            let case = format!("{dtype:?} l {l} b {b} seq {seq} in place {in_place}");
+            assert_eq!(flat(&y_rows), flat(&y_steps), "{case}");
+            assert_eq!(flat(&s_rows), flat(&s_steps), "{case}");
+            let head = proj.narrow(1, 0, cut).unwrap();
+            let tail = proj.narrow(1, cut, seq - cut).unwrap();
+            let (y_head, s_head) =
+                short_conv_card(&head, start.affine(1.0, 0.0).unwrap(), &taps, d, l).unwrap();
+            let (y_tail, s_tail) = short_conv_card(&tail, s_head, &taps, d, l).unwrap();
+            let joined = Tensor::cat(&[&y_head, &y_tail], 1).unwrap();
+            assert_eq!(flat(&joined), flat(&y_steps), "{case}, chunks at {cut}");
+            assert_eq!(flat(&s_tail), flat(&s_steps), "{case}, chunks at {cut}");
+        }
     }
 
     /// The Mamba2 block written out over the whole history: the convolution reads the

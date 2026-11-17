@@ -356,6 +356,15 @@ pub fn lfm2_shortconv_f16io(
 ) -> Result<Option<(Tensor, Tensor)>> {
     Ok(None)
 }
+pub fn lfm2_shortconv_rows(
+    _bcx: &Tensor,
+    _state: &Tensor,
+    _conv_w: &Tensor,
+    _d_model: usize,
+    _l_cache: usize,
+) -> Result<Option<(Tensor, Tensor)>> {
+    Ok(None)
+}
 pub fn zgate_rmsnorm_f16io(
     _o: &Tensor,
     _z: &Tensor,

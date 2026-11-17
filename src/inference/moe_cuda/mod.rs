@@ -16,6 +16,8 @@ crate::tensor::gpu_runtime::aot_kernels! {
         fn loken_gated_delta_net_chunk_rows() -> i32;
         /// The scratch, in floats, the chunked delta-rule launch needs for these shapes.
         fn loken_gated_delta_net_chunked_scratch(h: i32, n_tokens: i32, s_v: i32) -> i64;
+        /// The longest window the whole-sequence short convolution carries between chunks.
+        fn loken_lfm2_shortconv_rows_window() -> i32;
     }
 }
 
@@ -215,6 +217,9 @@ cuda_launchers! {
         bcx: *const c_void, state_in: *const c_void,
         conv_w: *const c_void, y_out: *mut c_void,
         state_out: *mut c_void, b: i32, d: i32, l: i32);
+    loken_lfm2_shortconv_rows(
+        bcx: *const c_void, state_in: *const f32, conv_w: *const f32, y_out: *mut c_void,
+        state_out: *mut f32, b: i32, seq: i32, d: i32, l: i32, in_f16: i32);
 }
 cuda_launchers! {
     loken_moe_gemm_gguf_gate_up_gelu_mul_concat(
