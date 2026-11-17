@@ -300,10 +300,14 @@ pub(super) unsafe fn dot_q2_0(xs: &[BlockQ2_0], ys: &[BlockQ8K32]) -> f32 {
 mod tests {
     use super::*;
 
-    /// `n` blocks of `T` from random bytes, each block's leading f16 scale a small finite value,
-    /// and its minimum too in a format with one.
+    /// `n` blocks of `T` from random bytes, each f16 scale of a block a small finite value: the
+    /// leading one, the minimum after it in a format with one, the trailing one of q3_K.
     fn blocks<T: BlockFormat>(n: usize, seed: u64) -> Vec<T> {
-        let scales = if T::DTYPE == GgmlDType::Q5_1 { 2 } else { 1 };
+        let scales: &[usize] = match T::DTYPE {
+            GgmlDType::Q5_1 => &[0, 2],
+            GgmlDType::Q3K => &[108],
+            _ => &[0],
+        };
         let size = std::mem::size_of::<T>();
         let mut state = seed;
         let mut next = || {
@@ -315,10 +319,10 @@ mod tests {
         (0..n)
             .map(|_| {
                 let mut bytes: Vec<u8> = (0..size).map(|_| next() as u8).collect();
-                for s in 0..scales {
+                for &at in scales {
                     let d =
                         f16::from_f32((next() % 2001) as f32 / 1000.0 - 1.0) * f16::from_f32(0.01);
-                    bytes[2 * s..2 * s + 2].copy_from_slice(&d.to_le_bytes());
+                    bytes[at..at + 2].copy_from_slice(&d.to_le_bytes());
                 }
                 // Safety: every format here is plain bytes after its scale.
                 unsafe { std::ptr::read_unaligned(bytes.as_ptr() as *const T) }
@@ -372,5 +376,6 @@ mod tests {
         same_bits::<BlockQ8_0>(&RUN_WIDTHS, super::super::q8_0::dot_exact_scalar);
         same_bits::<BlockQ5_0>(&RUN_WIDTHS, super::super::q5_0::dot_exact_scalar);
         same_bits::<BlockQ5_1>(&RUN_WIDTHS, super::super::q5_1::dot_exact_scalar);
+        same_bits::<BlockQ3K>(&BLOCK_WIDTHS, super::super::q3_k::dot_exact_scalar);
     }
 }

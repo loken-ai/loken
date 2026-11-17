@@ -146,6 +146,59 @@ impl BlockFormat for BlockQ3K {
     }
 }
 
+impl ExactDot for BlockQ3K {
+    type Act = BlockQ8K;
+    fn dot_exact(xs: &[Self], ys: &[BlockQ8K]) -> f32 {
+        #[cfg(target_arch = "x86_64")]
+        if crate::cpu::dispatch_avx2() {
+            return avx::vec_dot_q3k_q8k_exact(xs, ys);
+        }
+        dot_exact_scalar(xs, ys)
+    }
+}
+
+/// [`ExactDot::dot_exact`] one value at a time: the steps the vector kernel is held to.
+pub(crate) fn dot_exact_scalar(xs: &[BlockQ3K], ys: &[BlockQ8K]) -> f32 {
+    let mut total = -0.0f32;
+    for (x, y) in xs.iter().zip(ys) {
+        total += combine(x, y.d, block_sum(x, y));
+    }
+    total
+}
+
+/// A block's integer sum against a q8_K block: the signed 3-bit codes against the activations
+/// under each sixteen-value sub-block's signed scale.
+fn block_sum(x: &BlockQ3K, y: &BlockQ8K) -> i32 {
+    let scales = q3k_scales(&x.scales);
+    let mut scaled = 0i32;
+    for (s, &sc) in scales.iter().enumerate() {
+        let (chunk, t) = (s / 8, s % 8);
+        let (lane, half) = (t / 2, t % 2);
+        let qs = &x.qs[32 * chunk + 16 * half..][..16];
+        let hmask = &x.hmask[16 * half..][..16];
+        let bit = 1u8 << (4 * chunk + lane);
+        let acts = &y.qs[128 * chunk + 32 * lane + 16 * half..][..16];
+        let sum: i32 = qs
+            .iter()
+            .zip(acts)
+            .enumerate()
+            .map(|(k, (q, &a))| {
+                let low = ((q >> (2 * lane)) & 0x03) as i32;
+                let third = if hmask[k] & bit == 0 { -4 } else { 0 };
+                (low + third) * a as i32
+            })
+            .sum();
+        scaled += sc as i32 * sum;
+    }
+    scaled
+}
+
+/// One block's share of the exact dot from its integer sum (see [`block_sum`]).
+#[inline(always)]
+pub(crate) fn combine(x: &BlockQ3K, y_d: f32, scaled: i32) -> f32 {
+    y_d * (x.d.to_f32() * scaled as f32)
+}
+
 /// Quantise whole blocks, optionally against an importance matrix.
 ///
 /// Two stages, as in q4_K: each group of sixteen is fitted to a scale, then the sixteen scales

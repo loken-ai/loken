@@ -10,8 +10,9 @@
 use super::*;
 use crate::tensor::gpu_runtime::driver::{LaunchConfig, PushKernelArg};
 use crate::tensor::quant_cpu::{
-    BlockFormat, BlockIq2S, BlockIq3S, BlockIq3Xxs, BlockIq4Nl, BlockQ2K, BlockQ2_0, BlockQ4K,
-    BlockQ5_0, BlockQ5_1, BlockQ6K, BlockQ8K, BlockQ8K32, BlockQ8K32S, BlockQ8_0, ExactDot,
+    BlockFormat, BlockIq2S, BlockIq3S, BlockIq3Xxs, BlockIq4Nl, BlockQ2K, BlockQ2_0, BlockQ3K,
+    BlockQ4K, BlockQ5_0, BlockQ5_1, BlockQ6K, BlockQ8K, BlockQ8K32, BlockQ8K32S, BlockQ8_0,
+    ExactDot,
 };
 
 /// A format the exact kernels read.
@@ -28,6 +29,7 @@ pub(super) enum Fmt {
     Q8_0,
     Q5_0,
     Q5_1,
+    Q3K,
 }
 
 impl Fmt {
@@ -44,6 +46,7 @@ impl Fmt {
             GgmlDType::Q8_0 => Some(Self::Q8_0),
             GgmlDType::Q5_0 => Some(Self::Q5_0),
             GgmlDType::Q5_1 => Some(Self::Q5_1),
+            GgmlDType::Q3K => Some(Self::Q3K),
             _ => None,
         }
     }
@@ -62,6 +65,7 @@ impl Fmt {
             Self::Q8_0 => "q8_0",
             Self::Q5_0 => "q5_0",
             Self::Q5_1 => "q5_1",
+            Self::Q3K => "q3_k",
         }
     }
 
@@ -511,6 +515,7 @@ pub(super) fn host_pairs(
             Fmt::Q8_0 => run::<G, BlockQ8_0>(exact, host, x, pairs),
             Fmt::Q5_0 => run::<G, BlockQ5_0>(exact, host, x, pairs),
             Fmt::Q5_1 => run::<G, BlockQ5_1>(exact, host, x, pairs),
+            Fmt::Q3K => run::<G, BlockQ3K>(exact, host, x, pairs),
         }
     }
     Ok(match exact.gate {
@@ -525,6 +530,7 @@ pub(super) fn host_pairs(
         Fmt::Q8_0 => with_down::<BlockQ8_0>(exact, host, x, pairs),
         Fmt::Q5_0 => with_down::<BlockQ5_0>(exact, host, x, pairs),
         Fmt::Q5_1 => with_down::<BlockQ5_1>(exact, host, x, pairs),
+        Fmt::Q3K => with_down::<BlockQ3K>(exact, host, x, pairs),
     })
 }
 
@@ -1290,6 +1296,7 @@ pub mod bench {
                 Some(Fmt::Q8_0) => rows::<BlockQ8_0>(t, e, x, own),
                 Some(Fmt::Q5_0) => rows::<BlockQ5_0>(t, e, x, own),
                 Some(Fmt::Q5_1) => rows::<BlockQ5_1>(t, e, x, own),
+                Some(Fmt::Q3K) => rows::<BlockQ3K>(t, e, x, own),
                 None => f32::NAN,
             }
         }
@@ -1611,6 +1618,8 @@ mod tests {
         compare::<BlockQ4K, BlockQ5_0>(GgmlDType::Q4K, GgmlDType::Q5_0);
         compare::<BlockQ5_1, BlockQ5_1>(GgmlDType::Q5_1, GgmlDType::Q5_1);
         compare::<BlockQ4K, BlockQ5_1>(GgmlDType::Q4K, GgmlDType::Q5_1);
+        compare::<BlockQ3K, BlockQ3K>(GgmlDType::Q3K, GgmlDType::Q3K);
+        compare::<BlockQ2K, BlockQ3K>(GgmlDType::Q2K, GgmlDType::Q3K);
         // The widths of a released file whose expert width is whole runs, not whole blocks.
         compare_at::<BlockQ4K, BlockQ8_0>(GgmlDType::Q4K, GgmlDType::Q8_0, 2560, 640);
         compare_at::<BlockQ4K, BlockQ5_0>(GgmlDType::Q4K, GgmlDType::Q5_0, 2560, 640);

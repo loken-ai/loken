@@ -6950,6 +6950,8 @@ mod tests {
             [GgmlDType::Q8_0, GgmlDType::Q8_0],
             [GgmlDType::Q5_0, GgmlDType::Q5_0],
             [GgmlDType::Q5_1, GgmlDType::Q5_1],
+            [GgmlDType::Q3K, GgmlDType::Q3K],
+            [GgmlDType::Q2K, GgmlDType::Q3K],
         ];
         same_bits_wherever_pairs_run(&card, (16, 4, 512, 256), &formats);
     }
@@ -7345,7 +7347,7 @@ mod tests {
     }
 
     /// Expert formats with exact kernels: gate and up, down.
-    const FORMATS_WITH_EXACT_KERNELS: [[GgmlDType; 2]; 10] = [
+    const FORMATS_WITH_EXACT_KERNELS: [[GgmlDType; 2]; 11] = [
         [GgmlDType::Q4K, GgmlDType::Q6K],
         [GgmlDType::Iq2S, GgmlDType::Q6K],
         [GgmlDType::Iq3Xxs, GgmlDType::Q6K],
@@ -7356,13 +7358,13 @@ mod tests {
         [GgmlDType::Q4K, GgmlDType::Q8_0],
         [GgmlDType::Q4K, GgmlDType::Q5_0],
         [GgmlDType::Q4K, GgmlDType::Q5_1],
+        [GgmlDType::Q2K, GgmlDType::Q3K],
     ];
 
     /// Expert formats the tier serves without exact kernels, gate and up, down: a gate, up or
     /// down stack in a format they do not read sends the whole layer to the fallback.
-    const FORMATS_WITHOUT_EXACT_KERNELS: [[GgmlDType; 2]; 4] = [
+    const FORMATS_WITHOUT_EXACT_KERNELS: [[GgmlDType; 2]; 3] = [
         [GgmlDType::Q5K, GgmlDType::Q5K],
-        [GgmlDType::Q3K, GgmlDType::Q5_1],
         [GgmlDType::Iq4Xs, GgmlDType::Q5_1],
         [GgmlDType::Q4K, GgmlDType::Q5K],
     ];

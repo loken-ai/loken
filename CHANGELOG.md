@@ -9,6 +9,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 - Experts: give a mixture's first request the whole cache of its cards.
 - Experts: lock a mixture's host pages before its load ends, not during a first prompt.
 - Experts: compute a mixture's missing Q5_1 experts on the host.
+- Experts: compute a mixture's missing Q3_K experts on the host.
 
 ## [0.5.1] - 2026-11-17
 

@@ -2760,6 +2760,7 @@ extern "C" __global__ void cx_expert_down_q3_k(
 #define TX_Q8_0 8
 #define TX_Q5_0 9
 #define TX_Q5_1 10
+#define TX_Q3K 11
 
 // A format's bytes per 256 values, and whether its dot reads q8_K32 blocks and folds a block run
 // by run (RUNS) or reads q8_K blocks and folds a block in 1 step; ACT is the activation block's
@@ -2768,6 +2769,7 @@ template <int F> struct TxFmt;
 template <> struct TxFmt<TX_Q2K> { static constexpr int BYTES = 84; static constexpr bool RUNS = false; static constexpr int ACT = CX_Q8K_BYTES; };
 template <> struct TxFmt<TX_Q4K> { static constexpr int BYTES = 144; static constexpr bool RUNS = false; static constexpr int ACT = CX_Q8K_BYTES; };
 template <> struct TxFmt<TX_Q6K> { static constexpr int BYTES = 210; static constexpr bool RUNS = false; static constexpr int ACT = CX_Q8K_BYTES; };
+template <> struct TxFmt<TX_Q3K> { static constexpr int BYTES = 110; static constexpr bool RUNS = false; static constexpr int ACT = CX_Q8K_BYTES; };
 template <> struct TxFmt<TX_IQ2S> { static constexpr int BYTES = 82; static constexpr bool RUNS = true; static constexpr int ACT = CX_Q8K32_BYTES; };
 template <> struct TxFmt<TX_Q5_0> { static constexpr int BYTES = 176; static constexpr bool RUNS = true; static constexpr int ACT = CX_Q8K32_BYTES; };
 template <> struct TxFmt<TX_Q5_1> { static constexpr int BYTES = 192; static constexpr bool RUNS = true; static constexpr int ACT = CX_Q8K32S_BYTES; };
@@ -2866,6 +2868,31 @@ template <> __device__ void tx_lane_sums<TX_Q6K>(
     const int * ap = reinterpret_cast<const int *>(a + 4 + v0);
     const int dot = __dp4a(packed[1], ap[1], __dp4a(packed[0], ap[0], 0));
     *scaled = (int) reinterpret_cast<const signed char *>(w + 192)[v0 >> 4] * dot;
+    *offset = 0;
+}
+
+// 4 codes of a q3_K block from a word of its 2-bit codes and the matching word of its high bits:
+// bits `shift` of each byte, less 4 where bit `hb` of the high byte is clear.
+__device__ static __forceinline__ int tx_q3k_codes(const unsigned int qw, const unsigned int hw, const int shift, const int hb) {
+    const unsigned int low = (qw >> shift) & 0x03030303u;
+    const unsigned int clear = ~(hw >> hb) & 0x01010101u;
+    return (int) __vsub4(low, clear << 2);
+}
+
+// Value v of a q3_K block (32 bytes of high bits, 64 of 2-bit codes, 12 of scales, the f16 scale):
+// its code is bits 2j of byte 32 + 32c + l, less 4 where bit 4c + j of byte l is clear, with
+// c = v / 128, j = (v % 128) / 32, l = v % 32; sub-block v / 16 takes a signed 6-bit scale.
+template <> __device__ void tx_lane_sums<TX_Q3K>(
+        const unsigned char * w, const unsigned char * a, const int lane, int * scaled, int * offset) {
+    const int v0 = 8 * lane, chunk = v0 >> 7, j = (v0 & 127) >> 5, l0 = v0 & 31;
+    const unsigned char * q = w + 32 + 32 * chunk + l0;
+    const unsigned char * hm = w + l0;
+    const int shift = 2 * j, hb = 4 * chunk + j;
+    const int c0 = tx_q3k_codes(tx_u32_2(q), tx_u32_2(hm), shift, hb);
+    const int c1 = tx_q3k_codes(tx_u32_2(q + 4), tx_u32_2(hm + 4), shift, hb);
+    const int * ap = reinterpret_cast<const int *>(a + 4 + v0);
+    const int dot = __dp4a(c1, ap[1], __dp4a(c0, ap[0], 0));
+    *scaled = cx_q3k_scale(w + 96, v0 >> 4) * dot;
     *offset = 0;
 }
 
@@ -3038,6 +3065,9 @@ template <> __device__ float tx_combine<TX_Q4K>(const unsigned char * w, float y
 template <> __device__ float tx_combine<TX_Q6K>(const unsigned char * w, float yd, int scaled, int) {
     return __fmul_rn(yd, __fmul_rn(tx_f16(w + 208), (float) scaled));
 }
+template <> __device__ float tx_combine<TX_Q3K>(const unsigned char * w, float yd, int scaled, int) {
+    return __fmul_rn(yd, __fmul_rn(tx_f16(w + 108), (float) scaled));
+}
 template <> __device__ float tx_combine<TX_Q2K>(const unsigned char * w, float yd, int scaled, int offset) {
     return __fmul_rn(yd, __fsub_rn(__fmul_rn(tx_f16(w + 80), (float) scaled),
                                    __fmul_rn(tx_f16(w + 82), (float) offset)));
@@ -3155,6 +3185,33 @@ template <> __device__ void tx_part_sums<TX_Q4K>(
     }
     *scaled = sc;
     *offset = of;
+}
+
+// q3_K's 4 lane parts at once, the 12 bytes of its scales read as 3 words.
+template <> __device__ void tx_part_sums<TX_Q3K>(
+        const unsigned char * w, const unsigned char * a, const int part, int * scaled, int * offset) {
+    const unsigned int s0 = tx_u32_2(w + 96), s1 = tx_u32_2(w + 100), s2 = tx_u32_2(w + 104);
+    int sc = 0;
+    #pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        const int v0 = 8 * (part + 8 * k), chunk = v0 >> 7, j = (v0 & 127) >> 5, l0 = v0 & 31;
+        const unsigned char * q = w + 32 + 32 * chunk + l0;
+        const unsigned char * hm = w + l0;
+        const int shift = 2 * j, hb = 4 * chunk + j;
+        const int c0 = tx_q3k_codes(tx_u32_2(q), tx_u32_2(hm), shift, hb);
+        const int c1 = tx_q3k_codes(tx_u32_2(q + 4), tx_u32_2(hm + 4), shift, hb);
+        const int * ap = reinterpret_cast<const int *>(a + 4 + v0);
+        const int dot = __dp4a(c1, ap[1], __dp4a(c0, ap[0], 0));
+        // Sub-block s takes the nibble of byte s % 4 + 4 * (s / 4 % 2) (low for s < 8) and 2
+        // bits of byte 8 + s % 4, less 32: as cx_q3k_scale.
+        const int sb = v0 >> 4, group = sb >> 2, jj = sb & 3;
+        const unsigned int nibbles = (group & 1) ? s1 : s0;
+        const int low = (int) ((nibbles >> (8 * jj + 4 * (group >> 1))) & 15u);
+        const int high = (int) ((s2 >> (8 * jj + 2 * group)) & 3u);
+        sc += ((low | (high << 4)) - 32) * dot;
+    }
+    *scaled = sc;
+    *offset = 0;
 }
 
 // The part sums of 2 matrices `w` and `w2` against the same activation block.
@@ -3538,6 +3595,7 @@ TX_ENTRIES(q2_0, TX_Q2_0)
 TX_ENTRIES(q8_0, TX_Q8_0)
 TX_ENTRIES(q5_0, TX_Q5_0)
 TX_ENTRIES(q5_1, TX_Q5_1)
+TX_ENTRIES(q3_k, TX_Q3K)
 
 // A dense projection on a card as the host computes it: the weight rows `w` [n, nsb * block bytes]
 // against `rows` q8_K rows `xq` [rows, nsb * CX_Q8K_BYTES], written to y [rows, n]. A warp per

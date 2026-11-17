@@ -193,76 +193,107 @@ pub(crate) fn vec_dot_q3k_q8k(xs: &[BlockQ3K], ys: &[BlockQ8K]) -> f32 {
 #[target_feature(enable = "avx2,fma,f16c,bmi2")]
 unsafe fn vec_dot_q3k_q8k_avx2(xs: &[BlockQ3K], ys: &[BlockQ8K]) -> f32 {
     unsafe {
-        let two_bits = _mm256_set1_epi8(3);
-        let ones = _mm256_set1_epi8(1);
         let mut acc = _mm256_setzero_ps();
-
         for (x, y) in xs.iter().zip(ys) {
             let d = y.d * crate::tensor::quant_cpu::avx::f16c_to_f32(x.d);
-            let mut codes = x.qs.as_ptr();
-            let mut acts = y.qs.as_ptr();
-
-            let scale_bytes = q3k_scale_bytes(&x.scales);
-            let third_bits = _mm256_loadu_si256(x.hmask.as_ptr() as *const __m256i);
-
-            let mut total = _mm256_setzero_si256();
-            for (half, scales) in scales_by_half(scale_bytes).into_iter().enumerate() {
-                let packed_codes = _mm256_loadu_si256(codes as *const __m256i);
-                codes = codes.add(32);
-
-                let mut next = || {
-                    let a = _mm256_loadu_si256(acts as *const __m256i);
-                    acts = acts.add(32);
-                    a
-                };
-                let (a0, a1, a2, a3) = (next(), next(), next(), next());
-
-                // Bit 4.half + q of the plane, inverted, at position two.
-                macro_rules! borrow {
-                    ($bit:literal) => {
-                        _mm256_slli_epi16(
-                            _mm256_srli_epi16(
-                                _mm256_andnot_si256(third_bits, _mm256_slli_epi16(ones, $bit)),
-                                $bit,
-                            ),
-                            2,
-                        )
-                    };
-                }
-                let borrows = if half == 0 {
-                    [borrow!(0), borrow!(1), borrow!(2), borrow!(3)]
-                } else {
-                    [borrow!(4), borrow!(5), borrow!(6), borrow!(7)]
-                };
-
-                let low_two = [
-                    _mm256_and_si256(packed_codes, two_bits),
-                    _mm256_and_si256(_mm256_srli_epi16(packed_codes, 2), two_bits),
-                    _mm256_and_si256(_mm256_srli_epi16(packed_codes, 4), two_bits),
-                    _mm256_and_si256(_mm256_srli_epi16(packed_codes, 6), two_bits),
-                ];
-
-                let mut quarter = [_mm256_setzero_si256(); 4];
-                for (q, (a, (lo, bo))) in [a0, a1, a2, a3]
-                    .into_iter()
-                    .zip(low_two.into_iter().zip(borrows))
-                    .enumerate()
-                {
-                    let value =
-                        _mm256_sub_epi16(_mm256_maddubs_epi16(lo, a), _mm256_maddubs_epi16(bo, a));
-                    quarter[q] = scaled(scales, q, value);
-                }
-                total = _mm256_add_epi32(
-                    total,
-                    _mm256_add_epi32(
-                        _mm256_add_epi32(quarter[0], quarter[1]),
-                        _mm256_add_epi32(quarter[2], quarter[3]),
-                    ),
-                );
-            }
+            let total = q3k_block_sums(x, y);
             acc = _mm256_fmadd_ps(_mm256_broadcast_ss(&d), _mm256_cvtepi32_ps(total), acc);
         }
         lanes_sum(acc)
+    }
+}
+
+/// The dot in the steps of [`crate::tensor::quant_cpu::ExactDot`].
+pub(crate) fn vec_dot_q3k_q8k_exact(xs: &[BlockQ3K], ys: &[BlockQ8K]) -> f32 {
+    super::require_avx2();
+    // SAFETY: `require_avx2` just confirmed the CPU has every feature the kernel enables.
+    unsafe { vec_dot_q3k_q8k_exact_avx2(xs, ys) }
+}
+
+#[target_feature(enable = "avx2,fma,f16c,bmi2")]
+unsafe fn vec_dot_q3k_q8k_exact_avx2(xs: &[BlockQ3K], ys: &[BlockQ8K]) -> f32 {
+    unsafe {
+        let mut acc = -0.0f32;
+        for (x, y) in xs.iter().zip(ys) {
+            acc += crate::tensor::quant_cpu::format::q3_k::combine(
+                x,
+                y.d,
+                hsum_i32_8(q3k_block_sums(x, y)),
+            );
+        }
+        acc
+    }
+}
+
+/// A q3_K block against a q8_K block in integers, eight lanes: the signed codes against the
+/// activations under each sub-block's signed scale.
+#[inline(always)]
+unsafe fn q3k_block_sums(x: &BlockQ3K, y: &BlockQ8K) -> __m256i {
+    unsafe {
+        let two_bits = _mm256_set1_epi8(3);
+        let ones = _mm256_set1_epi8(1);
+        let mut codes = x.qs.as_ptr();
+        let mut acts = y.qs.as_ptr();
+
+        let scale_bytes = q3k_scale_bytes(&x.scales);
+        let third_bits = _mm256_loadu_si256(x.hmask.as_ptr() as *const __m256i);
+
+        let mut total = _mm256_setzero_si256();
+        for (half, scales) in scales_by_half(scale_bytes).into_iter().enumerate() {
+            let packed_codes = _mm256_loadu_si256(codes as *const __m256i);
+            codes = codes.add(32);
+
+            let mut next = || {
+                let a = _mm256_loadu_si256(acts as *const __m256i);
+                acts = acts.add(32);
+                a
+            };
+            let (a0, a1, a2, a3) = (next(), next(), next(), next());
+
+            // Bit 4.half + q of the plane, inverted, at position two.
+            macro_rules! borrow {
+                ($bit:literal) => {
+                    _mm256_slli_epi16(
+                        _mm256_srli_epi16(
+                            _mm256_andnot_si256(third_bits, _mm256_slli_epi16(ones, $bit)),
+                            $bit,
+                        ),
+                        2,
+                    )
+                };
+            }
+            let borrows = if half == 0 {
+                [borrow!(0), borrow!(1), borrow!(2), borrow!(3)]
+            } else {
+                [borrow!(4), borrow!(5), borrow!(6), borrow!(7)]
+            };
+
+            let low_two = [
+                _mm256_and_si256(packed_codes, two_bits),
+                _mm256_and_si256(_mm256_srli_epi16(packed_codes, 2), two_bits),
+                _mm256_and_si256(_mm256_srli_epi16(packed_codes, 4), two_bits),
+                _mm256_and_si256(_mm256_srli_epi16(packed_codes, 6), two_bits),
+            ];
+
+            let mut quarter = [_mm256_setzero_si256(); 4];
+            for (q, (a, (lo, bo))) in [a0, a1, a2, a3]
+                .into_iter()
+                .zip(low_two.into_iter().zip(borrows))
+                .enumerate()
+            {
+                let value =
+                    _mm256_sub_epi16(_mm256_maddubs_epi16(lo, a), _mm256_maddubs_epi16(bo, a));
+                quarter[q] = scaled(scales, q, value);
+            }
+            total = _mm256_add_epi32(
+                total,
+                _mm256_add_epi32(
+                    _mm256_add_epi32(quarter[0], quarter[1]),
+                    _mm256_add_epi32(quarter[2], quarter[3]),
+                ),
+            );
+        }
+        total
     }
 }
 
