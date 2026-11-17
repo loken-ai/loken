@@ -826,6 +826,7 @@ impl LayerRopes {
         dim: usize,
         base: f32,
         yarn: Option<crate::inference::model::rope::YarnParams>,
+        linear: Option<f32>,
         len: usize,
         device: &Device,
     ) -> Result<(Tensor, Tensor)> {
@@ -833,7 +834,7 @@ impl LayerRopes {
             format!("{:?}", device.location()),
             dim,
             base.to_bits(),
-            format!("{yarn:?}"),
+            format!("{yarn:?} {linear:?}"),
             len,
         );
         if let Some(t) = self.0.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
@@ -842,8 +843,8 @@ impl LayerRopes {
         // Built with no lock held: the build runs on the pool whose workers are the other callers
         // of this function, and a worker waiting for the lock cannot finish the work its holder
         // is waiting for.
-        let t = crate::inference::generic_transformer::rope::precomput_freqs_cis_yarn(
-            dim, base, yarn, len, device,
+        let t = crate::inference::generic_transformer::rope::precomput_freqs_cis_scaled(
+            dim, base, yarn, linear, len, device,
         )?;
         let mut tables = self.0.lock().unwrap_or_else(|e| e.into_inner());
         Ok(tables.entry(key).or_insert(t).clone())
@@ -2227,27 +2228,34 @@ fn build_generic_layer(
     } else {
         config.rope_freq_base
     };
-    let (cos, sin) =
-        if head_dim != config.head_dim || rope_dim > 0 || rope_base != config.rope_freq_base {
-            // YaRN applies to full-head-dim layers; SWA/partial layers (head_dim<config)
-            // keep plain rope (their lower freq base already shortens their context).
-            let yarn = if head_dim < config.head_dim {
-                None
-            } else {
-                config.yarn
-            };
-            ropes.table(
-                effective_rope_dim,
-                rope_base,
-                yarn,
-                config
-                    .effective_max_context()
-                    .max(crate::inference::generic_transformer::rope::ROPE_TABLE_SEQ_LEN),
-                device,
-            )?
+    // A linear scaling stretches the whole-context layers; a sliding-window layer keeps the
+    // plain table.
+    let linear = config.rope_linear.filter(|_| !is_swa);
+    let (cos, sin) = if head_dim != config.head_dim
+        || rope_dim > 0
+        || rope_base != config.rope_freq_base
+        || linear != config.rope_linear
+    {
+        // YaRN applies to full-head-dim layers; SWA/partial layers (head_dim<config)
+        // keep plain rope (their lower freq base already shortens their context).
+        let yarn = if head_dim < config.head_dim {
+            None
         } else {
-            (cos.clone(), sin.clone())
+            config.yarn
         };
+        ropes.table(
+            effective_rope_dim,
+            rope_base,
+            yarn,
+            linear,
+            config
+                .effective_max_context()
+                .max(crate::inference::generic_transformer::rope::ROPE_TABLE_SEQ_LEN),
+            device,
+        )?
+    } else {
+        (cos.clone(), sin.clone())
+    };
     // (Tried: baking rope_freq_factors into cos/sin at load time to
     // skip per-call recompute. Math should be equivalent but the baked
     // tables produced wrong output for gemma4 - reverted. Likely
@@ -4135,10 +4143,11 @@ impl GenericHeteroTransformer {
             .effective_max_context()
             .max(crate::inference::generic_transformer::rope::ROPE_TABLE_SEQ_LEN);
         let (cos_cpu, sin_cpu) =
-            crate::inference::generic_transformer::rope::precomput_freqs_cis_yarn(
+            crate::inference::generic_transformer::rope::precomput_freqs_cis_scaled(
                 rope_precompute_dim,
                 config.rope_freq_base,
                 config.yarn,
+                config.rope_linear,
                 rope_table_len,
                 &Device::Cpu,
             )?;
@@ -5870,10 +5879,11 @@ impl GenericHeteroTransformer {
             if let std::collections::hash_map::Entry::Vacant(slot) = rope.entry(card) {
                 let (dev, _) = device_of(card);
                 slot.insert(
-                    crate::inference::generic_transformer::rope::precomput_freqs_cis_yarn(
+                    crate::inference::generic_transformer::rope::precomput_freqs_cis_scaled(
                         config.head_dim,
                         config.rope_freq_base,
                         config.yarn,
+                        config.rope_linear,
                         config
                             .effective_max_context()
                             .max(crate::inference::generic_transformer::rope::ROPE_TABLE_SEQ_LEN),

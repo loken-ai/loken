@@ -402,6 +402,9 @@ pub struct GenericTransformerConfig {
     /// YaRN rope context-extension scaling (mistral3 devstral-small-2, deepseek).
     /// When Some, the rope tables interpolate inverse-freqs per the YaRN ramp.
     pub yarn: Option<crate::inference::generic_transformer::rope::YarnParams>,
+    /// Linear rope scaling: the layers that attend over the whole context divide every
+    /// rotary frequency by this factor. The sliding-window layers keep the plain table.
+    pub rope_linear: Option<f32>,
     pub rms_norm_eps: f64,
     pub sliding_window: Option<usize>,
     /// Number of layers at the end that share KV cache from earlier layers (Gemma4: 20)
@@ -519,6 +522,32 @@ pub(super) fn meta_u32(ct: &gguf_file::Content, arch: &str, key: &str) -> Option
         .and_then(|v| v.to_u32().ok())
 }
 
+/// The factor of a linear rope scaling, `None` when the layers rotate unscaled.
+///
+/// - A file whose scaling type is `linear`, or that gives a factor and no type, scales by its
+///   factor, unless the architecture reads a bare factor as YaRN.
+/// - A file without type or factor takes the scaling the architecture fixes for its declared
+///   context length.
+/// - A factor of 1 or below scales nothing.
+pub(super) fn linear_rope_factor(
+    scaling_type: Option<&str>,
+    factor: Option<f32>,
+    facts: crate::inference::model_facts::ArchFacts,
+    context_length: Option<u32>,
+) -> Option<f32> {
+    let factor = match (scaling_type, factor) {
+        (Some("linear"), f) => f,
+        (None, Some(_)) if facts.yarn_by_default => None,
+        (None, Some(f)) => Some(f),
+        (None, None) => facts
+            .long_context_linear_rope
+            .filter(|(context, _)| context_length.is_some_and(|c| c >= *context))
+            .map(|(_, f)| f),
+        (Some(_), _) => None,
+    };
+    factor.filter(|f| *f > 1.0)
+}
+
 pub(super) fn meta_f32(ct: &gguf_file::Content, arch: &str, key: &str) -> Option<f32> {
     ct.metadata
         .get(&format!("{arch}.{key}"))
@@ -631,11 +660,18 @@ impl GenericTransformerConfig {
                 .unwrap_or(4 * embedding_length),
         };
 
-        let rope_freq_base = meta_f32(content, arch, "rope.freq_base").unwrap_or(10000.0);
+        let facts = crate::inference::model_facts::facts_or_default(arch);
+        // The global base under either key name, else the architecture's, else 10000.
+        let rope_freq_base = meta_f32(content, arch, "rope.freq_base")
+            .or_else(|| meta_f32(content, arch, "rope.global.freq_base"))
+            .or(facts.rope_freq_base)
+            .unwrap_or(10000.0);
 
-        // Gemma4: separate RoPE freq for SWA layers (lower base -> shorter context)
+        // The sliding-window layers' base under any of its key names, else the architecture's.
         let rope_freq_base_swa = meta_f32(content, arch, "rope.freq_base_swa")
-            .or_else(|| meta_f32(content, arch, "rope.freq_base_local"));
+            .or_else(|| meta_f32(content, arch, "rope.freq_base_local"))
+            .or_else(|| meta_f32(content, arch, "rope.local.freq_base"))
+            .or(facts.rope_freq_base_swa);
 
         // Partial RoPE: some models (StableLM) only apply RoPE to a subset of head dims
         let rope_dim = meta_u32(content, arch, "rope.dimension_count").map(|v| v as usize);
@@ -644,12 +680,13 @@ impl GenericTransformerConfig {
         // Without it the rope frequencies are wrong past the original context and the
         // model emits garbage. The parameters go to `rope::precomput_freqs_cis_yarn`, which
         // is the only place these tables are built.
-        let facts = crate::inference::model_facts::facts_or_default(arch);
+        let scaling_type = content
+            .metadata
+            .get(&format!("{arch}.rope.scaling.type"))
+            .and_then(|v| v.to_string().ok().map(|s| s.to_string()));
         let yarn = {
-            let scaling_type = content
-                .metadata
-                .get(&format!("{arch}.rope.scaling.type"))
-                .and_then(|v| v.to_string().ok().map(|s| s.to_string()))
+            let scaling_type = scaling_type
+                .clone()
                 .or_else(|| facts.yarn_by_default.then(|| "yarn".to_string()));
             match scaling_type.as_deref() {
                 Some("yarn") => {
@@ -680,6 +717,18 @@ impl GenericTransformerConfig {
                 _ => None,
             }
         };
+
+        let context_length = meta_u32(content, arch, "context_length");
+        let rope_linear = linear_rope_factor(
+            scaling_type.as_deref(),
+            meta_f32(content, arch, "rope.scaling.factor")
+                .or_else(|| meta_f32(content, arch, "rope.scale_linear")),
+            facts,
+            context_length,
+        );
+        if let Some(factor) = rope_linear {
+            info!("📐 {arch} linear rope: factor={factor}");
+        }
 
         let rms_norm_eps = meta_f32(content, arch, "attention.layer_norm_rms_epsilon")
             .or_else(|| meta_f32(content, arch, "attention.layer_norm_epsilon"))
@@ -812,6 +861,7 @@ impl GenericTransformerConfig {
             rope_dim,
             learned_positions: content.tensor_infos.contains_key("position_embd.weight"),
             yarn,
+            rope_linear,
             rms_norm_eps,
             sliding_window,
             swa_pattern,
@@ -1387,5 +1437,125 @@ mod arch_facts_tests {
         assert!(windowed_by_period(3, 1));
         assert!(!windowed_by_period(3, 2));
         assert!(windowed_by_period(3, 3));
+    }
+
+    /// A small dense model of architecture `arch`: 2 query heads over 1 key/value head of 8,
+    /// 6 layers, a window of 4, and the extra metadata `extra`.
+    fn dense_like(arch: &str, extra: &[(&str, Value)]) -> Content {
+        let (hidden, heads, kv_heads, hd) = (16usize, 2usize, 1usize, 8usize);
+        let mut meta = vec![
+            ("attention.head_count", Value::U32(heads as u32)),
+            ("attention.head_count_kv", Value::U32(kv_heads as u32)),
+            ("attention.key_length", Value::U32(hd as u32)),
+            ("attention.sliding_window", Value::U32(4)),
+            ("block_count", Value::U32(6)),
+            ("embedding_length", Value::U32(hidden as u32)),
+            ("feed_forward_length", Value::U32(2 * hidden as u32)),
+        ];
+        meta.extend(extra.iter().cloned());
+        let tensors = vec![
+            ("token_embd.weight", vec![100, hidden]),
+            ("blk.0.attn_norm.weight", vec![hidden]),
+            ("blk.0.attn_q.weight", vec![heads * hd, hidden]),
+            ("blk.0.attn_k.weight", vec![kv_heads * hd, hidden]),
+            ("blk.0.attn_v.weight", vec![kv_heads * hd, hidden]),
+            ("blk.0.attn_output.weight", vec![hidden, heads * hd]),
+            ("blk.0.ffn_norm.weight", vec![hidden]),
+            ("blk.0.ffn_gate.weight", vec![2 * hidden, hidden]),
+            ("blk.0.ffn_up.weight", vec![2 * hidden, hidden]),
+            ("blk.0.ffn_down.weight", vec![hidden, 2 * hidden]),
+        ];
+        synth_content(arch, &meta, &tensors)
+    }
+
+    #[test]
+    fn a_linear_scaling_the_file_declares_is_read() {
+        let content = dense_like(
+            "llama",
+            &[
+                ("rope.scaling.type", Value::String("linear".into())),
+                ("rope.scaling.factor", Value::F32(4.0)),
+            ],
+        );
+        let cfg = GenericTransformerConfig::from_gguf(&content, "llama").unwrap();
+        assert_eq!(cfg.rope_linear, Some(4.0));
+        assert!(cfg.yarn.is_none());
+    }
+
+    #[test]
+    fn a_factor_without_a_type_scales_linearly_unless_the_architecture_reads_yarn() {
+        let facts = crate::inference::model_facts::facts_or_default("llama");
+        assert_eq!(linear_rope_factor(None, Some(2.0), facts, None), Some(2.0));
+        let yarn = crate::inference::model_facts::facts_or_default("gptoss");
+        assert_eq!(linear_rope_factor(None, Some(2.0), yarn, None), None);
+        assert_eq!(
+            linear_rope_factor(Some("yarn"), Some(2.0), facts, None),
+            None
+        );
+        assert_eq!(
+            linear_rope_factor(Some("linear"), Some(1.0), facts, None),
+            None
+        );
+    }
+
+    #[test]
+    fn a_gemma3_file_without_rope_keys_takes_the_architecture_defaults() {
+        let content = dense_like("gemma3", &[("context_length", Value::U32(131072))]);
+        let cfg = GenericTransformerConfig::from_gguf(&content, "gemma3").unwrap();
+        assert_eq!(cfg.rope_freq_base, 1.0e6);
+        assert_eq!(cfg.rope_freq_base_swa, Some(1.0e4));
+        assert_eq!(cfg.rope_linear, Some(8.0));
+        assert_eq!(cfg.swa_period, Some(6));
+        let windowed: Vec<bool> = (0..cfg.n_layers)
+            .map(|il| windowed_by_period(6, il))
+            .collect();
+        assert_eq!(windowed, vec![true, true, true, true, true, false]);
+        let short = dense_like("gemma3", &[("context_length", Value::U32(32768))]);
+        let cfg = GenericTransformerConfig::from_gguf(&short, "gemma3").unwrap();
+        assert_eq!(cfg.rope_linear, None, "a shorter context is not scaled");
+    }
+
+    #[test]
+    fn the_rope_keys_of_a_gemma3_file_win_over_the_defaults() {
+        let content = dense_like(
+            "gemma3",
+            &[
+                ("context_length", Value::U32(131072)),
+                ("rope.freq_base", Value::F32(5.0e5)),
+                ("rope.freq_base_swa", Value::F32(2.0e4)),
+                ("rope.scaling.type", Value::String("linear".into())),
+                ("rope.scaling.factor", Value::F32(2.0)),
+            ],
+        );
+        let cfg = GenericTransformerConfig::from_gguf(&content, "gemma3").unwrap();
+        assert_eq!(cfg.rope_freq_base, 5.0e5);
+        assert_eq!(cfg.rope_freq_base_swa, Some(2.0e4));
+        assert_eq!(cfg.rope_linear, Some(2.0));
+        let unscaled = dense_like(
+            "gemma3",
+            &[
+                ("context_length", Value::U32(131072)),
+                ("rope.scaling.type", Value::String("none".into())),
+            ],
+        );
+        let cfg = GenericTransformerConfig::from_gguf(&unscaled, "gemma3").unwrap();
+        assert_eq!(
+            cfg.rope_linear, None,
+            "a file that names no scaling is not scaled"
+        );
+    }
+
+    #[test]
+    fn the_older_key_names_of_the_two_bases_are_read() {
+        let content = dense_like(
+            "gemma3",
+            &[
+                ("rope.global.freq_base", Value::F32(3.0e5)),
+                ("rope.local.freq_base", Value::F32(3.0e3)),
+            ],
+        );
+        let cfg = GenericTransformerConfig::from_gguf(&content, "gemma3").unwrap();
+        assert_eq!(cfg.rope_freq_base, 3.0e5);
+        assert_eq!(cfg.rope_freq_base_swa, Some(3.0e3));
     }
 }

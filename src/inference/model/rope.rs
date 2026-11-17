@@ -111,6 +111,20 @@ pub fn precomput_freqs_cis_yarn(
     table_seq_len: usize,
     device: &Device,
 ) -> Result<(Tensor, Tensor)> {
+    precomput_freqs_cis_scaled(head_dim, freq_base, yarn, None, table_seq_len, device)
+}
+
+/// [`precomput_freqs_cis_yarn`] with an optional linear scaling: every frequency is divided
+/// by `linear`, so position `p` turns as position `p / linear` does unscaled.
+/// With `linear == None` the table is the one [`precomput_freqs_cis_yarn`] builds, bit for bit.
+pub fn precomput_freqs_cis_scaled(
+    head_dim: usize,
+    freq_base: f32,
+    yarn: Option<YarnParams>,
+    linear: Option<f32>,
+    table_seq_len: usize,
+    device: &Device,
+) -> Result<(Tensor, Tensor)> {
     // Number of precomputed positions. MUST cover the KV window the model was
     // loaded with, else prefilling past it fails with `narrow: pos+n > table_len`.
     let table_seq_len = table_seq_len.max(1);
@@ -139,6 +153,10 @@ pub fn precomput_freqs_cis_yarn(
                 })
                 .collect()
         }
+    };
+    let theta: Vec<f32> = match linear {
+        Some(f) => theta.iter().map(|t| t / f).collect(),
+        None => theta,
     };
     // The table is the outer product of the positions with the frequencies: one row per
     // position, one column per pair, each entry the angle that pair has turned through there.
@@ -355,6 +373,28 @@ mod tests {
                 assert!((sin[at] - angle.sin()).abs() < 1e-6, "sin[{row}][{i}]");
             }
         }
+        Ok(())
+    }
+
+    /// A linear factor turns position `p` as the plain table turns `p / factor`, and no factor
+    /// builds the plain table bit for bit.
+    #[test]
+    fn a_linear_factor_divides_the_positions() -> Result<()> {
+        let device = Device::Cpu;
+        let (head_dim, base, len, factor) = (16usize, 1.0e6f32, 64usize, 8usize);
+        let rows = |linear: Option<f32>| -> Result<Vec<Vec<f32>>> {
+            let (cos, _) = precomput_freqs_cis_scaled(head_dim, base, None, linear, len, &device)?;
+            cos.to_vec2::<f32>()
+        };
+        let plain = rows(None)?;
+        let scaled = rows(Some(factor as f32))?;
+        for p in 0..len / factor {
+            assert_eq!(scaled[p * factor], plain[p], "position {}", p * factor);
+        }
+        let (cos, sin) = precomput_freqs_cis_yarn(head_dim, base, None, len, &device)?;
+        assert_eq!(cos.to_vec2::<f32>()?, plain);
+        let (_, plain_sin) = precomput_freqs_cis_scaled(head_dim, base, None, None, len, &device)?;
+        assert_eq!(sin.to_vec2::<f32>()?, plain_sin.to_vec2::<f32>()?);
         Ok(())
     }
 }

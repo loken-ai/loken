@@ -48,6 +48,14 @@ pub struct ArchFacts {
     pub swa_period: Option<usize>,
     /// The rotary scaling is YaRN when the file gives a scaling factor but no type.
     pub yarn_by_default: bool,
+    /// The rotary base of the layers that attend over the whole context, when the file
+    /// gives none.
+    pub rope_freq_base: Option<f32>,
+    /// The rotary base of the sliding-window layers, when the file gives none.
+    pub rope_freq_base_swa: Option<f32>,
+    /// `(context, factor)`: a file that gives no rotary scaling and declares a context of at
+    /// least `context` positions scales its whole-context layers linearly by `factor`.
+    pub long_context_linear_rope: Option<(u32, f32)>,
     /// YaRN scales the rotary table by `1 + 0.1 ln(factor)`.
     pub yarn_attention_factor: bool,
     /// Routed experts gate through the clamped SwiGLU `x.sigmoid(alpha.x).(1 + up)` with
@@ -102,6 +110,9 @@ impl ArchFacts {
             no_rope_period: None,
             swa_period: None,
             yarn_by_default: false,
+            rope_freq_base: None,
+            rope_freq_base_swa: None,
+            long_context_linear_rope: None,
             yarn_attention_factor: false,
             expert_swiglu_clamp: None,
             sigmoid_expert_gating: false,
@@ -202,7 +213,20 @@ const FACTS: &[(&str, ArchFacts)] = &[
     ),
     ("gemma", GEMMA),
     ("gemma2", GEMMA),
-    ("gemma3", GEMMA),
+    // Five sliding-window layers precede each whole-context layer. The whole-context layers
+    // rotate at base 1e6, the windowed ones at 1e4. A file declaring a context of 131072
+    // positions scales its whole-context layers linearly by 8. Files that omit the rope keys
+    // rely on these constants of the published configurations.
+    (
+        "gemma3",
+        ArchFacts {
+            swa_period: Some(6),
+            rope_freq_base: Some(1.0e6),
+            rope_freq_base_swa: Some(1.0e4),
+            long_context_linear_rope: Some((131072, 8.0)),
+            ..GEMMA
+        },
+    ),
     // Beyond the Gemma feed-forward: the reference hardcodes an attention scale of 1 and
     // normalises the values without a weight, which Gemma 2 and 3 do not. The
     // K-norm weights are small and uniform, and a quantised cache amplifies their rounding

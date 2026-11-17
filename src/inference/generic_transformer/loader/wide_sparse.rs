@@ -359,6 +359,7 @@ fn generic_config(
         rope_dim: Some(meta.rope_dim),
         learned_positions: false,
         yarn: None,
+        rope_linear: None,
         rms_norm_eps: meta.rms_eps,
         sliding_window: None,
         shared_kv_layers: 0,

@@ -14,6 +14,8 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 ### Fixed
 
 - API: say that a non-streamed answer ended on its token budget when it did.
+- Generation: rotate positions as the model was trained when a file omits its rope keys.
+- Generation: apply the linear rope scaling a file declares.
 
 ## [0.5.1] - 2026-11-17
 
