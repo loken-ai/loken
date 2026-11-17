@@ -714,7 +714,7 @@ pub(crate) async fn pooling(
         .collect();
     v["data"] = serde_json::json!(data);
     v["id"] = serde_json::json!(format!("pool-{}", uuid::Uuid::new_v4()));
-    v["created"] = serde_json::json!(chrono::Utc::now().timestamp());
+    v["created"] = serde_json::json!(crate::timestamp::now_secs());
     Json(v).into_response()
 }
 

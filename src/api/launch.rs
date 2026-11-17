@@ -190,7 +190,7 @@ fn write_json(path: &Path, value: &Value) -> std::io::Result<()> {
 /// Point Cline at the daemon. Returns the files written.
 pub fn write_cline(home: &Path, launch: &Launch) -> std::io::Result<Vec<PathBuf>> {
     let (providers, state) = cline_paths(home);
-    let now = chrono::Utc::now().to_rfc3339();
+    let now = crate::timestamp::now_rfc3339();
     write_json(
         &providers,
         &cline_providers(read_json(&providers)?, launch, &now),

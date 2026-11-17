@@ -239,8 +239,8 @@ impl OllamaManager {
                                                         tag: tag.clone(),
                                                         size: total_size,
                                                         digest: manifest.config.digest.clone(),
-                                                        downloaded_at: chrono::Utc::now()
-                                                            .to_rfc3339(),
+                                                        downloaded_at:
+                                                            crate::timestamp::now_rfc3339(),
                                                         files: vec![], // Ollama doesn't track individual files
                                                         source: "ollama".to_string(),
                                                     });

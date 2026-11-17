@@ -217,7 +217,7 @@ pub(crate) async fn audio_separate(state: State<APIServer>, mut multipart: Multi
 
     let b64 = base64::engine::general_purpose::STANDARD;
     let mut body = serde_json::json!({
-        "created": chrono::Utc::now().timestamp(),
+        "created": crate::timestamp::now_secs(),
         "duration_s": seconds,
         "sample_rate": SAMPLE_RATE,
         "render_ms": started.elapsed().as_millis() as u64,

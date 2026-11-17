@@ -606,7 +606,7 @@ pub(crate) async fn chat_completion_at(
                 // treat it as a request id; the previous behaviour of
                 // re-sampling `now()` per chunk made it drift seconds
                 // over a long generation).
-                let created_at = chrono::Utc::now().timestamp();
+                let created_at = crate::timestamp::now_secs();
                 let stream = async_stream::stream! {
                     let _admitted = admission;
                     // First chunk: role indicator
@@ -1301,7 +1301,7 @@ pub(crate) async fn text_completions_at(
     };
 
     let completion_id = format!("cmpl-{}", uuid::Uuid::new_v4());
-    let created = chrono::Utc::now().timestamp();
+    let created = crate::timestamp::now_secs();
     // The prompt count a stream reports when the engine publishes no statistics.
     let prompt_tokens_est = estimate_token_count(&prompt) as u32;
     // A window that holds the prompt and what the request may write.
@@ -1709,7 +1709,7 @@ pub(crate) async fn openai_list_models(
     headers: axum::http::HeaderMap,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
-    let now = chrono::Utc::now().timestamp();
+    let now = crate::timestamp::now_secs();
 
     let mut data: Vec<serde_json::Value> = Vec::new();
 
@@ -1736,9 +1736,7 @@ pub(crate) async fn openai_list_models(
         // platform-dependent).
         models.sort_by(|a, b| a.id.cmp(&b.id));
         for m in models {
-            let created = chrono::DateTime::parse_from_rfc3339(&m.downloaded_at)
-                .map(|t| t.timestamp())
-                .unwrap_or(now);
+            let created = crate::timestamp::parse_rfc3339_secs(&m.downloaded_at).unwrap_or(now);
             let is_loaded = loaded_ids.contains(&m.id);
             // The widest window the model takes, as vLLM names it: a request is served
             // with the window it needs up to this one, so a client sizes its prompts by it.
@@ -1767,9 +1765,7 @@ pub(crate) async fn openai_list_models(
         if local.contains(&m.name) {
             continue;
         }
-        let created = chrono::DateTime::parse_from_rfc3339(&m.modified_at)
-            .map(|t| t.timestamp())
-            .unwrap_or(now);
+        let created = crate::timestamp::parse_rfc3339_secs(&m.modified_at).unwrap_or(now);
         data.push(serde_json::json!({
             "id": m.name,
             "object": "model",
@@ -1941,7 +1937,7 @@ pub(crate) async fn openai_retrieve_model(
         return e.into_response();
     }
     let normalized = state.served_model_id(&model_id).await;
-    let now = chrono::Utc::now().timestamp();
+    let now = crate::timestamp::now_secs();
     if let Some(refusal) = state.companion_refusal(&normalized).await {
         let code = axum::http::StatusCode::NOT_FOUND;
         return (code, Json(openai_error_body(code, refusal))).into_response();
@@ -1953,9 +1949,7 @@ pub(crate) async fn openai_retrieve_model(
             .iter()
             .find(|m| m.id == model_id || m.id == normalized)
         {
-            let created = chrono::DateTime::parse_from_rfc3339(&m.downloaded_at)
-                .map(|t| t.timestamp())
-                .unwrap_or(now);
+            let created = crate::timestamp::parse_rfc3339_secs(&m.downloaded_at).unwrap_or(now);
             let is_loaded = state
                 .engines
                 .read()

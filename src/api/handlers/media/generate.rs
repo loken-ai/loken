@@ -719,7 +719,7 @@ pub(crate) async fn handle_image_generation(
                         ImageEngineLoadingProgress::Stage(msg) => {
                             let chunk = serde_json::json!({
                                 "model": model_name_owned,
-                                "created_at": chrono::Utc::now().to_rfc3339(),
+                                "created_at": crate::timestamp::now_rfc3339(),
                                 "response": msg,
                                 "done": false,
                                 "node": node_s,
@@ -738,7 +738,7 @@ pub(crate) async fn handle_image_generation(
                     error!("Failed to load image model: {e}");
                     let chunk = serde_json::json!({
                         "model": model_name_owned,
-                        "created_at": chrono::Utc::now().to_rfc3339(),
+                        "created_at": crate::timestamp::now_rfc3339(),
                         "response": format!("Failed to load image model: {e}"),
                         "done": true,
                         "done_reason": "error",
@@ -784,7 +784,7 @@ pub(crate) async fn handle_image_generation(
                             ImageStreamEvent::Progress { completed, total } => {
                                 let chunk = serde_json::json!({
                                     "model": model_name_owned,
-                                    "created_at": chrono::Utc::now().to_rfc3339(),
+                                    "created_at": crate::timestamp::now_rfc3339(),
                                     "response": format_image_step_progress(completed, total),
                                     "done": false,
                                     "completed": completed,
@@ -796,7 +796,7 @@ pub(crate) async fn handle_image_generation(
                             ImageStreamEvent::Complete { image_base64 } => {
                                 let chunk = serde_json::json!({
                                     "model": model_name_owned,
-                                    "created_at": chrono::Utc::now().to_rfc3339(),
+                                    "created_at": crate::timestamp::now_rfc3339(),
                                     "response": format_seed_echo(resolved_seed),
                                     "done": true,
                                     "done_reason": "stop",

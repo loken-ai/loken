@@ -271,7 +271,7 @@ impl HuggingFaceManager {
                 revision,
                 size: total_size,
                 files,
-                downloaded_at: chrono::Utc::now().to_rfc3339(),
+                downloaded_at: crate::timestamp::now_rfc3339(),
                 source: "huggingface".to_string(),
             });
         }
@@ -314,10 +314,8 @@ impl HuggingFaceManager {
                 .ok()
                 .and_then(|m| m.modified().ok())
                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| {
-                    chrono::DateTime::<chrono::Utc>::from(std::time::UNIX_EPOCH + d).to_rfc3339()
-                })
-                .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
+                .and_then(|d| crate::timestamp::system_time_rfc3339(std::time::UNIX_EPOCH + d))
+                .unwrap_or_else(crate::timestamp::now_rfc3339);
 
             // Model name: strip .gguf extension
             let stem = filename.strip_suffix(".gguf").unwrap_or(&filename);

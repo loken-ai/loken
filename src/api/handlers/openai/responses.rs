@@ -617,7 +617,7 @@ pub(crate) async fn openai_responses_at(
     let chat_req: ChatCompletionRequest = serde_json::from_value(chat)
         .map_err(|e| ApiError::Validation(format!("responses: {e}")))?;
     let id = new_id("resp");
-    let created = chrono::Utc::now().timestamp();
+    let created = crate::timestamp::now_secs();
     let history = messages.clone();
     let inner = super::chat_completion_at(state, headers, chat_req, priority).await?;
     if !inner.status().is_success() {

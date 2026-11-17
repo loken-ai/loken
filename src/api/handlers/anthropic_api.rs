@@ -659,7 +659,7 @@ pub(crate) async fn list_models_by_dialect(
         return super::openai::openai_list_models(State(state), headers).await;
     }
     let mut data: Vec<serde_json::Value> = Vec::new();
-    let listed = chrono::Utc::now().to_rfc3339();
+    let listed = crate::timestamp::now_rfc3339();
     let mut local: Vec<String> = Vec::new();
     if let Ok(mut models) = state.model_manager.list_models().await {
         // What the tags route lists: present weights a loader reads.

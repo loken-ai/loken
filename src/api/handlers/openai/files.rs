@@ -25,7 +25,7 @@ fn files_dir(state: &APIServer) -> PathBuf {
 }
 
 fn now() -> i64 {
-    chrono::Utc::now().timestamp()
+    crate::timestamp::now_secs()
 }
 
 pub(super) fn new_id(prefix: &str) -> String {
@@ -251,9 +251,9 @@ fn evict_finished_batches() {
             // OpenAI batches stamp an epoch, Messages batches an RFC 3339 string.
             let created = match b.object.get("created_at") {
                 Some(Value::Number(n)) => n.as_i64().unwrap_or(i64::MAX),
-                Some(Value::String(t)) => chrono::DateTime::parse_from_rfc3339(t)
-                    .map(|d| d.timestamp())
-                    .unwrap_or(i64::MAX),
+                Some(Value::String(t)) => {
+                    crate::timestamp::parse_rfc3339_secs(t).unwrap_or(i64::MAX)
+                }
                 _ => i64::MAX,
             };
             !(done && created < cutoff)
@@ -524,8 +524,8 @@ pub(crate) async fn anthropic_batches_create(
         "processing_status": "in_progress",
         "request_counts": {"processing": requests.len(), "succeeded": 0, "errored": 0, "canceled": 0, "expired": 0},
         "ended_at": Value::Null,
-        "created_at": chrono::Utc::now().to_rfc3339(),
-        "expires_at": (chrono::Utc::now() + chrono::Duration::hours(24)).to_rfc3339(),
+        "created_at": crate::timestamp::now_rfc3339(),
+        "expires_at": crate::timestamp::rfc3339_in_secs(24 * 60 * 60),
         "cancel_initiated_at": Value::Null,
         "results_url": format!("/v1/messages/batches/{id}/results"),
     });
@@ -602,7 +602,7 @@ pub(crate) async fn anthropic_batches_create(
         .ok();
         batch_update(&runner_id, |o| {
             o["processing_status"] = json!("ended");
-            o["ended_at"] = json!(chrono::Utc::now().to_rfc3339());
+            o["ended_at"] = json!(crate::timestamp::now_rfc3339());
             o["request_counts"]["processing"] = json!(0);
             if let Some(f) = results.as_ref().and_then(|f| f.get("id").cloned()) {
                 o["results_file_id"] = f;
@@ -650,7 +650,7 @@ pub(crate) async fn anthropic_batches_cancel(
             batch_update(&id, |o| {
                 if o["processing_status"] == "in_progress" {
                     o["processing_status"] = json!("canceling");
-                    o["cancel_initiated_at"] = json!(chrono::Utc::now().to_rfc3339());
+                    o["cancel_initiated_at"] = json!(crate::timestamp::now_rfc3339());
                 }
             });
             Json(batch_get(&id).map(|b| b.object).unwrap_or(Value::Null)).into_response()

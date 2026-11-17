@@ -127,9 +127,9 @@ fn ollama_chat_response_new_marks_done_with_rfc3339_timestamp() {
     // created_at is RFC3339 - pin shape so a future refactor
     // doesn't switch to Unix epoch or a custom format.
     // Real Ollama clients rely on RFC3339 for log correlation.
-    let parsed = chrono::DateTime::parse_from_rfc3339(&resp.created_at);
+    let parsed = crate::timestamp::parse_rfc3339_secs(&resp.created_at);
     assert!(
-        parsed.is_ok(),
+        parsed.is_some(),
         "created_at must be RFC3339; got {}",
         resp.created_at
     );
@@ -149,7 +149,7 @@ fn ollama_generate_response_new_includes_audios_and_images_as_none() {
     assert!(resp.images.is_none());
     assert!(resp.audios.is_none());
     // RFC3339 timestamp, same as chat response.
-    assert!(chrono::DateTime::parse_from_rfc3339(&resp.created_at).is_ok());
+    assert!(crate::timestamp::parse_rfc3339_secs(&resp.created_at).is_some());
 }
 
 #[test]

@@ -208,7 +208,7 @@ pub(crate) fn inject_local_media(
             id: e.id.clone(),
             name: e.id,
             size,
-            downloaded_at: chrono::Utc::now().to_rfc3339(),
+            downloaded_at: crate::timestamp::now_rfc3339(),
             files: vec![e.path.to_string_lossy().into_owned()],
             source: "huggingface".to_string(),
             digest: "sha256:0000000000000000000000000000000000000000".to_string(),

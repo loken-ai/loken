@@ -82,6 +82,8 @@ mod notice_gate;
 pub mod privacy;
 pub mod request_metrics;
 pub mod stats;
+// Wall-clock timestamps as the API writes and reads them.
+pub mod timestamp;
 // Tensor substrate (in-crate native implementation).
 pub mod tensor;
 

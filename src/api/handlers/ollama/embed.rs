@@ -122,8 +122,7 @@ pub(crate) async fn ollama_ps(
             "never".to_string()
         } else {
             // Dynamic: current time + keep_alive duration (recalculated each request)
-            let expires = chrono::Utc::now() + chrono::Duration::minutes(keep_alive_mins);
-            expires.to_rfc3339()
+            crate::timestamp::rfc3339_in_secs(keep_alive_mins.saturating_mul(60))
         };
 
         // Determine VRAM size based on device (matches Ollama: size_vram for PROCESSOR field calculation)

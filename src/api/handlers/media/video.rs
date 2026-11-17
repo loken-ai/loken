@@ -1484,7 +1484,7 @@ pub(crate) async fn images_generations(
         Err(e) => return e.into_response(),
     };
     let mut body_v = serde_json::json!({
-        "created": chrono::Utc::now().timestamp(),
+        "created": crate::timestamp::now_secs(),
         "data": data,
         "render_ms": generate_ms as u64,
     });

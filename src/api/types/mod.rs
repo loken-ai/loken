@@ -380,7 +380,7 @@ impl OllamaChatResponse {
     pub fn new(model: String, message: Message) -> Self {
         Self {
             model,
-            created_at: chrono::Utc::now().to_rfc3339(),
+            created_at: crate::timestamp::now_rfc3339(),
             message,
             done: true,
             done_reason: None,
@@ -593,7 +593,7 @@ impl OllamaGenerateResponse {
     pub fn new(model: String, response: String) -> Self {
         Self {
             model,
-            created_at: chrono::Utc::now().to_rfc3339(),
+            created_at: crate::timestamp::now_rfc3339(),
             response,
             done: true,
             done_reason: None,
@@ -1407,7 +1407,7 @@ impl ChatCompletionResponse {
         Self {
             id,
             object: "chat.completion".to_string(),
-            created: chrono::Utc::now().timestamp(),
+            created: crate::timestamp::now_secs(),
             model,
             choices,
             usage,
@@ -1434,7 +1434,7 @@ impl ChatCompletionResponse {
         Self {
             id: format!("chatcmpl-{}", uuid::Uuid::new_v4()),
             object: "chat.completion".to_string(),
-            created: chrono::Utc::now().timestamp(),
+            created: crate::timestamp::now_secs(),
             model: ollama.model,
             choices: vec![Choice::new(0, ollama.message, finish_reason.to_string())],
             usage: Usage::new(prompt_tokens, completion_tokens),

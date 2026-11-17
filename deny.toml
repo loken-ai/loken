@@ -1,12 +1,11 @@
 [advisories]
 yanked = "deny"
 # Unmaintained crates reached only through dependencies that have no maintained
-# alternative yet: number_prefix through indicatif, paste through the image codecs,
-# proc-macro-error through validator. None of the three is on a request path.
+# alternative yet: number_prefix through indicatif, paste through the image codecs.
+# Neither is on a request path.
 ignore = [
     "RUSTSEC-2025-0119",
     "RUSTSEC-2024-0436",
-    "RUSTSEC-2024-0370",
 ]
 
 [licenses]

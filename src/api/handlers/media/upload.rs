@@ -493,7 +493,7 @@ async fn render_upload_batch(
         Err(e) => return e.into_response(),
     };
     let body = Json(serde_json::json!({
-        "created": chrono::Utc::now().timestamp(),
+        "created": crate::timestamp::now_secs(),
         "data": data,
         "render_ms": generate_ms as u64,
     }));

@@ -93,11 +93,8 @@ fn get_manifest_digest_info(manifest_path: &PathBuf) -> Option<ModelDigestInfo> 
                     .ok()
                     .and_then(|m| m.modified().ok())
                     .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map(|d| {
-                        chrono::DateTime::<chrono::Utc>::from(std::time::UNIX_EPOCH + d)
-                            .to_rfc3339()
-                    })
-                    .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
+                    .and_then(|d| crate::timestamp::system_time_rfc3339(std::time::UNIX_EPOCH + d))
+                    .unwrap_or_else(crate::timestamp::now_rfc3339);
 
                 return Some(ModelDigestInfo {
                     digest: config_digest.to_string(),
@@ -124,8 +121,8 @@ fn compute_model_digest_info(model_dir: &PathBuf) -> ModelDigestInfo {
         .ok()
         .and_then(|m| m.modified().ok())
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| chrono::DateTime::<chrono::Utc>::from(std::time::UNIX_EPOCH + d).to_rfc3339())
-        .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
+        .and_then(|d| crate::timestamp::system_time_rfc3339(std::time::UNIX_EPOCH + d))
+        .unwrap_or_else(crate::timestamp::now_rfc3339);
 
     ModelDigestInfo {
         digest: "sha256:0000000000000000000000000000000000000000".to_string(),
@@ -220,7 +217,7 @@ impl ModelManager {
                     .map(|p| compute_model_digest_info(&p))
                     .unwrap_or_else(|| ModelDigestInfo {
                         digest: "sha256:0000000000000000000000000000000000000000".to_string(),
-                        modified_at: chrono::Utc::now().to_rfc3339(),
+                        modified_at: crate::timestamp::now_rfc3339(),
                     });
 
                 models.push(ModelMetadata {
@@ -245,7 +242,7 @@ impl ModelManager {
                     .map(|p| compute_model_digest_info(&p))
                     .unwrap_or_else(|| ModelDigestInfo {
                         digest: "sha256:0000000000000000000000000000000000000000".to_string(),
-                        modified_at: chrono::Utc::now().to_rfc3339(),
+                        modified_at: crate::timestamp::now_rfc3339(),
                     });
 
                 models.push(ModelMetadata {
@@ -372,7 +369,7 @@ impl ModelManager {
                     .map(|p| compute_model_digest_info(&p))
                     .unwrap_or_else(|| ModelDigestInfo {
                         digest: "sha256:0000000000000000000000000000000000000000".to_string(),
-                        modified_at: chrono::Utc::now().to_rfc3339(),
+                        modified_at: crate::timestamp::now_rfc3339(),
                     });
 
                 Ok(ModelMetadata {
@@ -397,7 +394,7 @@ impl ModelManager {
                     .map(|p| compute_model_digest_info(&p))
                     .unwrap_or_else(|| ModelDigestInfo {
                         digest: "sha256:0000000000000000000000000000000000000000".to_string(),
-                        modified_at: chrono::Utc::now().to_rfc3339(),
+                        modified_at: crate::timestamp::now_rfc3339(),
                     });
 
                 Ok(ModelMetadata {
@@ -439,7 +436,7 @@ impl ModelManager {
             .map(|p| compute_model_digest_info(&p))
             .unwrap_or_else(|| ModelDigestInfo {
                 digest: "sha256:0000000000000000000000000000000000000000".to_string(),
-                modified_at: chrono::Utc::now().to_rfc3339(),
+                modified_at: crate::timestamp::now_rfc3339(),
             });
 
         let metadata = ModelMetadata {

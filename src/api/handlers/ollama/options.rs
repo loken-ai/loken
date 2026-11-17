@@ -478,7 +478,7 @@ pub(crate) async fn ollama_chat(
                                     };
                                     let mut response_chunk = serde_json::json!({
                                         "model": model_name_clone,
-                                        "created_at": chrono::Utc::now().to_rfc3339(),
+                                        "created_at": crate::timestamp::now_rfc3339(),
                                         "message": message,
                                         "done": false
                                     });
@@ -537,7 +537,7 @@ pub(crate) async fn ollama_chat(
                             };
                             let frame = serde_json::json!({
                                 "model": model_name_clone,
-                                "created_at": chrono::Utc::now().to_rfc3339(),
+                                "created_at": crate::timestamp::now_rfc3339(),
                                 "message": message,
                                 "done": false
                             });
@@ -598,7 +598,7 @@ pub(crate) async fn ollama_chat(
                             {
                                 let flush = serde_json::json!({
                                     "model": model_name_clone,
-                                    "created_at": chrono::Utc::now().to_rfc3339(),
+                                    "created_at": crate::timestamp::now_rfc3339(),
                                     "message": {"role": "assistant", "content": tail},
                                     "done": false
                                 });
@@ -621,7 +621,7 @@ pub(crate) async fn ollama_chat(
                         }
                         let mut final_chunk = serde_json::json!({
                             "model": model_name_clone,
-                            "created_at": chrono::Utc::now().to_rfc3339(),
+                            "created_at": crate::timestamp::now_rfc3339(),
                             "message": message,
                             "done": true,
                             "thinking_duration": thinking_ns,
@@ -1290,7 +1290,7 @@ pub(crate) async fn ollama_generate(
                                     };
                                     let mut response_chunk = serde_json::json!({
                                         "model": model_name_clone,
-                                        "created_at": chrono::Utc::now().to_rfc3339(),
+                                        "created_at": crate::timestamp::now_rfc3339(),
                                         "response": response,
                                         "done": false
                                     });
@@ -1343,7 +1343,7 @@ pub(crate) async fn ollama_generate(
                             };
                             let mut frame = serde_json::json!({
                                 "model": model_name_clone,
-                                "created_at": chrono::Utc::now().to_rfc3339(),
+                                "created_at": crate::timestamp::now_rfc3339(),
                                 "response": response,
                                 "done": false
                             });
@@ -1396,7 +1396,7 @@ pub(crate) async fn ollama_generate(
                         };
                         let mut final_chunk = serde_json::json!({
                             "model": model_name_clone,
-                            "created_at": chrono::Utc::now().to_rfc3339(),
+                            "created_at": crate::timestamp::now_rfc3339(),
                             "response": "",
                             "done": true,
                             "thinking_duration": thinking_ns,

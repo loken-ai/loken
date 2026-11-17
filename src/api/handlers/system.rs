@@ -43,7 +43,7 @@ pub(crate) async fn health_check(
         "status": "healthy",
         "service": "loken",
         "version": env!("LOKEN_VERSION"),
-        "time": chrono::Utc::now().to_rfc3339(),
+        "time": crate::timestamp::now_rfc3339(),
         "uptime_seconds": uptime_s,
         "loaded_models": loaded_models,
         // Per-engine breakdown so clients can tell WHICH modality
