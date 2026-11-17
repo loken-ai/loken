@@ -1859,7 +1859,7 @@ impl ModelBackend for GenericBackend {
     }
 
     fn forward(&mut self, x: &Tensor, index_pos: usize) -> crate::tensor::Result<Tensor> {
-        self.0.forward(x, index_pos)
+        self.0.step_within_card_room(|m| m.forward(x, index_pos))
     }
 
     fn widest_ffn(&self) -> usize {
@@ -2223,7 +2223,7 @@ impl ModelBackend for GenericBackend {
     }
 
     fn forward_from_hidden(&mut self) -> crate::tensor::Result<Tensor> {
-        self.0.forward_from_hidden()
+        self.0.step_within_card_room(|m| m.forward_from_hidden())
     }
 
     #[cfg(feature = "gpu")]
@@ -2244,11 +2244,13 @@ impl ModelBackend for GenericBackend {
         input_ids: &Tensor,
         pos: usize,
     ) -> crate::tensor::Result<Tensor> {
-        self.0.forward_from_hidden_split(input_ids, pos)
+        self.0
+            .step_within_card_room(|m| m.forward_from_hidden_split(input_ids, pos))
     }
 
     fn compute_all_from_kv_captured(&mut self) -> crate::tensor::Result<Tensor> {
-        self.0.compute_all_from_kv_captured()
+        self.0
+            .step_within_card_room(|m| m.compute_all_from_kv_captured())
     }
 
     fn graph_capture_auto_on(&self) -> bool {

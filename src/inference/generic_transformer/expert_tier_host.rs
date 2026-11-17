@@ -155,4 +155,12 @@ impl super::GenericHeteroTransformer {
     pub fn return_expert_cache(&mut self) -> Result<usize> {
         Ok(0)
     }
+
+    /// No card holds a cache of the experts: the step runs as it is.
+    pub fn step_within_card_room<T>(
+        &mut self,
+        mut step: impl FnMut(&mut Self) -> Result<T>,
+    ) -> Result<T> {
+        step(self)
+    }
 }

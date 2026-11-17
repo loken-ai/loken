@@ -993,16 +993,20 @@ pub fn reclaim_host_ram(needed_bytes: u64) -> u64 {
     freed
 }
 
+/// The tests that touch the process-wide demand ledger take turns: the harness runs tests in
+/// parallel threads, and one test's lease is another's baseline.
+#[cfg(test)]
+pub(crate) fn ledger_turn() -> std::sync::MutexGuard<'static, ()> {
+    static LEDGER: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LEDGER.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 #[cfg(test)]
 mod concurrent_admission_tests {
     use super::*;
 
-    /// The tests that touch the process-wide demand ledger take turns: the harness runs a
-    /// module's tests in parallel threads, and one test's lease is another's baseline.
-    static LEDGER: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     fn taking_turns() -> std::sync::MutexGuard<'static, ()> {
-        LEDGER.lock().unwrap_or_else(|e| e.into_inner())
+        super::ledger_turn()
     }
 
     /// The whole point of the ledger: a subsystem must not plan AROUND its own demand.
