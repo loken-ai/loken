@@ -2068,11 +2068,12 @@ impl GenericHeteroTransformer {
 
     pub fn kv_len(&self) -> Option<usize> {
         // A recurrent layer keeps no cache: the first attending layer holds the length.
+        // A windowed cache that slid holds fewer rows than its position: the position counts.
         let l = self
             .layers
             .iter()
             .find(|l| matches!(l.mixer, super::mixer::Mixer::Attention))?;
-        let mut n = l.kv_cache.current_seq_len();
+        let mut n = l.kv_cache.position();
         if let Some(c) = l.context.as_ref() {
             n = n.max(c.len());
         }
@@ -3175,52 +3176,11 @@ impl GenericHeteroTransformer {
             } else {
                 None
             };
-            // gemma4 bounded sliding-window attention: SWA layers with a windowed SpecKvCache
-            // store only the last `window+chunk` keys, so their prefill K is shorter
-            // than the full seq_kv - they need a mask matching the BOUNDED length
-            // (swa_bounded_mask_data), not the full `mask`. All windowed SWA layers
-            // share the same post-append length (identical append history). Only
-            // built when a windowed SWA layer is present in this segment (gemma4 on
-            // F16 KV); else None -> all layers use the full `mask` (unchanged).
-            let mask_swa = if seq_len > 1 {
-                let swa = (seg_start..seg_end).find_map(|i| {
-                    let l = &self.layers[i];
-                    l.kv_cache.window().filter(|&w| w > 0).map(|w| {
-                        (
-                            w,
-                            l.kv_cache.current_seq_len(),
-                            l.kv_cache.max_seq_len_padded(),
-                        )
-                    })
-                });
-                match swa {
-                    Some((w, cur, cap)) => {
-                        // Mirror EXACTLY the windowed SpecKvCache::append the SWA
-                        // layers are about to perform, so the mask width equals
-                        // the K length the attention will see:
-                        //  - the prefill attention resets the cache at index_pos==0
-                        //    (first chunk), so the pre-append length is 0 there  -
-                        //    NOT the stale current_seq_len left by a prior request.
-                        //  - otherwise it's the cache's current length, and the
-                        //    slide keeps the last `w` keys before appending.
-                        let before = if index_pos == 0 { 0 } else { cur };
-                        let post = if before + seq_len > cap && before > w {
-                            w + seq_len
-                        } else {
-                            before + seq_len
-                        };
-                        let buf_start = (index_pos + seq_len) - post;
-                        let dev = current_cuda_idx
-                            .and_then(|idx| self.cuda_devices.get(&idx))
-                            .unwrap_or(&Device::Cpu);
-                        let data = swa_bounded_mask_data(seq_len, index_pos, post, buf_start, w);
-                        Some(Tensor::from_slice(&data, (seq_len, post), dev)?)
-                    }
-                    None => None,
-                }
-            } else {
-                None
-            };
+            // Bounded sliding-window attention: a layer whose windowed cache keeps only its
+            // last rows reads a K shorter than the sequence, and takes a mask as wide as that K.
+            // The masks are built once per window and K width for this segment.
+            let mut window_masks: std::collections::HashMap<(usize, usize), Tensor> =
+                std::collections::HashMap::new();
 
             // Shared KV: layers >= first_kv_own compute their own K/V;
             // layers after that reuse K/V from reference layers.
@@ -3330,10 +3290,48 @@ impl GenericHeteroTransformer {
                 } else {
                     None
                 };
+                // A windowed layer reads its donor's rows, which the donor appended earlier in
+                // this pass, or its own rows once this pass appends to them.
+                let window_rows = match self.layers[layer_idx].kv_cache.window() {
+                    Some(w) if w > 0 && seq_len > 1 && own_mask.is_none() => {
+                        let rows = match ref_idx_opt {
+                            Some(r) => self.layers[r].kv_cache.current_seq_len(),
+                            None => {
+                                let cache = &self.layers[layer_idx].kv_cache;
+                                // The prefill attention resets the cache at position 0.
+                                let before = match index_pos {
+                                    0 => 0,
+                                    _ => cache.current_seq_len(),
+                                };
+                                cache.rows_after_append(before, seq_len)
+                            }
+                        };
+                        Some((w, rows))
+                    }
+                    _ => None,
+                };
+                if let Some((w, rows)) = window_rows {
+                    if let std::collections::hash_map::Entry::Vacant(slot) =
+                        window_masks.entry((w, rows))
+                    {
+                        let start = (index_pos + seq_len).checked_sub(rows).ok_or_else(|| {
+                            crate::tensor::Error::msg(format!(
+                                "layer {layer_idx}: {rows} window rows past position {}",
+                                index_pos + seq_len
+                            ))
+                        })?;
+                        let dev = current_cuda_idx
+                            .and_then(|idx| self.cuda_devices.get(&idx))
+                            .unwrap_or(&Device::Cpu);
+                        let data = swa_bounded_mask_data(seq_len, index_pos, rows, start, w);
+                        let m = Tensor::from_slice(&data, (seq_len, rows), dev)?;
+                        slot.insert(m);
+                    }
+                }
                 let layer_mask = if own_mask.is_some() {
                     own_mask.as_ref()
-                } else if self.layers[layer_idx].kv_cache.is_windowed() {
-                    mask_swa.as_ref()
+                } else if let Some(key) = window_rows {
+                    window_masks.get(&key)
                 } else {
                     mask.as_ref()
                 };

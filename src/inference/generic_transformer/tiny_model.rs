@@ -212,8 +212,11 @@ fn write_wide_full(
         ),
         ("llama.rope.freq_base".into(), Value::F32(10000.0)),
     ];
+    // A key of `extra` replaces the base key of the same name.
+    let replaced: Vec<String> = extra.iter().map(|(k, _)| k.clone()).collect();
     let metadata: Vec<_> = metadata
         .into_iter()
+        .filter(|(k, _)| !replaced.contains(k))
         .chain(
             routed
                 .then(|| {

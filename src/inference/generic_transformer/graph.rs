@@ -2165,6 +2165,7 @@ impl GenericHeteroTransformer {
             ..
         } = self;
         restore_layers(layers, &kv_snapshots[index].layers)?;
+        end_windows_at(layers, kv_snapshots[index].kv_len);
         self.rebuild_host_stores();
         let draft = self.kv_snapshots[index].draft.clone();
         self.restore_draft(draft.as_ref())?;
@@ -2345,6 +2346,7 @@ impl GenericHeteroTransformer {
         } = self;
         let snap = &kv_snapshots[index];
         restore_layers(layers, &snap.layers)?;
+        end_windows_at(layers, snap.kv_len);
         let out = (snap.tokens.clone(), snap.kv_len);
         // The engram layers hash the ids of the restored sequence.
         if let Some(tokens) = self.wide_sparse.as_ref().and_then(|ws| ws.tokens.as_ref()) {
@@ -3211,6 +3213,14 @@ pub(super) fn restore_layers(
         restore_layer(l, s)?;
     }
     Ok(())
+}
+
+/// Places the rows of every windowed cache so that they end at `position`, the length of the
+/// sequence a snapshot restored.
+pub(super) fn end_windows_at(layers: &mut [GenericTransformerLayer], position: usize) {
+    for l in layers.iter_mut().filter(|l| l.kv_cache.is_windowed()) {
+        l.kv_cache.end_at(position);
+    }
 }
 
 /// The element type the rows of a cache cut over cards are handed over in: the one the layer's

@@ -1424,6 +1424,7 @@ impl GenericHeteroTransformer {
         let snaps = self.point_snapshots(point, blocks)?;
         self.reserve_context(point.pos);
         super::graph::restore_layers(&mut self.layers, &snaps)?;
+        super::graph::end_windows_at(&mut self.layers, point.pos);
         for l in &mut self.layers {
             rebuild_host_rows(l);
         }

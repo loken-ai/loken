@@ -229,6 +229,8 @@ pub(crate) mod wide_sparse_toy;
 #[cfg(test)]
 pub(crate) mod wide_sparse_variant_tests;
 pub mod wide_sparse_variants;
+#[cfg(test)]
+mod window_verify_tests;
 pub use config::*;
 pub use dense::{text_bytes, BlockScaledCheckpoint, DenseCheckpoint, TableRows};
 pub(crate) use loader::{tp_awq_refusal, tp_file_refusal};

@@ -2719,7 +2719,7 @@ impl GenericTransformerLayer {
         } else if let Some(c) = self.q8_kv() {
             return c.current_seq_len();
         }
-        self.kv_cache.current_seq_len()
+        self.kv_cache.position()
     }
 
     pub(super) fn forward_attn_graph(&mut self, x: &Tensor) -> Result<Tensor> {

@@ -105,6 +105,9 @@ pub struct SpecKvCache {
     /// their full window (`w >= chunk`). None = unbounded (default; all non-SWA
     /// layers and non-gemma models -> append is bit-identical to before).
     window: Option<usize>,
+    /// Positions a slide moved out ahead of the first row held.
+    /// The position after the last row is `dropped + current_seq_len`.
+    dropped: usize,
     /// The buffers were made whole by [`Self::preallocate`] and stay when the sequence restarts.
     resident: bool,
     /// Times the buffers were made, grown or dropped: a graph recorded against them is stale
@@ -131,6 +134,7 @@ impl Clone for SpecKvCache {
             max_seq_len: self.max_seq_len,
             dim: self.dim,
             window: self.window,
+            dropped: self.dropped,
             resident: self.resident,
             moves: self.moves,
             // seq_kv_dev is per-instance device state; clone resets it
@@ -154,6 +158,7 @@ impl SpecKvCache {
             max_seq_len,
             dim: 2, // Default: 4D tensors, seq at axis 2
             window: None,
+            dropped: 0,
             resident: false,
             moves: 0,
             #[cfg(feature = "gpu")]
@@ -200,6 +205,7 @@ impl SpecKvCache {
             self.moves += 1;
         }
         self.current_seq_len = 0;
+        self.dropped = 0;
         // Don't drop seq_kv_dev - its device address must stay stable
         // for any captured graph that references it. The next update
         // will overwrite the value via memcpy_htod.
@@ -263,6 +269,19 @@ impl SpecKvCache {
         self.current_seq_len
     }
 
+    /// The position after the last row held.
+    /// It equals [`Self::current_seq_len`] until a windowed cache slides.
+    pub fn position(&self) -> usize {
+        self.dropped + self.current_seq_len
+    }
+
+    /// Makes the rows held end at `position`, for rows restored without the positions a slide
+    /// dropped ahead of them.
+    /// A cache of more rows than `position` keeps no dropped positions.
+    pub fn end_at(&mut self, position: usize) {
+        self.dropped = position.saturating_sub(self.current_seq_len);
+    }
+
     /// True when this cache is bounded to a sliding window (gemma4 SWA layers via
     /// set_window). The prefill attention uses this to gate the bounded SWA mask.
     pub fn is_windowed(&self) -> bool {
@@ -274,10 +293,30 @@ impl SpecKvCache {
         self.window
     }
 
+    /// The rows a slide keeps when `n_new` rows join `before` rows, or `None` when the append
+    /// does not slide.
+    ///
+    /// A slide keeps the window and the rows a draft verify may take back.
+    /// A cut back to the verify's start then still leaves the window of the next row.
+    /// The kept rows and the new ones fit the buffer, the window at the least.
+    fn slide_keeps(&self, before: usize, n_new: usize) -> Option<usize> {
+        let w = self.window?;
+        let verify = crate::inference::engine::decode_step::VERIFY_ROWS;
+        let keep = (w + verify)
+            .min(self.max_seq_len.saturating_sub(n_new))
+            .max(w);
+        (before + n_new > self.max_seq_len && before > keep).then_some(keep)
+    }
+
+    /// The rows held once `n_new` rows join `before` rows, as `append` writes them.
+    pub fn rows_after_append(&self, before: usize, n_new: usize) -> usize {
+        self.slide_keeps(before, n_new).unwrap_or(before) + n_new
+    }
+
     /// The host length after graph replays, which wrote rows on the card without counting
-    /// them here. Clamped to the buffers.
+    /// them here. `len` is a position. Clamped to the buffers.
     pub fn sync_len(&mut self, len: usize) {
-        self.current_seq_len = len.min(self.max_seq_len);
+        self.current_seq_len = len.saturating_sub(self.dropped).min(self.max_seq_len);
     }
 
     /// Advance the sequence length counter without writing data.
@@ -368,16 +407,21 @@ impl SpecKvCache {
         }
     }
 
-    /// Makes a snapshot the whole content of the cache.
+    /// Makes a snapshot the whole content of the cache, its rows starting at position 0.
+    /// [`Self::end_at`] places rows that a slide had moved.
     pub fn restore(&mut self, snap: &SpecKvSnapshot) -> Result<()> {
         self.current_seq_len = 0;
+        self.dropped = 0;
         self.append(&snap.k, &snap.v).map(|_| ())
     }
 
-    /// Trim the KV cache to a specific sequence length.
-    /// This is O(1): only updates current_seq_len counter.
-    pub fn trim_to(&mut self, seq_len: usize) {
-        self.current_seq_len = seq_len.min(self.current_seq_len);
+    /// Cuts the cache back to `position`: the rows of later positions are dropped.
+    /// This is O(1): only the length moves.
+    /// A cut before the first row held leaves the cache empty at `position`.
+    pub fn trim_to(&mut self, position: usize) {
+        let rows = position.saturating_sub(self.dropped);
+        self.current_seq_len = rows.min(self.current_seq_len);
+        self.dropped = self.dropped.min(position);
     }
 
     /// EAGLE-2 tree-KV COMPACTION. After a tree verify writes M+1 tokens
@@ -461,17 +505,16 @@ impl SpecKvCache {
         // without growing, and every query in the appended chunk still sees its full
         // `w`-key window (w >= chunk). Overlap-safe: narrow->contiguous (a copy) before
         // the in-place write at offset 0. No-op when window is None (default).
-        if let Some(w) = self.window {
-            if self.current_seq_len + n_new > self.max_seq_len && self.current_seq_len > w {
-                let kb = self.k.as_mut().unwrap();
-                let vb = self.v.as_mut().unwrap();
-                let start = self.current_seq_len - w;
-                let gk = kb.narrow(dim, start, w)?.contiguous()?;
-                let gv = vb.narrow(dim, start, w)?.contiguous()?;
-                kb.slice_set(&gk, dim, 0)?;
-                vb.slice_set(&gv, dim, 0)?;
-                self.current_seq_len = w;
-            }
+        if let Some(keep) = self.slide_keeps(self.current_seq_len, n_new) {
+            let kb = self.k.as_mut().unwrap();
+            let vb = self.v.as_mut().unwrap();
+            let start = self.current_seq_len - keep;
+            let gk = kb.narrow(dim, start, keep)?.contiguous()?;
+            let gv = vb.narrow(dim, start, keep)?.contiguous()?;
+            kb.slice_set(&gk, dim, 0)?;
+            vb.slice_set(&gv, dim, 0)?;
+            self.current_seq_len = keep;
+            self.dropped += start;
         }
 
         // Grow if needed (double the buffer)

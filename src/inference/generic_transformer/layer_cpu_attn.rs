@@ -412,6 +412,13 @@ impl GenericTransformerLayer {
             .flatten_all()?
             .to_dtype(crate::tensor::DType::F32)?
             .to_vec1::<f32>()?;
+        // The workers index the mask by row and key: a mask of other keys is refused here.
+        if md.len() != seq_q * seq_kv && md.len() != n_head * seq_q * seq_kv {
+            crate::tensor::bail!(
+                "host attention: a mask of {:?} for {seq_q} rows over {seq_kv} keys",
+                mask.dims()
+            );
+        }
         let mut out = vec![0f32; b * n_head * seq_q * d];
         let job = HostPrefillAttn {
             q: &qd,
