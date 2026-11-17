@@ -143,6 +143,28 @@ impl QHostTensor {
         })
     }
 
+    /// Owned tensor whose block bytes `fill` writes into aligned storage, with no other copy.
+    pub fn filled(
+        dtype: GgmlDType,
+        dims: Vec<usize>,
+        fill: impl FnOnce(&mut [u8]) -> Result<()>,
+    ) -> Result<Self> {
+        let elems: usize = dims.iter().product();
+        if !elems.is_multiple_of(dtype.block_size()) {
+            return Err(Error(format!(
+                "QHostTensor::filled: {dims:?} is not whole blocks of {dtype:?}"
+            )));
+        }
+        let mut bytes = AlignedBytes::zeroed(elems / dtype.block_size() * dtype.type_size());
+        fill(bytes.as_mut_slice())?;
+        Ok(Self {
+            storage: QHostStorage::Owned(bytes),
+            dtype,
+            dims,
+            id: next_tensor_id(),
+        })
+    }
+
     /// Zero-copy view of `byte_len` block bytes at `base + byte_offset`, kept
     /// alive by `owner` ( re-host). Alignment and length are checked here so
     /// every downstream block cast is safe.

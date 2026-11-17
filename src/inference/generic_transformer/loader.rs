@@ -3216,6 +3216,111 @@ impl AwqShare {
     }
 }
 
+/// What AWQ layer `layer` holds in host memory of its own once built on the host: its packed
+/// projections as `format` blocks, every other tensor held F32.
+fn awq_host_layer_bytes(
+    st: &crate::tensor::safetensors::MmapedSafetensors,
+    layer: usize,
+    format: crate::tensor::quantized::GgmlDType,
+) -> u64 {
+    let prefix = format!("model.layers.{layer}.");
+    let blocks = |values: usize| (values / format.block_size() * format.type_size()) as u64;
+    st.names()
+        .into_iter()
+        .filter(|name| name.starts_with(&prefix))
+        .map(|name| {
+            let values: usize = st.shape_of(name).map_or(0, |d| d.iter().product());
+            if name.ends_with(".qweight") {
+                // Each stored word packs the codes of 8 outputs.
+                blocks(values * crate::inference::load::awq::PACK)
+            } else if name.ends_with(".qzeros") || name.ends_with(".scales") {
+                0
+            } else {
+                (values * DType::F32.size_in_bytes()) as u64
+            }
+        })
+        .sum()
+}
+
+/// The AWQ projections `projs` of block `prefix`, fused along their outputs into one host
+/// weight of `format` blocks, one of `host_block_format`'s.
+///
+/// The packed codes are read from the mapping and written once into the blocks.
+/// The host holds no other copy of them.
+fn host_awq_blocks(
+    st: &crate::tensor::safetensors::MmapedSafetensors,
+    prefix: &str,
+    projs: &[&str],
+    group_size: usize,
+    format: crate::tensor::quantized::GgmlDType,
+) -> Result<QMatMul> {
+    use crate::inference::load::awq::{write_block_rows, StoredAwq};
+    let mut parts = Vec::with_capacity(projs.len());
+    let mut inputs = None;
+    let mut stored = 0u64;
+    for proj in projs {
+        let name = |what: &str| format!("{prefix}.{proj}.{what}");
+        let (qweight, dims, wtype) = st.stored_bytes(&name("qweight"))?;
+        let (qzeros, _, ztype) = st.stored_bytes(&name("qzeros"))?;
+        let (scales, sdims, stype) = st.stored_bytes(&name("scales"))?;
+        if wtype != DType::I32 || ztype != DType::I32 || dims.len() != 2 || sdims.len() != 2 {
+            crate::tensor::bail!("{prefix}.{proj} is not packed as AWQ stores it");
+        }
+        // CONVERSION: AWQ scales are held F16, the width the AWQ kernels read.
+        let scales: Vec<half::f16> = match stype {
+            DType::F16 => scales
+                .chunks_exact(2)
+                .map(|c| half::f16::from_le_bytes([c[0], c[1]]))
+                .collect(),
+            DType::BF16 => scales
+                .chunks_exact(2)
+                .map(|c| half::f16::from_f32(half::bf16::from_le_bytes([c[0], c[1]]).to_f32()))
+                .collect(),
+            DType::F32 => scales
+                .chunks_exact(4)
+                .map(|c| half::f16::from_f32(f32::from_le_bytes([c[0], c[1], c[2], c[3]])))
+                .collect(),
+            other => crate::tensor::bail!("{prefix}.{proj}: AWQ scales in {other}"),
+        };
+        stored += (qweight.len() + qzeros.len() + scales.len() * stype.size_in_bytes()) as u64;
+        match inputs {
+            Some(k) if k != dims[0] => {
+                crate::tensor::bail!(
+                    "{prefix}: fused projections read {k} and {} inputs",
+                    dims[0]
+                )
+            }
+            _ => inputs = Some(dims[0]),
+        }
+        parts.push(StoredAwq {
+            qweight,
+            qzeros,
+            scales,
+            n: sdims[1],
+        });
+    }
+    let k = inputs.ok_or_else(|| crate::tensor::Error::msg("no projection to read"))?;
+    let rows: usize = parts.iter().map(|part| part.n).sum();
+    // CONVERSION: AWQ codes into host blocks the host kernels read.
+    let blocks = QTensor::host_filled(format, vec![rows, k], |out| {
+        write_block_rows(&parts, k, group_size, format, out).map_err(crate::tensor::Error::msg)
+    })?;
+    let class = if projs.iter().all(|proj| proj.starts_with("mlp.")) {
+        "ffn"
+    } else {
+        "attention"
+    };
+    crate::tensor::conversion::record_kept(
+        class,
+        "awq_int4",
+        format.gguf_name(),
+        stored,
+        (rows * k / format.block_size() * format.type_size()) as u64,
+        "AWQ codes held as host blocks",
+    );
+    QMatMul::from_qtensor(blocks)
+}
+
 /// Build one `GenericTransformerLayer` from an AWQ checkpoint. Dense
 /// Qwen2/Qwen3/Mistral: separate q/k/v (so the GGUF-byte APQ fast path gates off
 /// and `standard_attention` - which works with any `QMatMul` - runs), f16 norms,
@@ -3232,6 +3337,7 @@ fn build_awq_layer(
     group_size: usize,
     keep_free: usize,
     share: Option<&AwqShare>,
+    host_form: crate::tensor::quantized::GgmlDType,
 ) -> Result<GenericTransformerLayer> {
     use crate::inference::generic_transformer::projection::AwqWeight;
     let eps = config.rms_norm_eps;
@@ -3239,7 +3345,12 @@ fn build_awq_layer(
 
     // One AWQ projection -> QMatMul::Awq. k = in (qweight rows), n = out (scales cols). A
     // tensor-parallel share cuts the projection to `slice` on the host first.
+    // A host layer holds its projections in host blocks, read from the mapping.
+    let on_host = matches!(device, Device::Cpu) && share.is_none();
     let load_awq = |proj: &str, slice: AwqSlice| -> Result<QMatMul> {
+        if on_host {
+            return host_awq_blocks(st, &p, &[proj], group_size, host_form);
+        }
         // Force contiguous, offset-0 device buffers - the AWQ kernels take raw
         // `as_cuda_slice`s and assume a packed layout from the buffer start.
         let (qweight, qzeros, scales) = if slice == AwqSlice::Whole {
@@ -3307,6 +3418,10 @@ fn build_awq_layer(
     // into ONE AwqWeight - qweight/qzeros are [K|K/gs, N/8] (cat dim 1), scales
     // [K/gs, N] (cat dim 1). One GEMV + one launch instead of N.
     let fuse_awq = |projs: &[(&str, AwqSlice)]| -> Result<QMatMul> {
+        if on_host {
+            let names: Vec<&str> = projs.iter().map(|(proj, _)| *proj).collect();
+            return host_awq_blocks(st, &p, &names, group_size, host_form);
+        }
         // Concatenate on the host: there is no i32 concat CUDA kernel (cat on i32
         // device tensors -> "named symbol not found"). Load each shard to CPU, cat,
         // then move the fused tensor to the device once.
@@ -5828,6 +5943,47 @@ impl GenericHeteroTransformer {
             "AWQ load: {} arch={} layers={} (gs={})",
             cfgj.hf_arch, arch, config.n_layers, group_size
         );
+        // The host layers hold their values exactly when the host budget the plan carries holds
+        // the exact blocks, and in the 4-bit blocks otherwise.
+        let host_layers: Vec<usize> = (0..config.n_layers)
+            .filter(|&l| layer_card[l].is_none())
+            .collect();
+        let budget = plan
+            .segments
+            .iter()
+            .find(|s| matches!(s.kind, DeviceKind::Cpu))
+            .map_or(0, |s| s.free_memory_bytes);
+        let owned_in = |format| -> u64 {
+            host_layers
+                .iter()
+                .map(|&l| awq_host_layer_bytes(&st, l, format))
+                .sum()
+        };
+        let exact = crate::inference::load::awq::host_block_format(true);
+        let host_form = match host_spill_fits(owned_in(exact), budget) {
+            true => exact,
+            false => crate::inference::load::awq::host_block_format(false),
+        };
+        if !host_layers.is_empty() {
+            let owned = owned_in(host_form);
+            if host_spill_fits(owned, budget) {
+                info!(
+                    "🧠 host spill admitted: {} layers in {}, {:.1} GB owned of {:.1} GB available, 0.0 GB read from the mapping",
+                    host_layers.len(),
+                    host_form.gguf_name(),
+                    owned as f64 / 1e9,
+                    budget as f64 / 1e9,
+                );
+            } else {
+                warn!(
+                    "host memory: {} AWQ layers hold {:.1} GB on the host in {} and {:.1} GB is available after the safety margin",
+                    host_layers.len(),
+                    owned as f64 / 1e9,
+                    host_form.gguf_name(),
+                    budget as f64 / 1e9,
+                );
+            }
+        }
 
         // Prewarm the fused decode kernels onto a CLEAN device - BEFORE loading
         // the ~336 AWQ weight tensors. Lazily loading the "loken_fused" module
@@ -5974,6 +6130,7 @@ impl GenericHeteroTransformer {
                         group_size,
                         keep_free as usize,
                         Some(&AwqShare::of(layout, rank, config.head_dim)),
+                        host_form,
                     )?);
                 }
                 let mut owner = shares.remove(0);
@@ -6002,6 +6159,7 @@ impl GenericHeteroTransformer {
                 group_size,
                 keep_free as usize,
                 None,
+                host_form,
             )?);
             layer_devs.push(dev_enum);
         }

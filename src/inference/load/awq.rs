@@ -256,9 +256,194 @@ impl RepackedAwq {
     }
 }
 
+/// One AWQ projection as its checkpoint stores it, read in place.
+pub struct StoredAwq<'a> {
+    /// `[k, n / 8]` little-endian i32, 8 output nibbles per word in AWQ order.
+    pub qweight: &'a [u8],
+    /// `[k / group, n / 8]` little-endian i32, 8 zero nibbles per word in AWQ order.
+    pub qzeros: &'a [u8],
+    /// `[k / group, n]` scales, each held f16.
+    pub scales: Vec<f16>,
+    /// Output features.
+    pub n: usize,
+}
+
+/// The host block formats an AWQ projection is written in.
+///
+/// `Q8_0` holds every stored value exactly: the group's scale and the code less the zero.
+/// `Q4_1` holds the codes as stored, the group's scale and `-scale * zero` rounded to f16 as the
+/// minimum: a value differs from the stored one by the rounding of the minimum alone.
+pub fn host_block_format(exact: bool) -> crate::tensor::quantized::GgmlDType {
+    use crate::tensor::quantized::GgmlDType;
+    if exact {
+        GgmlDType::Q8_0
+    } else {
+        GgmlDType::Q4_1
+    }
+}
+
+/// Write the projections `parts`, all of `k` inputs, into `out` as rows of `format` blocks, one
+/// of [`host_block_format`]'s: the rows of each part in order, one row per output.
+pub fn write_block_rows(
+    parts: &[StoredAwq],
+    k: usize,
+    group_size: usize,
+    format: crate::tensor::quantized::GgmlDType,
+    out: &mut [u8],
+) -> Result<(), String> {
+    use crate::tensor::quantized::GgmlDType;
+    use rayon::prelude::*;
+    let exact = match format {
+        GgmlDType::Q8_0 => true,
+        GgmlDType::Q4_1 => false,
+        other => return Err(format!("no AWQ host blocks in {other:?}")),
+    };
+    let block = format.block_size();
+    let block_bytes = format.type_size();
+    if group_size == 0 || !group_size.is_multiple_of(block) || !k.is_multiple_of(group_size) {
+        return Err(format!(
+            "AWQ groups of {group_size} over {k} inputs do not hold whole blocks of {block}"
+        ));
+    }
+    let row_bytes = k / block * block_bytes;
+    let rows: usize = parts.iter().map(|p| p.n).sum();
+    if out.len() != rows * row_bytes {
+        return Err(format!(
+            "{} bytes for {rows} rows of {row_bytes}",
+            out.len()
+        ));
+    }
+    let groups = k / group_size;
+    let mut rest = out;
+    for part in parts {
+        let pcols = part.n / PACK;
+        if !part.n.is_multiple_of(PACK)
+            || part.qweight.len() != k * pcols * 4
+            || part.qzeros.len() != groups * pcols * 4
+            || part.scales.len() != groups * part.n
+        {
+            return Err(format!(
+                "an AWQ projection of {} outputs over {k} inputs is not stored whole",
+                part.n
+            ));
+        }
+        let (mine, after) = rest.split_at_mut(part.n * row_bytes);
+        rest = after;
+        let word = |bytes: &[u8], at: usize| -> u32 {
+            u32::from_le_bytes(bytes[at * 4..at * 4 + 4].try_into().expect("4 bytes"))
+        };
+        // One packed column holds 8 outputs: its rows are written by one task.
+        mine.par_chunks_mut(PACK * row_bytes)
+            .enumerate()
+            .for_each(|(pc, rows8)| {
+                let mut words = vec![0u32; block];
+                for b in 0..k / block {
+                    let g = b * block / group_size;
+                    for (t, w) in words.iter_mut().enumerate() {
+                        *w = word(part.qweight, (b * block + t) * pcols + pc);
+                    }
+                    let zeros = word(part.qzeros, g * pcols + pc);
+                    for (j, row) in rows8.chunks_exact_mut(row_bytes).enumerate() {
+                        let shift = 4 * AWQ_ORDER[j];
+                        let scale = part.scales[g * part.n + pc * PACK + j];
+                        let zero = (zeros >> shift) & 0xF;
+                        let code = |t: usize| (words[t] >> shift) & 0xF;
+                        let dst = &mut row[b * block_bytes..(b + 1) * block_bytes];
+                        dst[0..2].copy_from_slice(&scale.to_le_bytes());
+                        if exact {
+                            for t in 0..block {
+                                dst[2 + t] = (code(t) as i8 - zero as i8) as u8;
+                            }
+                        } else {
+                            let min = f16::from_f32(-(zero as f32) * scale.to_f32());
+                            dst[2..4].copy_from_slice(&min.to_le_bytes());
+                            let half = block / 2;
+                            for t in 0..half {
+                                dst[4 + t] = (code(t) | code(t + half) << 4) as u8;
+                            }
+                        }
+                    }
+                }
+            });
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The rows written from a stored projection give the stored values back: exactly in the
+    /// exact format, up to the rounding of each block's minimum in the other.
+    #[test]
+    fn block_rows_give_the_stored_values() {
+        use crate::tensor::quant_cpu::to_float_bytes;
+        let (k, gs) = (256usize, 128usize);
+        let mut state = 0x9e37_79b9_u32;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state
+        };
+        let build = |n: usize, next: &mut dyn FnMut() -> u32| {
+            let qweight: Vec<i32> = (0..k * n / PACK).map(|_| next() as i32).collect();
+            let qzeros: Vec<i32> = (0..k / gs * n / PACK).map(|_| next() as i32).collect();
+            let scales: Vec<f16> = (0..k / gs * n)
+                .map(|_| f16::from_f32(1e-3 + (next() % 1000) as f32 * 1e-5))
+                .collect();
+            AwqTensor::new(k, n, gs, qweight, qzeros, scales)
+        };
+        let parts = [build(16, &mut next), build(8, &mut next)];
+        let bytes = |v: &[i32]| -> Vec<u8> { v.iter().flat_map(|w| w.to_le_bytes()).collect() };
+        let stored: Vec<(Vec<u8>, Vec<u8>)> = parts
+            .iter()
+            .map(|t| (bytes(&t.qweight), bytes(&t.qzeros)))
+            .collect();
+        let views: Vec<StoredAwq> = parts
+            .iter()
+            .zip(&stored)
+            .map(|(t, (w, z))| StoredAwq {
+                qweight: w,
+                qzeros: z,
+                scales: t.scales.clone(),
+                n: t.n,
+            })
+            .collect();
+        let rows = 24;
+        for exact in [true, false] {
+            let format = host_block_format(exact);
+            let row_bytes = k / format.block_size() * format.type_size();
+            let mut out = vec![0u8; rows * row_bytes];
+            write_block_rows(&views, k, gs, format, &mut out).unwrap();
+            let mut got = vec![0f32; rows * k];
+            to_float_bytes(format, &out, &mut got).unwrap();
+            let mut row = 0;
+            for t in &parts {
+                let want = t.dequant();
+                for o in 0..t.n {
+                    for kk in 0..k {
+                        let g = kk / gs;
+                        let pc = o / PACK;
+                        let shift = 4 * AWQ_ORDER[o % PACK];
+                        let zero = ((t.qzeros[g * (t.n / PACK) + pc] as u32 >> shift) & 0xF) as f32;
+                        let scale = t.scales[g * t.n + o].to_f32();
+                        // Half a unit in the last place of an f16 minimum, nothing when exact.
+                        let bound = match exact {
+                            true => 0.0,
+                            false => (zero * scale).abs() * 2f32.powi(-11),
+                        };
+                        let (w, g2) = (want[kk * t.n + o], got[row * k + kk]);
+                        assert!(
+                            (w - g2).abs() <= bound,
+                            "{format:?} row {row} input {kk}: {g2} against {w}"
+                        );
+                    }
+                    row += 1;
+                }
+            }
+        }
+    }
 
     /// Golden scalars captured from vLLM's authoritative `awq_dequantize`
     /// (deepcoder-14b-preview-awq, layer 0 q_proj). Verifies the

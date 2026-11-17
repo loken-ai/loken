@@ -1398,6 +1398,63 @@ fn qwen3_loads_from_awq_safetensors() {
     load_awq("qwen3_awq", "Qwen3ForCausalLM", false, true);
 }
 
+/// A host layer of an AWQ checkpoint holds each projection in exact 8-bit blocks when the host
+/// budget holds them, in 4-bit blocks with a scale and a minimum when it does not, and runs.
+#[test]
+fn awq_host_layers_hold_their_codes_as_blocks() {
+    use crate::inference::load::awq_loader as awql;
+    let dir = scratch("awq_host_blocks");
+    write_awq(&dir, "Qwen2ForCausalLM", true, false);
+    let dir_str = dir.to_string_lossy().to_string();
+    let (_, shards) = awql::checkpoint_shards(&dir).unwrap();
+    let ample = host_plan(2);
+    let mut short = host_plan(2);
+    for seg in &mut short.segments {
+        seg.free_memory_bytes = 1;
+    }
+    let built: Vec<_> = [(&ample, "q8_0"), (&short, "q4_1")]
+        .into_iter()
+        .map(|(plan, format)| {
+            let model = GenericWeights::Awq {
+                dir: &dir_str,
+                shards: &shards,
+            }
+            .build(
+                &HashMap::new(),
+                plan,
+                crate::inference::engine::llm_engine::KvQuant::Off,
+                None,
+                false,
+                false,
+            );
+            (model, format)
+        })
+        .collect();
+    let _ = std::fs::remove_dir_all(&dir);
+    for (built, format) in built {
+        let mut model = built.unwrap_or_else(|e| panic!("{format}: load failed: {e}"));
+        for (i, layer) in model.layers.iter().enumerate() {
+            let projections = [
+                layer
+                    .attn_qkv
+                    .as_ref()
+                    .expect("a fused query, key and value"),
+                &layer.attn_output,
+                &layer.ffn_up,
+                &layer.ffn_down,
+            ];
+            for qm in projections {
+                assert_eq!(
+                    qm.resident_format(),
+                    (format.to_string(), 0),
+                    "layer {i}: a projection is not held in {format}"
+                );
+            }
+        }
+        assert_runs(format, &mut model, VOCAB);
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // The checkpoints publishers ship. Each test writes the weights of an architecture's recipe in
 // the publisher's tensor names and layout, loads the directory as the server does, and compares

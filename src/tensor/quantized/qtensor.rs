@@ -454,6 +454,18 @@ impl QTensor {
             device,
         )
     }
+
+    /// A host tensor of `dims` in `ggml_dtype` whose block bytes `fill` writes, held once.
+    pub fn host_filled(
+        ggml_dtype: GgmlDType,
+        dims: Vec<usize>,
+        fill: impl FnOnce(&mut [u8]) -> Result<()>,
+    ) -> Result<QTensor> {
+        QTensor::from_native(
+            Arc::new(QHostTensor::filled(ggml_dtype, dims, fill)?),
+            &Device::Cpu,
+        )
+    }
 }
 
 /// The little-endian 16-bit words of `bytes`, each turned into a `T` by `from_bits`.

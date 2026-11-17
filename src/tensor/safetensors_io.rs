@@ -177,6 +177,52 @@ impl SafeTensorsLoader {
         Ok(dtype)
     }
 
+    /// The stored bytes of tensor `name` as the mapping holds them, its shape and its dtype.
+    ///
+    /// Nothing is copied: the slice is the mapping's, and lives as long as the loader.
+    /// The read is counted and cancelled as a [`Self::load`] is.
+    pub fn stored_bytes(&self, name: &str) -> Result<(&[u8], Vec<usize>, super::DType)> {
+        crate::inference::serve::cancel::scoped::bail()?;
+        let &fi = self
+            .index
+            .get(name)
+            .ok_or_else(|| Error(format!("safetensors: no tensor `{name}`")))?;
+        let st = safetensors::SafeTensors::deserialize(&self.maps[fi])
+            .map_err(|e| Error(format!("safetensors parse: {e}")))?;
+        let view = st
+            .tensor(name)
+            .map_err(|e| Error(format!("safetensors `{name}`: {e}")))?;
+        let dtype = match view.dtype() {
+            safetensors::Dtype::F32 => super::DType::F32,
+            safetensors::Dtype::F16 => super::DType::F16,
+            safetensors::Dtype::BF16 => super::DType::BF16,
+            safetensors::Dtype::U8 => super::DType::U8,
+            safetensors::Dtype::U32 => super::DType::U32,
+            safetensors::Dtype::I16 => super::DType::I16,
+            safetensors::Dtype::I32 => super::DType::I32,
+            safetensors::Dtype::I64 => super::DType::I64,
+            safetensors::Dtype::F64 => super::DType::F64,
+            other => {
+                return Err(Error(format!(
+                    "safetensors `{name}`: no host dtype for {other:?}"
+                )))
+            }
+        };
+        let out = (view.data(), view.shape().to_vec(), dtype);
+        self.count_read();
+        Ok(out)
+    }
+
+    /// Count one tensor read, for the progress a client sees.
+    fn count_read(&self) {
+        let done = self.read.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        crate::inference::serve::progress::scoped::note(
+            crate::inference::serve::progress::phase::LOAD_MODEL,
+            done,
+            self.index.len(),
+        );
+    }
+
     /// Load one tensor to host as a native tensor (dtype preserved).
     pub fn load(&self, name: &str) -> Result<Tensor> {
         // Cooperative cancellation at the grain the reading happens, and for the same
@@ -261,12 +307,7 @@ impl SafeTensorsLoader {
         // Counted after the read succeeded, so the number means "on the host", not
         // "attempted". Costs one relaxed increment and one thread-local read when no
         // render published a reporter, which is every non-serving caller.
-        let done = self.read.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-        crate::inference::serve::progress::scoped::note(
-            crate::inference::serve::progress::phase::LOAD_MODEL,
-            done,
-            self.index.len(),
-        );
+        self.count_read();
         Ok(t)
     }
 
@@ -318,6 +359,11 @@ impl MmapedSafetensors {
     pub fn load(&self, name: &str, device: &Device) -> Result<Tensor> {
         let t = self.inner.load(name)?;
         t.to_device(device)
+    }
+
+    /// The stored bytes of tensor `name` in the mapping, its shape and its dtype, with no copy.
+    pub fn stored_bytes(&self, name: &str) -> Result<(&[u8], Vec<usize>, super::DType)> {
+        self.inner.stored_bytes(name)
     }
 
     /// Presence probe (the loader returns a TensorView; the call sites
