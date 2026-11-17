@@ -790,7 +790,10 @@ pub(crate) trait ModelBackend: Send {
     /// now, off the caller's thread.
     fn rerank_hot_experts(&self) {}
     /// Before a request's decode: wait for the experts a re-rank is moving.
-    fn settle_hot_experts(&self) {}
+    /// Whether the experts were being moved.
+    fn settle_hot_experts(&self) -> bool {
+        false
+    }
 
     /// Where the model's layers run, when the backend can say.
     fn placement(&self) -> Option<crate::inference::place::Placement> {
@@ -2034,7 +2037,7 @@ impl ModelBackend for GenericBackend {
         self.0.rerank_hot_experts()
     }
     #[cfg(feature = "gpu")]
-    fn settle_hot_experts(&self) {
+    fn settle_hot_experts(&self) -> bool {
         self.0.settle_hot_experts()
     }
 

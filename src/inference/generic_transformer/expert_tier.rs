@@ -993,10 +993,9 @@ impl super::GenericHeteroTransformer {
         }
     }
     /// Wait for the locks of the hot experts a re-rank is moving, before a request runs.
-    pub fn settle_hot_experts(&self) {
-        if let Some(h) = &self.hot_locks {
-            h.settle();
-        }
+    /// Whether locks were being moved.
+    pub fn settle_hot_experts(&self) -> bool {
+        self.hot_locks.as_ref().is_some_and(|h| h.settle())
     }
 }
 
@@ -1186,7 +1185,21 @@ impl super::GenericHeteroTransformer {
         if recording || !self.slots_on_planned_need() {
             return step(self);
         }
-        let states = match self.recurrent_checkpoint() {
+        let copying = std::time::Instant::now();
+        let copied = self.recurrent_checkpoint();
+        // The stage profile times the copy once the cards have run it.
+        if crate::inference::stage_prof::stage_prof_enabled() {
+            for dev in self.cuda_devices.values() {
+                if let Ok(cd) = dev.as_cuda_device() {
+                    let _ = cd.0.stream().synchronize();
+                }
+            }
+            crate::inference::stage_prof::prof_record(
+                "expert tier: recurrent states copied before a step",
+                copying.elapsed().as_nanos() as u64,
+            );
+        }
+        let states = match copied {
             Ok(states) => states,
             Err(e) => {
                 tracing::warn!(

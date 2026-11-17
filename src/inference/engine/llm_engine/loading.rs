@@ -1674,20 +1674,11 @@ impl LlmEngine {
             // Free VRAM just changed by the size of a model.
             crate::inference::place::vram_manager::residency_changed();
             *guard = Some(new_state);
-            // --- Warm the prefill path ---
-            // The first prompt of a fresh server otherwise pays for the code objects, the
-            // device buffers, the card probes and the clocks it is the first to touch. It runs
-            // after the residency epoch moved, so the chunk sizing it memoises is the one the
-            // first request reads.
-            let warm_started = std::time::Instant::now();
-            if guard
-                .as_mut()
-                .is_some_and(|st| warm_prefill(st.model.as_mut(), &st.device))
-            {
-                info!(
-                    "prefill warmed in {:.0}ms",
-                    warm_started.elapsed().as_secs_f64() * 1e3
-                );
+            // --- Ready the model for its first request ---
+            // It runs after the residency epoch moved, so the chunk sizing the warmup memoises
+            // is the one the first request reads.
+            if let Some(st) = guard.as_mut() {
+                ready_for_requests(st.model.as_mut(), &st.device);
             }
             drop(guard);  // Release lock early
 
@@ -1954,6 +1945,31 @@ mod cache_format_tests {
     }
 }
 
+/// Readies a loaded model for its first request.
+/// The prefill path is warmed first: the first prompt of a fresh server otherwise pays for the
+/// code objects, the device buffers, the card probes and the clocks it is the first to touch.
+/// The host pages of the hot experts a profile ranked are registered next: a registration
+/// holds the driver until it ends, and a request run beside it waits for it.
+fn ready_for_requests(
+    model: &mut dyn crate::inference::engine::model_backend::ModelBackend,
+    device: &Device,
+) {
+    let warm_started = std::time::Instant::now();
+    if warm_prefill(model, device) {
+        info!(
+            "prefill warmed in {:.0}ms",
+            warm_started.elapsed().as_secs_f64() * 1e3
+        );
+    }
+    let settle_started = std::time::Instant::now();
+    if model.settle_hot_experts() {
+        info!(
+            "hot experts' host pages registered, {:.0}ms waited",
+            settle_started.elapsed().as_secs_f64() * 1e3
+        );
+    }
+}
+
 /// Runs prompts of a few lengths through a loaded text model and cuts the KV back to empty, so
 /// the first request finds the kernels loaded, the buffers sized and the card clocked up.
 /// Returns whether the warmup ran. A model that cannot cut its KV back, or that fails a pass,
@@ -1985,4 +2001,97 @@ fn warm_prefill(
     }
     model.invalidate_graph_state();
     ran
+}
+
+#[cfg(test)]
+mod ready_tests {
+    use super::*;
+    use crate::inference::engine::model_backend::{BoxedModelBackend, Capabilities, ModelBackend};
+    use crate::inference::generic_transformer::GenericHeteroTransformer;
+    use std::sync::{Arc, Mutex};
+
+    /// A backend that records the calls the load makes of it, in order.
+    struct ReadyToy {
+        calls: Arc<Mutex<Vec<&'static str>>>,
+        trims: bool,
+    }
+
+    impl ReadyToy {
+        fn note(&self, call: &'static str) {
+            self.calls.lock().unwrap().push(call);
+        }
+    }
+
+    impl ModelBackend for ReadyToy {
+        fn forward(&mut self, _: &Tensor, _: usize) -> crate::tensor::Result<Tensor> {
+            Tensor::zeros((1, 4), crate::tensor::DType::F32)
+        }
+
+        fn forward_prefill_chunked(
+            &mut self,
+            _: &Tensor,
+            _: usize,
+        ) -> crate::tensor::Result<Tensor> {
+            self.note("prefill");
+            Tensor::zeros((1, 4), crate::tensor::DType::F32)
+        }
+
+        fn trim_kv(&mut self, _: usize) {
+            self.note("trim");
+        }
+
+        fn capabilities(&self) -> Capabilities {
+            Capabilities {
+                trim_kv: self.trims,
+                ..Capabilities::default()
+            }
+        }
+
+        fn kv_capacity(&self) -> Option<usize> {
+            Some(4096)
+        }
+
+        fn settle_hot_experts(&self) -> bool {
+            self.note("settle");
+            true
+        }
+
+        fn take_generic(self: Box<Self>) -> Result<GenericHeteroTransformer, BoxedModelBackend> {
+            Err(self)
+        }
+
+        fn into_serial(self: Box<Self>) -> Result<BoxedModelBackend, BoxedModelBackend> {
+            Err(self)
+        }
+    }
+
+    /// The load waits for the registration of the hot experts' pages once, after the warmup
+    /// when there is one, and before it hands the model to a request.
+    #[test]
+    fn a_load_settles_the_registration_after_its_warmup() {
+        for trims in [true, false] {
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let mut model = ReadyToy {
+                calls: calls.clone(),
+                trims,
+            };
+            ready_for_requests(&mut model, &Device::Cpu);
+            let calls = calls.lock().unwrap().clone();
+            assert_eq!(
+                calls.last(),
+                Some(&"settle"),
+                "the load ended with {calls:?}"
+            );
+            assert_eq!(
+                calls.iter().filter(|c| **c == "settle").count(),
+                1,
+                "{calls:?}"
+            );
+            assert_eq!(
+                calls.contains(&"prefill"),
+                trims,
+                "a warmup ran where it could not, or none where it could: {calls:?}"
+            );
+        }
+    }
 }
