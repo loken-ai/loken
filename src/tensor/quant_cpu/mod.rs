@@ -149,6 +149,19 @@ pub mod repack_mxfp4_x8;
 /// `{0,1,4,5}`/`{2,3,6,7}`.
 pub mod repack_q8_0_x8;
 
+/// Q5_0 weights repacked for the Q8_0 prefill GEMM: each block as the Q8_0 block of the same
+/// values, in the `BlockQ8_0x8` layout.
+pub mod repack_q5_0_wide {
+    use super::repack_q8_0_x8::{repack_from, BlockQ8_0x8};
+    use super::BlockQ5_0;
+
+    /// Repack row-major `[n][nb]` `BlockQ5_0` into `[n/8][nb]` `BlockQ8_0x8` of the same values.
+    pub fn repack(raw: &[BlockQ5_0], n: usize, nb: usize) -> Vec<BlockQ8_0x8> {
+        debug_assert_eq!(raw.len(), n * nb);
+        repack_from(n, nb, |i| raw[i].widened())
+    }
+}
+
 mod repack_inline;
 pub use repack_inline::*;
 mod tests_repack;

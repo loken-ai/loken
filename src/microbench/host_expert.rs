@@ -248,7 +248,9 @@ fn format_of(name: &str) -> Result<GgmlDType, String> {
     match name {
         "iq2_xxs" => Ok(GgmlDType::Iq2Xxs),
         "q2_k" => Ok(GgmlDType::Q2K),
+        "q4_1" => Ok(GgmlDType::Q4_1),
         "q4_k" => Ok(GgmlDType::Q4K),
+        "q5_0" => Ok(GgmlDType::Q5_0),
         "q6_k" => Ok(GgmlDType::Q6K),
         "q8_0" => Ok(GgmlDType::Q8_0),
         other => Err(format!("format {other} is not one the bench knows")),

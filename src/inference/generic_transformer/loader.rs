@@ -3201,6 +3201,28 @@ fn awq_host_layer_bytes(
         .sum()
 }
 
+/// The bytes of the copies AWQ layer `layer`'s projections, held as `format` blocks on the host,
+/// build for their host GEMMs.
+fn awq_host_copy_bytes(
+    st: &crate::tensor::safetensors::MmapedSafetensors,
+    layer: usize,
+    format: crate::tensor::quantized::GgmlDType,
+) -> u64 {
+    let prefix = format!("model.layers.{layer}.");
+    st.names()
+        .into_iter()
+        .filter(|name| name.starts_with(&prefix) && name.ends_with(".qweight"))
+        .map(|name| {
+            let words: usize = st.shape_of(name).map_or(0, |d| d.iter().product());
+            // Each stored word packs the codes of 8 outputs.
+            crate::tensor::quantized::QKernelMatMul::host_copy_bytes(
+                format,
+                words * crate::inference::load::awq::PACK,
+            )
+        })
+        .sum()
+}
+
 /// The AWQ projections `projs` of block `prefix`, fused along their outputs into one host
 /// weight of `format` blocks, one of `host_block_format`'s.
 ///
@@ -5959,13 +5981,19 @@ impl GenericHeteroTransformer {
         };
         if !host_layers.is_empty() {
             let owned = owned_in(host_form);
+            // The copies are built at the first prompt, each while the measured budget holds it.
+            let copies: u64 = host_layers
+                .iter()
+                .map(|&l| awq_host_copy_bytes(&st, l, host_form))
+                .sum();
             if host_spill_fits(owned, budget) {
                 info!(
-                    "🧠 host spill admitted: {} layers in {}, {:.1} GB owned of {:.1} GB available, 0.0 GB read from the mapping",
+                    "🧠 host spill admitted: {} layers in {}, {:.1} GB owned of {:.1} GB available, 0.0 GB read from the mapping, up to {:.1} GB more of GEMM copies while the host budget holds them",
                     host_layers.len(),
                     host_form.gguf_name(),
                     owned as f64 / 1e9,
                     budget as f64 / 1e9,
+                    copies as f64 / 1e9,
                 );
             } else {
                 warn!(

@@ -10,6 +10,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 - Experts: lock a mixture's host pages before its load ends, not during a first prompt.
 - Experts: compute a mixture's missing Q5_1 experts on the host.
 - Experts: compute a mixture's missing Q3_K experts on the host.
+- Host: decode an AWQ model faster and read Q5_0 prompts about 4 times faster.
 
 ### Fixed
 

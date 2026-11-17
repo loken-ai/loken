@@ -133,6 +133,21 @@ impl BlockFormat for BlockQ5_0 {
     }
 }
 
+impl BlockQ5_0 {
+    /// The `Q8_0` block holding the same 32 values: the same scale, each code less its bias.
+    pub(crate) fn widened(&self) -> BlockQ8_0 {
+        const HALF: usize = QK5_0 / 2;
+        let qh = u32::from_le_bytes(self.qh);
+        let mut qs = [0i8; QK8_0];
+        for (j, &packed) in self.qs.iter().enumerate() {
+            let top = |v: usize| (((qh >> v) & 1) << 4) as i32;
+            qs[j] = ((packed & 0x0F) as i32 + top(j) - Q5_0_BIAS) as i8;
+            qs[j + HALF] = ((packed >> 4) as i32 + top(j + HALF) - Q5_0_BIAS) as i8;
+        }
+        BlockQ8_0 { d: self.d, qs }
+    }
+}
+
 impl ExactDot for BlockQ5_0 {
     type Act = BlockQ8K32;
     fn dot_exact(xs: &[Self], ys: &[BlockQ8K32]) -> f32 {

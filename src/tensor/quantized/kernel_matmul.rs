@@ -120,10 +120,6 @@ pub struct QKernelMatMul {
     /// prefill that hits a Q6_K weight (e.g. the Q6_K `ffn_down` rows).
     pub(super) cpu_repack_q6k:
         std::sync::OnceLock<Vec<crate::tensor::quant_cpu::repack_q6k::BlockQ6Kx8>>,
-    /// CPU Q5_0 prefill: 8-column block-major repack, same weight-reuse story as
-    /// the K-quant repacks. Built lazily on the first CPU prefill that hits a
-    /// Q5_0 weight (the projections of the Q5-quant models).
-    pub(super) cpu_repack_q5_0: std::sync::OnceLock<Vec<crate::tensor::quant_cpu::BlockQ5_0>>,
     /// CPU Q5_K prefill: 8-column repack keeping the packed 4-bit + 1-bit planes,
     /// same shape as the Q6_K repack. Built lazily on the first CPU prefill that
     /// hits a Q5_K weight (qwen3next, deepseek-r1's Q5_K rows).
@@ -140,6 +136,7 @@ pub struct QKernelMatMul {
         std::sync::OnceLock<Vec<crate::tensor::quant_cpu::repack_mxfp4_x8::BlockMxFp4x8>>,
     /// Column-interleaved Q8_0 repack (`block_q8_0x8`) - same denser prefill GEMM
     /// generalized to Q8_0 (fleet-wide: many small models + attention). Lazy.
+    /// A Q5_0 weight holds here the Q8_0 blocks of its values.
     pub(super) cpu_repack_q8_0_x8:
         std::sync::OnceLock<Vec<crate::tensor::quant_cpu::repack_q8_0_x8::BlockQ8_0x8>>,
     /// Arc-shared so the compat shim's `QCudaStorage` projection
@@ -219,7 +216,6 @@ impl QKernelMatMul {
             dequant: std::sync::OnceLock::new(),
             cpu_repack_q4k: std::sync::OnceLock::new(),
             cpu_repack_q6k: std::sync::OnceLock::new(),
-            cpu_repack_q5_0: std::sync::OnceLock::new(),
             cpu_repack_q5k: std::sync::OnceLock::new(),
             cpu_repack_q4_0: std::sync::OnceLock::new(),
             cpu_repack_mxfp4_x8: std::sync::OnceLock::new(),
@@ -279,7 +275,6 @@ impl QKernelMatMul {
             dequant: std::sync::OnceLock::new(),
             cpu_repack_q4k: std::sync::OnceLock::new(),
             cpu_repack_q6k: std::sync::OnceLock::new(),
-            cpu_repack_q5_0: std::sync::OnceLock::new(),
             cpu_repack_q5k: std::sync::OnceLock::new(),
             cpu_repack_q4_0: std::sync::OnceLock::new(),
             cpu_repack_mxfp4_x8: std::sync::OnceLock::new(),
@@ -1248,11 +1243,12 @@ impl QKernelMatMul {
                 )
                 .map(|b| b.len() == self.n * nb)
                 .unwrap_or(false);
-            // Q5_0 (the projections of the Q5-quant models) gets the same tiled
-            // weight-reuse; its per-column path is doubly penalised (no reuse and
-            // a 32-weight block, so the high-bit decode is paid far more often).
-            let q5_0_prefill = self.repack_fits(self.cpu_repack_q5_0.get().is_some())
-                && self.dtype == GgmlDType::Q5_0
+            // Q5_0 prefill runs the Q8_0 tiled GEMM over a Q8_0 copy of the same values.
+            let q5_0_prefill = self.repack_fits_bytes(
+                self.cpu_repack_q8_0_x8.get().is_some(),
+                self.host.byte_len() as u64 / GgmlDType::Q5_0.type_size() as u64
+                    * GgmlDType::Q8_0.type_size() as u64,
+            ) && self.dtype == GgmlDType::Q5_0
                 && rows >= 4
                 && self.n.is_multiple_of(8)
                 && self.k.is_multiple_of(32)
@@ -1336,18 +1332,18 @@ impl QKernelMatMul {
                     &mut dst,
                 )?;
             } else if q5_0_prefill {
-                let g8 = self.cpu_repack_q5_0.get_or_init(|| {
+                let x8 = self.cpu_repack_q8_0_x8.get_or_init(|| {
                     let blocks = crate::tensor::quant_cpu::cast_blocks::<
                         crate::tensor::quant_cpu::BlockQ5_0,
                     >(self.host.data())
                     .expect("q5_0_prefill guard verified the cast");
-                    // CONVERSION: x8 interleaved layout the host dot kernels read; the stored blocks stay.
-                    crate::tensor::quant_cpu::repack_q5_0::repack(blocks, self.n, nb40)
+                    // CONVERSION: Q8_0 x8 blocks of the same values the host GEMM reads; the stored blocks stay.
+                    crate::tensor::quant_cpu::repack_q5_0_wide::repack(blocks, self.n, nb40)
                 });
-                crate::tensor::quant_cpu::matmul_q5_0_repacked_tiled(
+                crate::tensor::quant_cpu::matmul_q8_0_x8_tiled(
                     (rows, self.k, self.n),
                     lhs,
-                    g8,
+                    x8,
                     &mut dst,
                 )?;
             } else if q8_0_prefill {
@@ -1719,9 +1715,12 @@ impl QKernelMatMul {
     /// or the host has the room for its bytes beside the stored blocks now.
     /// Without it, the products read the stored blocks.
     fn repack_fits(&self, built: bool) -> bool {
-        built
-            || self.host.byte_len() as u64
-                <= crate::inference::place::layer_executor::host_spill_budget_bytes()
+        self.repack_fits_bytes(built, self.host.byte_len() as u64)
+    }
+
+    /// Whether a repacked copy of `bytes` is built or fits the host budget.
+    fn repack_fits_bytes(&self, built: bool, bytes: u64) -> bool {
+        built || bytes <= crate::inference::place::layer_executor::host_spill_budget_bytes()
     }
 
     /// Output dim (`n`) - needed to size decode-arena buffers.

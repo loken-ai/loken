@@ -24,8 +24,14 @@ pub struct BlockQ8_0x8 {
 
 /// Repack raw row-major `[n][nb]` `BlockQ8_0` into `[n/8][nb]` `BlockQ8_0x8`.
 pub fn repack(raw: &[BlockQ8_0], n: usize, nb: usize) -> Vec<BlockQ8_0x8> {
-    debug_assert_eq!(n % 8, 0);
     debug_assert_eq!(raw.len(), n * nb);
+    repack_from(n, nb, |i| raw[i].clone())
+}
+
+/// Repack row-major `[n][nb]` blocks into `[n/8][nb]` `BlockQ8_0x8`.
+/// `block(i)` is the `BlockQ8_0` holding the values of block `i`, row by row.
+pub fn repack_from(n: usize, nb: usize, block: impl Fn(usize) -> BlockQ8_0) -> Vec<BlockQ8_0x8> {
+    debug_assert_eq!(n % 8, 0);
     let groups = n / 8;
     let mut out = vec![
         BlockQ8_0x8 {
@@ -37,18 +43,17 @@ pub fn repack(raw: &[BlockQ8_0], n: usize, nb: usize) -> Vec<BlockQ8_0x8> {
     for g in 0..groups {
         for l in 0..nb {
             let ob = &mut out[g * nb + l];
+            let cols: [BlockQ8_0; 8] = std::array::from_fn(|c| block((g * 8 + c) * nb + l));
             for c in 0..8 {
-                ob.d[c] = raw[(g * 8 + c) * nb + l].d;
+                ob.d[c] = cols[c].d;
             }
             // element-group eg (8 elements) x [cols 0-3][cols 4-7].
             for eg in 0..4 {
                 for cc in 0..4 {
                     let dl = eg * 64 + cc * 8;
                     let dh = eg * 64 + 32 + cc * 8;
-                    ob.qs[dl..dl + 8]
-                        .copy_from_slice(&raw[(g * 8 + cc) * nb + l].qs[eg * 8..eg * 8 + 8]);
-                    ob.qs[dh..dh + 8]
-                        .copy_from_slice(&raw[(g * 8 + 4 + cc) * nb + l].qs[eg * 8..eg * 8 + 8]);
+                    ob.qs[dl..dl + 8].copy_from_slice(&cols[cc].qs[eg * 8..eg * 8 + 8]);
+                    ob.qs[dh..dh + 8].copy_from_slice(&cols[4 + cc].qs[eg * 8..eg * 8 + 8]);
                 }
             }
         }

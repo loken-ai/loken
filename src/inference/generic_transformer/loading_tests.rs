@@ -1412,7 +1412,7 @@ fn awq_host_layers_hold_their_codes_as_blocks() {
     for seg in &mut short.segments {
         seg.free_memory_bytes = 1;
     }
-    let built: Vec<_> = [(&ample, "q8_0"), (&short, "q4_1")]
+    let built: Vec<_> = [(&ample, "q5_0"), (&short, "q4_1")]
         .into_iter()
         .map(|(plan, format)| {
             let model = GenericWeights::Awq {

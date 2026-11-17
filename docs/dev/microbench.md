@@ -28,6 +28,7 @@ cargo bench --features cuda,microbench --bench microbench -- decode-layer --batc
 cargo bench --features cuda,microbench --bench microbench -- media-overlap --rows 1024 --hidden 1280 --layers 4
 cargo bench --features cuda,microbench --bench microbench -- parler-step --hidden 1024 --inter 4096 --layers 24 --heads 16 --vocab 1088
 cargo bench --features microbench --bench microbench -- schedule-host --batch 64 --context 512
+cargo bench --features microbench --bench microbench -- host-prompt --hidden 4096 --inter 12288 --rows 108
 ```
 
 A ROCm build takes `rocm` in place of `cuda`.  
@@ -51,7 +52,7 @@ Arguments after `--`:
 | `--projection-bytes` | The bytes of each projection, 1 value or 3, in place of `--inter` and `--weight-bits`. | derived |
 | `--gate-format` | The format of an expert's gate and up weights, without a file (`host-expert`, `expert-pairs`). | iq2_xxs |
 | `--down-format` | The format of an expert's down weights, without a file (`host-expert`, `expert-pairs`). | q2_k |
-| `--rows` | Rows of the prompt batch one layer of `prefill-layer` moves. | 130 |
+| `--rows` | Rows of the prompt batch one layer of `prefill-layer` moves, or the prompt rows of `host-prompt`. | 130 |
 | `--heads` | Query heads, without a file (`prefill-layer`, `marlin-rows`, `decode-layer`). | the file's for `prefill-layer`, 32 for `marlin-rows` |
 | `--kv-heads` | Key-value heads, without a file (`prefill-layer`, `marlin-rows`, `decode-layer`). | the file's, else the heads for `prefill-layer`, 8 for `marlin-rows` |
 | `--head-dim` | Elements of one head, without a file. It sizes the rope rows of `schedule-host` and `decode-inputs`, and the heads of `decode-layer`. | the file's, else the hidden size over the heads for `prefill-layer`, 128 for the others |
@@ -348,6 +349,20 @@ Its variants:
 - 4 experts per call out of 96 distinct ones, far more than the caches hold, so the weights come from memory.
   Each runs through the thread pool in 3 regions, 1 thread per expert, and one after the other on 1 thread.
 - The same 4 experts on weights in the page cache of a mapped file, where a served model keeps them.
+
+The formats are `iq2_xxs`, `q2_k`, `q4_1`, `q4_k`, `q5_0`, `q6_k` and `q8_0`.
+
+### host-prompt
+
+`host-prompt` runs the rows of a prompt through 1 Q5_0 projection on the host cores.
+It runs `--rows` rows against `--hidden` inputs and `--inter` outputs.  
+It touches no disk and no card.
+Its variants:
+
+- The tiled GEMM over the Q5_0 blocks, repacked 8 columns a group.
+- The tiled Q8_0 GEMM over the same values held as Q8_0 blocks, which the served prompt runs.
+
+The note of the second variant counts the outputs that differ from the first's.
 
 ### prefill-layer
 

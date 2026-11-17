@@ -268,15 +268,19 @@ pub struct StoredAwq<'a> {
     pub n: usize,
 }
 
+/// The bias of a `Q5_0` code: code `c` holds the value `c - 16`.
+const Q5_0_BIAS: u32 = 16;
+
 /// The host block formats an AWQ projection is written in.
 ///
-/// `Q8_0` holds every stored value exactly: the group's scale and the code less the zero.
+/// `Q5_0` holds every stored value exactly: the group's scale and the code less the zero, which
+/// lies in -15..15, in 5.5 bits a value.
 /// `Q4_1` holds the codes as stored, the group's scale and `-scale * zero` rounded to f16 as the
 /// minimum: a value differs from the stored one by the rounding of the minimum alone.
 pub fn host_block_format(exact: bool) -> crate::tensor::quantized::GgmlDType {
     use crate::tensor::quantized::GgmlDType;
     if exact {
-        GgmlDType::Q8_0
+        GgmlDType::Q5_0
     } else {
         GgmlDType::Q4_1
     }
@@ -294,7 +298,7 @@ pub fn write_block_rows(
     use crate::tensor::quantized::GgmlDType;
     use rayon::prelude::*;
     let exact = match format {
-        GgmlDType::Q8_0 => true,
+        GgmlDType::Q5_0 => true,
         GgmlDType::Q4_1 => false,
         other => return Err(format!("no AWQ host blocks in {other:?}")),
     };
@@ -350,14 +354,20 @@ pub fn write_block_rows(
                         let code = |t: usize| (words[t] >> shift) & 0xF;
                         let dst = &mut row[b * block_bytes..(b + 1) * block_bytes];
                         dst[0..2].copy_from_slice(&scale.to_le_bytes());
+                        let half = block / 2;
                         if exact {
-                            for t in 0..block {
-                                dst[2 + t] = (code(t) as i8 - zero as i8) as u8;
+                            // The code less the zero lies in -15..15: its biased code fits 5 bits.
+                            let biased = |t: usize| code(t) + Q5_0_BIAS - zero;
+                            let mut high = 0u32;
+                            for t in 0..half {
+                                let (lo, hi) = (biased(t), biased(t + half));
+                                dst[6 + t] = (lo & 0xF | (hi & 0xF) << 4) as u8;
+                                high |= (lo >> 4) << t | (hi >> 4) << (t + half);
                             }
+                            dst[2..6].copy_from_slice(&high.to_le_bytes());
                         } else {
                             let min = f16::from_f32(-(zero as f32) * scale.to_f32());
                             dst[2..4].copy_from_slice(&min.to_le_bytes());
-                            let half = block / 2;
                             for t in 0..half {
                                 dst[4 + t] = (code(t) | code(t + half) << 4) as u8;
                             }
@@ -443,6 +453,99 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The exact rows multiply as rows of `Q8_0` blocks holding the same values do: the same
+    /// signed codes against the same quantised activation under the same scale, to the bit.
+    #[test]
+    fn exact_rows_multiply_as_eight_bit_rows_of_the_same_values() {
+        use crate::tensor::quant_cpu::{matmul_bytes, to_float_bytes};
+        use crate::tensor::quantized::GgmlDType;
+        let (k, n, gs) = (512usize, 24usize, 128usize);
+        let mut state = 0x2545_f491_u32;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state
+        };
+        let qweight: Vec<i32> = (0..k * n / PACK).map(|_| next() as i32).collect();
+        let qzeros: Vec<i32> = (0..k / gs * n / PACK).map(|_| next() as i32).collect();
+        let scales: Vec<f16> = (0..k / gs * n)
+            .map(|_| f16::from_f32(1e-3 + (next() % 1000) as f32 * 1e-5))
+            .collect();
+        let bytes = |v: &[i32]| -> Vec<u8> { v.iter().flat_map(|w| w.to_le_bytes()).collect() };
+        let (w, z) = (bytes(&qweight), bytes(&qzeros));
+        let part = StoredAwq {
+            qweight: &w,
+            qzeros: &z,
+            scales: scales.clone(),
+            n,
+        };
+        let exact = host_block_format(true);
+        let mut rows = vec![0u8; n * k / exact.block_size() * exact.type_size()];
+        write_block_rows(&[part], k, gs, exact, &mut rows).unwrap();
+
+        // The same values as Q8_0 blocks: the group's scale, the code less the zero.
+        let t = AwqTensor::new(k, n, gs, qweight, qzeros, scales);
+        let q8 = GgmlDType::Q8_0;
+        let mut eight = vec![0u8; n * k / q8.block_size() * q8.type_size()];
+        for (o, row) in eight
+            .chunks_exact_mut(k / q8.block_size() * q8.type_size())
+            .enumerate()
+        {
+            for (b, block) in row.chunks_exact_mut(q8.type_size()).enumerate() {
+                let g = b * q8.block_size() / gs;
+                let shift = 4 * AWQ_ORDER[o % PACK];
+                let zero = (t.qzeros[g * (n / PACK) + o / PACK] as u32 >> shift) & 0xF;
+                block[0..2].copy_from_slice(&t.scales[g * n + o].to_le_bytes());
+                for j in 0..q8.block_size() {
+                    let kk = b * q8.block_size() + j;
+                    let code = (t.qweight[kk * (n / PACK) + o / PACK] as u32 >> shift) & 0xF;
+                    block[2 + j] = (code as i8 - zero as i8) as u8;
+                }
+            }
+        }
+        let (mut a, mut b) = (vec![0f32; n * k], vec![0f32; n * k]);
+        to_float_bytes(exact, &rows, &mut a).unwrap();
+        to_float_bytes(q8, &eight, &mut b).unwrap();
+        assert_eq!(a, b, "the 2 forms hold different values");
+        for m in [1usize, 3] {
+            let x: Vec<f32> = (0..m * k)
+                .map(|i| ((next() % 2001) as f32 - 1000.0) * 1e-3 + (i % 5) as f32 * 0.1)
+                .collect();
+            let (mut got, mut want) = (vec![0f32; m * n], vec![0f32; m * n]);
+            matmul_bytes(exact, (m, k, n), &x, &rows, &mut got).unwrap();
+            matmul_bytes(q8, (m, k, n), &x, &eight, &mut want).unwrap();
+            let bits = |v: &[f32]| v.iter().map(|f| f.to_bits()).collect::<Vec<_>>();
+            assert_eq!(bits(&got), bits(&want), "{m} rows");
+        }
+        // The rows of a prompt through the host matmul the layers call.
+        let matmul = |format: GgmlDType, blocks: &[u8]| {
+            let held = crate::tensor::quantized::QTensor::host_filled(format, vec![n, k], |out| {
+                out.copy_from_slice(blocks);
+                Ok(())
+            })
+            .unwrap();
+            crate::tensor::quantized::QMatMul::from_qtensor(held).unwrap()
+        };
+        let (wide, narrow) = (matmul(q8, &eight), matmul(exact, &rows));
+        let rows_in = 9;
+        let x: Vec<f32> = (0..rows_in * k)
+            .map(|i| ((next() % 2001) as f32 - 1000.0) * 1e-3 + (i % 3) as f32 * 0.2)
+            .collect();
+        let x = crate::tensor::Tensor::from_vec_f32(x, vec![rows_in, k]).unwrap();
+        let bits = |t: crate::tensor::Tensor| {
+            t.to_vec_f32()
+                .iter()
+                .map(|f| f.to_bits())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            bits(narrow.forward(&x).unwrap()),
+            bits(wide.forward(&x).unwrap()),
+            "{rows_in} prompt rows"
+        );
     }
 
     /// Golden scalars captured from vLLM's authoritative `awq_dequantize`
