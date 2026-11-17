@@ -745,6 +745,18 @@ fn a_gemma4_verify_gives_its_decode_steps_on_the_host() {
     gemma4_verify_gives_its_decode_steps(&HashMap::new());
 }
 
+/// [`a_gemma4_verify_gives_its_decode_steps_on_the_host`] with every layer on a card: its
+/// shared layers attend the donor's rows up to their own, as a step attends them.
+#[cfg(feature = "gpu")]
+#[test]
+fn a_gemma4_verify_gives_its_decode_steps_on_a_card() {
+    let Ok(card) = Device::new_cuda(0) else {
+        eprintln!("skipping: no card");
+        return;
+    };
+    gemma4_verify_gives_its_decode_steps(&[(0usize, card)].into_iter().collect());
+}
+
 /// Each row of a verify of every width on `cards` against the decode step it stands for, and
 /// the steps after a cut verify against the steps of a run that never verified.
 fn gemma4_verify_gives_its_decode_steps(cards: &HashMap<usize, Device>) {

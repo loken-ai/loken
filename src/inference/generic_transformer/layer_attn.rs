@@ -631,6 +631,11 @@ impl GenericTransformerLayer {
         if self.attends_rows_as_decode(x, &shared_kv)? {
             return self.forward_attn_rows_as_decode(x, index_pos, pre_computed_qkv, donor_f16);
         }
+        if let Some(y) =
+            self.forward_shared_rows_as_decode(x, index_pos, &shared_kv, pre_computed_qkv)?
+        {
+            return Ok(y);
+        }
         let projected = pre_computed_qkv.map(|t| Projected::Qkv(t.clone()));
         let (y, via_graph_buffer) =
             self.attend(x, mask, index_pos, shared_kv, projected, donor_f16)?;
@@ -678,6 +683,47 @@ impl GenericTransformerLayer {
             && b == 1
             && shared_kv.is_none()
             && crate::tensor::quantized::DecodeOrder::active())
+    }
+
+    /// A verify's rows on a card through a layer that reads a donor's cache, each row the decode
+    /// step it stands for: it attends the donor's rows up to its own position, with no mask.
+    /// The donor has already appended every row of the verify, the last `seq` of its rows.
+    /// `None`, with nothing done, where the call is not such a verify.
+    fn forward_shared_rows_as_decode(
+        &mut self,
+        x: &Tensor,
+        index_pos: usize,
+        shared_kv: &Option<(Tensor, Tensor)>,
+        pre_computed_qkv: Option<&Tensor>,
+    ) -> Result<Option<Tensor>> {
+        let (b, seq, _) = x.dims3()?;
+        let Some((k, v)) = shared_kv else {
+            return Ok(None);
+        };
+        if seq < 2
+            || b != 1
+            || pre_computed_qkv.is_some()
+            || matches!(x.device(), Device::Cpu)
+            || !crate::tensor::quantized::DecodeOrder::active()
+        {
+            return Ok(None);
+        }
+        let total = k.dim(2)?;
+        if total < seq {
+            return Ok(None);
+        }
+        let base = total - seq;
+        let mut ys = Vec::with_capacity(seq);
+        for r in 0..seq {
+            let row = x.narrow(1, r, 1)?;
+            let len = base + r + 1;
+            let history = Some((k.narrow(2, 0, len)?, v.narrow(2, 0, len)?));
+            let (y, via_graph_buffer) =
+                self.attend(&row, None, index_pos + r, history, None, None)?;
+            let y = self.gate_attention(&row, y)?;
+            ys.push(self.attn_output_projection(&y, via_graph_buffer)?);
+        }
+        Ok(Some(Tensor::cat(&ys.iter().collect::<Vec<_>>(), 1)?))
     }
 
     /// The attention block over `x`'s rows, each row through the decode step at its own

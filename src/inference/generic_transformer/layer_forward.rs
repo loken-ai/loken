@@ -1766,7 +1766,9 @@ impl GenericTransformerLayer {
                 // MB per layer.
                 let x = if let Some(post_norm) = &self.post_attn_norm {
                     let is_decode = attn_out.dim(1).map(|d| d == 1).unwrap_or(false);
-                    let raw = if is_decode
+                    // The rows of a draft verify take the step's kernel, each row as its step.
+                    let fused_rows = is_decode || crate::tensor::quantized::DecodeOrder::active();
+                    let raw = if fused_rows
                         && attn_out.dtype() == DType::F32
                         && residual.dtype() == DType::F32
                     {
@@ -1944,7 +1946,9 @@ impl GenericTransformerLayer {
                 let is_decode = combined.dim(1).map(|d| d == 1).unwrap_or(false);
                 #[cfg(feature = "gpu")]
                 {
-                    if is_decode
+                    // The rows of a draft verify take the step's kernel, each row as its step.
+                    let fused_rows = is_decode || crate::tensor::quantized::DecodeOrder::active();
+                    if fused_rows
                         && combined.dtype() == DType::F32
                         && residual_ffn.dtype() == DType::F32
                     {
@@ -2071,8 +2075,10 @@ impl GenericTransformerLayer {
                 #[cfg(feature = "gpu")]
                 let (x_after_ple, scale_applied) = {
                     let is_decode = ple_state.dim(1).map(|d| d == 1).unwrap_or(false);
+                    // The rows of a draft verify take the step's kernel, each row as its step.
+                    let fused_rows = is_decode || crate::tensor::quantized::DecodeOrder::active();
                     let cuda_f32 =
-                        is_decode && ple_state.dtype() == DType::F32 && x.dtype() == DType::F32;
+                        fused_rows && ple_state.dtype() == DType::F32 && x.dtype() == DType::F32;
                     let (raw_out, applied) = if cuda_f32 {
                         if let Some(scale) = &self.ple_output_scale {
                             if scale.dtype() == DType::F32 {
