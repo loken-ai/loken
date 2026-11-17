@@ -374,7 +374,7 @@ pub mod registry {
         /// A caller sees, cancels and displaces only its own renders.
         #[tokio::test]
         async fn a_render_belongs_to_the_caller_that_registered_it() {
-            let (a, b) = (CacheScope::of_key("a"), CacheScope::of_key("b"));
+            let (a, b) = (CacheScope::of_key("c-a"), CacheScope::of_key("c-b"));
             let (ta, tb) = (CancelToken::new(), CancelToken::new());
             let _ea = Entry::new(a, "render-c", &ta);
             let _eb = Entry::new(b, "render-c", &tb);
