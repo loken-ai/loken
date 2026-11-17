@@ -244,7 +244,9 @@ impl LlmEngine {
         if self.config.layer_share.is_none() {
             return Err("no layer share is configured".to_string());
         }
-        self.load_model_only().await.map_err(|e| e.to_string())?;
+        self.load_model_only(Warmup::Ahead)
+            .await
+            .map_err(|e| e.to_string())?;
         let inputs = self.segment_inputs().await;
         let unloaded = self.unload().await.map_err(|e| e.to_string());
         let inputs = inputs.ok_or_else(|| "this model cannot be cut into layers".to_string())?;
@@ -263,7 +265,9 @@ impl LlmEngine {
         if self.config.layer_share.is_none() {
             return Err("no layer share is configured".to_string());
         }
-        self.load_model_only().await.map_err(|e| e.to_string())?;
+        self.load_model_only(Warmup::Ahead)
+            .await
+            .map_err(|e| e.to_string())?;
         let state = self.model_state.lock().await.take();
         let state = state.ok_or_else(|| "no model loaded".to_string())?;
         let model = state
@@ -288,7 +292,9 @@ impl LlmEngine {
         if self.config.layer_share != Some((0, cut)) {
             return Err(format!("the share is not layers [0, {cut})"));
         }
-        self.load_model_only().await.map_err(|e| e.to_string())?;
+        self.load_model_only(Warmup::Ahead)
+            .await
+            .map_err(|e| e.to_string())?;
         self.connect_pipeline_tail(addr, cut).await
     }
 

@@ -11,6 +11,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 - Experts: compute a mixture's missing Q5_1 experts on the host.
 - Experts: compute a mixture's missing Q3_K experts on the host.
 - Host: decode an AWQ model faster and read Q5_0 prompts about 4 times faster.
+- Loading: answer a request that widens the context sooner after its reload.
 
 ### Fixed
 

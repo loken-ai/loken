@@ -574,7 +574,7 @@ impl LlmEngine {
         dcfg.model_id = id.clone();
         dcfg.disable_arc_layers = true;
         let nested = LlmEngine::with_config(dcfg);
-        if let Err(e) = nested.load_model_only().await {
+        if let Err(e) = nested.load_model_only(Warmup::Ahead).await {
             warn!("spec-decode: drafter '{id}' failed to load: {e}; spec-decode OFF");
             return;
         }
@@ -1861,7 +1861,7 @@ pub(crate) mod generation_defaults;
 mod handover;
 mod handover_rate;
 mod loading;
-pub(crate) use loading::per_card_reserve;
+pub(crate) use loading::{per_card_reserve, Warmup};
 // The pool must be sized from `main`, before anything can build rayon's global one.
 pub use loading::configure_thread_pool;
 mod query;

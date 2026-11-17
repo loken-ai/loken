@@ -321,13 +321,26 @@ impl LlmEngine {
     /// Loads the configured model. A model that will spill to the host may take a drafter
     /// in the room its placement leaves, once placed (see `plan_drafter`).
     pub async fn load_model(&self) -> Result<(), Box<dyn std::error::Error>> {
+        self.load_model_warming(Warmup::Ahead).await
+    }
+
+    /// Loads the configured model for a request that waits on the load.
+    /// The load does not warm the prefill path: the request's prompt is the first to run it.
+    pub async fn load_model_for_request(&self) -> Result<(), Box<dyn std::error::Error>> {
+        self.load_model_warming(Warmup::ByRequest).await
+    }
+
+    async fn load_model_warming(&self, warmup: Warmup) -> Result<(), Box<dyn std::error::Error>> {
         let planned = self
             .find_model_file(&self.config.model_id)
             .and_then(|target| {
                 let size = std::fs::metadata(&target).ok()?.len();
                 self.plan_drafter(&target, size)
             });
-        let loaded = self.load_model_only().await.map_err(|e| e.to_string());
+        let loaded = self
+            .load_model_only(warmup)
+            .await
+            .map_err(|e| e.to_string());
         if loaded.is_ok() {
             self.load_planned_drafter(planned).await;
             self.calibrate_between_requests().await;
@@ -338,7 +351,11 @@ impl LlmEngine {
     }
 
     /// Loads the configured model alone.
-    pub(super) async fn load_model_only(&self) -> Result<(), Box<dyn std::error::Error>> {
+    /// `warmup` says whether the load warms the prefill path before it returns.
+    pub(super) async fn load_model_only(
+        &self,
+        warmup: Warmup,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let model_id = self.config.model_id.clone();
         // The draft head's experts stay on its card only when the drafts run: otherwise
         // their room serves the layers.
@@ -1678,7 +1695,7 @@ impl LlmEngine {
             // It runs after the residency epoch moved, so the chunk sizing the warmup memoises
             // is the one the first request reads.
             if let Some(st) = guard.as_mut() {
-                ready_for_requests(st.model.as_mut(), &st.device);
+                ready_for_requests(st.model.as_mut(), &st.device, warmup);
             }
             drop(guard);  // Release lock early
 
@@ -1945,17 +1962,28 @@ mod cache_format_tests {
     }
 }
 
+/// Whether a load warms the prefill path before it returns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Warmup {
+    /// No request waits on the load: the load warms the path for the first one.
+    Ahead,
+    /// A request waits on the load: its own prompt is the first to run the path.
+    ByRequest,
+}
+
 /// Readies a loaded model for its first request.
-/// The prefill path is warmed first: the first prompt of a fresh server otherwise pays for the
-/// code objects, the device buffers, the card probes and the clocks it is the first to touch.
-/// The host pages of the hot experts a profile ranked are registered next: a registration
-/// holds the driver until it ends, and a request run beside it waits for it.
+/// The prefill path is warmed first when `warmup` asks for it ahead of the requests: the first
+/// prompt of a fresh server otherwise pays for the code objects, the device buffers, the card
+/// probes and the clocks it is the first to touch.
+/// The host pages of the hot experts a profile ranked are registered next, in both cases: a
+/// registration holds the driver until it ends, and a request run beside it waits for it.
 fn ready_for_requests(
     model: &mut dyn crate::inference::engine::model_backend::ModelBackend,
     device: &Device,
+    warmup: Warmup,
 ) {
     let warm_started = std::time::Instant::now();
-    if warm_prefill(model, device) {
+    if warmup == Warmup::Ahead && warm_prefill(model, device) {
         info!(
             "prefill warmed in {:.0}ms",
             warm_started.elapsed().as_secs_f64() * 1e3
@@ -2065,18 +2093,26 @@ mod ready_tests {
         }
     }
 
-    /// The load waits for the registration of the hot experts' pages once, after the warmup
-    /// when there is one, and before it hands the model to a request.
+    /// The calls, in order, that a load with `warmup` makes of a model that can cut its cache
+    /// back when `trims` holds.
+    fn calls_of(trims: bool, warmup: Warmup) -> Vec<&'static str> {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut model = ReadyToy {
+            calls: calls.clone(),
+            trims,
+        };
+        ready_for_requests(&mut model, &Device::Cpu, warmup);
+        let made = calls.lock().unwrap().clone();
+        made
+    }
+
+    /// A load no request waits on warms the prefill path where the model can cut its cache
+    /// back, then waits for the registration of the hot experts' pages once, before it hands
+    /// the model to a request.
     #[test]
-    fn a_load_settles_the_registration_after_its_warmup() {
+    fn a_load_ahead_of_the_requests_warms_then_settles_the_registration() {
         for trims in [true, false] {
-            let calls = Arc::new(Mutex::new(Vec::new()));
-            let mut model = ReadyToy {
-                calls: calls.clone(),
-                trims,
-            };
-            ready_for_requests(&mut model, &Device::Cpu);
-            let calls = calls.lock().unwrap().clone();
+            let calls = calls_of(trims, Warmup::Ahead);
             assert_eq!(
                 calls.last(),
                 Some(&"settle"),
@@ -2092,6 +2128,15 @@ mod ready_tests {
                 trims,
                 "a warmup ran where it could not, or none where it could: {calls:?}"
             );
+        }
+    }
+
+    /// A load a request waits on runs no prompt before that request, and still waits for the
+    /// registration once.
+    #[test]
+    fn a_load_for_a_waiting_request_settles_the_registration_without_a_warmup() {
+        for trims in [true, false] {
+            assert_eq!(calls_of(trims, Warmup::ByRequest), vec!["settle"]);
         }
     }
 }

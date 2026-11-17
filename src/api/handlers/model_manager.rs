@@ -738,7 +738,11 @@ impl APIServer {
         // leaves the node serving nothing until somebody asks for the model again.
         // Kept as text from the start: the loader's error is not `Send`, and holding it
         // across the reload below would make this whole future unspawnable.
-        let failure = engine.load_model().await.err().map(|e| e.to_string());
+        let failure = engine
+            .load_model_for_request()
+            .await
+            .err()
+            .map(|e| e.to_string());
         if let Some(e) = failure {
             let mut back = self.config_for_model(model_id);
             back.context_length = current;
