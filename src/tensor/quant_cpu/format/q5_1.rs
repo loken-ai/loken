@@ -131,3 +131,49 @@ impl BlockFormat for BlockQ5_1 {
             .sum()
     }
 }
+
+impl ExactDot for BlockQ5_1 {
+    type Act = BlockQ8K32S;
+    fn dot_exact(xs: &[Self], ys: &[BlockQ8K32S]) -> f32 {
+        #[cfg(target_arch = "x86_64")]
+        if crate::cpu::dispatch_avx2() {
+            // SAFETY: dispatch_avx2 implies the CPU has every feature `dot_q5_1` enables.
+            return unsafe { super::exact_runs::dot_q5_1(xs, ys) };
+        }
+        dot_exact_scalar(xs, ys)
+    }
+}
+
+/// [`ExactDot::dot_exact`] one value at a time: the steps the vector kernel is held to.
+/// Run `r` of an activation block is weight block `r` of its 8, fewer in a row's last block.
+/// A run's term takes the codes against the activation codes under both scales, and the
+/// activation's scaled code sum under the minimum, as q5_1's own dot against q8_1.
+pub(super) fn dot_exact_scalar(xs: &[BlockQ5_1], ys: &[BlockQ8K32S]) -> f32 {
+    let mut total = -0.0f32;
+    for (x8, y) in xs.chunks(QK_K / QK5_1).zip(ys) {
+        total += exact_block_share_min(y, x8.len(), |r| {
+            (
+                x8[r].d.to_f32(),
+                exact_run_sum(&x8[r], &y.qs[QK5_1 * r..QK5_1 * (r + 1)]),
+                x8[r].m.to_f32(),
+            )
+        });
+    }
+    total
+}
+
+/// A block's integer sum against its 32 activation codes: the 5-bit codes against the codes.
+fn exact_run_sum(x: &BlockQ5_1, acts: &[i8]) -> i32 {
+    let qh = u32::from_le_bytes(x.qh);
+    acts.iter()
+        .enumerate()
+        .map(|(v, &a)| {
+            let nibble = if v < QK5_1 / 2 {
+                x.qs[v] & 0x0F
+            } else {
+                x.qs[v - QK5_1 / 2] >> 4
+            };
+            (nibble as u32 | (((qh >> v) & 1) << 4)) as i32 * a as i32
+        })
+        .sum()
+}

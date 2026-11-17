@@ -4454,10 +4454,10 @@ mod tests {
             eprintln!("skipping: no usable CUDA device");
             return;
         };
-        let mut plain = layer_of(&card, 8, 2, 512, 256, [GgmlDType::Q5_1; 2]);
-        assert!(serves(&plain), "a Q5_1 layer is served unbounded");
+        let mut plain = layer_of(&card, 8, 2, 512, 256, [GgmlDType::Iq4Xs; 2]);
+        assert!(serves(&plain), "an IQ4_XS layer is served unbounded");
         plain.swiglu_limit = Some(BOUNDED_SWIGLU_LIMIT);
-        assert!(!serves(&plain), "Q5_1 has no exact kernel");
+        assert!(!serves(&plain), "IQ4_XS has no exact kernel");
         let mut k_quants = layer_of(&card, 8, 2, 512, 256, [GgmlDType::Q4K, GgmlDType::Q6K]);
         k_quants.swiglu_limit = Some(BOUNDED_SWIGLU_LIMIT);
         assert!(serves(&k_quants));
@@ -4935,6 +4935,7 @@ mod tests {
         for formats in [
             [GgmlDType::Q4K, GgmlDType::Q5_0],
             [GgmlDType::Q4K, GgmlDType::Q8_0],
+            [GgmlDType::Q4K, GgmlDType::Q5_1],
         ] {
             recorded_decode_matches_the_host((32, 8, 2560, 640), formats, 12);
         }
@@ -5161,7 +5162,7 @@ mod tests {
         };
         // A format without exact kernels, whose misses all go to transit below the fast level,
         // and one with them.
-        kernel_loaded_while_the_card_waits(&card, (32, 4, 64, 64), [GgmlDType::Q5_1; 2], false);
+        kernel_loaded_while_the_card_waits(&card, (32, 4, 512, 256), [GgmlDType::Iq4Xs; 2], false);
         kernel_loaded_while_the_card_waits(
             &card,
             (32, 4, 512, 256),
@@ -6187,6 +6188,7 @@ mod tests {
         for formats in [
             [GgmlDType::Q4K, GgmlDType::Q5_0],
             [GgmlDType::Q4K, GgmlDType::Q8_0],
+            [GgmlDType::Q4K, GgmlDType::Q5_1],
         ] {
             resident_layer_matches_the_host((32, 8, 2560, 640), formats);
         }
@@ -6947,6 +6949,7 @@ mod tests {
             [GgmlDType::Q2_0, GgmlDType::Q2_0],
             [GgmlDType::Q8_0, GgmlDType::Q8_0],
             [GgmlDType::Q5_0, GgmlDType::Q5_0],
+            [GgmlDType::Q5_1, GgmlDType::Q5_1],
         ];
         same_bits_wherever_pairs_run(&card, (16, 4, 512, 256), &formats);
     }
@@ -6963,6 +6966,7 @@ mod tests {
         let formats = [
             [GgmlDType::Q4K, GgmlDType::Q8_0],
             [GgmlDType::Q4K, GgmlDType::Q5_0],
+            [GgmlDType::Q4K, GgmlDType::Q5_1],
         ];
         same_bits_wherever_pairs_run(&card, (16, 4, 2560, 640), &formats);
     }
@@ -7008,6 +7012,10 @@ mod tests {
                     &exact::host_pairs(&exact, &stacks, &x, &pairs).unwrap(),
                     used,
                     hidden,
+                );
+                assert!(
+                    want.iter().all(|v| v.is_finite()),
+                    "{formats:?} bounded at {limit}: the host's rows are not finite"
                 );
                 let bits = |v: &[f32]| v.iter().map(|f| f.to_bits()).collect::<Vec<_>>();
                 // All missing, half, none; the misses split from mostly the host's to mostly the
@@ -7337,7 +7345,7 @@ mod tests {
     }
 
     /// Expert formats with exact kernels: gate and up, down.
-    const FORMATS_WITH_EXACT_KERNELS: [[GgmlDType; 2]; 9] = [
+    const FORMATS_WITH_EXACT_KERNELS: [[GgmlDType; 2]; 10] = [
         [GgmlDType::Q4K, GgmlDType::Q6K],
         [GgmlDType::Iq2S, GgmlDType::Q6K],
         [GgmlDType::Iq3Xxs, GgmlDType::Q6K],
@@ -7347,15 +7355,15 @@ mod tests {
         [GgmlDType::Iq3Xxs, GgmlDType::Q2_0],
         [GgmlDType::Q4K, GgmlDType::Q8_0],
         [GgmlDType::Q4K, GgmlDType::Q5_0],
+        [GgmlDType::Q4K, GgmlDType::Q5_1],
     ];
 
     /// Expert formats the tier serves without exact kernels, gate and up, down: a gate, up or
     /// down stack in a format they do not read sends the whole layer to the fallback.
-    const FORMATS_WITHOUT_EXACT_KERNELS: [[GgmlDType; 2]; 5] = [
+    const FORMATS_WITHOUT_EXACT_KERNELS: [[GgmlDType; 2]; 4] = [
         [GgmlDType::Q5K, GgmlDType::Q5K],
         [GgmlDType::Q3K, GgmlDType::Q5_1],
         [GgmlDType::Iq4Xs, GgmlDType::Q5_1],
-        [GgmlDType::Q5_1, GgmlDType::Q5_1],
         [GgmlDType::Q4K, GgmlDType::Q5K],
     ];
 

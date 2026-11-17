@@ -2175,6 +2175,8 @@ extern "C" __global__ void mmv_iq2_xxs_f32(
 
 #define CX_Q8K32_BYTES 272
 #define CX_Q8K_BYTES 292
+// A q8_K32 block followed by the f32 `s` of each of its 8 runs (quant_cpu's `run_s`).
+#define CX_Q8K32S_BYTES 304
 #define CX_IQ2XXS_BYTES 66
 #define CX_Q2K_BYTES 84
 
@@ -2757,6 +2759,7 @@ extern "C" __global__ void cx_expert_down_q3_k(
 #define TX_Q2_0 7
 #define TX_Q8_0 8
 #define TX_Q5_0 9
+#define TX_Q5_1 10
 
 // A format's bytes per 256 values, and whether its dot reads q8_K32 blocks and folds a block run
 // by run (RUNS) or reads q8_K blocks and folds a block in 1 step; ACT is the activation block's
@@ -2767,6 +2770,7 @@ template <> struct TxFmt<TX_Q4K> { static constexpr int BYTES = 144; static cons
 template <> struct TxFmt<TX_Q6K> { static constexpr int BYTES = 210; static constexpr bool RUNS = false; static constexpr int ACT = CX_Q8K_BYTES; };
 template <> struct TxFmt<TX_IQ2S> { static constexpr int BYTES = 82; static constexpr bool RUNS = true; static constexpr int ACT = CX_Q8K32_BYTES; };
 template <> struct TxFmt<TX_Q5_0> { static constexpr int BYTES = 176; static constexpr bool RUNS = true; static constexpr int ACT = CX_Q8K32_BYTES; };
+template <> struct TxFmt<TX_Q5_1> { static constexpr int BYTES = 192; static constexpr bool RUNS = true; static constexpr int ACT = CX_Q8K32S_BYTES; };
 template <> struct TxFmt<TX_Q8_0> { static constexpr int BYTES = 272; static constexpr bool RUNS = true; static constexpr int ACT = CX_Q8K32_BYTES; };
 template <> struct TxFmt<TX_Q2_0> { static constexpr int BYTES = 72; static constexpr bool RUNS = true; static constexpr int ACT = CX_Q8K32_BYTES; };
 template <> struct TxFmt<TX_IQ4NL> { static constexpr int BYTES = 144; static constexpr bool RUNS = true; static constexpr int ACT = CX_Q8K32_BYTES; };
@@ -3004,6 +3008,27 @@ template <> __device__ void tx_run_codes<TX_Q5_0>(const unsigned char * w, const
     *lo = *hi = 1;
 }
 
+// Block `rr` of 8 blocks of 32 values, 24 bytes each (scale, minimum, 32 high bits, 16 bytes of
+// nibbles): the low nibbles are values 0..16, the high nibbles 16..32; bit `v` of the high bits
+// tops value `v`; each value is its 5-bit code, 0 to 31.
+template <> __device__ void tx_run_codes<TX_Q5_1>(const unsigned char * w, const int rr, int * q, int * lo, int * hi) {
+    unsigned int words[5];
+    tx_words<5>(w + 24 * rr + 4, words);
+    const unsigned int qh = words[0];
+    #pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        const unsigned int x = words[k + 1];
+        #pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            const unsigned int low = (x >> (4 * h)) & 0x0F0F0F0Fu;
+            const unsigned int top = (qh >> (16 * h + 4 * k)) & 0xFu;
+            const unsigned int high = ((top & 1u) | ((top & 2u) << 7) | ((top & 4u) << 14) | ((top & 8u) << 21)) << 4;
+            q[k + 4 * h] = (int) (low | high);
+        }
+    }
+    *lo = *hi = 1;
+}
+
 // A block's share from its two integer sums, as quant_cpu's `combine` of each format.
 template <int F> __device__ static float tx_combine(const unsigned char * w, float yd, int scaled, int offset);
 template <> __device__ float tx_combine<TX_Q4K>(const unsigned char * w, float yd, int scaled, int offset) {
@@ -3069,6 +3094,19 @@ template <int F> __device__ static __forceinline__ float tx_run_term(
     const unsigned char * wb = w + (long) b * TxFmt<F>::BYTES;
     const unsigned char * ab = a + (long) b * TxFmt<F>::ACT;
     return __fmul_rn(__fmul_rn(tx_run_scale<F>(wb, rr), (float) tx_run_sum<F>(wb, ab, rr)), tx_f16(ab + 2 * rr));
+}
+
+// Q5_1's term of run `run`: (ws * s) * da + wm * sa, as quant_cpu's `exact_block_share_min` forms
+// it, with `wm` the block's minimum and `sa` the run's scaled code sum.
+template <> __device__ __forceinline__ float tx_run_term<TX_Q5_1>(
+        const unsigned char * w, const unsigned char * a, const int run) {
+    const int b = run >> 3, rr = run & 7;
+    const unsigned char * wb = w + (long) b * TxFmt<TX_Q5_1>::BYTES;
+    const unsigned char * ab = a + (long) b * TxFmt<TX_Q5_1>::ACT;
+    const unsigned char * blk = wb + 24 * rr;
+    const float scaled = __fmul_rn(__fmul_rn(tx_f16(blk), (float) tx_run_sum<TX_Q5_1>(wb, ab, rr)), tx_f16(ab + 2 * rr));
+    const float sa = reinterpret_cast<const float *>(ab + CX_Q8K32_BYTES)[rr];
+    return __fadd_rn(scaled, __fmul_rn(tx_f16(blk + 2), sa));
 }
 
 // A q8_K format's 2 integer sums over the 4 lane parts `part`, `part + 8`, .. of a block: the
@@ -3362,7 +3400,10 @@ extern "C" __global__ void tx_quantize_h(
 // for value: each run of 32 takes the scale amax / 127 stored as f16, and codes rounded half away
 // from zero from the values times the reciprocal of the unrounded scale.
 // The block holds `valid` values of `x`; the others read as 0, as the host pads a row.
+// With `SUMS`, each run's code sum times the unrounded scale follows the block as an f32, as
+// quant_cpu's `run_s` forms it: rounded to f16, or unrounded where that rounding is not finite.
 // A warp per block, 8 consecutive values to a lane, 4 lanes to a run.
+template <bool SUMS>
 __device__ static void tx_q8k32_block(const float * __restrict__ x, unsigned char * __restrict__ ob, const int lane, const int valid) {
     const float * xb = x + lane * 8;
     float v[8];
@@ -3385,6 +3426,18 @@ __device__ static void tx_q8k32_block(const float * __restrict__ x, unsigned cha
     if ((lane & 3) == 0) {
         reinterpret_cast<unsigned short *>(ob)[lane >> 2] = __half_as_ushort(__float2half_rn(d));
     }
+    if constexpr (SUMS) {
+        int sum = 0;
+        #pragma unroll
+        for (int t = 0; t < 8; ++t) sum += (int) qs[lane * 8 + t];
+        sum += __shfl_xor_sync(0xffffffffu, sum, 1);
+        sum += __shfl_xor_sync(0xffffffffu, sum, 2);
+        if ((lane & 3) == 0) {
+            const float s = __fmul_rn((float) sum, d);
+            const float rounded = __half2float(__float2half_rn(s));
+            reinterpret_cast<float *>(ob + CX_Q8K32_BYTES)[lane >> 2] = isfinite(rounded) ? rounded : s;
+        }
+    }
 }
 
 // Rows of `x` [rows, len] as rows of ceil(len / 256) q8_K32 blocks (see tx_q8k32_block). One
@@ -3397,7 +3450,19 @@ extern "C" __global__ void tx_quantize_q8_k32(
     const int per_row = (len + 255) / 256;
     const long row = blk / per_row;
     const int b = (int) (blk % per_row);
-    tx_q8k32_block(x + row * len + 256 * b, out + blk * CX_Q8K32_BYTES, threadIdx.x, len - 256 * b);
+    tx_q8k32_block<false>(x + row * len + 256 * b, out + blk * CX_Q8K32_BYTES, threadIdx.x, len - 256 * b);
+}
+
+// The same as rows of q8_K32 blocks with run sums.
+extern "C" __global__ void tx_quantize_q8_k32s(
+        const float * __restrict__ x, unsigned char * __restrict__ out, const long nblocks,
+        const int len) {
+    const long blk = blockIdx.x;
+    if (blk >= nblocks) return;
+    const int per_row = (len + 255) / 256;
+    const long row = blk / per_row;
+    const int b = (int) (blk % per_row);
+    tx_q8k32_block<true>(x + row * len + 256 * b, out + blk * CX_Q8K32S_BYTES, threadIdx.x, len - 256 * b);
 }
 
 // The rows of `h` of the launch's instances as q8_K32 blocks. A warp per (block, instance).
@@ -3408,8 +3473,20 @@ extern "C" __global__ void tx_quantize_h_q8_k32(
     if (slots[i] == TX_SKIP) return;
     const int pair = pairs != nullptr ? (int) pairs[i] : i;
     const int nb = (inter + 255) / 256;
-    tx_q8k32_block(h + (long) pair * inter + (long) blk * 256, hq + ((long) pair * nb + blk) * CX_Q8K32_BYTES, threadIdx.x,
-                   inter - 256 * blk);
+    tx_q8k32_block<false>(h + (long) pair * inter + (long) blk * 256, hq + ((long) pair * nb + blk) * CX_Q8K32_BYTES, threadIdx.x,
+                          inter - 256 * blk);
+}
+
+// The same as q8_K32 blocks with run sums.
+extern "C" __global__ void tx_quantize_h_q8_k32s(
+        const float * __restrict__ h, const unsigned int * __restrict__ slots,
+        const unsigned int * __restrict__ pairs, unsigned char * __restrict__ hq, const int inter) {
+    const int blk = blockIdx.x, i = blockIdx.y;
+    if (slots[i] == TX_SKIP) return;
+    const int pair = pairs != nullptr ? (int) pairs[i] : i;
+    const int nb = (inter + 255) / 256;
+    tx_q8k32_block<true>(h + (long) pair * inter + (long) blk * 256, hq + ((long) pair * nb + blk) * CX_Q8K32S_BYTES, threadIdx.x,
+                         inter - 256 * blk);
 }
 
 // The pairs' rows: out[pair, row] = weight[pair] * (down . hq[pair]). A block per (`rows` output
@@ -3460,6 +3537,7 @@ TX_ENTRIES(iq4_nl, TX_IQ4NL)
 TX_ENTRIES(q2_0, TX_Q2_0)
 TX_ENTRIES(q8_0, TX_Q8_0)
 TX_ENTRIES(q5_0, TX_Q5_0)
+TX_ENTRIES(q5_1, TX_Q5_1)
 
 // A dense projection on a card as the host computes it: the weight rows `w` [n, nsb * block bytes]
 // against `rows` q8_K rows `xq` [rows, nsb * CX_Q8K_BYTES], written to y [rows, n]. A warp per

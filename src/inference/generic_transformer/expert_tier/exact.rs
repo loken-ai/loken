@@ -11,7 +11,7 @@ use super::*;
 use crate::tensor::gpu_runtime::driver::{LaunchConfig, PushKernelArg};
 use crate::tensor::quant_cpu::{
     BlockFormat, BlockIq2S, BlockIq3S, BlockIq3Xxs, BlockIq4Nl, BlockQ2K, BlockQ2_0, BlockQ4K,
-    BlockQ5_0, BlockQ6K, BlockQ8K, BlockQ8K32, BlockQ8_0, ExactDot,
+    BlockQ5_0, BlockQ5_1, BlockQ6K, BlockQ8K, BlockQ8K32, BlockQ8K32S, BlockQ8_0, ExactDot,
 };
 
 /// A format the exact kernels read.
@@ -27,6 +27,7 @@ pub(super) enum Fmt {
     Q2_0,
     Q8_0,
     Q5_0,
+    Q5_1,
 }
 
 impl Fmt {
@@ -42,6 +43,7 @@ impl Fmt {
             GgmlDType::Q2_0 => Some(Self::Q2_0),
             GgmlDType::Q8_0 => Some(Self::Q8_0),
             GgmlDType::Q5_0 => Some(Self::Q5_0),
+            GgmlDType::Q5_1 => Some(Self::Q5_1),
             _ => None,
         }
     }
@@ -59,6 +61,7 @@ impl Fmt {
             Self::Q2_0 => "q2_0",
             Self::Q8_0 => "q8_0",
             Self::Q5_0 => "q5_0",
+            Self::Q5_1 => "q5_1",
         }
     }
 
@@ -74,12 +77,21 @@ impl Fmt {
                 | Self::Q2_0
                 | Self::Q8_0
                 | Self::Q5_0
+                | Self::Q5_1
         )
+    }
+
+    /// Whether the format's dot reads q8_K32 blocks with the sum of each run's values: a run
+    /// format with a minimum.
+    fn sums(self) -> bool {
+        matches!(self, Self::Q5_1)
     }
 
     /// Bytes of an activation block the format's dot reads.
     fn act_block_bytes(self) -> usize {
-        if self.runs() {
+        if self.sums() {
+            std::mem::size_of::<BlockQ8K32S>()
+        } else if self.runs() {
             std::mem::size_of::<BlockQ8K32>()
         } else {
             std::mem::size_of::<BlockQ8K>()
@@ -229,7 +241,9 @@ pub(super) fn quantize_rows(
     let cd = dev.as_cuda_device()?;
     let stream = cd.0.stream();
     let blocks = (rows * dim.div_ceil(BLOCK)) as i64;
-    let name = if fmt.runs() {
+    let name = if fmt.sums() {
+        "tx_quantize_q8_k32s"
+    } else if fmt.runs() {
         "tx_quantize_q8_k32"
     } else {
         "cx_quantize_q8_k"
@@ -327,7 +341,9 @@ fn launch_quantize_h(
     let cd = dev.as_cuda_device()?;
     let stream = cd.0.stream();
     let inter = exact.inter as i32;
-    let name = if exact.down.runs() {
+    let name = if exact.down.sums() {
+        "tx_quantize_h_q8_k32s"
+    } else if exact.down.runs() {
         "tx_quantize_h_q8_k32"
     } else {
         "tx_quantize_h"
@@ -494,6 +510,7 @@ pub(super) fn host_pairs(
             Fmt::Q2_0 => run::<G, BlockQ2_0>(exact, host, x, pairs),
             Fmt::Q8_0 => run::<G, BlockQ8_0>(exact, host, x, pairs),
             Fmt::Q5_0 => run::<G, BlockQ5_0>(exact, host, x, pairs),
+            Fmt::Q5_1 => run::<G, BlockQ5_1>(exact, host, x, pairs),
         }
     }
     Ok(match exact.gate {
@@ -507,6 +524,7 @@ pub(super) fn host_pairs(
         Fmt::Q2_0 => with_down::<BlockQ2_0>(exact, host, x, pairs),
         Fmt::Q8_0 => with_down::<BlockQ8_0>(exact, host, x, pairs),
         Fmt::Q5_0 => with_down::<BlockQ5_0>(exact, host, x, pairs),
+        Fmt::Q5_1 => with_down::<BlockQ5_1>(exact, host, x, pairs),
     })
 }
 
@@ -1271,6 +1289,7 @@ pub mod bench {
                 Some(Fmt::Q2_0) => rows::<BlockQ2_0>(t, e, x, own),
                 Some(Fmt::Q8_0) => rows::<BlockQ8_0>(t, e, x, own),
                 Some(Fmt::Q5_0) => rows::<BlockQ5_0>(t, e, x, own),
+                Some(Fmt::Q5_1) => rows::<BlockQ5_1>(t, e, x, own),
                 None => f32::NAN,
             }
         }
@@ -1590,12 +1609,16 @@ mod tests {
         compare::<BlockQ4K, BlockQ8_0>(GgmlDType::Q4K, GgmlDType::Q8_0);
         compare::<BlockQ5_0, BlockQ5_0>(GgmlDType::Q5_0, GgmlDType::Q5_0);
         compare::<BlockQ4K, BlockQ5_0>(GgmlDType::Q4K, GgmlDType::Q5_0);
+        compare::<BlockQ5_1, BlockQ5_1>(GgmlDType::Q5_1, GgmlDType::Q5_1);
+        compare::<BlockQ4K, BlockQ5_1>(GgmlDType::Q4K, GgmlDType::Q5_1);
         // The widths of a released file whose expert width is whole runs, not whole blocks.
         compare_at::<BlockQ4K, BlockQ8_0>(GgmlDType::Q4K, GgmlDType::Q8_0, 2560, 640);
         compare_at::<BlockQ4K, BlockQ5_0>(GgmlDType::Q4K, GgmlDType::Q5_0, 2560, 640);
+        compare_at::<BlockQ4K, BlockQ5_1>(GgmlDType::Q4K, GgmlDType::Q5_1, 2560, 640);
     }
 
-    /// The card's q8_K32 rows are the bytes of the host's, zeros, ties and extremes included.
+    /// The card's q8_K32 rows, with run sums or without, are the bytes of the host's, zeros, ties
+    /// and extremes included.
     #[test]
     fn the_card_quantises_q8_k32_rows_as_the_host() {
         let Ok(card) = Device::new_cuda(0) else {
@@ -1657,7 +1680,7 @@ mod tests {
             std::slice::from_raw_parts(want.as_ptr() as *const u8, std::mem::size_of_val(&want[..]))
         }
         .to_vec();
-        let xs = Tensor::from_vec(x, rows * len, &card).unwrap();
+        let xs = Tensor::from_vec(x.clone(), rows * len, &card).unwrap();
         let out = Tensor::zeros_on(want.len() / 4, crate::tensor::DType::F32, &card).unwrap();
         quantize_rows(
             &card,
@@ -1675,6 +1698,84 @@ mod tests {
             .flat_map(|f| f.to_le_bytes())
             .collect();
         assert_eq!(got, want, "rows of {len} values");
+        // The same rows with run sums, for a format with a minimum, at values whose runs sum
+        // past the range of an f16.
+        let x: Vec<f32> = x.iter().map(|v| 4000.0 * v + 3000.0).collect();
+        let xs = Tensor::from_vec(x.clone(), rows * len, &card).unwrap();
+        let mut want = vec![BlockQ8K32S::zeros(); rows * per_row];
+        for (r, q) in want.chunks_exact_mut(per_row).enumerate() {
+            quantize_padded(&x[r * len..(r + 1) * len], q);
+        }
+        assert!(
+            want.iter()
+                .flat_map(|b| b.s)
+                .any(|s| s.abs() > half::f16::MAX.to_f32()),
+            "no run sums past the range of an f16"
+        );
+        // Safety: the blocks are `repr(C)` plain data, read as the bytes they occupy.
+        let want = unsafe {
+            std::slice::from_raw_parts(want.as_ptr() as *const u8, std::mem::size_of_val(&want[..]))
+        }
+        .to_vec();
+        let out = Tensor::zeros_on(want.len() / 4, crate::tensor::DType::F32, &card).unwrap();
+        quantize_rows(
+            &card,
+            Fmt::Q5_1,
+            address_of::<f32>(&xs).unwrap(),
+            address_of::<f32>(&out).unwrap(),
+            rows,
+            len,
+        )
+        .unwrap();
+        let got: Vec<u8> = out
+            .to_vec1::<f32>()
+            .unwrap()
+            .iter()
+            .flat_map(|f| f.to_le_bytes())
+            .collect();
+        assert_eq!(got, want, "rows of {len} values with run sums");
+    }
+
+    /// A run of activations whose sum passes the range of an f16 keeps the exact dot of a format
+    /// with a minimum finite and close to the float product.
+    #[test]
+    fn a_run_past_the_f16_range_keeps_the_dot_of_a_format_with_a_minimum_finite() {
+        let (rows, len) = (4usize, 512usize);
+        let w = stack(1, rows, len, 5, GgmlDType::Q5_1);
+        let x: Vec<f32> = (0..len)
+            .map(|i| 4000.0 + ((i * 7919 % 1000) as f32 - 500.0))
+            .collect();
+        let mut a = vec![BlockQ8K32S::zeros(); len / BLOCK];
+        BlockQ8K32S::quantize(&x, &mut a);
+        assert!(a
+            .iter()
+            .flat_map(|b| b.s)
+            .any(|s| s > half::f16::MAX.to_f32()));
+        let floats: Vec<f32> = w
+            .dequantize(&Device::Cpu)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        for (r, row) in typed::<BlockQ5_1>(&w).chunks_exact(len / 32).enumerate() {
+            let got = BlockQ5_1::dot_exact(row, &a);
+            let want: f64 = floats[r * len..(r + 1) * len]
+                .iter()
+                .zip(&x)
+                .map(|(&w, &v)| w as f64 * v as f64)
+                .sum();
+            let scale: f64 = floats[r * len..(r + 1) * len]
+                .iter()
+                .zip(&x)
+                .map(|(&w, &v)| (w as f64 * v as f64).abs())
+                .sum();
+            assert!(got.is_finite(), "row {r}: {got}");
+            assert!(
+                (got as f64 - want).abs() <= 1e-2 * scale,
+                "row {r}: {got} against {want}"
+            );
+        }
     }
 
     /// Under a SwiGLU bound the host's pairs are the bits of the bounded SwiGLU of

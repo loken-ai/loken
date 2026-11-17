@@ -39,6 +39,30 @@ unsafe fn block_share(ws: __m256, sums: __m256i, da: &[f16; Q8K32_RUNS], runs: u
     share
 }
 
+/// A block's share for a format with a minimum: the fold from -0, in run order, of the first
+/// `runs` terms `(ws[r] * s[r]) * da[r] + wm[r] * sa[r]`, with `s` the run sums, `da` the
+/// activation's run scales and `sa` its scaled code sums.
+#[inline(always)]
+unsafe fn block_share_min(
+    ws: __m256,
+    sums: __m256i,
+    wm: __m256,
+    y: &BlockQ8K32S,
+    runs: usize,
+) -> f32 {
+    let da = _mm256_cvtph_ps(_mm_loadu_si128(y.d.as_ptr() as *const __m128i));
+    let sa = _mm256_loadu_ps(y.s.as_ptr());
+    let scaled = _mm256_mul_ps(_mm256_mul_ps(ws, _mm256_cvtepi32_ps(sums)), da);
+    let terms = _mm256_add_ps(scaled, _mm256_mul_ps(wm, sa));
+    let mut t = [0f32; Q8K32_RUNS];
+    _mm256_storeu_ps(t.as_mut_ptr(), terms);
+    let mut share = -0.0f32;
+    for &term in &t[..runs] {
+        share += term;
+    }
+    share
+}
+
 /// Eight i32 lanes whose sum is the dot of the signed bytes `w` and `a`.
 #[inline(always)]
 unsafe fn signed_lanes(w: __m256i, a: __m256i) -> __m256i {
@@ -204,6 +228,40 @@ pub(super) unsafe fn dot_q5_0(xs: &[BlockQ5_0], ys: &[BlockQ8K32]) -> f32 {
     )
 }
 
+/// The exact dot of Q5_1: block `r` of each 8 against run `r` of an activation block, fewer in a
+/// row's last block.
+///
+/// # Safety
+/// The caller runs with AVX2, FMA, F16C and BMI2 enabled.
+#[target_feature(enable = "avx2,fma,f16c,bmi2")]
+pub(super) unsafe fn dot_q5_1(xs: &[BlockQ5_1], ys: &[BlockQ8K32S]) -> f32 {
+    use crate::tensor::quant_cpu::avx::{mask_from_bits, split_nibbles};
+    let ones16 = _mm256_set1_epi16(1);
+    // The fifth bit of a code, set where its bit of `qh` is.
+    let fifth = _mm256_set1_epi8(0x10);
+    let mut total = -0.0f32;
+    for (x8, y) in xs.chunks(Q8K32_RUNS).zip(ys) {
+        let mut lanes = [_mm256_setzero_si256(); Q8K32_RUNS];
+        let mut ws = [f16::ZERO; Q8K32_RUNS];
+        let mut wm = [f16::ZERO; Q8K32_RUNS];
+        for (r, x) in x8.iter().enumerate() {
+            let a = _mm256_loadu_si256(y.qs.as_ptr().add(32 * r) as *const __m256i);
+            // The codes 0 to 31 are unsigned bytes against the signed activation codes.
+            let codes = _mm256_or_si256(
+                split_nibbles(x.qs.as_ptr()),
+                _mm256_and_si256(mask_from_bits(&x.qh), fifth),
+            );
+            lanes[r] = _mm256_madd_epi16(_mm256_maddubs_epi16(codes, a), ones16);
+            ws[r] = x.d;
+            wm[r] = x.m;
+        }
+        let ws = _mm256_cvtph_ps(_mm_loadu_si128(ws.as_ptr() as *const __m128i));
+        let wm = _mm256_cvtph_ps(_mm_loadu_si128(wm.as_ptr() as *const __m128i));
+        total += block_share_min(ws, run_sums(lanes), wm, y, x8.len());
+    }
+    total
+}
+
 /// The exact dot of Q2_0: runs `2b` and `2b + 1` of an activation block are the halves of
 /// block `b` of its 4, fewer in a row's last block.
 ///
@@ -242,8 +300,10 @@ pub(super) unsafe fn dot_q2_0(xs: &[BlockQ2_0], ys: &[BlockQ8K32]) -> f32 {
 mod tests {
     use super::*;
 
-    /// `n` blocks of `T` from random bytes, each block's leading f16 scale a small finite value.
+    /// `n` blocks of `T` from random bytes, each block's leading f16 scale a small finite value,
+    /// and its minimum too in a format with one.
     fn blocks<T: BlockFormat>(n: usize, seed: u64) -> Vec<T> {
+        let scales = if T::DTYPE == GgmlDType::Q5_1 { 2 } else { 1 };
         let size = std::mem::size_of::<T>();
         let mut state = seed;
         let mut next = || {
@@ -255,37 +315,37 @@ mod tests {
         (0..n)
             .map(|_| {
                 let mut bytes: Vec<u8> = (0..size).map(|_| next() as u8).collect();
-                let d = f16::from_f32((next() % 2001) as f32 / 1000.0 - 1.0) * f16::from_f32(0.01);
-                bytes[..2].copy_from_slice(&d.to_le_bytes());
+                for s in 0..scales {
+                    let d =
+                        f16::from_f32((next() % 2001) as f32 / 1000.0 - 1.0) * f16::from_f32(0.01);
+                    bytes[2 * s..2 * s + 2].copy_from_slice(&d.to_le_bytes());
+                }
                 // Safety: every format here is plain bytes after its scale.
                 unsafe { std::ptr::read_unaligned(bytes.as_ptr() as *const T) }
             })
             .collect()
     }
 
-    /// A row of `len` values as q8_K32 blocks, the last block padded with zeros.
-    fn activations(len: usize, seed: u64) -> Vec<BlockQ8K32> {
+    /// A row of `len` values as activation blocks `A`, the last block padded with zeros.
+    fn activations<A: BlockFormat>(len: usize, seed: u64) -> Vec<A> {
         let mut x: Vec<f32> = (0..len)
             .map(|i| (((i as u64 * 2_654_435_761 + seed) % 2001) as f32 / 1000.0 - 1.0) * 3.0)
             .collect();
         x.resize(len.div_ceil(QK_K) * QK_K, 0.0);
-        let mut y = vec![BlockQ8K32::zeros(); x.len() / QK_K];
-        BlockQ8K32::quantize(&x, &mut y);
+        let mut y = vec![A::zeros(); x.len() / QK_K];
+        A::quantize(&x, &mut y);
         y
     }
 
     /// The vector dot of `T` against its scalar steps on random rows of each width, to the bit.
-    fn same_bits<T: ExactDot<Act = BlockQ8K32>>(
-        widths: &[usize],
-        scalar: fn(&[T], &[BlockQ8K32]) -> f32,
-    ) {
+    fn same_bits<T: ExactDot>(widths: &[usize], scalar: fn(&[T], &[T::Act]) -> f32) {
         if !crate::cpu::dispatch_avx2() {
             return;
         }
         for &len in widths {
             for seed in 0..64u64 {
                 let x = blocks::<T>(len / T::BLOCK_LEN, seed * 7 + len as u64);
-                let y = activations(len, seed);
+                let y = activations::<T::Act>(len, seed);
                 let (fast, slow) = (T::dot_exact(&x, &y), scalar(&x, &y));
                 assert_eq!(
                     fast.to_bits(),
@@ -311,5 +371,6 @@ mod tests {
         same_bits::<BlockQ2_0>(&RUN_WIDTHS, super::super::q2_0::dot_exact_scalar);
         same_bits::<BlockQ8_0>(&RUN_WIDTHS, super::super::q8_0::dot_exact_scalar);
         same_bits::<BlockQ5_0>(&RUN_WIDTHS, super::super::q5_0::dot_exact_scalar);
+        same_bits::<BlockQ5_1>(&RUN_WIDTHS, super::super::q5_1::dot_exact_scalar);
     }
 }

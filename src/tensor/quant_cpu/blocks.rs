@@ -84,8 +84,9 @@ pub trait BlockFormat: Sized + Clone + Send + Sync {
 /// bits on a card and on the host.
 ///
 /// A k-quant reads q8_K blocks and folds a block in 1 step.
-/// A codebook or 2-bit format reads q8_K32 blocks and folds a block run by run, see
-/// [`exact_block_share`].
+/// A codebook or 32-value block format reads q8_K32 blocks and folds a block run by run, see
+/// [`exact_block_share`]; a format with a minimum reads q8_K32 blocks with run sums, see
+/// [`exact_block_share_min`].
 /// `xs` and `ys` cover the same values: a format's blocks divide the 256 values of an activation
 /// block.
 pub trait ExactDot: BlockFormat {
@@ -105,6 +106,27 @@ pub fn exact_block_share(y: &BlockQ8K32, runs: usize, run: impl Fn(usize) -> (f3
     for (r, da) in y.d.iter().enumerate().take(runs) {
         let (ws, s) = run(r);
         share += ws * s as f32 * da.to_f32();
+    }
+    share
+}
+
+/// [`exact_block_share`] for a format with a minimum, against a q8_K32 block with run sums:
+/// the fold from -0, in run order, of each of its first `runs` runs' `(ws * s) * da + wm * sa`,
+/// each step rounded.
+/// `run(r)` gives run `r`'s float weight scale `ws`, its integer sum `s` and its float minimum
+/// `wm`.
+/// `da` is the run's activation scale and `sa` its scaled code sum, q8_1's `s`, finite where
+/// q8_1's f16 overflows.
+#[inline(always)]
+pub fn exact_block_share_min(
+    y: &BlockQ8K32S,
+    runs: usize,
+    run: impl Fn(usize) -> (f32, i32, f32),
+) -> f32 {
+    let mut share = -0.0f32;
+    for r in 0..runs {
+        let (ws, s, wm) = run(r);
+        share += ws * s as f32 * y.d[r].to_f32() + wm * y.s[r];
     }
     share
 }
