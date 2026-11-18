@@ -600,8 +600,25 @@ fn a_batched_model_names_the_format_it_runs_in() {
 mod on_a_card {
     use super::*;
 
-    /// Whether card 0 opens. A run without a card says so on its error stream.
-    fn card() -> bool {
+    /// The free memory of card 0, shared by the tests of this module.
+    /// A test that fills it holds it alone.
+    static CARD_MEMORY: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
+    /// A share of card 0, or `None` when it does not open.
+    /// A run without a card says so on its error stream.
+    fn card() -> Option<std::sync::RwLockReadGuard<'static, ()>> {
+        let share = CARD_MEMORY.read().unwrap_or_else(|e| e.into_inner());
+        opens().then_some(share)
+    }
+
+    /// Card 0 with no other test of this module on it, or `None` when it does not open.
+    fn card_alone() -> Option<std::sync::RwLockWriteGuard<'static, ()>> {
+        let alone = CARD_MEMORY.write().unwrap_or_else(|e| e.into_inner());
+        opens().then_some(alone)
+    }
+
+    /// Whether card 0 opens.
+    fn opens() -> bool {
         let present = Device::new_cuda(0).is_ok();
         if !present {
             eprintln!("no card: the card variants checked nothing");
@@ -690,9 +707,9 @@ mod on_a_card {
 
     #[test]
     fn a_stretched_rotation_batches_on_a_card() {
-        if !card() {
+        let Some(_card) = card() else {
             return;
-        }
+        };
         let keys = stretched();
         let path = quant(
             "cb-card-yarn",
@@ -707,9 +724,9 @@ mod on_a_card {
 
     #[test]
     fn a_partial_rotation_batches_on_a_card() {
-        if !card() {
+        let Some(_card) = card() else {
             return;
-        }
+        };
         let rotated = tiny_model::QUANT_EMBD / tiny_model::QUANT_HEADS / 2;
         let keys = vec![(
             "qwen3.rope.dimension_count".into(),
@@ -728,9 +745,9 @@ mod on_a_card {
 
     #[test]
     fn attention_sinks_and_a_window_batch_on_a_card() {
-        if !card() {
+        let Some(_card) = card() else {
             return;
-        }
+        };
         let extras = tiny_model::QuantExtras {
             keys: windowed(),
             sinks: true,
@@ -748,9 +765,9 @@ mod on_a_card {
     /// 2 prompts that differ only before those give the same logits from their last row on.
     #[test]
     fn a_window_without_sinks_batches_on_a_card() {
-        if !card() {
+        let Some(_card) = card() else {
             return;
-        }
+        };
         let extras = tiny_model::QuantExtras {
             keys: windowed_everywhere(),
             ..Default::default()
@@ -852,9 +869,10 @@ mod on_a_card {
     #[test]
     fn a_sink_prompt_whose_scores_exceed_the_free_card_memory_answers() {
         use crate::inference::place::room::free_now;
-        if !card() {
+        // The filler below takes the card's free memory: no other test of this module runs then.
+        let Some(_card) = card_alone() else {
             return;
-        }
+        };
         let extras = tiny_model::QuantExtras {
             sinks: true,
             ..Default::default()
@@ -907,9 +925,9 @@ mod on_a_card {
 
     #[test]
     fn a_mixture_batches_on_a_card() {
-        if !card() {
+        let Some(_card) = card() else {
             return;
-        }
+        };
         let extras = tiny_model::QuantExtras {
             routed: true,
             ..Default::default()
@@ -922,9 +940,9 @@ mod on_a_card {
     /// A mixture with sinks, a windowed layer and a stretched rotation batches on a card.
     #[test]
     fn a_mixture_with_sinks_window_and_stretched_rotation_batches_on_a_card() {
-        if !card() {
+        let Some(_card) = card() else {
             return;
-        }
+        };
         let extras = tiny_model::QuantExtras {
             keys: windowed().into_iter().chain(stretched()).collect(),
             sinks: true,
@@ -952,7 +970,10 @@ mod on_a_card {
     #[test]
     fn a_model_whose_first_layer_sits_on_the_second_card_serves_serially() {
         use crate::inference::engine::model_backend::{GenericBackend, ModelBackend};
-        if !card() || !second_card() {
+        let Some(_card) = card() else {
+            return;
+        };
+        if !second_card() {
             return;
         }
         let extras = tiny_model::QuantExtras {
@@ -997,9 +1018,9 @@ mod on_a_card {
     /// [`a_long_prompt_reads_in_chunks_on`] on card 0.
     #[test]
     fn a_long_prompt_reads_in_chunks_on_a_card() {
-        if !card() {
+        let Some(_card) = card() else {
             return;
-        }
+        };
         let path = quant("cb-card-chunked", tiny_model::QuantExtras::default());
         a_long_prompt_reads_in_chunks_on(
             &|| tiny_model::load_on_card(&path, LAYERS),
