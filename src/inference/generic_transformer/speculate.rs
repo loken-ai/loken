@@ -9,6 +9,14 @@
 
 use super::*;
 
+#[cfg(test)]
+thread_local! {
+    /// Layers a verify on this thread records before the next one fails, as a test asks.
+    /// `None` lets every layer record.
+    pub(super) static FAILING_RECORDS: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+
 /// What one layer holds from a verify, until the rows kept are known.
 pub(super) struct LayerPending {
     /// Position of the first row.
@@ -45,6 +53,20 @@ impl GenericTransformerLayer {
         emb: Option<&Tensor>,
         index_pos: usize,
     ) -> Result<()> {
+        #[cfg(test)]
+        if FAILING_RECORDS.with(|n| match n.get() {
+            Some(0) => {
+                n.set(None);
+                true
+            }
+            Some(left) => {
+                n.set(Some(left - 1));
+                false
+            }
+            None => false,
+        }) {
+            crate::tensor::bail!("the layer's state was not recorded, as the test asks");
+        }
         let rows = r.dims3()?.1;
         let mixer = match self.mixer {
             mixer::Mixer::Attention | mixer::Mixer::Absent => None,
@@ -151,12 +173,19 @@ impl GenericHeteroTransformer {
     }
 
     /// Stop recording once the verify's forward has run.
+    ///
+    /// A verify that failed part-way leaves the model at the position it started from.
+    /// Every layer it reached returns to its state before the rows.
+    /// Every cache drops the rows the verify wrote.
     pub(super) fn spec_close(&mut self, ran: bool) {
         self.spec_recording = false;
         for l in &mut self.layers {
             l.spec_record = false;
         }
         if !ran {
+            if let Some(base) = self.spec_window.as_ref().map(|w| w.base) {
+                self.trim_kv(base);
+            }
             self.spec_clear();
         }
     }

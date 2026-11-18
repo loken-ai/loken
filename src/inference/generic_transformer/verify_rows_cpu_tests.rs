@@ -600,3 +600,87 @@ fn stored_gemma4_verifies_its_decode_steps(load: &dyn Fn() -> GenericHeteroTrans
         assert!(got == want[i], "step {i} after a cut verify differs");
     }
 }
+
+/// Tokens of the prompt the hybrid reads before it decodes.
+const HYBRID_PROMPT: usize = 20;
+/// Tokens the hybrid decodes after its prompt.
+const HYBRID_NEW: usize = 8;
+
+/// The greedy tokens of the hybrid at `file` and the bits of each step's logits.
+/// With `failing` set, a verify fails at that step before the step runs:
+/// the first recurrent layer and the attention layer after it take the rows, the second
+/// recurrent layer fails to record its state.
+fn hybrid_decode(
+    file: &std::path::Path,
+    load: &dyn Fn(&std::path::Path) -> GenericHeteroTransformer,
+    failing: Option<usize>,
+) -> (Vec<usize>, Vec<Vec<u32>>) {
+    use super::state_cache_tests::{argmax, bits, floats, prompt};
+    let mut m = load(file);
+    assert!(m.is_recurrent(), "the hybrid carries recurrent states");
+    let tokens = prompt(HYBRID_PROMPT);
+    let mut logits = m.forward(&ids(&tokens), 0).unwrap();
+    let mut out = Vec::new();
+    let mut seen = Vec::new();
+    for i in 0..HYBRID_NEW {
+        let next = argmax(&floats(&logits)) as u32;
+        out.push(next as usize);
+        let pos = HYBRID_PROMPT + i;
+        if failing == Some(i) {
+            super::speculate::FAILING_RECORDS.with(|n| n.set(Some(1)));
+            let rows = [next, NEXT[0], NEXT[1], NEXT[2]];
+            let verified = m.forward_all(&ids(&rows), pos);
+            super::speculate::FAILING_RECORDS.with(|n| n.set(None));
+            assert!(verified.is_err(), "the verify at step {i} fails as asked");
+        }
+        logits = m.forward(&ids(&[next]), pos).unwrap();
+        seen.push(bits(&logits));
+    }
+    (out, seen)
+}
+
+/// A verify that fails part-way leaves the hybrid at the position it started from.
+/// The decode that follows gives the tokens and the logits of a decode that never verified.
+fn a_failed_verify_leaves_the_hybrid_where_it_started(
+    tag: &str,
+    load: &dyn Fn(&std::path::Path) -> GenericHeteroTransformer,
+) {
+    let dir = super::state_cache_tests::scratch_dir(tag);
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("hybrid.gguf");
+    super::state_cache_tests::write_hybrid(&file);
+    let want = hybrid_decode(&file, load, None);
+    for at in [0, HYBRID_NEW / 2] {
+        let got = hybrid_decode(&file, load, Some(at));
+        assert_eq!(
+            got.0, want.0,
+            "the tokens after a verify failed at step {at}"
+        );
+        assert!(
+            got.1 == want.1,
+            "the logits after a verify failed at step {at} differ"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_failed_verify_leaves_the_hybrid_where_it_started_on_the_host() {
+    a_failed_verify_leaves_the_hybrid_where_it_started(
+        "failed-verify-host",
+        &super::state_cache_tests::load,
+    );
+}
+
+#[cfg(feature = "gpu")]
+#[test]
+#[ignore = "needs a card"]
+fn a_failed_verify_leaves_the_hybrid_where_it_started_on_a_card() {
+    if Device::new_cuda(0).is_err() {
+        eprintln!("no usable card");
+        return;
+    }
+    a_failed_verify_leaves_the_hybrid_where_it_started("failed-verify-card", &|p| {
+        tiny_model::load_on_card(p, 4)
+    });
+}
