@@ -1045,7 +1045,7 @@ impl Mamba2 {
             );
             return Tensor::from_vec(y, (1, seq, dims.d_inner), &x.device())?.to_dtype(x.dtype());
         }
-        let (mut conv, mut h) = match self.state.clone() {
+        let (conv, h) = match self.state.clone() {
             Some(SsmState::Card { conv, h }) => (conv, h),
             _ => (
                 Tensor::zeros_on((b, dims.d_xbc(), dims.d_conv), DType::F32, &x.device())?,
@@ -1056,7 +1056,94 @@ impl Mamba2 {
                 )?,
             ),
         };
+        let (y, conv, h) = self.card(&proj, conv, h)?;
+        hold_ssm(&mut self.state, conv, h, &mut self.moves)?;
+        y.to_dtype(x.dtype())
+    }
+
+    /// The block over the rows of `proj` `[b, seq, d_inner + d_xbc + nheads]` F32 on a card,
+    /// from the window `conv` `[b, d_xbc, d_conv]` and the hidden `h`: every row in one pass
+    /// when there are several, else row by row.
+    /// Returns `y` `[b, seq, d_inner]` F32 and the window and hidden after the last row, all
+    /// those of the row loop.
+    pub fn card(&self, proj: &Tensor, conv: Tensor, h: Tensor) -> Result<(Tensor, Tensor, Tensor)> {
+        if proj.dim(1)? > 1 && proj.device().is_cuda() {
+            return self.card_rows(proj, conv, h);
+        }
+        self.card_steps(proj, conv, h)
+    }
+
+    /// [`Mamba2::card`] over every row at once: 1 launch for the convolution, 1 for the time
+    /// steps, 1 for the recurrence and 1 for the gate and norm.
+    pub fn card_rows(
+        &self,
+        proj: &Tensor,
+        conv: Tensor,
+        h: Tensor,
+    ) -> Result<(Tensor, Tensor, Tensor)> {
         use crate::inference::kernel::fused;
+        let dims = self.dims;
+        let (b, seq, _) = proj.dims3()?;
+        let (di, dx, nh) = (dims.d_inner, dims.d_xbc(), dims.nheads);
+        let xbc = proj.narrow(D::Minus1, di, dx)?;
+        let (xbc, conv) = fused::fused_causal_conv1d_silu_rows(
+            &xbc,
+            &conv,
+            &self.conv_w,
+            &self.conv_b,
+            dx,
+            dims.d_conv,
+        )?;
+        let dt = proj.narrow(D::Minus1, di + dx, nh)?;
+        let dt = match fused::softplus_bias(&dt, &self.dt_bias)? {
+            Some(y) => y,
+            None => ((dt.broadcast_add(&self.dt_bias)?.exp()? + 1.0)?).log()?,
+        };
+        let (y, h) = fused::fused_mamba2_ssm_scan(
+            &xbc,
+            &dt,
+            &self.a,
+            &h,
+            nh,
+            dims.headdim(),
+            dims.d_state,
+            dims.ngroups,
+        )?;
+        let rows = b * seq;
+        let x_c = xbc
+            .narrow(D::Minus1, 0, di)?
+            .contiguous()?
+            .reshape((rows, di))?;
+        let z = proj
+            .narrow(D::Minus1, 0, di)?
+            .contiguous()?
+            .reshape((rows, di))?;
+        let y = fused::fused_mamba2_gate_gnorm(
+            &y.reshape((rows, di))?,
+            &x_c,
+            &self.d,
+            &z,
+            &self.norm_w,
+            rows,
+            di,
+            dims.headdim(),
+            dims.ngroups,
+            self.eps,
+        )?;
+        Ok((y.reshape((b, seq, di))?, conv, h))
+    }
+
+    /// [`Mamba2::card`] one row at a time: the 4 token kernels launched for each row.
+    pub fn card_steps(
+        &self,
+        proj: &Tensor,
+        conv: Tensor,
+        h: Tensor,
+    ) -> Result<(Tensor, Tensor, Tensor)> {
+        use crate::inference::kernel::fused;
+        let dims = self.dims;
+        let (b, seq, _) = proj.dims3()?;
+        let (mut conv, mut h) = (conv, h);
         let per_group = dims.ngroups * dims.d_state;
         let mut rows = Vec::with_capacity(seq);
         for t in 0..seq {
@@ -1105,13 +1192,13 @@ impl Mamba2 {
                 dims.ngroups,
                 self.eps,
             )?;
-            rows.push(y.to_dtype(x.dtype())?.unsqueeze(1)?);
+            rows.push(y.unsqueeze(1)?);
         }
-        hold_ssm(&mut self.state, conv, h, &mut self.moves)?;
-        if rows.len() == 1 {
-            return Ok(rows.pop().unwrap());
-        }
-        Tensor::cat(&rows.iter().collect::<Vec<_>>(), 1)
+        let y = match rows.len() {
+            1 => rows.pop().expect("one row"),
+            _ => Tensor::cat(&rows.iter().collect::<Vec<_>>(), 1)?,
+        };
+        Ok((y, conv, h))
     }
 }
 
@@ -2297,6 +2384,94 @@ mod tests {
             }
         }
         out
+    }
+
+    /// The Mamba2 block over a chunk on a card gives the rows and the state of its token steps,
+    /// bit for bit: at 1 and 2 batch rows, over runs of rows that do and do not fill the
+    /// convolution's, across 2 chunks that carry the state from one to the next, and with the
+    /// state advanced in place as a recorded step does, at a state size the held kernel is built
+    /// for and at one it is not.
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn the_card_mamba2_over_a_chunk_gives_the_rows_and_state_of_its_token_steps() {
+        let Ok(dev) = Device::new_cuda(0) else {
+            return;
+        };
+        for d_state in [16, 24] {
+            card_mamba2_over_a_chunk(&dev, d_state);
+        }
+    }
+
+    /// The test above at a state size: one the held kernel is built for, or one it is not.
+    #[cfg(feature = "gpu")]
+    fn card_mamba2_over_a_chunk(dev: &Device, d_state: usize) {
+        let dims = Mamba2Dims {
+            d_inner: 256,
+            d_state,
+            ngroups: 2,
+            d_conv: 4,
+            nheads: 8,
+        };
+        let (dx, nh, hd) = (dims.d_xbc(), dims.nheads, dims.headdim());
+        let width = dims.d_inner + dx + nh;
+        let t = |v: Vec<f32>, shape: &[usize]| Tensor::from_vec(v, shape, dev).unwrap();
+        let a: Vec<f32> = values(nh, 14, 0.5)
+            .iter()
+            .map(|v| -(0.5 + v.abs()))
+            .collect();
+        let weights = Mamba2Weights {
+            in_proj: QMatMul::from_qtensor(
+                crate::tensor::quantized::QTensor::quantize_onto(
+                    &Tensor::from_vec(values(width, 11, 0.3), (width, 1), &Device::Cpu).unwrap(),
+                    crate::tensor::quantized::GgmlDType::F32,
+                    &Device::Cpu,
+                )
+                .unwrap(),
+            )
+            .unwrap(),
+            conv_w: t(values(dx * dims.d_conv, 12, 0.5), &[dx, dims.d_conv]),
+            conv_b: t(values(dx, 13, 0.2), &[dx]),
+            a: t(a, &[nh, 1]),
+            d: t(values(nh, 15, 1.0), &[nh, 1]),
+            dt_bias: t(values(nh, 16, 0.5), &[nh]),
+            norm_w: t(
+                values(dims.d_inner, 17, 1.0),
+                &[dims.ngroups, dims.d_inner / dims.ngroups],
+            ),
+        };
+        let mamba = Mamba2::new(weights, dims, 1e-5, dev).unwrap();
+        let flat = |t: &Tensor| t.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let copy = |t: &Tensor| t.affine(1.0, 0.0).unwrap();
+        let cases = [(1, 70, 33), (2, 33, 1), (1, 5, 3)];
+        for ((b, seq, cut), in_place) in cases.into_iter().flat_map(|c| [(c, false), (c, true)]) {
+            let _mode = crate::inference::moe_cuda::in_place_state(in_place);
+            let proj = t(values(b * seq * width, 18, 1.0), &[b, seq, width]);
+            let conv = t(values(b * dx * dims.d_conv, 19, 1.0), &[b, dx, dims.d_conv]);
+            let h = t(
+                values(b * nh * hd * dims.d_state, 20, 0.5),
+                &[b, nh, hd, dims.d_state],
+            );
+            let case = format!("state {d_state} b {b} seq {seq} in place {in_place}");
+            let (y_steps, conv_steps, h_steps) =
+                mamba.card_steps(&proj, copy(&conv), copy(&h)).unwrap();
+            let (y_rows, conv_rows, h_rows) = mamba.card(&proj, copy(&conv), copy(&h)).unwrap();
+            assert_eq!(y_rows.dims(), y_steps.dims(), "{case}");
+            assert_eq!(flat(&y_rows), flat(&y_steps), "{case}");
+            assert_eq!(flat(&conv_rows), flat(&conv_steps), "{case}");
+            assert_eq!(flat(&h_rows), flat(&h_steps), "{case}");
+            let head = proj.narrow(1, 0, cut).unwrap();
+            let tail = proj.narrow(1, cut, seq - cut).unwrap();
+            let (y_head, conv_head, h_head) = mamba.card(&head, copy(&conv), copy(&h)).unwrap();
+            let (y_tail, conv_tail, h_tail) = mamba.card(&tail, conv_head, h_head).unwrap();
+            let joined = Tensor::cat(&[&y_head, &y_tail], 1).unwrap();
+            assert_eq!(flat(&joined), flat(&y_steps), "{case}, chunks at {cut}");
+            assert_eq!(
+                flat(&conv_tail),
+                flat(&conv_steps),
+                "{case}, chunks at {cut}"
+            );
+            assert_eq!(flat(&h_tail), flat(&h_steps), "{case}, chunks at {cut}");
+        }
     }
 
     #[test]

@@ -317,6 +317,155 @@ extern "C" __global__ void fused_mamba2_ssm_step_f32(
     y_out[idx] = y;
 }
 
+// The Mamba2 convolution above over the rows of a prompt chunk, one launch for every row.
+//   padded   = [ state_in[b,d,0..L-1], x[b,0,d], .., x[b,seq-1,d] ]
+//   acc[t]   = bias[d] + sum_{k<L-1} padded[t+1+k]*conv_w[d,k] + x[b,t,d]*conv_w[d,L-1]
+//   y[b,t,d] = silu(acc[t])
+//   state_out[b,d,k] = padded[seq+k]
+// Each row sums its taps in the order of the token kernel, so the rows and the state are those
+// of `seq` token steps.
+// One thread per channel d and run of `rows_per_run` rows, batch row b on the grid's z.
+// `rows_per_run` is at least L, so only the first run reads the old window: the state may be
+// advanced in place.
+// The new window is written in order and each value is read from a later place than the ones
+// written before it.
+extern "C" __global__ void fused_causal_conv1d_silu_rows_f32(
+    const float* __restrict__ x,         // [b, seq, D]
+    const float* state_in,               // [b, D, L]; may be `state_out`
+    const float* __restrict__ conv_w,    // [D, L]
+    const float* __restrict__ conv_b,    // [D]
+    float* __restrict__ y_out,           // [b, seq, D]
+    float* state_out,                    // [b, D, L]
+    const int seq, const int D, const int L, const int rows_per_run
+) {
+    const int d = blockIdx.x * blockDim.x + threadIdx.x;
+    if (d >= D) return;
+    const int bi = blockIdx.z;
+    const int t0 = blockIdx.y * rows_per_run;
+    const int t1 = min(seq, t0 + rows_per_run);
+    const float* xs = x + (size_t)bi * seq * D + d;
+    const float* st = state_in + ((size_t)bi * D + d) * L;
+    const float* cw = conv_w + (size_t)d * L;
+    for (int t = t0; t < t1; ++t) {
+        const float xv = xs[(size_t)t * D];
+        float acc = conv_b[d];
+        #pragma unroll 1
+        for (int k = 0; k < L - 1; ++k) {
+            const int m = t + 1 + k;
+            const float v = m < L ? st[m] : xs[(size_t)(m - L) * D];
+            acc += v * cw[k];
+        }
+        acc += xv * cw[L - 1];
+        y_out[((size_t)bi * seq + t) * D + d] = acc / (1.0f + expf(-acc)); // SiLU
+    }
+    if (blockIdx.y != 0) return;
+    float* so = state_out + ((size_t)bi * D + d) * L;
+    #pragma unroll 1
+    for (int k = 0; k < L; ++k) {
+        const int m = seq + k;
+        so[k] = m < L ? st[m] : xs[(size_t)(m - L) * D];
+    }
+}
+
+// The Mamba2 recurrence above over the rows of a prompt chunk, one launch for every row.
+// Each thread runs one (b, head, p) through the rows in order, each row as the token kernel
+// computes it, so the outputs and the state are those of `seq` token steps.
+// The row `t` of `xbc` holds x at 0, B at `d_inner` and C at `d_inner + ngroups*ds`.
+extern "C" __global__ void fused_mamba2_ssm_scan_f32(
+    const float* __restrict__ xbc,   // [b, seq, xbc_width]
+    const float* __restrict__ dt,    // [b, seq, nh]
+    const float* __restrict__ a,     // [nh]
+    const float* h_in,               // [b, nh, hd, ds]; may be `h_out`, each thread owns its row
+    float* __restrict__ y_out,       // [b, seq, nh, hd]
+    float* h_out,                    // [b, nh, hd, ds]
+    const int b, const int seq, const int nh, const int hd, const int ds, const int ngroups,
+    const int xbc_width
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x; // = (bi*nh+head)*hd + p
+    if (idx >= b * nh * hd) return;
+    const int p    = idx % hd;
+    const int head = (idx / hd) % nh;
+    const int bi   = idx / (nh * hd);
+    const int hpg  = nh / ngroups;
+    const int group = head / hpg;
+    const int d_inner = nh * hd;
+    float* hout = h_out + (size_t)idx * ds;
+    for (int t = 0; t < seq; ++t) {
+        const size_t row = (size_t)bi * seq + t;
+        const float* r = xbc + row * xbc_width;
+        const float dt_v  = dt[row * nh + head];
+        const float decay = expf(dt_v * a[head]);
+        const float x_v   = r[head * hd + p];
+        const float* b_row = r + d_inner + (size_t)group * ds;
+        const float* c_row = r + d_inner + (size_t)ngroups * ds + (size_t)group * ds;
+        const float* hin  = t == 0 ? h_in + (size_t)idx * ds : hout;
+        float y = 0.0f;
+        for (int s = 0; s < ds; ++s) {
+            const float hn = hin[s] * decay + dt_v * x_v * b_row[s];
+            hout[s] = hn;
+            y += hn * c_row[s];
+        }
+        y_out[row * d_inner + head * hd + p] = y;
+    }
+}
+
+// `fused_mamba2_ssm_scan_f32` with the state row of each thread held in registers for the
+// whole chunk: read once before the first row, written once after the last.
+// `DS` is the state size; the sums run in the order of the token kernel.
+template <int DS>
+__device__ __forceinline__ void mamba2_ssm_scan_held(
+    const float* __restrict__ xbc, const float* __restrict__ dt, const float* __restrict__ a,
+    const float* h_in, float* __restrict__ y_out, float* h_out,
+    const int b, const int seq, const int nh, const int hd, const int ngroups,
+    const int xbc_width
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x; // = (bi*nh+head)*hd + p
+    if (idx >= b * nh * hd) return;
+    const int p    = idx % hd;
+    const int head = (idx / hd) % nh;
+    const int bi   = idx / (nh * hd);
+    const int hpg  = nh / ngroups;
+    const int group = head / hpg;
+    const int d_inner = nh * hd;
+    float h[DS];
+    #pragma unroll
+    for (int s = 0; s < DS; ++s) h[s] = h_in[(size_t)idx * DS + s];
+    for (int t = 0; t < seq; ++t) {
+        const size_t row = (size_t)bi * seq + t;
+        const float* r = xbc + row * xbc_width;
+        const float dt_v  = dt[row * nh + head];
+        const float decay = expf(dt_v * a[head]);
+        const float x_v   = r[head * hd + p];
+        const float* b_row = r + d_inner + (size_t)group * DS;
+        const float* c_row = r + d_inner + (size_t)ngroups * DS + (size_t)group * DS;
+        float y = 0.0f;
+        #pragma unroll
+        for (int s = 0; s < DS; ++s) {
+            const float hn = h[s] * decay + dt_v * x_v * b_row[s];
+            h[s] = hn;
+            y += hn * c_row[s];
+        }
+        y_out[row * d_inner + head * hd + p] = y;
+    }
+    #pragma unroll
+    for (int s = 0; s < DS; ++s) h_out[(size_t)idx * DS + s] = h[s];
+}
+
+#define MAMBA2_SSM_SCAN_HELD(DS)                                                              \
+extern "C" __global__ void fused_mamba2_ssm_scan_ds##DS##_f32(                                 \
+    const float* __restrict__ xbc, const float* __restrict__ dt, const float* __restrict__ a, \
+    const float* h_in, float* __restrict__ y_out, float* h_out,                               \
+    const int b, const int seq, const int nh, const int hd, const int ds, const int ngroups,  \
+    const int xbc_width                                                                       \
+) {                                                                                           \
+    mamba2_ssm_scan_held<DS>(xbc, dt, a, h_in, y_out, h_out, b, seq, nh, hd, ngroups,         \
+                             xbc_width);                                                      \
+}
+MAMBA2_SSM_SCAN_HELD(16)
+MAMBA2_SSM_SCAN_HELD(32)
+MAMBA2_SSM_SCAN_HELD(64)
+MAMBA2_SSM_SCAN_HELD(128)
+
 // LFM2 gated short-conv inner, fused per (batch, channel) into one launch in
 // place of ~20 (3 narrows, B*X gate, cat, the l_cache-step conv loop, state
 // shift, C gate). bcx = in_proj(x) split as [B | C | X] each d_model wide.

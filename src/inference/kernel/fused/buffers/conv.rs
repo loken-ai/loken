@@ -87,6 +87,218 @@ pub fn fused_causal_conv1d_silu(
     Ok((y, state_out))
 }
 
+/// Rows of a prompt chunk one thread of [`fused_causal_conv1d_silu_rows`] convolves.
+const CONV_ROWS_PER_RUN: usize = 32;
+
+/// [`fused_causal_conv1d_silu`] over every row of a chunk in one launch: x `[b, seq, D]` F32,
+/// state_in `[b, D, L]`. Returns `(y [b, seq, D], state_out [b, D, L])`, the rows and the
+/// state of `seq` calls of the token launch. CUDA only.
+pub fn fused_causal_conv1d_silu_rows(
+    x: &Tensor,
+    state_in: &Tensor,
+    conv_w: &Tensor,
+    conv_b: &Tensor,
+    d: usize,
+    l: usize,
+) -> Result<(Tensor, Tensor)> {
+    if !x.device().is_cuda() {
+        crate::tensor::bail!("fused_causal_conv1d_silu_rows requires CUDA");
+    }
+    let (bsz, seq, width) = x.dims3()?;
+    if width != d || seq == 0 {
+        crate::tensor::bail!(
+            "fused_causal_conv1d_silu_rows: rows [{bsz}, {seq}, {width}] for {d} channels"
+        );
+    }
+    let x = x.contiguous()?;
+    // An in-place state is written where it lies, so it is used as it is, never a copy.
+    let in_place = crate::inference::moe_cuda::in_place_state_on();
+    if in_place && !state_in.is_contiguous() {
+        crate::tensor::bail!("fused_causal_conv1d_silu_rows: an in-place state must be contiguous");
+    }
+    let state_in = state_in.contiguous()?;
+    let conv_w = conv_w.contiguous()?;
+    let conv_b = conv_b.contiguous()?;
+    let y = unsafe { Tensor::empty((bsz, seq, d), DType::F32, &x.device())? };
+    let state_out = if in_place {
+        state_in.clone()
+    } else {
+        unsafe { Tensor::empty((bsz, d, l), DType::F32, &x.device())? }
+    };
+
+    let cuda_dev = x.device().as_cuda_device()?;
+    let ptx = get_ptx(&cuda_dev)?;
+    let func = cuda_dev.get_or_load_custom_func(
+        "fused_causal_conv1d_silu_rows_f32",
+        "loken_fused",
+        ptx,
+    )?;
+
+    let (x_s, x_l) = x.storage_and_layout();
+    let (si_s, si_l) = state_in.storage_and_layout();
+    let (cw_s, cw_l) = conv_w.storage_and_layout();
+    let (cb_s, cb_l) = conv_b.storage_and_layout();
+    let (y_s, _) = y.storage_and_layout();
+    let (so_s, _) = state_out.storage_and_layout();
+    use crate::tensor::StorageView::Cuda as C;
+    if let (C(xx), C(si), C(cw), C(cb), C(yy), C(so)) =
+        (&*x_s, &*si_s, &*cw_s, &*cb_s, &*y_s, &*so_s)
+    {
+        let x_v = xx.as_cuda_slice::<f32>()?.slice(x_l.start_offset()..);
+        let si_v = si.as_cuda_slice::<f32>()?.slice(si_l.start_offset()..);
+        let cw_v = cw.as_cuda_slice::<f32>()?.slice(cw_l.start_offset()..);
+        let cb_v = cb.as_cuda_slice::<f32>()?.slice(cb_l.start_offset()..);
+        let y_sl = yy.as_cuda_slice::<f32>()?;
+        let so_sl = so.as_cuda_slice::<f32>()?;
+        // Only the first run of rows reads the old window, so a run spans at least the window.
+        let rows_per_run = CONV_ROWS_PER_RUN.max(l);
+        let block = 256u32;
+        let cfg = crate::tensor::cuda_ext::LaunchConfig {
+            grid_dim: (
+                (d as u32).div_ceil(block),
+                seq.div_ceil(rows_per_run) as u32,
+                bsz as u32,
+            ),
+            block_dim: (block, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let (si32, di, li, ri) = (seq as i32, d as i32, l as i32, rows_per_run as i32);
+        let mut builder = func.builder();
+        builder.arg(&x_v);
+        builder.arg(&si_v);
+        builder.arg(&cw_v);
+        builder.arg(&cb_v);
+        builder.arg(y_sl);
+        builder.arg(so_sl);
+        builder.arg(&si32);
+        builder.arg(&di);
+        builder.arg(&li);
+        builder.arg(&ri);
+        unsafe { builder.launch(cfg) }.map_err(|e| {
+            crate::tensor::Error::msg(format!("fused_causal_conv1d_silu_rows: {e}"))
+        })?;
+    }
+    drop(x_s);
+    drop(si_s);
+    drop(cw_s);
+    drop(cb_s);
+    drop(y_s);
+    drop(so_s);
+    Ok((y, state_out))
+}
+
+/// [`fused_mamba2_ssm_step`] over every row of a chunk in one launch: xbc `[b, seq, width]`
+/// F32 holding x at 0, B at `nh * hd` and C after B, dt `[b, seq, nh]`, h_in `[b, nh, hd, ds]`.
+/// Returns `(y [b, seq, nh, hd], h_out [b, nh, hd, ds])`, the outputs and the state of `seq`
+/// calls of the token launch. CUDA only.
+#[allow(clippy::too_many_arguments)]
+pub fn fused_mamba2_ssm_scan(
+    xbc: &Tensor,
+    dt: &Tensor,
+    a: &Tensor,
+    h_in: &Tensor,
+    nh: usize,
+    hd: usize,
+    ds: usize,
+    ngroups: usize,
+) -> Result<(Tensor, Tensor)> {
+    if !xbc.device().is_cuda() {
+        crate::tensor::bail!("fused_mamba2_ssm_scan requires CUDA");
+    }
+    let (bsz, seq, width) = xbc.dims3()?;
+    if width < nh * hd + 2 * ngroups * ds || dt.dims() != [bsz, seq, nh] {
+        crate::tensor::bail!(
+            "fused_mamba2_ssm_scan: rows {:?} and steps {:?} for {nh} heads",
+            xbc.dims(),
+            dt.dims()
+        );
+    }
+    let xbc = xbc.contiguous()?;
+    let dt = dt.contiguous()?;
+    let a = a.contiguous()?;
+    // An in-place state is written where it lies, so it is used as it is, never a copy.
+    let in_place = crate::inference::moe_cuda::in_place_state_on();
+    if in_place && !h_in.is_contiguous() {
+        crate::tensor::bail!("fused_mamba2_ssm_scan: an in-place state must be contiguous");
+    }
+    let h_in = h_in.contiguous()?;
+    let y = unsafe { Tensor::empty((bsz, seq, nh, hd), DType::F32, &xbc.device())? };
+    let h_out = if in_place {
+        h_in.clone()
+    } else {
+        unsafe { Tensor::empty((bsz, nh, hd, ds), DType::F32, &xbc.device())? }
+    };
+
+    let cuda_dev = xbc.device().as_cuda_device()?;
+    let ptx = get_ptx(&cuda_dev)?;
+    // A state size the held kernels are built for keeps each state row in registers.
+    let name = match ds {
+        16 => "fused_mamba2_ssm_scan_ds16_f32",
+        32 => "fused_mamba2_ssm_scan_ds32_f32",
+        64 => "fused_mamba2_ssm_scan_ds64_f32",
+        128 => "fused_mamba2_ssm_scan_ds128_f32",
+        _ => "fused_mamba2_ssm_scan_f32",
+    };
+    let func = cuda_dev.get_or_load_custom_func(name, "loken_fused", ptx)?;
+
+    let (x_s, x_l) = xbc.storage_and_layout();
+    let (dt_s, dt_l) = dt.storage_and_layout();
+    let (a_s, a_l) = a.storage_and_layout();
+    let (h_s, h_l) = h_in.storage_and_layout();
+    let (y_s, _) = y.storage_and_layout();
+    let (ho_s, _) = h_out.storage_and_layout();
+    use crate::tensor::StorageView::Cuda as C;
+    if let (C(xx), C(dtt), C(aa), C(hh), C(yy), C(hoo)) =
+        (&*x_s, &*dt_s, &*a_s, &*h_s, &*y_s, &*ho_s)
+    {
+        let x_v = xx.as_cuda_slice::<f32>()?.slice(x_l.start_offset()..);
+        let dt_v = dtt.as_cuda_slice::<f32>()?.slice(dt_l.start_offset()..);
+        let a_v = aa.as_cuda_slice::<f32>()?.slice(a_l.start_offset()..);
+        let h_v = hh.as_cuda_slice::<f32>()?.slice(h_l.start_offset()..);
+        let y_sl = yy.as_cuda_slice::<f32>()?;
+        let ho_sl = hoo.as_cuda_slice::<f32>()?;
+        let n = (bsz * nh * hd) as u32;
+        let (block, grid) = adaptive_grid_1d(n, cuda_dev.multiprocessor_count() as u32);
+        let cfg = crate::tensor::cuda_ext::LaunchConfig {
+            grid_dim: (grid, 1, 1),
+            block_dim: (block, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let (bi, si, nhi, hdi, dsi, ngi, wi) = (
+            bsz as i32,
+            seq as i32,
+            nh as i32,
+            hd as i32,
+            ds as i32,
+            ngroups as i32,
+            width as i32,
+        );
+        let mut builder = func.builder();
+        builder.arg(&x_v);
+        builder.arg(&dt_v);
+        builder.arg(&a_v);
+        builder.arg(&h_v);
+        builder.arg(y_sl);
+        builder.arg(ho_sl);
+        builder.arg(&bi);
+        builder.arg(&si);
+        builder.arg(&nhi);
+        builder.arg(&hdi);
+        builder.arg(&dsi);
+        builder.arg(&ngi);
+        builder.arg(&wi);
+        unsafe { builder.launch(cfg) }
+            .map_err(|e| crate::tensor::Error::msg(format!("fused_mamba2_ssm_scan: {e}")))?;
+    }
+    drop(x_s);
+    drop(dt_s);
+    drop(a_s);
+    drop(h_s);
+    drop(y_s);
+    drop(ho_s);
+    Ok((y, h_out))
+}
+
 /// Mamba2 single-token SSM recurrence fused into one launch. Inputs (all F32):
 /// x_c [b, nh*hd], b_/c_ [b, ngroups*ds], dt [b, nh], a [nh], h_in [b,nh,hd,ds].
 /// Returns (y [b,nh,hd], h_out [b,nh,hd,ds]). CUDA only.

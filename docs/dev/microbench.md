@@ -23,6 +23,7 @@ cargo bench --features cuda,microbench --bench microbench -- expert-pairs --shap
 cargo bench --features cuda,microbench --bench microbench -- host-pairs --shapes-from /models/large.gguf --layer 3 --block 1,9 --json results/host-pairs.json
 cargo bench --features cuda,microbench --bench microbench -- prefill-layer --shapes-from /models/dense.gguf --json results/prefill-layer.json
 cargo bench --features cuda,microbench --bench microbench -- shortconv-prompt --shapes-from /models/hybrid.gguf --rows 1000
+cargo bench --features cuda,microbench --bench microbench -- mamba2-prompt --shapes-from /models/mamba.gguf --rows 1000
 cargo bench --features cuda,microbench --bench microbench -- marlin-rows --json results/marlin-rows.json
 cargo bench --features cuda,microbench --bench microbench -- decode-inputs --batch 64 --context 512
 cargo bench --features cuda,microbench --bench microbench -- decode-layer --batch 64 --context 512 --json results/decode-layer.json
@@ -33,7 +34,7 @@ cargo bench --features microbench --bench microbench -- host-prompt --hidden 409
 ```
 
 A ROCm build takes `rocm` in place of `cuda`.  
-A build without a GPU runtime omits `crossing`, `decode-inputs`, `decode-layer`, `dequant-gemm`, `expert-ahead`, `expert-pairs`, `expert-upload`, `host-pairs`, `marlin-rows`, `media-overlap`, `prefill-layer`, `shortconv-prompt` and `parler-step`.
+A build without a GPU runtime omits `crossing`, `decode-inputs`, `decode-layer`, `dequant-gemm`, `expert-ahead`, `expert-pairs`, `expert-upload`, `host-pairs`, `marlin-rows`, `media-overlap`, `prefill-layer`, `shortconv-prompt`, `mamba2-prompt` and `parler-step`.
 `parler-step` also needs the `audio` feature, which `media` brings.
 
 Arguments after `--`:
@@ -53,7 +54,7 @@ Arguments after `--`:
 | `--projection-bytes` | The bytes of each projection, 1 value or 3, in place of `--inter` and `--weight-bits`. | derived |
 | `--gate-format` | The format of an expert's gate and up weights, without a file (`host-expert`, `expert-pairs`). | iq2_xxs |
 | `--down-format` | The format of an expert's down weights, without a file (`host-expert`, `expert-pairs`). | q2_k |
-| `--rows` | Rows of the prompt batch one layer of `prefill-layer` moves, or the prompt rows of `host-prompt` and `shortconv-prompt`. | 130 |
+| `--rows` | Rows of the prompt batch one layer of `prefill-layer` moves, or the prompt rows of `host-prompt`, `shortconv-prompt` and `mamba2-prompt`. | 130 |
 | `--heads` | Query heads, without a file (`prefill-layer`, `marlin-rows`, `decode-layer`). | the file's for `prefill-layer`, 32 for `marlin-rows` |
 | `--kv-heads` | Key-value heads, without a file (`prefill-layer`, `marlin-rows`, `decode-layer`). | the file's, else the heads for `prefill-layer`, 8 for `marlin-rows` |
 | `--head-dim` | Elements of one head, without a file. It sizes the rope rows of `schedule-host` and `decode-inputs`, and the heads of `decode-layer`. | the file's, else the hidden size over the heads for `prefill-layer`, 128 for the others |
@@ -374,6 +375,16 @@ Its variants:
 
 - The token steps: 1 launch of the token kernel per row, then the rows concatenated.
 - The whole sequence: 1 launch for every row, with the same rows and the same state after them.
+
+### mamba2-prompt
+
+`mamba2-prompt` runs the Mamba2 block of one layer over `--rows` prompt rows on a card, from the rows its input projection gives.
+The dimensions are the file's `ssm.inner_size`, `ssm.state_size`, `ssm.group_count`, `ssm.conv_kernel` and `ssm.time_step_rank`, so it needs `--shapes-from`.
+A file whose routed experts the shapes do not read takes `--tensor` with any tensor of the file, such as `token_embd.weight`.
+Its variants:
+
+- The token steps: the convolution, the time step, the recurrence and the gated norm launched for each row, then the rows concatenated.
+- The whole sequence: 1 launch of each of the 4 kernels for every row, with the same rows and the same state after them.
 
 ### prefill-layer
 

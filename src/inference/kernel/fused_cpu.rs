@@ -467,6 +467,33 @@ pub fn fused_causal_conv1d_silu(
     Ok((y, window.contiguous()?))
 }
 
+// -- the Mamba2 convolution over every row of a chunk: the card's one launch --
+pub fn fused_causal_conv1d_silu_rows(
+    _x: &Tensor,
+    _state_in: &Tensor,
+    _conv_w: &Tensor,
+    _conv_b: &Tensor,
+    _d: usize,
+    _l: usize,
+) -> Result<(Tensor, Tensor)> {
+    crate::tensor::bail!("fused_causal_conv1d_silu_rows runs on a card only")
+}
+
+// -- the Mamba2 recurrence over every row of a chunk: the card's one launch --
+#[allow(clippy::too_many_arguments)]
+pub fn fused_mamba2_ssm_scan(
+    _xbc: &Tensor,
+    _dt: &Tensor,
+    _a: &Tensor,
+    _h_in: &Tensor,
+    _nh: usize,
+    _hd: usize,
+    _ds: usize,
+    _ngroups: usize,
+) -> Result<(Tensor, Tensor)> {
+    crate::tensor::bail!("fused_mamba2_ssm_scan runs on a card only")
+}
+
 // -- Mamba2 gate + group-norm epilogue: y = gnorm(y_ssm + D⊙x_c) . silu(z) . w --
 // y_ssm: [b, d_inner] (caller reshapes the SSM output); x_c: [b, d_inner];
 // dvec(D): [nh]; z: [b, d_inner]; norm_w: [d_inner]. nh = d_inner / hd.

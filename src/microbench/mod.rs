@@ -32,6 +32,7 @@ pub mod expert_read;
 pub mod expert_upload;
 pub mod host_expert;
 pub mod host_prompt;
+pub mod mamba2_prompt;
 pub mod marlin_rows;
 pub mod media_overlap;
 pub mod parler_step;
@@ -349,6 +350,12 @@ pub fn benches() -> Vec<Bench> {
             about: "one routed expert's weights host to card: compute or copy stream, pageable or pinned, the card idle or busy",
             needs_card: true,
             run: expert_upload::run,
+        });
+        all.push(Bench {
+            name: "mamba2-prompt",
+            about: "the Mamba2 block of one layer over a prompt chunk on a card: the token kernels row by row against one pass for every row",
+            needs_card: true,
+            run: mamba2_prompt::run,
         });
         all.push(Bench {
             name: "shortconv-prompt",
