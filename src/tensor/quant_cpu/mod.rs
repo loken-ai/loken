@@ -34,6 +34,7 @@ use rayon::prelude::*;
 mod scale;
 use scale::*;
 mod blocks;
+pub mod exponent;
 pub mod format;
 // The block types keep the paths their callers already use: `quant_cpu::BlockQ4K`
 // names the same struct whether it lives here or in `format/q4_k.rs`.

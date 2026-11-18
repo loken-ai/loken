@@ -930,6 +930,7 @@ mod on_a_card {
             sinks: true,
             routed: true,
             key_norm: None,
+            key_bias: None,
         };
         let path = quant("cb-card-all", extras);
         alone_and_batched_agree_on_a_card(&path);

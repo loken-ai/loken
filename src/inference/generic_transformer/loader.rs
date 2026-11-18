@@ -26,6 +26,8 @@ struct RawGenericLayer {
     attn_q: Option<QTensor>,
     attn_k: Option<QTensor>,
     attn_v: Option<QTensor>,
+    /// Whether `attn_q`, `attn_k` and their biases carry the key scale of `key_scale`.
+    key_scaled: bool,
     // Fused QKV (Phi3)
     attn_qkv: Option<QTensor>,
     // Biases (Qwen2) - CPU QTensors, dequantized in Phase 2
@@ -1321,6 +1323,7 @@ fn tp_share(
         attn_q: rows_opt(&raw.attn_q, q_per)?,
         attn_k: rows_opt(&raw.attn_k, kv_per)?,
         attn_v: rows_opt(&raw.attn_v, kv_per)?,
+        key_scaled: raw.key_scaled,
         attn_qkv: None,
         attn_q_bias: vector(&raw.attn_q_bias, q_per)?,
         attn_k_bias: vector(&raw.attn_k_bias, kv_per)?,
@@ -2959,7 +2962,7 @@ fn build_generic_layer(
             };
             config.shared_kv_layers > 0 && raw.layer_idx < first_kv_shared
         },
-        key_scaled: false,
+        key_scaled: raw.key_scaled,
         // An unquantised cache on a card stores F16 when the architecture keeps its cache
         // unquantised: the half-width read stands in for the quantised one it cannot take.
         // A sink layer stores F16 too: its card decode attention reads F16 K/V.
@@ -4516,6 +4519,23 @@ impl GenericHeteroTransformer {
 
             let mixer_kind = super::mixer::layer_mixer_kind(content, idx);
             let attends = mixer_kind == super::mixer::MixerKind::Attention;
+            // A card layer that stores its keys quantised and has no K norm folds the key scale
+            // into its Q and K projections.
+            // It reads them on the host to fold them.
+            let card_layer = matches!(dk, DeviceKind::Cuda(i) if cuda_devices.contains_key(&i));
+            let computing_card = matches!(dk, DeviceKind::Cuda(i) if cuda_devices.get(&i).is_some_and(Device::is_cuda));
+            let fold_keys = card_layer
+                && attends
+                && !f.fused_qkv
+                && !f.has_attn_sinks
+                && !config.attn_output_gate
+                && config.shared_kv_layers == 0
+                && config.kv_quant != crate::inference::engine::llm_engine::KvQuant::Off
+                && !ti.contains_key(&format!("{prefix}.attn_k_norm.weight"));
+            let qk_dev = match fold_keys {
+                true => &Device::Cpu,
+                false => qkv_dev,
+            };
             let has_ffn = super::mixer::layer_has_ffn(content, idx);
             // A block that holds the tail of a mixer and not its head is incomplete, not a block
             // without a mixer.
@@ -4549,7 +4569,7 @@ impl GenericHeteroTransformer {
                 let qkv = req!(&format!("{prefix}.attn_qkv.weight"))?;
                 (None, None, None, Some(qkv))
             } else {
-                let q = source.read(&format!("{prefix}.attn_q.weight"), qkv_dev)?;
+                let q = source.read(&format!("{prefix}.attn_q.weight"), qk_dev)?;
                 let q = match config.attn_output_gate {
                     true => {
                         let (q, gate) = split_q_gate(q, config.n_head, weight_dev)?;
@@ -4564,7 +4584,7 @@ impl GenericHeteroTransformer {
                     && idx >= config.n_layers.saturating_sub(config.shared_kv_layers);
                 let k = match shared {
                     true => source.read_opt(&format!("{prefix}.attn_k.weight"), weight_dev)?,
-                    false => Some(source.read(&format!("{prefix}.attn_k.weight"), qkv_dev)?),
+                    false => Some(source.read(&format!("{prefix}.attn_k.weight"), qk_dev)?),
                 };
                 // Gemma4 26B Global layers omit attn_v and reuse attn_k
                 // as V (AttentionKEqV pattern). Use opt-load for V.
@@ -4966,6 +4986,30 @@ impl GenericHeteroTransformer {
                     }
                 }
             };
+            // The fold runs for a card that computes.
+            // A counted load keeps the file's values, which take the same room.
+            let folded = match (&attn_q, &attn_k) {
+                (Some(q), Some(k)) if fold_keys && computing_card => {
+                    let no_rope = config.learned_positions
+                        || config.max_alibi_bias.is_some()
+                        || crate::inference::model_facts::no_rope_layer_period(&config.arch)
+                            .is_some_and(|period| (idx + 1).is_multiple_of(period));
+                    super::key_scale::fold_projections(
+                        q,
+                        k,
+                        (attn_q_bias.as_ref(), attn_k_bias.as_ref()),
+                        attn_norm_qt.as_ref(),
+                        config.n_head,
+                        (config.rope_dim, no_rope, f.use_rope_i),
+                    )?
+                }
+                _ => None,
+            };
+            let key_scaled = folded.is_some();
+            let (attn_q, attn_k, attn_q_bias, attn_k_bias) = match folded {
+                Some(p) => (Some(p.q), Some(p.k), p.q_bias, p.k_bias),
+                None => (attn_q, attn_k, attn_q_bias, attn_k_bias),
+            };
             Ok(RawGenericLayer {
                 layer_idx: idx,
                 device_kind: dk,
@@ -4974,6 +5018,7 @@ impl GenericHeteroTransformer {
                 attn_q,
                 attn_k,
                 attn_v,
+                key_scaled,
                 attn_qkv,
                 attn_q_bias,
                 attn_k_bias,

@@ -389,6 +389,9 @@ pub(crate) struct QuantExtras {
     pub routed: bool,
     /// The K norm weight of every layer, one head of lanes, in place of ones.
     pub key_norm: Option<Vec<f32>>,
+    /// Q, K and V biases on every layer in place of its Q and K norms: this K bias on each key
+    /// head, one head of lanes, and small Q and V biases.
+    pub key_bias: Option<Vec<f32>>,
 }
 
 /// [`write_quant`] with `extras`.
@@ -397,12 +400,7 @@ pub(crate) fn write_quant_with(
     layers: usize,
     extras: QuantExtras,
 ) -> std::path::PathBuf {
-    let (mut metadata, entries) = quant_model_with(
-        layers,
-        extras.sinks,
-        extras.routed,
-        extras.key_norm.as_deref(),
-    );
+    let (mut metadata, entries) = quant_model_with(layers, &extras);
     metadata.extend(extras.keys);
     let path = scratch_dir(tag).join("m.gguf");
     write_gguf_with_metadata(&path, &metadata, &entries).unwrap();
@@ -538,18 +536,13 @@ fn scratch_dir(tag: &str) -> std::path::PathBuf {
 
 /// The metadata and tensors of the model [`write_quant`] writes.
 fn quant_model(layers: usize) -> (Vec<(String, Value)>, Vec<GgufEntry>) {
-    quant_model_with(layers, false, false, None)
+    quant_model_with(layers, &QuantExtras::default())
 }
 
-/// [`quant_model`], each layer with a sink logit per head when `sinks` is set, with
-/// quantised experts in place of its feed-forward when `routed` is set, and with `key_norm` as
-/// its K norm weight when given.
-fn quant_model_with(
-    layers: usize,
-    sinks: bool,
-    routed: bool,
-    key_norm: Option<&[f32]>,
-) -> (Vec<(String, Value)>, Vec<GgufEntry>) {
+/// [`quant_model`] with the variations of `extras`.
+fn quant_model_with(layers: usize, extras: &QuantExtras) -> (Vec<(String, Value)>, Vec<GgufEntry>) {
+    let (sinks, routed) = (extras.sinks, extras.routed);
+    let key_norm = extras.key_norm.as_deref();
     let mut seed = 23u32;
     let mut values = |n: usize| -> Vec<f32> {
         (0..n)
@@ -597,16 +590,30 @@ fn quant_model_with(
     for il in 0..layers {
         entries.push(ones(format!("blk.{il}.attn_norm.weight"), QUANT_EMBD));
         entries.push(ones(format!("blk.{il}.ffn_norm.weight"), QUANT_EMBD));
-        entries.push(ones(format!("blk.{il}.attn_q_norm.weight"), head_dim));
-        entries.push(match key_norm {
-            Some(w) => GgufEntry {
-                name: format!("blk.{il}.attn_k_norm.weight"),
-                dims: vec![head_dim],
-                dtype: GgmlDType::F32,
-                data: w.iter().flat_map(|v| v.to_le_bytes()).collect(),
-            },
-            None => ones(format!("blk.{il}.attn_k_norm.weight"), head_dim),
-        });
+        let floats = |name: String, xs: Vec<f32>| GgufEntry {
+            name,
+            dims: vec![xs.len()],
+            dtype: GgmlDType::F32,
+            data: xs.iter().flat_map(|v| v.to_le_bytes()).collect(),
+        };
+        match &extras.key_bias {
+            Some(b) => {
+                let small = |n: usize| (0..n).map(|i| (i % 7) as f32 * 0.01 - 0.03).collect();
+                entries.push(floats(format!("blk.{il}.attn_q.bias"), small(QUANT_EMBD)));
+                entries.push(floats(
+                    format!("blk.{il}.attn_k.bias"),
+                    b.repeat(QUANT_KV_HEADS),
+                ));
+                entries.push(floats(format!("blk.{il}.attn_v.bias"), small(kv)));
+            }
+            None => {
+                entries.push(ones(format!("blk.{il}.attn_q_norm.weight"), head_dim));
+                entries.push(match key_norm {
+                    Some(w) => floats(format!("blk.{il}.attn_k_norm.weight"), w.to_vec()),
+                    None => ones(format!("blk.{il}.attn_k_norm.weight"), head_dim),
+                });
+            }
+        }
         for (n, d, t) in [
             ("attn_q", [QUANT_EMBD, QUANT_EMBD], GgmlDType::Q4K),
             ("attn_k", [kv, QUANT_EMBD], GgmlDType::Q4K),

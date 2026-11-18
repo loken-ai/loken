@@ -19,7 +19,7 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Channels one quantised KV block spans; a head is a whole number of blocks.
-const KV_BLOCK: usize = crate::tensor::quantized::GgmlDType::Q8_0.block_size();
+pub const KV_BLOCK: usize = crate::tensor::quantized::GgmlDType::Q8_0.block_size();
 /// Positions a fixed-stride score buffer grows by.
 const STRIDE_STEP: usize = 256;
 /// Largest head size the quantised attention kernels are instantiated for: one warp lane per
