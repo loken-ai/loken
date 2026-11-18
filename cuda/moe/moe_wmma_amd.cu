@@ -21,6 +21,7 @@
 #include "gguf_iq.cuh"
 #include "moe_utils.cuh"
 #include "amd_mma16.cuh"
+#include "stream_scratch.cuh"
 
 namespace loken_moe_wmma_amd {
 
@@ -278,20 +279,6 @@ __global__ void __launch_bounds__(expander_threads<typename fmt::block_t>::value
     }
 }
 
-// False, with `offsets` untouched, when the counts could not be allocated.
-static bool expert_offsets_on_stream(const int32_t* expert_ids, int size_m, int32_t* offsets,
-                                     int num_experts, hipStream_t stream) {
-    int32_t* counts = nullptr;
-    if (hipMallocAsync(reinterpret_cast<void**>(&counts), num_experts * sizeof(int32_t),
-                       stream) != hipSuccess) {
-        (void) hipGetLastError();
-        return false;
-    }
-    calculate_expert_offsets(expert_ids, size_m, counts, offsets, num_experts, stream);
-    (void) hipFreeAsync(counts, stream);
-    return true;
-}
-
 template <typename act_t>
 static void launch_prefill(dim3 grid, hipStream_t stream, const void* input,
                            const uint8_t* weights, const int32_t* sorted_token_ids,
@@ -328,16 +315,13 @@ extern "C" int loken_moe_gemm_gguf_prefill(const void* input, const uint8_t* wei
                                            int size_n, int size_k, int input_dtype,
                                            int gguf_type, hipStream_t stream) {
     using namespace loken_moe_wmma_amd;
-    int32_t* expert_offsets = nullptr;
-    if (hipMallocAsync(reinterpret_cast<void**>(&expert_offsets),
-                       (num_experts + 1) * sizeof(int32_t), stream) != hipSuccess) {
-        (void) hipGetLastError();
-        return 1;
-    }
-    if (!expert_offsets_on_stream(expert_ids, size_m, expert_offsets, num_experts, stream)) {
-        (void) hipFreeAsync(expert_offsets, stream);
-        return 1;
-    }
+    // The offsets, then the counts. Held until the prefill is on the stream.
+    const stream_scratch_reservation routing = reserve_stream_scratch(
+        STREAM_SCRATCH_ROUTING, (size_t) (2 * num_experts + 1) * sizeof(int32_t), stream);
+    if (routing.ptr == nullptr) return 1;
+    int32_t* expert_offsets = static_cast<int32_t*>(routing.ptr);
+    calculate_expert_offsets(expert_ids, size_m, expert_offsets + num_experts + 1, expert_offsets,
+                             num_experts, stream);
     const dim3 grid(num_experts, ceil_div(size_n, N_BLK), 1);
     if (input_dtype == 0) {
         launch_prefill<__half>(grid, stream, input, weights, sorted_token_ids, expert_offsets,
@@ -348,15 +332,18 @@ extern "C" int loken_moe_gemm_gguf_prefill(const void* input, const uint8_t* wei
                                        expert_offsets, topk_weights, output, num_experts, topk,
                                        size_m, size_n, size_k, gguf_type);
     }
-    (void) hipFreeAsync(expert_offsets, stream);
     return 0;
 }
 
 extern "C" int loken_moe_expert_offsets(const int32_t* expert_ids, int size_m,
                                         int32_t* expert_offsets, int num_experts,
                                         hipStream_t stream) {
-    return loken_moe_wmma_amd::expert_offsets_on_stream(expert_ids, size_m, expert_offsets,
-                                                        num_experts, stream)
-               ? 0
-               : 1;
+    using namespace loken_moe_wmma_amd;
+    // Held until the offsets are on the stream.
+    const stream_scratch_reservation counts = reserve_stream_scratch(
+        STREAM_SCRATCH_ROUTING, (size_t) num_experts * sizeof(int32_t), stream);
+    if (counts.ptr == nullptr) return 1;
+    calculate_expert_offsets(expert_ids, size_m, static_cast<int32_t*>(counts.ptr),
+                             expert_offsets, num_experts, stream);
+    return 0;
 }

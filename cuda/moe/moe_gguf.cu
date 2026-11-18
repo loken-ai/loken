@@ -10,6 +10,7 @@
 #include "gguf.cuh"
 #include "gguf_iq.cuh"
 #include "mxfp4_moe.cuh"
+#include "stream_scratch.cuh"
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <cstdio>
@@ -17,88 +18,72 @@
 #include <type_traits>
 #include <cassert>
 #include <mutex>
+#include <vector>
 
 // A row is padded to this many values before it is quantised, so that every format's block size
 // divides it and a row is a whole number of blocks whatever k the model has.
 constexpr int MATRIX_ROW_PADDING = 512;
 
-// Where a launch stages the activation it quantised to q8_1.
-//
-// The buffer is kept and grown rather than allocated per call, because a captured
-// `cudaMallocAsync` hands back a different pointer on replay and the captured kernels would
-// then read memory that has moved. A stable pointer is what CUDA-graph capture needs.
-//
-// One buffer per STREAM, not per device. The kernel that reads the buffer runs on the stream
-// that wrote it, and that is the only ordering there is: a host lock does not order the card.
-// Two streams on one card - an LLM and an image engine, two requests in flight, or simply two
-// callers - quantise into the same bytes and read each other's if they share one.
-struct y_q8_1_slot {
+namespace {
+
+// The buffers of one use on one stream of one card.
+struct stream_scratch_slot {
     int device;
     cudaStream_t stream;
     void* ptr;
     size_t bytes;
-};
-static y_q8_1_slot g_y_q8_1[64] = {};
-static int g_y_q8_1_used = 0;
-static std::mutex g_y_q8_1_lock;
-
-// The buffer, held for as long as the caller needs it.
-//
-// The pointer is null when the card could not grow the buffer. A caller that gets null
-// launches nothing.
-//
-// One stream is not one caller: several host threads submit to the same stream, and they all
-// stage into these same bytes. So the quantise and the matmul that reads what it wrote have to
-// reach the stream as a pair - if another thread's pair lands between them, the matmul reads
-// the other thread's activation. Handing the pointer out under a lock is not enough, because
-// nothing has been enqueued yet when the lock is dropped; the caller holds the reservation
-// until both launches are on the stream.
-//
-// It also keeps the buffer from moving under a caller. A caller that needs more gets a larger
-// one; the smaller one is never freed, since a graph recorded against it still reads it.
-struct y_q8_1_reservation {
-    std::unique_lock<std::mutex> held;
-    void* ptr;
-    operator void*() const { return ptr; }
+    // Every buffer the slot grew through, `ptr` included.
+    std::vector<void*> kept;
 };
 
-static y_q8_1_reservation get_y_q8_1_scratch(size_t needed, cudaStream_t stream) {
+struct stream_scratch_table {
+    std::vector<stream_scratch_slot> slots;
+    std::mutex lock;
+};
+
+stream_scratch_table g_stream_scratch[STREAM_SCRATCH_USES];
+
+}  // namespace
+
+stream_scratch_reservation reserve_stream_scratch(stream_scratch_use use, size_t needed,
+                                                  cudaStream_t stream) {
     int dev = 0;
     cudaGetDevice(&dev);
 
-    std::unique_lock<std::mutex> held(g_y_q8_1_lock);
-    y_q8_1_slot* slot = nullptr;
-    for (int i = 0; i < g_y_q8_1_used; ++i) {
-        if (g_y_q8_1[i].device == dev && g_y_q8_1[i].stream == stream) {
-            slot = &g_y_q8_1[i];
+    stream_scratch_table& table = g_stream_scratch[use];
+    std::unique_lock<std::mutex> held(table.lock);
+    stream_scratch_slot* slot = nullptr;
+    for (stream_scratch_slot& s : table.slots) {
+        if (s.device == dev && s.stream == stream) {
+            slot = &s;
             break;
         }
     }
     if (!slot) {
-        // Past the table the last slot is shared, which is the old behaviour rather than a
-        // failure; sixty-four is well above the streams a machine puts on one card.
-        const int at = g_y_q8_1_used < 64 ? g_y_q8_1_used++ : 63;
-        slot = &g_y_q8_1[at];
-        slot->device = dev;
-        slot->stream = stream;
-        slot->ptr = nullptr;
-        slot->bytes = 0;
+        table.slots.push_back({dev, stream, nullptr, 0, {}});
+        slot = &table.slots.back();
     }
     if (needed > slot->bytes) {
-        // The old buffer stays allocated: a recorded graph holds its address and replays into
-        // it after a wider call moved on. Doubling bounds how many are left behind. A stream
-        // that is being captured gets a plain allocation: a stream-ordered one would be a node
-        // of the graph, its memory the graph's, while the slot keeps it for every later call.
+        // Doubling bounds how many smaller buffers the slot keeps.
         const size_t doubled = needed > 2 * slot->bytes ? needed : 2 * slot->bytes;
+#if !defined(GGML_USE_HIP)
+        // A stream that is being captured gets a plain allocation.
+        // A stream-ordered one would be a node of the graph, and its memory the graph's.
         cudaStreamCaptureStatus capturing = cudaStreamCaptureStatusNone;
         cudaStreamIsCapturing(stream, &capturing);
+#endif
         void* grown = nullptr;
         size_t bytes = 0;
         // The doubled size first, then exactly what the call needs.
         for (const size_t want : {doubled, needed}) {
+#if defined(GGML_USE_HIP)
+            // The HIP build takes every allocation outside stream order.
+            const cudaError_t status = cudaMalloc(&grown, want);
+#else
             const cudaError_t status = capturing == cudaStreamCaptureStatusNone
                                            ? cudaMallocAsync(&grown, want, stream)
                                            : cudaMalloc(&grown, want);
+#endif
             if (status == cudaSuccess) {
                 bytes = want;
                 break;
@@ -107,14 +92,36 @@ static y_q8_1_reservation get_y_q8_1_scratch(size_t needed, cudaStream_t stream)
             grown = nullptr;
         }
         if (grown == nullptr) {
-            // The slot keeps its buffer and its size.
-            // The caller gets a null pointer.
             return {std::move(held), nullptr};
         }
+        slot->kept.push_back(grown);
         slot->ptr = grown;
         slot->bytes = bytes;
     }
     return {std::move(held), slot->ptr};
+}
+
+extern "C" void loken_stream_scratch_release() {
+    int dev = 0;
+    cudaGetDevice(&dev);
+    for (stream_scratch_table& table : g_stream_scratch) {
+        std::lock_guard<std::mutex> held(table.lock);
+        for (auto it = table.slots.begin(); it != table.slots.end();) {
+            if (it->device != dev) {
+                ++it;
+                continue;
+            }
+            for (void* p : it->kept) cudaFree(p);
+            it = table.slots.erase(it);
+        }
+    }
+}
+
+using y_q8_1_reservation = stream_scratch_reservation;
+
+// Where a launch stages the activation it quantised to q8_1.
+static y_q8_1_reservation get_y_q8_1_scratch(size_t needed, cudaStream_t stream) {
+    return reserve_stream_scratch(STREAM_SCRATCH_Y_Q8_1, needed, stream);
 }
 
 /// The activation, quantised to q8_1 on `stream`, with its buffer still reserved.

@@ -29,6 +29,7 @@
 // the tokens so that those of one lane's accumulator are contiguous.
 
 #include "gguf.cuh"
+#include "stream_scratch.cuh"
 #include <hip/hip_runtime.h>
 #include <cstdint>
 
@@ -522,7 +523,7 @@ extern "C" void loken_moe_q4k_imma_m8_gate_up(const void* gate_up_w, const void*
 }
 
 // One row per routed pair, folded into the tokens in slot order afterwards, as the CUDA
-// launcher does: the same sum on every run. The rows are a stream-ordered allocation.
+// launcher does: the same sum on every run.
 extern "C" int loken_moe_q4k_imma_m8_down(const void* down_w, const void* inputs_q81,
                                           const int32_t* sorted_token_ids,
                                           const int32_t* expert_ids, const float* topk_weights,
@@ -530,16 +531,15 @@ extern "C" int loken_moe_q4k_imma_m8_down(const void* down_w, const void* inputs
                                           int hidden, int K, hipStream_t stream) {
     using namespace loken_imma_amd;
     if (size_m <= 0 || hidden <= 0 || K <= 0) return 0;
-    float* pairs = nullptr;
     const size_t pair_bytes = (size_t) size_m * hidden * sizeof(float);
-    if (hipMallocAsync(reinterpret_cast<void**>(&pairs), pair_bytes, stream) != hipSuccess) {
-        (void) hipGetLastError();
-        return 1;
-    }
+    // Held until the fold is on the stream.
+    const stream_scratch_reservation rows =
+        reserve_stream_scratch(STREAM_SCRATCH_PAIR_ROWS, pair_bytes, stream);
+    if (rows.ptr == nullptr) return 1;
+    float* pairs = static_cast<float*>(rows.ptr);
     (void) hipMemsetAsync(pairs, 0, pair_bytes, stream);
     launch_moe<false>(down_w, inputs_q81, sorted_token_ids, expert_ids, topk_weights, pairs,
                       num_experts, topk, size_m, hidden, K, stream);
     loken_moe_sum_topk(pairs, dst_f32, size_m / topk, topk, hidden, stream);
-    (void) hipFreeAsync(pairs, stream);
     return 0;
 }

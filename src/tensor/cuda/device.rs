@@ -454,6 +454,13 @@ fn purge_card_caches(ordinal: usize) -> bool {
         && super::quant::release_copy_stream(ordinal)
 }
 
+crate::tensor::gpu_runtime::aot_kernels! {
+    extern "C" {
+        /// Frees the stream scratch the kernels keep on the current card.
+        fn loken_stream_scratch_release();
+    }
+}
+
 /// Frees what is left of card `ordinal` under its primary context, which nothing in the process
 /// holds but the CUDA runtime, then resets that context. False when the card stays as it was.
 fn reset_card(ordinal: usize) -> bool {
@@ -470,6 +477,7 @@ fn reset_card(ordinal: usize) -> bool {
         }
         let _ = sys::cuCtxPushCurrent_v2(ctx);
         let _ = sys::cuCtxSynchronize();
+        loken_stream_scratch_release();
     }
     let freed = super::quant::release_host_buffers(ordinal, ctx as usize);
     crate::tensor::quantized::release_lent_pool(ordinal);

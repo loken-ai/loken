@@ -35,11 +35,12 @@ pub(crate) use cuda_launchers;
 ///
 /// 0 means the kernel was launched. Anything else means the launcher skipped it because a
 /// scratch allocation failed, and the caller's output buffer was not written.
+/// The error carries the `[oom]` marker, so the pressure ladder reads it as a card out of memory.
 #[cfg(feature = "gpu")]
 pub(crate) fn launch_status(status: i32, launcher: &str) -> crate::tensor::Result<()> {
     if status != 0 {
         crate::tensor::bail!(
-            "{launcher}: launch skipped because a scratch allocation failed (status {status})"
+            "[oom] {launcher}: launch skipped because a scratch allocation failed (status {status})"
         );
     }
     Ok(())

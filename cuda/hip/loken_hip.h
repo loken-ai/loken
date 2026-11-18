@@ -108,6 +108,7 @@ __device__ static __forceinline__ float loken_f32_fence(float x) {
 #define cudaMallocAsync hipMallocAsync
 #define cudaFreeAsync hipFreeAsync
 #define cudaMalloc hipMalloc
+#define cudaFree hipFree
 #define cudaStreamIsCapturing hipStreamIsCapturing
 #define cudaStreamCaptureStatus hipStreamCaptureStatus
 #define cudaStreamCaptureStatusNone hipStreamCaptureStatusNone
