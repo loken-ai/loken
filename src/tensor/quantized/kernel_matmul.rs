@@ -35,10 +35,16 @@ thread_local! {
     static DECODE_ORDER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// While alive, every quantized matmul on this thread computes each activation row
-/// bit-identically to a one-row call over that row: the rows take the mat-vec kernels in
-/// launches that sum like a single column, never the tiled GEMM. A draft verify holds it,
-/// so a verified row reproduces the decode step it stands for.
+/// While alive, every projection on this thread computes each activation row bit-identically
+/// to a one-row call over that row.
+/// A quantised weight takes the mat-vec kernels in launches that sum like a single column,
+/// never the tiled GEMM.
+/// A float weight on a card, and the float head held in F16 through [`half_head`], take the
+/// float mat-vec kernel a decode step takes, which sums each row alone.
+/// Where that kernel declines, each row takes a one-row call.
+/// A draft verify holds it, so a verified row reproduces the decode step it stands for.
+///
+/// [`half_head`]: super::half_head
 pub struct DecodeOrder {
     previous: bool,
 }
@@ -52,6 +58,38 @@ impl DecodeOrder {
 
     pub fn active() -> bool {
         DECODE_ORDER.with(std::cell::Cell::get)
+    }
+
+    /// `f` over the rows of `x` `[.., k]`, into `[.., n]`.
+    /// While this thread holds the decode order and `x` holds more than `per_call` rows, `f`
+    /// runs over each run of `per_call` rows apart and the results join in row order.
+    /// Otherwise `f` runs once over `x`.
+    pub fn by_rows(
+        x: &Tensor,
+        per_call: usize,
+        mut f: impl FnMut(&Tensor) -> Result<Tensor>,
+    ) -> Result<Tensor> {
+        let dims = x.dims().to_vec();
+        let k = *dims
+            .last()
+            .ok_or_else(|| Error::msg("DecodeOrder::by_rows: rank-0 input"))?;
+        let rows = x.elem_count() / k.max(1);
+        let per_call = per_call.max(1);
+        if !Self::active() || rows <= per_call {
+            return f(x);
+        }
+        let x2 = x.reshape((rows, k))?;
+        let mut parts = Vec::with_capacity(rows.div_ceil(per_call));
+        let mut at = 0;
+        while at < rows {
+            let m = per_call.min(rows - at);
+            parts.push(f(&x2.narrow(0, at, m)?)?);
+            at += m;
+        }
+        let y = Tensor::cat(&parts.iter().collect::<Vec<_>>(), 0)?;
+        let mut odims = dims;
+        *odims.last_mut().expect("checked above") = y.dims()[1];
+        y.reshape(odims)
     }
 }
 

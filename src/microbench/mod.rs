@@ -39,6 +39,7 @@ pub mod parler_step;
 pub mod prefill_layer;
 pub mod schedule_host;
 pub mod shortconv_prompt;
+pub mod verify_float;
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -82,7 +83,7 @@ pub struct Options {
     pub element_bytes: usize,
 
     /// The feed-forward length, without a file: the expert's for the expert benches, the layer's
-    /// for `marlin-rows`; each bench has its own default when this is absent
+    /// for `marlin-rows` and `verify-float`; each bench has its own default when this is absent
     #[arg(long)]
     pub inter: Option<usize>,
 
@@ -153,7 +154,7 @@ pub struct Options {
 
     /// Tokens verified together, a draft's block: the experts the block routes to are read once
     /// for all of it, one variant for each size (`cache-policy`); the rows of a verify, one
-    /// variant each (`expert-pairs`)
+    /// variant each (`expert-pairs`, `verify-float`)
     #[arg(long, value_delimiter = ',', default_values_t = vec![1])]
     pub block: Vec<usize>,
 
@@ -222,7 +223,8 @@ pub struct Options {
     #[arg(long, default_value_t = crate::microbench::decode_layer::DEFAULT_LAYERS)]
     pub layers: usize,
 
-    /// Entries of the vocabulary the head matmul and the argmax run over (`decode-layer`)
+    /// Entries of the vocabulary the head matmul and the argmax run over (`decode-layer`,
+    /// `verify-float`)
     #[arg(long, default_value_t = crate::microbench::decode_layer::DEFAULT_VOCAB)]
     pub vocab: usize,
 
@@ -362,6 +364,12 @@ pub fn benches() -> Vec<Bench> {
             about: "the gated short convolution of one layer over a prompt chunk on a card: a launch per row against one launch for every row",
             needs_card: true,
             run: shortconv_prompt::run,
+        });
+        all.push(Bench {
+            name: "verify-float",
+            about: "a decode step and the rows of a verify through F32 and F16 projections and the F16 head on a card: the library's products against the float mat-vec kernel",
+            needs_card: true,
+            run: verify_float::run,
         });
         all.push(Bench {
             name: "prefill-layer",

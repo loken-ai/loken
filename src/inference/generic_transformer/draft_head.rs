@@ -864,7 +864,7 @@ impl GenericHeteroTransformer {
             &self.output_proj_cuda,
         ) {
             (Some(qmm), _) => qmm.forward(&normed)?,
-            (None, Some(proj)) => normed.to_dtype(DType::F16)?.matmul_t(proj)?,
+            (None, Some(proj)) => crate::tensor::quantized::half_head(&normed, proj)?,
             (None, None) => crate::tensor::bail!("a recorded guess needs the card's head"),
         }
         .to_dtype(DType::F32)?;

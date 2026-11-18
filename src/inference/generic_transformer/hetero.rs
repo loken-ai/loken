@@ -1898,9 +1898,7 @@ impl GenericHeteroTransformer {
                 } else {
                     f.to_device(&dev)?
                 };
-                return f
-                    .to_dtype(crate::tensor::DType::F16)?
-                    .matmul_t(proj)?
+                return crate::tensor::quantized::half_head(&f, proj)?
                     .to_dtype(crate::tensor::DType::F16);
             }
         }
@@ -1933,9 +1931,7 @@ impl GenericHeteroTransformer {
         let logits = if let Some(proj) = self.output_proj_cuda_qmm.as_ref() {
             proj.forward(&on_dev(f)?)?
         } else if let Some(proj) = self.output_proj_cuda.as_ref() {
-            on_dev(f)?
-                .to_dtype(crate::tensor::DType::F16)?
-                .matmul_t(proj)?
+            crate::tensor::quantized::half_head(&on_dev(f)?, proj)?
                 .to_dtype(crate::tensor::DType::F32)?
         } else {
             let host = f
@@ -2822,9 +2818,13 @@ impl GenericHeteroTransformer {
     /// (shape `[batch, seq_len, vocab]`). Used by speculative decoding to
     /// verify K drafts in a single batched forward.
     ///
-    /// A draft verify (a few rows continuing a cache) computes every row as the decode step it
-    /// stands for, on the host and on a card, so drafting never changes what greedy decoding
-    /// emits. The rows still share each weight read where the decode kernels take several.
+    /// A draft verify (a few rows continuing a cache) computes every row bit for bit as the
+    /// decode step it stands for, on the host and on a card.
+    /// So drafting never changes what greedy decoding emits.
+    /// The rows share each weight read where a kernel sums each row as a one-row call: the
+    /// quantised mat-vec kernels, the float mat-vec kernel and every product on the host.
+    /// The float mat-vec kernel serves an F32, F16 or BF16 weight on a card and the float head
+    /// held in F16, for a decode step and for a verify alike.
     pub fn forward_all(&mut self, input_ids: &Tensor, index_pos: usize) -> Result<Tensor> {
         let (_, seq_len) = input_ids.dims2()?;
         let verify = is_verify(seq_len, index_pos);
@@ -3590,8 +3590,7 @@ impl GenericHeteroTransformer {
                     .reshape((b * s, h))?
                     .to_dtype(crate::tensor::DType::F32)?;
                 let normed = self.final_norm_on_device(&hidden_2d)?;
-                let normed_f16 = normed.to_dtype(crate::tensor::DType::F16)?;
-                let out_2d = normed_f16.matmul_t(proj)?;
+                let out_2d = crate::tensor::quantized::half_head(&normed, proj)?;
                 let vocab = out_2d.dims()[1];
                 out_2d.reshape((b, s, vocab))?
             } else {
@@ -3608,8 +3607,7 @@ impl GenericHeteroTransformer {
                 if !head {
                     return Ok((None, kept));
                 }
-                let normed_f16 = normed.to_dtype(crate::tensor::DType::F16)?;
-                normed_f16.matmul_t(proj)?
+                crate::tensor::quantized::half_head(&normed, proj)?
             }
         } else if let Some(logits) = self
             .vulkan

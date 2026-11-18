@@ -247,7 +247,53 @@ impl QMatMul {
         y.reshape(odims)?.to_dtype(x.dtype())
     }
 
+    /// The rows one call of a float weight on a card takes while a verify holds the decode
+    /// order: the most rows one launch of the float mat-vec kernel takes.
+    /// `None` for a weight that is not a float weight on a card.
+    fn decode_rows(&self) -> Option<usize> {
+        match self {
+            Self::Tensor(w) | Self::TensorF16(w) | Self::Bf16(w) if w.device().is_cuda() => {
+                Some(crate::inference::moe_cuda::FLOAT_MATVEC_ROWS)
+            }
+            _ => None,
+        }
+    }
+
+    /// `x @ w^T` for a float weight `w` on a card through the float mat-vec kernel.
+    /// It takes up to `few` rows, or the rows of a verify while it holds the decode order.
+    /// A decode step and a verify row take the same kernel, so a verify row gives its step.
+    /// `None` where the kernel does not take the call.
+    fn card_matvec(x: &Tensor, w: &Tensor, few: usize) -> Result<Option<Tensor>> {
+        let mut dims = x.dims().to_vec();
+        let k = *dims
+            .last()
+            .ok_or_else(|| Error::msg("QMatMul: rank-0 input"))?;
+        let rows = x.elem_count() / k.max(1);
+        if !w.device().is_cuda() || (rows > few && !DecodeOrder::active()) {
+            return Ok(None);
+        }
+        let Some(y) = crate::inference::moe_cuda::float_matvec(&x.reshape((rows, k))?, w)? else {
+            return Ok(None);
+        };
+        *dims.last_mut().expect("checked above") = w.dims()[0];
+        Ok(Some(y.reshape(dims)?.to_dtype(x.dtype())?))
+    }
+
+    /// Whether the rows of a verify through the float weight `w` on a card take a one-row call
+    /// each, the float mat-vec kernel having declined them.
+    fn verify_rows_apart(x: &Tensor, w: &Tensor) -> bool {
+        let k = x.dims().last().copied().unwrap_or(0);
+        k > 0 && x.elem_count() / k > 1 && DecodeOrder::active() && w.device().is_cuda()
+    }
+
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        // A verify's rows through a float weight on a card go a launch's worth at a time.
+        if let Some(per_call) = self.decode_rows().filter(|_| DecodeOrder::active()) {
+            let k = x.dims().last().copied().unwrap_or(0);
+            if k > 0 && x.elem_count() / k > per_call {
+                return DecodeOrder::by_rows(x, per_call, |rows| self.forward(rows));
+            }
+        }
         match self {
             Self::QTensor(qt) if host_half_view(qt) => Self::host_half_mapped(x, qt),
             Self::QTensor(qt) => {
@@ -264,15 +310,29 @@ impl QMatMul {
             // never read it.
             // An F32 weight takes the activation read as F32, a half one included.
             // The output follows the activation's dtype.
+            // On a card, one row and the rows of a verify take the float mat-vec kernel.
             Self::Tensor(w) => {
+                if let Some(y) = Self::card_matvec(x, w, 1)? {
+                    return Ok(y);
+                }
+                if Self::verify_rows_apart(x, w) {
+                    return DecodeOrder::by_rows(x, 1, |row| self.forward(row));
+                }
                 Self::dense_matmul_t(&x.to_dtype(crate::tensor::DType::F32)?, w, x.dtype())
             }
             Self::TensorF16(w) if w.device().is_cpu() => Self::host_half(x, w),
             Self::Bf16(w) if w.device().is_cpu() => Self::host_half(x, w),
             Self::TensorF16(w) => {
-                // One row takes the F16-weight product summed in F32; more, the library's F16
-                // product with the activation rounded to F16, summed in F32 where the card
-                // offers it, where the level allows it.
+                // One row and the rows of a verify take the float mat-vec kernel.
+                // Where it declines, one row takes the F16-weight product summed in F32.
+                // More rows take the library's F16 product with the activation rounded to F16,
+                // summed in F32 where the card offers it, where the level allows it.
+                if let Some(y) = Self::card_matvec(x, w, 1)? {
+                    return Ok(y);
+                }
+                if Self::verify_rows_apart(x, w) {
+                    return DecodeOrder::by_rows(x, 1, |row| self.forward(row));
+                }
                 let k = *x
                     .dims()
                     .last()
@@ -301,34 +361,39 @@ impl QMatMul {
                 Self::dense_matmul_t(&xf, w, x.dtype())
             }
             Self::Bf16(w) => {
-                // A few rows take the BF16 product summed in F32, the decode's and a verify's
-                // rows alike; more, the library's BF16 product with the activation rounded to
-                // BF16, summed in F32, where the level allows it.
+                // A few rows take the float mat-vec kernel, summed in F32, the decode's and a
+                // verify's rows alike.
+                // More take the library's BF16 product with the activation rounded to BF16,
+                // summed in F32, where the level allows it.
+                if let Some(y) =
+                    Self::card_matvec(x, w, crate::inference::moe_cuda::BF16_MATVEC_ROWS)?
+                {
+                    return Ok(y);
+                }
+                if Self::verify_rows_apart(x, w) {
+                    return DecodeOrder::by_rows(x, 1, |row| self.forward(row));
+                }
                 let dims = x.dims().to_vec();
                 let k = *dims
                     .last()
                     .ok_or_else(|| Error::msg("QMatMul: rank-0 input"))?;
                 let rows = x.elem_count() / k;
                 let x2 = x.reshape((rows, k))?;
-                let y = match crate::inference::moe_cuda::bf16_matvec(&x2, w)? {
-                    Some(y) => y,
-                    // Where rows may not be read in BF16, they stay F32 as a few rows do.
-                    None if !half_rows() => {
-                        Self::widened_product(&x2.to_dtype(crate::tensor::DType::F32)?, w)?
-                    }
-                    None => {
-                        #[cfg(feature = "gpu")]
-                        let y = x2
-                            .to_dtype(crate::tensor::DType::BF16)?
-                            .matmul_t_bf16_f32(w)?;
-                        #[cfg(not(feature = "gpu"))]
-                        let y: Option<Tensor> = None;
-                        match y {
-                            Some(y) => y,
-                            None => x2
-                                .to_dtype(crate::tensor::DType::F32)?
-                                .matmul_t(&w.to_dtype(crate::tensor::DType::F32)?)?,
-                        }
+                // Where rows may not be read in BF16, they stay F32 as a few rows do.
+                let y = if !half_rows() {
+                    Self::widened_product(&x2.to_dtype(crate::tensor::DType::F32)?, w)?
+                } else {
+                    #[cfg(feature = "gpu")]
+                    let y = x2
+                        .to_dtype(crate::tensor::DType::BF16)?
+                        .matmul_t_bf16_f32(w)?;
+                    #[cfg(not(feature = "gpu"))]
+                    let y: Option<Tensor> = None;
+                    match y {
+                        Some(y) => y,
+                        None => x2
+                            .to_dtype(crate::tensor::DType::F32)?
+                            .matmul_t(&w.to_dtype(crate::tensor::DType::F32)?)?,
                     }
                 };
                 let mut odims = dims;
@@ -439,6 +504,33 @@ impl QMatMul {
             _ => None,
         }
     }
+}
+
+/// `x @ w^T` for the rows `x` `[rows, k]` and the float head `w` `[n, k]` held in F16 on a card.
+/// One row, and the rows of a verify while it holds the decode order, take the float mat-vec
+/// kernel: the product summed and written in F32.
+/// A card that takes that kernel through its tensor cores multiplies each row as 2 F16 parts:
+/// its nearest F16 value and what that misses.
+/// Another card reads the rows in F32.
+/// Where that kernel declines, each of them takes the product of more rows alone.
+/// More rows are rounded to F16, and their product is written in F16.
+pub fn half_head(x: &Tensor, w: &Tensor) -> Result<Tensor> {
+    let k = x.dims().last().copied().unwrap_or(0);
+    let rows = x.elem_count() / k.max(1);
+    let half_rows = |x: &Tensor| x.to_dtype(crate::tensor::DType::F16)?.matmul_t(w);
+    if rows > 1 && !DecodeOrder::active() {
+        return half_rows(x);
+    }
+    let x = x.to_dtype(crate::tensor::DType::F32)?;
+    let per_call = crate::inference::moe_cuda::FLOAT_MATVEC_ROWS;
+    DecodeOrder::by_rows(
+        &x,
+        per_call,
+        |part| match crate::inference::moe_cuda::float_matvec(part, w)? {
+            Some(y) => Ok(y),
+            None => DecodeOrder::by_rows(part, 1, half_rows),
+        },
+    )
 }
 
 impl crate::tensor::Module for QMatMul {

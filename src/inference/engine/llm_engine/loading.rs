@@ -2011,6 +2011,8 @@ fn ready_for_requests(
 
 /// Runs prompts of a few lengths through a loaded text model and cuts the KV back to empty, so
 /// the first request finds the kernels loaded, the buffers sized and the card clocked up.
+/// On a card whose float products offer variants, a first 1-token prompt runs them as a decode
+/// step does, and each weight shape there measures its variants, so no request pays for that.
 /// Returns whether the warmup ran. A model that cannot cut its KV back, or that fails a pass,
 /// is left as loaded.
 fn warm_prefill(
@@ -2022,15 +2024,26 @@ fn warm_prefill(
         return false;
     }
     let room = model.kv_capacity().unwrap_or(0) / 2;
-    let mut ran = false;
-    for n in LENGTHS.into_iter().filter(|n| *n <= room) {
+    let pass = |model: &mut dyn crate::inference::engine::model_backend::ModelBackend, n: usize| {
         let ids: Vec<u32> = (0..n as u32).map(|i| 10 + i % 1000).collect();
         let pass = Tensor::new(&ids[..], device)
             .and_then(|t| t.unsqueeze(0))
             .and_then(|x| model.forward_prefill_chunked(&x, 0))
             .and_then(|l| l.to_device(&Device::Cpu));
         model.trim_kv(0);
-        match pass {
+        pass
+    };
+    // The 1-token prompt runs only on a card whose float products offer variants to measure.
+    // It leaves what the warmup returns to the prompts below.
+    if room >= 1 && crate::inference::moe_cuda::measures_float_variants(device) {
+        let _choose = crate::inference::moe_cuda::ChooseFloatVariants::enter();
+        if let Err(e) = pass(model, 1) {
+            debug!("float product variants unmeasured: the 1-token warmup failed: {e}");
+        }
+    }
+    let mut ran = false;
+    for n in LENGTHS.into_iter().filter(|n| *n <= room) {
+        match pass(model, n) {
             Ok(_) => ran = true,
             Err(e) => {
                 debug!("prefill warmup stopped at {n} tokens: {e}");

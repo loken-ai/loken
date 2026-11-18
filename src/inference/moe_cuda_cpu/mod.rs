@@ -319,10 +319,22 @@ fn expert_qmms(weights: &Arc<QTensor>) -> Option<Arc<Vec<QMatMul>>> {
 }
 
 // -- optional fused router/conv helpers: None -> caller uses its portable fallback -
-/// Rows one launch of the BF16 product takes on a card.
+/// The most rows one launch of the float product takes on a card: the rows of a verify.
+pub const FLOAT_MATVEC_ROWS: usize = crate::inference::engine::decode_step::VERIFY_ROWS;
+/// Rows a BF16 product takes through [`float_matvec`] outside a verify.
 pub const BF16_MATVEC_ROWS: usize = 8;
-pub fn bf16_matvec(_x: &Tensor, _w: &Tensor) -> Result<Option<Tensor>> {
+pub fn float_matvec(_x: &Tensor, _w: &Tensor) -> Result<Option<Tensor>> {
     Ok(None)
+}
+/// Without a card the float product has no variants to choose among.
+pub struct ChooseFloatVariants;
+impl ChooseFloatVariants {
+    pub fn enter() -> Self {
+        Self
+    }
+}
+pub fn measures_float_variants(_device: &crate::tensor::Device) -> bool {
+    false
 }
 pub fn gate_gemv_f32(_xs: &Tensor, _gate_w: &Tensor) -> Result<Option<Tensor>> {
     Ok(None)

@@ -1334,8 +1334,10 @@ impl MoeWeights {
                     crate::tensor::quantized::QMatMul::Tensor(w) => {
                         crate::inference::moe_cuda::gate_gemv_f32(&xs, w)?
                     }
-                    crate::tensor::quantized::QMatMul::Bf16(w) => {
-                        crate::inference::moe_cuda::bf16_matvec(&xs, w)?
+                    crate::tensor::quantized::QMatMul::Bf16(w)
+                        if xs.dim(0)? <= crate::inference::moe_cuda::BF16_MATVEC_ROWS =>
+                    {
+                        crate::inference::moe_cuda::float_matvec(&xs, w)?
                     }
                     _ => None,
                 };

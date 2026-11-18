@@ -104,7 +104,7 @@ pub use kernel_matmul::kernel_known_answer_test;
 pub use kernel_matmul::QKernelMatMul;
 #[cfg(feature = "gpu")]
 pub use kernel_matmul::QuantizedActivation;
-pub use matmul::{set_half_rows, QMatMul};
+pub use matmul::{half_head, set_half_rows, QMatMul};
 #[cfg(feature = "gpu")]
 pub use mmq::release_mmq_workspaces;
 #[cfg(feature = "gpu")]

@@ -131,7 +131,7 @@ const KERNELS: [&str; 31] = [
     "cuda/moe/l2norm_gqa.cu",
     "cuda/moe/head_rmsnorm.cu",
     "cuda/moe/gate_gemv.cu",
-    "cuda/moe/bf16_matvec.cu",
+    "cuda/moe/float_matvec.cu",
     "cuda/moe/gate_topk.cu",
     "cuda/moe/tier_graph.cu",
     "cuda/moe/tp_local.cu",

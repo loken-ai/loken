@@ -2056,3 +2056,63 @@ fn an_f32_weight_takes_a_half_activation_on(device: &crate::tensor::Device) {
         }
     }
 }
+
+/// A verify's rows through a float weight on a card, and through the float head held in F16,
+/// each give the bits of the one-row call a decode step makes.
+#[cfg(feature = "gpu")]
+#[test]
+fn verify_rows_through_float_weights_on_a_card_match_one_row_calls() {
+    use crate::tensor::DType;
+    let Ok(dev) = Device::new_cuda(0) else {
+        eprintln!("no card: the card variant checked nothing");
+        return;
+    };
+    let rows = crate::inference::engine::decode_step::VERIFY_ROWS;
+    let (n, k) = (320usize, 512usize);
+    let w: Vec<f32> = (0..n * k)
+        .map(|i| ((i * 37 % 101) as f32 - 50.0) / 400.0)
+        .collect();
+    let w = Tensor::from_vec(w, (n, k), &Device::Cpu).unwrap();
+    let x: Vec<f32> = (0..rows * k)
+        .map(|i| ((i * 53 % 97) as f32 - 48.0) / 50.0)
+        .collect();
+    let x = Tensor::from_vec(x, (rows, k), &dev).unwrap();
+    let held = |dtype: DType| w.to_dtype(dtype).unwrap().to_device(&dev).unwrap();
+    let bits = |t: &Tensor| -> Vec<u32> {
+        let t = t.to_device(&Device::Cpu).unwrap();
+        let t = t.to_dtype(DType::F32).unwrap().flatten_all().unwrap();
+        t.to_vec1::<f32>()
+            .unwrap()
+            .iter()
+            .map(|v| v.to_bits())
+            .collect()
+    };
+    let one_by_one = |f: &dyn Fn(&Tensor) -> Tensor| -> Vec<u32> {
+        (0..rows)
+            .flat_map(|r| bits(&f(&x.narrow(0, r, 1).unwrap())))
+            .collect()
+    };
+    let weights = [
+        ("F32", QMatMul::Tensor(held(DType::F32))),
+        ("F16", QMatMul::TensorF16(held(DType::F16))),
+        ("BF16", QMatMul::Bf16(held(DType::BF16))),
+    ];
+    for (name, qmm) in &weights {
+        let want = one_by_one(&|row| qmm.forward(row).unwrap());
+        let got = {
+            let _order = DecodeOrder::enter();
+            bits(&qmm.forward(&x).unwrap())
+        };
+        assert!(got == want, "{name}: a verify row differs from its step");
+    }
+    let head = held(DType::F16);
+    let want = one_by_one(&|row| half_head(row, &head).unwrap());
+    let got = {
+        let _order = DecodeOrder::enter();
+        bits(&half_head(&x, &head).unwrap())
+    };
+    assert!(
+        got == want,
+        "the F16 head: a verify row differs from its step"
+    );
+}

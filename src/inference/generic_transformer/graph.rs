@@ -1759,8 +1759,7 @@ impl GenericHeteroTransformer {
                 }
                 (None, None) => unreachable!("a norm was found above"),
             };
-            let normed_f16 = normed.to_dtype(crate::tensor::DType::F16)?;
-            normed_f16.matmul_t(proj)?
+            crate::tensor::quantized::half_head(&normed, proj)?
         };
         logits = self.apply_output_bias(logits)?;
         logits = logits.to_dtype(crate::tensor::DType::F32)?;
@@ -2759,9 +2758,7 @@ impl GenericHeteroTransformer {
                 crate::tensor::ops::rms_norm(&last_f32, norm_w, self.config.rms_norm_eps as f32)?;
             self.graph_alive_tensors_model.push(normed.clone());
             let proj = self.output_proj_cuda.as_ref().unwrap();
-            let normed_f16 = normed.to_dtype(crate::tensor::DType::F16)?;
-            self.graph_alive_tensors_model.push(normed_f16.clone());
-            let mm_out = normed_f16.matmul_t(proj)?;
+            let mm_out = crate::tensor::quantized::half_head(&normed, proj)?;
             self.graph_alive_tensors_model.push(mm_out.clone());
             mm_out
         } else {

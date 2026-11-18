@@ -18,6 +18,13 @@ crate::tensor::gpu_runtime::aot_kernels! {
         fn loken_gated_delta_net_chunked_scratch(h: i32, n_tokens: i32, s_v: i32) -> i64;
         /// The longest window the whole-sequence short convolution carries between chunks.
         fn loken_lfm2_shortconv_rows_window() -> i32;
+        /// The variants the float product of a half weight offers on a card of compute
+        /// capability `cc`.
+        /// More than 1: the card takes the tensor-core path.
+        fn loken_float_matvec_variants(cc: i32) -> i32;
+        /// The groups of 8 weight rows a warp of the tensor-core variant `variant` of the float
+        /// product takes.
+        fn loken_float_matvec_tiles(variant: i32) -> i32;
     }
 }
 
@@ -204,7 +211,11 @@ cuda_launchers! {
     loken_gate_gemv_f32(xs: *const c_void, gate_w: *const c_void,
         logits: *mut c_void, hidden: i32, n_rows: i32, n_experts: i32);
     loken_bf16_matvec(x: *const c_void, w: *const c_void, y: *mut c_void, k: i32, n: i32,
-        rows: i32);
+        rows: i32, sms: i32, cc: i32, variant: i32);
+    loken_f16_matvec(x: *const c_void, w: *const c_void, y: *mut c_void, k: i32, n: i32,
+        rows: i32, sms: i32, cc: i32, variant: i32);
+    loken_f32_matvec(x: *const c_void, w: *const c_void, y: *mut c_void, k: i32, n: i32,
+        rows: i32, sms: i32, cc: i32);
     loken_gate_topk_softmax(xs: *const c_void, gate_w: *const c_void,
         weights: *mut c_void, ids: *mut c_void, hidden: i32, n_rows: i32,
         n_experts: i32, n_expert_used: i32, with_norm: i32);

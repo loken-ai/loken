@@ -868,7 +868,7 @@ impl GenericHeteroTransformer {
         // The quantised head where the card has one, else the float head read in place.
         let mut logits = match (&self.output_proj_cuda_qmm, &self.output_proj_cuda) {
             (Some(qmm), _) => qmm.forward(&normed)?,
-            (None, Some(proj)) => normed.to_dtype(DType::F16)?.matmul_t(proj)?,
+            (None, Some(proj)) => crate::tensor::quantized::half_head(&normed, proj)?,
             (None, None) => crate::tensor::bail!("a recorded verify needs the card's head"),
         };
         logits = self.apply_output_bias(logits)?;

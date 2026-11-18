@@ -16,10 +16,6 @@ const ROWS: usize = 6;
 /// Keys the windowed layer reads.
 const WINDOW: usize = 4;
 
-/// Largest logit difference a row may show against its step, over the range of the step's
-/// logits.
-const SHARE: f32 = 1e-4;
-
 /// The header keys that window the first layer, leave the second global, and give the model
 /// room for a prompt of a whole prefill chunk and its decode.
 fn windowed_first_layer() -> Vec<(String, Value)> {
@@ -89,15 +85,39 @@ fn rows(t: &Tensor) -> Vec<Vec<f32>> {
     flat.chunks(vocab).map(<[f32]>::to_vec).collect()
 }
 
-/// The largest difference of `got` from `want`, over the largest magnitude of `want`.
-fn share(want: &[f32], got: &[f32]) -> f32 {
-    let range = want.iter().map(|v| v.abs()).fold(0f32, f32::max);
-    let worst = want
-        .iter()
-        .zip(got)
-        .map(|(a, b)| (a - b).abs())
-        .fold(0f32, f32::max);
-    worst / range.max(f32::MIN_POSITIVE)
+/// Largest logit difference a row of the host may show against its step, over the range of
+/// the step's logits, when the second layer reads the windowed first layer's cache.
+/// The reading layer attends a verify's rows over the windowed donor together, not as its
+/// steps.
+const SHARED_HOST_SHARE: f32 = 1e-4;
+
+/// How a row must match its step: bit for bit, or within a share of the step's range.
+#[derive(Clone, Copy)]
+enum Match {
+    Bits,
+    Share(f32),
+}
+
+/// Why `got` does not match `want` as `how` asks, `None` when it does.
+fn mismatch(want: &[f32], got: &[f32], how: Match) -> Option<String> {
+    assert_eq!(want.len(), got.len(), "the rows differ in width");
+    match how {
+        Match::Bits => want
+            .iter()
+            .zip(got)
+            .position(|(a, b)| a.to_bits() != b.to_bits())
+            .map(|i| format!("at logit {i}: {} against {}", want[i], got[i])),
+        Match::Share(share) => {
+            let range = want.iter().map(|v| v.abs()).fold(0f32, f32::max);
+            let worst = want
+                .iter()
+                .zip(got)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0f32, f32::max);
+            let gap = worst / range.max(f32::MIN_POSITIVE);
+            (gap > share).then(|| format!("by {gap:.3e} of the range"))
+        }
+    }
 }
 
 /// The logits of each token of `next` decoded alone after the prompt.
@@ -112,8 +132,13 @@ fn decode_steps(m: &mut GenericHeteroTransformer, dev: &Device) -> Vec<Vec<f32>>
 }
 
 /// 2 verifies, each keeping 2 of its rows, then plain steps: every row and every step gives
-/// the logits of its decode step, and the model's length follows the tokens kept.
-fn verifies_follow_the_steps(m: &mut GenericHeteroTransformer, want: &[Vec<f32>], dev: &Device) {
+/// the logits of its decode step as `how` asks, and the model's length follows the tokens kept.
+fn verifies_follow_the_steps(
+    m: &mut GenericHeteroTransformer,
+    want: &[Vec<f32>],
+    dev: &Device,
+    how: Match,
+) {
     let prompt = prompt();
     let next = next();
     m.forward(&ids(&prompt, dev), 0).unwrap();
@@ -126,11 +151,9 @@ fn verifies_follow_the_steps(m: &mut GenericHeteroTransformer, want: &[Vec<f32>]
                 .unwrap(),
         );
         for (r, row) in got.iter().enumerate() {
-            let gap = share(&want[kept + r], row);
-            assert!(
-                gap <= SHARE,
-                "row {r} of the verify at {at} differs from its step by {gap:.3e}"
-            );
+            if let Some(why) = mismatch(&want[kept + r], row, how) {
+                panic!("row {r} of the verify at {at} differs from its step {why}");
+            }
         }
         assert_eq!(m.kv_len(), Some(at + ROWS));
         kept += 2;
@@ -143,11 +166,9 @@ fn verifies_follow_the_steps(m: &mut GenericHeteroTransformer, want: &[Vec<f32>]
     );
     for (i, &t) in next.iter().enumerate().skip(kept) {
         let got = rows(&m.forward(&ids(&[t], dev), prompt.len() + i).unwrap()).remove(0);
-        let gap = share(&want[i], &got);
-        assert!(
-            gap <= SHARE,
-            "step {i} after the verifies differs by {gap:.3e}"
-        );
+        if let Some(why) = mismatch(&want[i], &got, how) {
+            panic!("step {i} after the verifies differs {why}");
+        }
     }
 }
 
@@ -160,7 +181,7 @@ fn a_verify_after_the_window_slides_gives_the_decode_steps_on_the_host() {
     assert!(!stepped.layers[1].kv_cache.is_windowed());
     let want = decode_steps(&mut stepped, &Device::Cpu);
     let mut verified = tiny_model::load(&path, LAYERS);
-    verifies_follow_the_steps(&mut verified, &want, &Device::Cpu);
+    verifies_follow_the_steps(&mut verified, &want, &Device::Cpu, Match::Bits);
     tiny_model::remove(&path);
 }
 
@@ -177,7 +198,7 @@ fn a_verify_after_the_window_slides_gives_the_decode_steps_on_a_card() {
     let mut stepped = tiny_model::load_on_card(&path, LAYERS);
     let want = decode_steps(&mut stepped, &dev);
     let mut verified = tiny_model::load_on_card(&path, LAYERS);
-    verifies_follow_the_steps(&mut verified, &want, &dev);
+    verifies_follow_the_steps(&mut verified, &want, &dev, Match::Bits);
     tiny_model::remove(&path);
 }
 
@@ -195,7 +216,12 @@ fn a_verify_reading_a_slid_donor_gives_the_decode_steps_on_the_host() {
     assert_eq!(stepped.config.shared_kv_layers, 1);
     let want = decode_steps(&mut stepped, &Device::Cpu);
     let mut verified = tiny_model::load(&path, LAYERS);
-    verifies_follow_the_steps(&mut verified, &want, &Device::Cpu);
+    verifies_follow_the_steps(
+        &mut verified,
+        &want,
+        &Device::Cpu,
+        Match::Share(SHARED_HOST_SHARE),
+    );
     tiny_model::remove(&path);
 }
 
@@ -216,6 +242,6 @@ fn a_verify_reading_a_slid_donor_gives_the_decode_steps_on_a_card() {
     let mut stepped = tiny_model::load_on_card(&path, LAYERS);
     let want = decode_steps(&mut stepped, &dev);
     let mut verified = tiny_model::load_on_card(&path, LAYERS);
-    verifies_follow_the_steps(&mut verified, &want, &dev);
+    verifies_follow_the_steps(&mut verified, &want, &dev, Match::Bits);
     tiny_model::remove(&path);
 }

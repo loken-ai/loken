@@ -25,6 +25,7 @@ cargo bench --features cuda,microbench --bench microbench -- prefill-layer --sha
 cargo bench --features cuda,microbench --bench microbench -- shortconv-prompt --shapes-from /models/hybrid.gguf --rows 1000
 cargo bench --features cuda,microbench --bench microbench -- mamba2-prompt --shapes-from /models/mamba.gguf --rows 1000
 cargo bench --features cuda,microbench --bench microbench -- marlin-rows --json results/marlin-rows.json
+cargo bench --features cuda,microbench --bench microbench -- verify-float --hidden 4096 --inter 12288 --vocab 151936 --block 1,2,4,8,9
 cargo bench --features cuda,microbench --bench microbench -- decode-inputs --batch 64 --context 512
 cargo bench --features cuda,microbench --bench microbench -- decode-layer --batch 64 --context 512 --json results/decode-layer.json
 cargo bench --features cuda,microbench --bench microbench -- media-overlap --rows 1024 --hidden 1280 --layers 4
@@ -34,7 +35,7 @@ cargo bench --features microbench --bench microbench -- host-prompt --hidden 409
 ```
 
 A ROCm build takes `rocm` in place of `cuda`.  
-A build without a GPU runtime omits `crossing`, `decode-inputs`, `decode-layer`, `dequant-gemm`, `expert-ahead`, `expert-pairs`, `expert-upload`, `host-pairs`, `marlin-rows`, `media-overlap`, `prefill-layer`, `shortconv-prompt`, `mamba2-prompt` and `parler-step`.
+A build without a GPU runtime omits `crossing`, `decode-inputs`, `decode-layer`, `dequant-gemm`, `expert-ahead`, `expert-pairs`, `expert-upload`, `host-pairs`, `marlin-rows`, `media-overlap`, `prefill-layer`, `shortconv-prompt`, `mamba2-prompt`, `verify-float` and `parler-step`.
 `parler-step` also needs the `audio` feature, which `media` brings.
 
 Arguments after `--`:
@@ -49,7 +50,7 @@ Arguments after `--`:
 | `--hidden` | Elements of one activation row, without a file. | 4096 |
 | `--hc` | The hyper-connection multiple, without a file. | 1 |
 | `--element-bytes` | Bytes per element of a row. | 4 |
-| `--inter` | The feed-forward length, without a file. | 2048 for an expert, 12288 for `marlin-rows` |
+| `--inter` | The feed-forward length, without a file. | 2048 for an expert, 12288 for `marlin-rows` and `verify-float` |
 | `--weight-bits` | Bits per stored weight, without a file. 4.5 for q4_k, 8.5 for q8_0. | 4.5 |
 | `--projection-bytes` | The bytes of each projection, 1 value or 3, in place of `--inter` and `--weight-bits`. | derived |
 | `--gate-format` | The format of an expert's gate and up weights, without a file (`host-expert`, `expert-pairs`). | iq2_xxs |
@@ -69,7 +70,7 @@ Arguments after `--`:
 | `--prompt-tokens` | Tokens of each sequence's prompt (`schedule-host`). | 53 |
 | `--block-size` | Tokens per block of the paged cache (`schedule-host`, `decode-inputs`, `decode-layer`). | 16 |
 | `--layers` | Layers of the stack a step runs (`decode-layer`, `expert-ahead`). | 36 |
-| `--vocab` | Entries of the vocabulary the head matmul and the argmax run over (`decode-layer`). | 131072 |
+| `--vocab` | Entries of the vocabulary the head matmul and the argmax run over (`decode-layer`, `verify-float`). | 131072 |
 | `--codebooks` | The codebooks of the audio decoder (`parler-step`). | 9 |
 | `--blocks-per-row` | The width of a block table (`decode-inputs`). | `--context` over `--block-size`, rounded up: 32 |
 | `--rope-base` | The rope base of the rope rows (`schedule-host`, `decode-inputs`). | 10000 |
@@ -78,7 +79,7 @@ Arguments after `--`:
 | `--card-slots` | The hottest experts per layer the cards hold, which the host tier never serves (`cache-policy`). | 58 |
 | `--slots` | Slots per layer the host tier is tried with, 1 variant each (`cache-policy`). | 94,130,170 |
 | `--guess-hit` | The share of a token's experts the read-ahead guess names, 1 variant each (`cache-policy`, `expert-ahead`). | 1.0 |
-| `--block` | Tokens verified together, a draft's block. The block reads its experts once. 1 variant each (`cache-policy`). The rows of a verify, 1 variant each (`expert-pairs`). | 1 |
+| `--block` | Tokens verified together, a draft's block. The block reads its experts once. 1 variant each (`cache-policy`). The rows of a verify, 1 variant each (`expert-pairs`, `verify-float`). | 1 |
 | `--accept` | The share of a draft token accepted once the token before it was (`cache-policy`). | 0.8 |
 | `--tokens` | Tokens routed per variant (`cache-policy`). | 20000 |
 | `--group-size` | Weights per quantisation group, only 128 runs (`marlin-rows`). | 128 |
@@ -385,6 +386,25 @@ Its variants:
 
 - The token steps: the convolution, the time step, the recurrence and the gated norm launched for each row, then the rows concatenated.
 - The whole sequence: 1 launch of each of the 4 kernels for every row, with the same rows and the same state after them.
+
+### verify-float
+
+`verify-float` times a decode step and the rows of a draft verify through a float weight on a card.
+It answers what the float mat-vec kernel costs against the products it replaced.
+The weights are an F32 and an F16 projection of `--hidden` by `--hidden`, the F16 up and down projections of `--inter` by `--hidden` and `--hidden` by `--inter`, and the float head held in F16, `--vocab` by `--hidden`.
+The rows of each variant are the row counts of `--block`, 1 variant each.
+
+Its variants, for each weight and row count:
+
+- `library`: the product the card ran before. 1 row took the F16-weight mat-vec for an F16 projection and the library's product for the others. More rows took the library's product.
+- `library row by row`: that 1-row product for each row.
+- `mat-vec`: the server's projection or head under the decode order a verify holds, the float mat-vec kernel for every row at once.
+
+Before its variants, each F16 weight measures the variants of the float mat-vec and keeps one for 1 row, one up to 8 rows and one for more, as a model's warm-up does.
+Each call waits for the card.
+Several copies of each weight, together larger than twice the card's second-level cache, are called in turn.
+The bandwidth is the weight bytes the call reads: once for all the rows, once per row for the rows apart.
+The table after each weight gives the time of the mat-vec over the time of the library's product.
 
 ### prefill-layer
 
