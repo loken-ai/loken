@@ -1505,7 +1505,18 @@ impl LlmEngine {
                                         .map(|s| format!("{}:{}-{}", s.kind, s.layer_start, s.layer_end))
                                         .collect::<Vec<_>>()
                                         .join(", ");
-                                    info!("✅ {arch} loaded: layers {placement} (kv_quant={kv:?}, kv_ctx={ctx:?})");
+                                    // The routed experts the build put in host memory beside a
+                                    // layer that runs on a card.
+                                    let host_experts = m
+                                        .host_expert_runs()
+                                        .iter()
+                                        .map(|(a, b)| format!("{a}-{b}"))
+                                        .collect::<Vec<_>>();
+                                    let host_experts = match host_experts.is_empty() {
+                                        true => String::new(),
+                                        false => format!(", routed experts of layers {} in host memory", host_experts.join(", ")),
+                                    };
+                                    info!("✅ {arch} loaded: layers {placement}{host_experts} (kv_quant={kv:?}, kv_ctx={ctx:?})");
                                     #[cfg(feature = "gpu")]
                                     for card in crate::inference::place::ladder::cards_of(plan) {
                                         if let Some((used, reserved)) = crate::inference::place::device_probe::pool_bytes(card) {

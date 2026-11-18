@@ -635,6 +635,18 @@ fn build_gguf_with(
     without: Option<&str>,
     replaced: &Replaced,
 ) -> Result<GenericHeteroTransformer> {
+    let plan = host_plan(recipe.mixers.len());
+    build_gguf_placed(recipe, without, replaced, &HashMap::new(), &plan)
+}
+
+/// [`build_gguf_with`] loaded through `plan` onto the devices `cards` holds by index.
+fn build_gguf_placed(
+    recipe: &Recipe,
+    without: Option<&str>,
+    replaced: &Replaced,
+    cards: &HashMap<usize, Device>,
+    plan: &HeteroPlan,
+) -> Result<GenericHeteroTransformer> {
     let dir = scratch(&format!(
         "{}-{}-{}",
         recipe.arch,
@@ -696,10 +708,9 @@ fn build_gguf_with(
         mmap_bytes: bytes,
         mmap: &mmap,
     };
-    let layers = recipe.mixers.len();
     let built = weights.build(
-        &HashMap::new(),
-        &host_plan(layers),
+        cards,
+        plan,
         crate::inference::engine::llm_engine::KvQuant::Off,
         None,
         false,
@@ -707,6 +718,58 @@ fn build_gguf_with(
     );
     let _ = std::fs::remove_dir_all(&dir);
     built
+}
+
+/// A hybrid mixture whose plan keeps every block on a card and its routed experts in host
+/// memory loads them there, and answers as the load on the host does.
+#[cfg(feature = "gpu")]
+#[test]
+fn gateless_experts_in_host_memory_answer_on_a_card() {
+    use crate::inference::place::layer_executor::{DeviceKind, HeteroSegment};
+    let Ok(card) = Device::new_cuda(0) else {
+        return;
+    };
+    let recipe = recipe_of("nemotron_h_moe");
+    let layers = recipe.mixers.len();
+    let plan = HeteroPlan {
+        segments: vec![HeteroSegment {
+            kind: DeviceKind::Cuda(0),
+            layer_start: 0,
+            layer_end: layers,
+            free_memory_bytes: u64::MAX,
+        }],
+        tp_cards: None,
+        total_layers: layers,
+        host_experts_from: Some(0),
+    };
+    let cards = HashMap::from([(0, card)]);
+    let mut card = build_gguf_placed(&recipe, None, &BTreeMap::new(), &cards, &plan).unwrap();
+    // The build holds what the plan says: every block on the card, the routed experts on the host.
+    assert!(card
+        .layer_devs
+        .iter()
+        .all(|d| matches!(d, LayerDevice::Cuda(0))));
+    let routed: Vec<usize> = (0..layers)
+        .filter(|&l| card.layers[l].moe.is_some())
+        .collect();
+    assert_eq!(routed, vec![1], "the recipe routes its second block");
+    assert!(card.layers[1]
+        .moe
+        .as_ref()
+        .is_some_and(|m| m.experts_on_host()));
+    // The load reports what it built.
+    assert_eq!(card.host_expert_runs(), vec![(1, 2)]);
+    let got = assert_runs("card", &mut card, VOCAB);
+    let mut host = build_gguf(&recipe, None).unwrap();
+    let want = assert_runs("host", &mut host, VOCAB);
+    let peak = want.iter().map(|v| v.abs()).fold(0f32, f32::max);
+    let worst = got
+        .iter()
+        .zip(&want)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0f32, f32::max);
+    // The card's kernels quantise their activations to 8 bits.
+    assert!(worst <= 5e-2 * peak, "max diff {worst} of {peak}");
 }
 
 /// Verifies of drafted rows on the hybrid model of `arch`, each cut back to the rows it kept,

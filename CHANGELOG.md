@@ -28,6 +28,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 - Generation: keep an AWQ model's key cache at the configured fidelity on a card.
 - Generation: keep a quantised key cache accurate on models without a key norm.
 - ROCm: keep a mixture serving when a card refuses a scratch allocation.
+- Loading: serve a hybrid model whose experts do not all fit on its card.
 
 ## [0.5.1] - 2026-11-17
 

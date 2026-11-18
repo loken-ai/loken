@@ -1689,6 +1689,9 @@ impl MoeWeights {
 
     /// Experts without a gate: `down(relu(up(x))^2)` for every chosen expert, weighed and
     /// summed per token. `[tokens, hidden]` F32.
+    ///
+    /// The card kernels run when the rows and both stacks are on a card.
+    /// Stacks in host memory run on the host, whatever device the rows are on.
     fn forward_up_relu2(
         &self,
         xs: &Tensor,
@@ -1701,7 +1704,7 @@ impl MoeWeights {
             .as_ref()
             .ok_or_else(|| crate::tensor::Error::msg("gateless experts without an up stack"))?;
         #[cfg(feature = "gpu")]
-        if xs.device().runs_as_card() {
+        if xs.device().runs_as_card() && !self.experts_on_host() && up.device().runs_as_card() {
             let routing = ExpertRouting::group(topk_ids, self.n_experts_used)?;
             let h = crate::inference::moe_cuda::moe_gemm_gguf(
                 xs,
@@ -2715,21 +2718,38 @@ mod clamped_swiglu_tests {
 
     #[test]
     fn gateless_experts_and_a_shared_expert_match_the_scalar_reference() {
+        gateless_experts_in_host_memory_match_the_scalar_reference(&Device::Cpu);
+    }
+
+    /// A layer on a card whose gateless expert stacks sit in host memory answers its rows.
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn gateless_experts_in_host_memory_serve_rows_on_a_card() {
+        let Ok(card) = Device::new_cuda(0) else {
+            return;
+        };
+        gateless_experts_in_host_memory_match_the_scalar_reference(&card);
+    }
+
+    /// Gateless experts and a shared expert against the scalar reference.
+    /// The rows, the router and the shared expert are on `dev`.
+    /// The routed expert stacks are in host memory.
+    fn gateless_experts_in_host_memory_match_the_scalar_reference(dev: &Device) {
         let (experts, used, hidden, ffn, tokens) = (4usize, 2usize, 32usize, 32usize, 3usize);
-        let dev = Device::Cpu;
+        let host = Device::Cpu;
         let stack = |seed| {
             let w = Tensor::from_vec(
                 values(experts * ffn * hidden, seed, 1.0),
                 (experts, ffn, hidden),
-                &dev,
+                &host,
             )
             .unwrap();
-            QTensor::quantize_onto(&w, GgmlDType::Q8_0, &dev).unwrap()
+            QTensor::quantize_onto(&w, GgmlDType::Q8_0, &host).unwrap()
         };
         let dense = |seed, rows, cols| {
             let v = values(rows * cols, seed, 0.5);
-            let w = Tensor::from_vec(v.clone(), (rows, cols), &dev).unwrap();
-            let q = QTensor::quantize_onto(&w, GgmlDType::F32, &dev).unwrap();
+            let w = Tensor::from_vec(v.clone(), (rows, cols), dev).unwrap();
+            let q = QTensor::quantize_onto(&w, GgmlDType::F32, dev).unwrap();
             (
                 super::super::projection::QMatMul::from_qtensor(q).unwrap(),
                 v,
@@ -2741,9 +2761,9 @@ mod clamped_swiglu_tests {
         let (sh_down, sh_down_w) = dense(35, hidden, ffn);
         let moe = MoeWeights {
             gate_inp: QMatMul::Tensor(
-                Tensor::from_vec(router.clone(), (experts, hidden), &dev).unwrap(),
+                Tensor::from_vec(router.clone(), (experts, hidden), dev).unwrap(),
             ),
-            gate_inp_scale: Tensor::ones(hidden, DType::F32, &dev).unwrap(),
+            gate_inp_scale: Tensor::ones(hidden, DType::F32, dev).unwrap(),
             gate_inp_bias: None,
             gate_exps_bias: None,
             up_exps_bias: None,
@@ -2785,16 +2805,18 @@ mod clamped_swiglu_tests {
             down_exps_f32: None,
         };
         let xs = values(tokens * hidden, 36, 1.0);
-        let input = Tensor::from_vec(xs.clone(), (1, tokens, hidden), &dev).unwrap();
+        let input = Tensor::from_vec(xs.clone(), (1, tokens, hidden), dev).unwrap();
         let got = moe
             .forward(&input, &input, hidden, 1e-5, tokens > 1)
+            .unwrap()
+            .to_device(&host)
             .unwrap()
             .flatten_all()
             .unwrap()
             .to_vec1::<f32>()
             .unwrap();
         let deq = |q: &QTensor| {
-            q.dequantize(&dev)
+            q.dequantize(&host)
                 .unwrap()
                 .flatten_all()
                 .unwrap()

@@ -949,8 +949,8 @@ impl HeteroPlan {
             if cpu_bytes_needed > cpu_budget {
                 warn!(
                     "  Host-RAM guard: planned {} CPU layers need {:.1} GB but only {:.1} GB available \
-                     (after {} GB safety headroom). The loader will refuse this segment via the \
-                     host-RAM budget check.",
+                     (after {} GB safety headroom). The loader holds the bytes it owns to that \
+                     budget and reads mapped weights from the file.",
                     cpu_layers,
                     cpu_bytes_needed as f64 / 1e9,
                     cpu_budget as f64 / 1e9,

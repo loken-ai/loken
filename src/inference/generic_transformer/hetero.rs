@@ -1976,6 +1976,30 @@ impl GenericHeteroTransformer {
         crate::inference::place::Placement { cards, host_layers }
     }
 
+    /// The runs `[start, end)` of layers, by their place in the stack, whose routed experts
+    /// the load put in host memory while the layer itself runs on a card.
+    /// A layer without routed experts does not end a run.
+    pub fn host_expert_runs(&self) -> Vec<(usize, usize)> {
+        let mut runs: Vec<(usize, usize)> = Vec::new();
+        let mut open = false;
+        for (i, (layer, dev)) in self.layers.iter().zip(&self.layer_devs).enumerate() {
+            let Some(moe) = layer.moe.as_ref() else {
+                continue;
+            };
+            let at = self.first_layer + i;
+            if !matches!(dev, LayerDevice::Cuda(_)) || !moe.experts_on_host() {
+                open = false;
+                continue;
+            }
+            match runs.last_mut() {
+                Some(run) if open => run.1 = at + 1,
+                _ => runs.push((at, at + 1)),
+            }
+            open = true;
+        }
+        runs
+    }
+
     /// The routing counts of every layer since the load, zero for a layer without an expert
     /// cache; `None` when no layer has one.
     #[cfg(feature = "gpu")]
