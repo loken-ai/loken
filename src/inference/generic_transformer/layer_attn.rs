@@ -631,9 +631,13 @@ impl GenericTransformerLayer {
         if self.attends_rows_as_decode(x, &shared_kv)? {
             return self.forward_attn_rows_as_decode(x, index_pos, pre_computed_qkv, donor_f16);
         }
-        if let Some(y) =
-            self.forward_shared_rows_as_decode(x, index_pos, &shared_kv, pre_computed_qkv)?
-        {
+        if let Some(y) = self.forward_shared_rows_as_decode(
+            x,
+            index_pos,
+            &shared_kv,
+            pre_computed_qkv,
+            donor_f16,
+        )? {
             return Ok(y);
         }
         let projected = pre_computed_qkv.map(|t| Projected::Qkv(t.clone()));
@@ -685,25 +689,32 @@ impl GenericTransformerLayer {
             && crate::tensor::quantized::DecodeOrder::active())
     }
 
-    /// A verify's rows on a card through a layer that reads a donor's cache, each row the decode
-    /// step it stands for: it attends the donor's rows up to its own position, with no mask.
+    /// A verify's rows through a layer that reads a donor's cache, each row the decode step it
+    /// stands for: it attends the donor's rows up to its own position, with no mask.
     /// The donor has already appended every row of the verify, the last `seq` of its rows.
     /// `None`, with nothing done, where the call is not such a verify.
+    ///
+    /// On the host, a donor's F16 store that serves this layer keeps its own row-wise verify
+    /// (`cpu_shared_f16_attention`): a row alone would read the store whole.
     fn forward_shared_rows_as_decode(
         &mut self,
         x: &Tensor,
         index_pos: usize,
         shared_kv: &Option<(Tensor, Tensor)>,
         pre_computed_qkv: Option<&Tensor>,
+        donor_f16: Option<&crate::inference::cache::cpu_f16_kv::CpuF16Kv>,
     ) -> Result<Option<Tensor>> {
         let (b, seq, _) = x.dims3()?;
         let Some((k, v)) = shared_kv else {
             return Ok(None);
         };
+        let my_window = self.sliding_window.filter(|&w| w > 0);
+        let store_serves = matches!(x.device(), Device::Cpu)
+            && donor_f16.is_some_and(|c| !c.is_empty() && c.window() == my_window);
         if seq < 2
             || b != 1
             || pre_computed_qkv.is_some()
-            || matches!(x.device(), Device::Cpu)
+            || store_serves
             || !crate::tensor::quantized::DecodeOrder::active()
         {
             return Ok(None);
@@ -713,6 +724,19 @@ impl GenericTransformerLayer {
             return Ok(None);
         }
         let base = total - seq;
+        // On the host, the rows take one call: their queries are made together, each as its step
+        // makes it under the decode order, and each row attends as its step over the donor's rows
+        // up to its own, read in place.
+        // Positional biases take the call of each row.
+        if matches!(x.device(), Device::Cpu) && self.alibi_slopes.is_none() {
+            self.donor_rows = Some(base);
+            let attended =
+                self.attend(x, None, index_pos, Some((k.clone(), v.clone())), None, None);
+            self.donor_rows = None;
+            let (y, via_graph_buffer) = attended?;
+            let y = self.gate_attention(x, y)?;
+            return Ok(Some(self.attn_output_projection(&y, via_graph_buffer)?));
+        }
         let mut ys = Vec::with_capacity(seq);
         for r in 0..seq {
             let row = x.narrow(1, r, 1)?;

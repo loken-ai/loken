@@ -318,6 +318,29 @@ impl Tensor {
         self.packed.get().expect("just set")
     }
 
+    /// The tensor's F32 elements where they lie in its host allocation, a view included.
+    /// A view is a contiguous range of its allocation, so nothing is copied.
+    /// `None` for a tensor held otherwise.
+    pub(crate) fn host_f32_in_place(&self) -> Option<&[f32]> {
+        match self.storage_raw.as_ref() {
+            Storage::Cpu(CpuStorage::F32(v)) => {
+                Some(&v[self.offset..self.offset + self.shape.elem_count()])
+            }
+            _ => None,
+        }
+    }
+
+    /// The tensor's F16 elements where they lie in its host allocation, a view included.
+    /// `None` for a tensor held otherwise.
+    pub(super) fn host_f16_in_place(&self) -> Option<&[half::f16]> {
+        match self.storage_raw.as_ref() {
+            Storage::Cpu(CpuStorage::F16(v)) => {
+                Some(&v[self.offset..self.offset + self.shape.elem_count()])
+            }
+            _ => None,
+        }
+    }
+
     /// Copy the view's element range `[offset, offset + elem_count)` out of the
     /// raw storage into a fresh packed storage.
     fn materialize_packed(&self) -> Result<Arc<Storage>> {
@@ -779,6 +802,140 @@ fn nt_dot(x: &[f32], y: &[f32]) -> f32 {
     (s0 + s1) + (s2 + s3)
 }
 
+/// Rows of `a` [`dots_by_key_f32`] sums against one row of `b` together, one lane each.
+const DOT_LANES: usize = 8;
+
+/// The dot of each of the `m` rows of `a` with each of the `n` rows of `b`, all rows of `k`
+/// values, each summed as [`gemm_nt_f32_cpu`] sums it.
+/// The result is key-major: `out[j * m + i]` is the dot of row `i` of `a` and row `j` of `b`.
+/// Each row of `b` is read once for all the rows of `a`, the rows of `b` split over the threads.
+///
+/// Each key's dots are [`dots_of_key_f32`]'s.
+pub(crate) fn dots_by_key_f32(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
+    use rayon::prelude::*;
+    let lanes = dot_lanes_f32(a, m, k);
+    let mut out = vec![0f32; n * m];
+    let per = n.div_ceil(rayon::current_num_threads()).max(1);
+    out.par_chunks_mut(per * m)
+        .enumerate()
+        .for_each(|(c, chunk)| {
+            for (jj, row) in chunk.chunks_mut(m).enumerate() {
+                dots_of_key_f32(&lanes, m, k, &b[(c * per + jj) * k..][..k], row);
+            }
+        });
+    out
+}
+
+/// The `m` rows of `a`, rows of `k` values, laid out for [`dots_of_key_f32`]: group `g` holds
+/// rows `g * DOT_LANES..`, element `e` of its lane `l` at `(g * k + e) * DOT_LANES + l`, the lanes
+/// past `m` zero.
+pub(crate) fn dot_lanes_f32(a: &[f32], m: usize, k: usize) -> Vec<f32> {
+    let groups = m.div_ceil(DOT_LANES);
+    let mut lanes = vec![0f32; groups * k * DOT_LANES];
+    for i in 0..m {
+        let (g, l) = (i / DOT_LANES, i % DOT_LANES);
+        for (e, &x) in a[i * k..][..k].iter().enumerate() {
+            lanes[(g * k + e) * DOT_LANES + l] = x;
+        }
+    }
+    lanes
+}
+
+/// The dot of `key`, `k` values, with each of the `m` rows `lanes` holds ([`dot_lanes_f32`]),
+/// into `out[i]`, each summed as [`nt_dot`] sums it.
+/// [`DOT_LANES`] rows go together, one lane each: each lane keeps the 4 sums of [`nt_dot`] in its
+/// order and adds them as it does.
+pub(crate) fn dots_of_key_f32(lanes: &[f32], m: usize, k: usize, key: &[f32], out: &mut [f32]) {
+    for g in 0..m.div_ceil(DOT_LANES) {
+        let x = &lanes[g * k * DOT_LANES..][..k * DOT_LANES];
+        let mut s = [[0f32; DOT_LANES]; 4];
+        let c4 = k / 4 * 4;
+        let mut e = 0;
+        while e < c4 {
+            for (q, sq) in s.iter_mut().enumerate() {
+                let y = key[e + q];
+                let xe = &x[(e + q) * DOT_LANES..][..DOT_LANES];
+                for l in 0..DOT_LANES {
+                    sq[l] += xe[l] * y;
+                }
+            }
+            e += 4;
+        }
+        while e < k {
+            let y = key[e];
+            let xe = &x[e * DOT_LANES..][..DOT_LANES];
+            for l in 0..DOT_LANES {
+                s[0][l] += xe[l] * y;
+            }
+            e += 1;
+        }
+        for l in 0..DOT_LANES.min(m - g * DOT_LANES) {
+            out[g * DOT_LANES + l] = (s[0][l] + s[1][l]) + (s[2][l] + s[3][l]);
+        }
+    }
+}
+
+/// Rows of `a` one block of [`gemm_f32_rows`] carries.
+const FOLD_ROWS: usize = 4;
+/// Columns of `b` one block of [`gemm_f32_rows`] carries.
+const FOLD_COLS: usize = 16;
+/// Elements of `k` [`gemm_f32_rows`] folds before it stores its sums.
+const FOLD_DEPTH: usize = 256;
+
+/// `a[m,k] . b[k,n]`, each output the fold of its row and column over `k` from zero, in order,
+/// the fold [`gemm_f32_cpu`] sums.
+/// A block of [`FOLD_ROWS`] rows by [`FOLD_COLS`] columns keeps its sums in registers over
+/// [`FOLD_DEPTH`] elements of `k` at a time, and the blocks of columns are split over the threads.
+pub(crate) fn gemm_f32_rows(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
+    use rayon::prelude::*;
+    let stripes = n.div_ceil(FOLD_COLS);
+    let tiles: Vec<Vec<f32>> = (0..stripes)
+        .into_par_iter()
+        .map(|s| {
+            let c0 = s * FOLD_COLS;
+            let cw = FOLD_COLS.min(n - c0);
+            let mut tile = vec![0f32; m * FOLD_COLS];
+            let mut kb = 0;
+            while kb < k {
+                let ke = (kb + FOLD_DEPTH).min(k);
+                let mut i0 = 0;
+                while i0 < m {
+                    let rows = FOLD_ROWS.min(m - i0);
+                    let mut acc = [[0f32; FOLD_COLS]; FOLD_ROWS];
+                    for (r, sums) in acc.iter_mut().enumerate().take(rows) {
+                        sums.copy_from_slice(&tile[(i0 + r) * FOLD_COLS..][..FOLD_COLS]);
+                    }
+                    for kk in kb..ke {
+                        let mut row = [0f32; FOLD_COLS];
+                        row[..cw].copy_from_slice(&b[kk * n + c0..][..cw]);
+                        for (r, sums) in acc.iter_mut().enumerate().take(rows) {
+                            let av = a[(i0 + r) * k + kk];
+                            for c in 0..FOLD_COLS {
+                                sums[c] += av * row[c];
+                            }
+                        }
+                    }
+                    for (r, sums) in acc.iter().enumerate().take(rows) {
+                        tile[(i0 + r) * FOLD_COLS..][..FOLD_COLS].copy_from_slice(sums);
+                    }
+                    i0 += rows;
+                }
+                kb = ke;
+            }
+            tile
+        })
+        .collect();
+    let mut out = vec![0f32; m * n];
+    for (s, tile) in tiles.iter().enumerate() {
+        let c0 = s * FOLD_COLS;
+        let cw = FOLD_COLS.min(n - c0);
+        for i in 0..m {
+            out[i * n + c0..][..cw].copy_from_slice(&tile[i * FOLD_COLS..][..cw]);
+        }
+    }
+    out
+}
+
 /// NT (dot-product) f32 gemm: `out[m,n] = a[m,k] . b[n,k]ᵀ` with `b` given
 /// UNtransposed - both operand rows are contiguous, so the `x @ wᵀ` linear
 /// pattern needs no transpose materialization. Parallelized over output
@@ -829,10 +986,22 @@ pub(super) fn gemm_f32_cpu(a: &[f32], b: &[f32], m: usize, k: usize, n: usize, o
     const NT: usize = 512; // column-stripe width
     const KB: usize = 256; // k block: B k-tile = KB*NT*4B = 512 KB, L2-resident
 
+    // A product of this size runs on several threads.
+    let parallel = m * k * n >= (1 << 20);
+    // Across threads the columns are split before the rows: a stripe reads only its own columns
+    // of `b`, while each block of rows reads every column of its stripe again.
+    // A stripe narrower than `NT` gives each thread a share of the columns, and keeps whole
+    // cache lines of `b` with `NT / 16` columns at the least.
+    let threads = rayon::current_num_threads();
+    let width = match parallel {
+        true => NT.min(n.div_ceil(threads).next_power_of_two().max(NT / 16)),
+        false => NT,
+    };
+
     // A tile holds rows `r0..r0 + m` of the stripe at `j0`.
     let compute_tile = |j0: usize, r0: usize, m: usize| -> (usize, usize, Vec<f32>) {
         let a = &a[r0 * k..(r0 + m) * k];
-        let nt = NT.min(n - j0);
+        let nt = width.min(n - j0);
         let mut tile = vec![0f32; m * nt];
         let mut kb = 0;
         while kb < k {
@@ -882,28 +1051,30 @@ pub(super) fn gemm_f32_cpu(a: &[f32], b: &[f32], m: usize, k: usize, n: usize, o
     };
 
     // Each output is the fold of its own row and column over `k` in order.
-    // So any split of the rows gives the same bits.
+    // So any split of the rows or of the columns gives the same bits.
     //
     // A block of rows holds a multiple of 4 rows.
     // So every row takes the path it takes when all the rows go together.
-    let stripes = n.div_ceil(NT);
-    let blocks = (rayon::current_num_threads() / stripes.max(1)).clamp(1, m.div_ceil(4).max(1));
+    let stripes = n.div_ceil(width);
+    let blocks = (threads / stripes.max(1)).clamp(1, m.div_ceil(4).max(1));
     let rows = m.div_ceil(blocks).next_multiple_of(4).max(4);
     let blocks = m.div_ceil(rows).max(1);
-    let tiles: Vec<(usize, usize, Vec<f32>)> = if m * k * n >= (1 << 20) && stripes * blocks > 1 {
+    let tiles: Vec<(usize, usize, Vec<f32>)> = if parallel && stripes * blocks > 1 {
         use rayon::prelude::*;
         (0..stripes * blocks)
             .into_par_iter()
             .map(|t| {
                 let r0 = (t % blocks) * rows;
-                compute_tile((t / blocks) * NT, r0, rows.min(m - r0))
+                compute_tile((t / blocks) * width, r0, rows.min(m - r0))
             })
             .collect()
     } else {
-        (0..stripes).map(|t| compute_tile(t * NT, 0, m)).collect()
+        (0..stripes)
+            .map(|t| compute_tile(t * width, 0, m))
+            .collect()
     };
     for (j0, r0, tile) in tiles {
-        let nt = NT.min(n - j0);
+        let nt = width.min(n - j0);
         for (i, row) in tile.chunks_exact(nt).enumerate() {
             out[(r0 + i) * n + j0..][..nt].copy_from_slice(row);
         }

@@ -85,17 +85,10 @@ fn rows(t: &Tensor) -> Vec<Vec<f32>> {
     flat.chunks(vocab).map(<[f32]>::to_vec).collect()
 }
 
-/// Largest logit difference a row of the host may show against its step, over the range of
-/// the step's logits, when the second layer reads the windowed first layer's cache.
-/// The reading layer attends a verify's rows over the windowed donor together, not as its
-/// steps.
-const SHARED_HOST_SHARE: f32 = 1e-4;
-
-/// How a row must match its step: bit for bit, or within a share of the step's range.
+/// How a row must match its step: bit for bit.
 #[derive(Clone, Copy)]
 enum Match {
     Bits,
-    Share(f32),
 }
 
 /// Why `got` does not match `want` as `how` asks, `None` when it does.
@@ -107,16 +100,6 @@ fn mismatch(want: &[f32], got: &[f32], how: Match) -> Option<String> {
             .zip(got)
             .position(|(a, b)| a.to_bits() != b.to_bits())
             .map(|i| format!("at logit {i}: {} against {}", want[i], got[i])),
-        Match::Share(share) => {
-            let range = want.iter().map(|v| v.abs()).fold(0f32, f32::max);
-            let worst = want
-                .iter()
-                .zip(got)
-                .map(|(a, b)| (a - b).abs())
-                .fold(0f32, f32::max);
-            let gap = worst / range.max(f32::MIN_POSITIVE);
-            (gap > share).then(|| format!("by {gap:.3e} of the range"))
-        }
     }
 }
 
@@ -216,12 +199,7 @@ fn a_verify_reading_a_slid_donor_gives_the_decode_steps_on_the_host() {
     assert_eq!(stepped.config.shared_kv_layers, 1);
     let want = decode_steps(&mut stepped, &Device::Cpu);
     let mut verified = tiny_model::load(&path, LAYERS);
-    verifies_follow_the_steps(
-        &mut verified,
-        &want,
-        &Device::Cpu,
-        Match::Share(SHARED_HOST_SHARE),
-    );
+    verifies_follow_the_steps(&mut verified, &want, &Device::Cpu, Match::Bits);
     tiny_model::remove(&path);
 }
 

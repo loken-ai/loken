@@ -930,6 +930,7 @@ impl GenericHeteroTransformer {
                 graph_ngram_rows: None,
                 spec: None,
                 spec_record: false,
+                donor_rows: None,
                 kv_only: false,
                 graph_kv_cap: None,
                 verify_pos_i32: None,

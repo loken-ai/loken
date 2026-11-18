@@ -146,14 +146,18 @@ impl Tensor {
                 return Ok(t);
             }
         }
+        // Only operands on a card are packed for the card's product: host views stay in place.
         #[cfg(feature = "gpu")]
-        if let (
+        let on_cards =
+            (self.is_on_cuda() && rhs.is_on_cuda()).then(|| (self.storage(), rhs.storage()));
+        #[cfg(feature = "gpu")]
+        if let Some((
             Storage::Cuda { data, dev },
             Storage::Cuda {
                 data: rd,
                 dev: rdev,
             },
-        ) = (self.storage().as_ref(), rhs.storage().as_ref())
+        )) = on_cards.map(|(a, b)| (a.as_ref(), b.as_ref()))
         {
             if dev.ordinal() != rdev.ordinal() {
                 return Err(Error("matmul: operands on different cuda devices".into()));
@@ -246,9 +250,8 @@ impl Tensor {
             // (see gemm_f16w_matches_upcast_path test). bf16 keeps the f32
             // round-trip (mirrors matmul_t's f16/bf16 split).
             if dt == DType::F16 {
-                if let (Storage::Cpu(CpuStorage::F16(af)), Storage::Cpu(CpuStorage::F16(bf))) =
-                    (self.storage().as_ref(), rhs.storage().as_ref())
-                {
+                // The operands are read where they lie, a view included.
+                if let (Some(af), Some(bf)) = (self.host_f16_in_place(), rhs.host_f16_in_place()) {
                     use half::slice::HalfFloatSliceExt;
                     // activations convert once (m.k - small next to the k.n rhs)
                     let mut a = vec![0f32; lbatch * m * k];
@@ -319,8 +322,15 @@ impl Tensor {
                 .matmul(&rhs.to_dtype(DType::F32)?)?
                 .to_dtype(dt);
         }
-        let a = self.f32_data()?;
-        let b = rhs.f32_data()?;
+        // The operands are read where they lie, a view included.
+        let a = match self.host_f32_in_place() {
+            Some(a) => a,
+            None => self.f32_data()?,
+        };
+        let b = match rhs.host_f32_in_place() {
+            Some(b) => b,
+            None => rhs.f32_data()?,
+        };
         // gemm_f32_cpu fully overwrites `out` (its column stripes partition
         // 0..n and every stripe writes all m rows via copy_from_slice), so
         // skip the zero-fill: `vec![0.0; ..]` memset/calloc'd a fresh buffer
@@ -656,14 +666,22 @@ impl Tensor {
                 let (n, k2) = (rdims[rdims.len() - 2], rdims[rdims.len() - 1]);
                 let lbatch: usize = ldims[..ldims.len() - 2].iter().product();
                 let rbatch: usize = rdims[..rdims.len() - 2].iter().product();
-                if k == k2 && lbatch == rbatch && self.dtype() == rhs.dtype() {
-                    if let (
+                // Only operands on a card are packed for the card's product: host views stay
+                // in place.
+                let on_cards = (k == k2
+                    && lbatch == rbatch
+                    && self.dtype() == rhs.dtype()
+                    && self.is_on_cuda()
+                    && rhs.is_on_cuda())
+                .then(|| (self.storage(), rhs.storage()));
+                {
+                    if let Some((
                         Storage::Cuda { data, dev },
                         Storage::Cuda {
                             data: rd,
                             dev: rdev,
                         },
-                    ) = (self.storage().as_ref(), rhs.storage().as_ref())
+                    )) = on_cards.map(|(a, b)| (a.as_ref(), b.as_ref()))
                     {
                         if dev.ordinal() != rdev.ordinal() {
                             return Err(Error(
@@ -747,8 +765,8 @@ impl Tensor {
                     && self.dtype() == DType::F16
                     && rhs.dtype() == DType::F16
                 {
-                    if let (Storage::Cpu(CpuStorage::F16(a)), Storage::Cpu(CpuStorage::F16(b))) =
-                        (self.storage().as_ref(), rhs.storage().as_ref())
+                    // The operands are read where they lie, a view included.
+                    if let (Some(a), Some(b)) = (self.host_f16_in_place(), rhs.host_f16_in_place())
                     {
                         use half::slice::HalfFloatSliceExt;
                         let pool = crate::tensor::quant_cpu::gemv_pool::pool();
@@ -823,8 +841,15 @@ impl Tensor {
                         .to_dtype(dt);
                 }
                 if k == k2 && lbatch == rbatch && self.dtype() == DType::F32 {
-                    let a = self.f32_data()?;
-                    let b = rhs.f32_data()?;
+                    // The operands are read where they lie, a view included.
+                    let a = match self.host_f32_in_place() {
+                        Some(a) => a,
+                        None => self.f32_data()?,
+                    };
+                    let b = match rhs.host_f32_in_place() {
+                        Some(b) => b,
+                        None => rhs.f32_data()?,
+                    };
                     let mut out = vec![0.0f32; lbatch * m * n];
                     for bi in 0..lbatch {
                         gemm_nt_f32_cpu(

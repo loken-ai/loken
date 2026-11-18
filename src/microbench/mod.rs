@@ -38,6 +38,7 @@ pub mod media_overlap;
 pub mod parler_step;
 pub mod prefill_layer;
 pub mod schedule_host;
+pub mod shared_verify;
 pub mod shortconv_prompt;
 pub mod verify_float;
 
@@ -403,6 +404,12 @@ pub fn benches() -> Vec<Bench> {
         about: "the rows of a prompt through one Q5_0 projection on the host cores, tiled over Q5_0 blocks and over the same values as Q8_0 blocks",
         needs_card: false,
         run: host_prompt::run,
+    });
+    all.push(Bench {
+        name: "shared-verify",
+        about: "the rows of a verify through a layer reading a donor's cache on the host: one masked attention against one decode-step attention per row",
+        needs_card: false,
+        run: shared_verify::run,
     });
     all.push(Bench {
         name: "cache-policy",

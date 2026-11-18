@@ -32,6 +32,7 @@ cargo bench --features cuda,microbench --bench microbench -- media-overlap --row
 cargo bench --features cuda,microbench --bench microbench -- parler-step --hidden 1024 --inter 4096 --layers 24 --heads 16 --vocab 1088
 cargo bench --features microbench --bench microbench -- schedule-host --batch 64 --context 512
 cargo bench --features microbench --bench microbench -- host-prompt --hidden 4096 --inter 12288 --rows 108
+cargo bench --features microbench --bench microbench -- shared-verify --file /models/shared.gguf --context 4096 --block 2,3,4,5,6,7,8,9
 ```
 
 A ROCm build takes `rocm` in place of `cuda`.  
@@ -582,6 +583,23 @@ A sample is 1 prompt pass, not timed, then timed steps whose median is reported 
 `--hidden` sets the width, `--inter` the feed-forward length, `--layers` the layer count, `--heads` the attention heads, `--vocab` the audio tokens per codebook and `--codebooks` the codebooks.
 `--prompt-tokens` sets the text prefix the first pass carries.
 The note of each variant gives the rate at which the projections one step reads stream.
+
+### shared-verify
+
+`shared-verify` times the rows of a draft verify through a layer that reads a donor's cache on the host.
+It answers what a verify pays for rows that each give the bits of their decode step.
+Its variants, at each verify width of `--block`:
+
+- One masked attention over all the rows, the host attention a verify ran before.
+- One decode-step attention per row over the donor's rows up to its own position, read in place. On a global layer the rows of a key-value head share one read of the donor's rows. On a windowed layer 2 parallel regions make every score, then every output.
+
+A decode step of 1 row over the same donor is timed beside them.
+
+The heads come from the header of `--file`: the global layers' head width, and the windowed layers' head width and window.
+Without a file, `--heads`, `--kv-heads` and `--head-dim` give one global layer.
+`--context` sets the donor's rows before the verify.
+A windowed donor holds its window and the verify's rows.
+Every call reads the donor's rows as a new view of a larger buffer, as the cache hands them to each forward.
 
 ## Report
 

@@ -46,6 +46,7 @@ pub use kernel_ffi::StorageView;
 pub use ops::traits::{IndexOp, Module, TensorId, TensorIndexer};
 pub use shape::{Dim, Shape, D};
 pub use tensor::Tensor;
+pub(crate) use tensor::{dot_lanes_f32, dots_by_key_f32, dots_of_key_f32, gemm_f32_rows};
 
 /// Host-bounce profiler:
 /// env-gated counters on every correctness-first CPU fallback so the decode

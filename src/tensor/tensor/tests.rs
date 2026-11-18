@@ -1629,3 +1629,46 @@ fn add_mul_reshape() {
     assert_eq!(r.dims(), &[6, 4]);
     assert!(nx.reshape(vec![5, 5]).is_err());
 }
+
+#[test]
+fn the_dots_by_key_are_the_dots_of_the_nt_product() {
+    // Rows past a multiple of the lanes and of 4 elements, one key and many.
+    for (m, k, n) in [(37usize, 301usize, 100usize), (8, 512, 1), (3, 6, 2049)] {
+        let a = data(m * k, 21);
+        let b = data(n * k, 22);
+        let mut want = vec![0f32; m * n];
+        gemm_nt_f32_cpu(&a, &b, m, k, n, &mut want);
+        let got = dots_by_key_f32(&a, &b, m, k, n);
+        for i in 0..m {
+            for j in 0..n {
+                assert_eq!(
+                    got[j * m + i].to_bits(),
+                    want[i * n + j].to_bits(),
+                    "row {i} key {j}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn the_row_folds_are_the_folds_of_the_f32_product() {
+    // Rows and columns past a block, several depths of `k`, a zero input.
+    for (m, k, n) in [(37usize, 600usize, 100usize), (4, 520, 256), (3, 70, 17)] {
+        let mut a = data(m * k, 31);
+        a[7] = 0.0;
+        let b = data(k * n, 32);
+        let mut want = vec![0f32; m * n];
+        gemm_f32_cpu(&a, &b, m, k, n, &mut want);
+        let got = gemm_f32_rows(&a, &b, m, k, n);
+        for i in 0..m {
+            for j in 0..n {
+                assert_eq!(
+                    got[i * n + j].to_bits(),
+                    want[i * n + j].to_bits(),
+                    "row {i} column {j}"
+                );
+            }
+        }
+    }
+}

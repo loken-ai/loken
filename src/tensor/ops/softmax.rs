@@ -25,23 +25,7 @@ pub fn softmax_last_dim(x: &Tensor) -> Result<Tensor> {
         if cols > 0 {
             let mut out = x.flatten_all()?.to_vec1::<f32>()?;
             let rows = out.len() / cols;
-            let sm_row = |row: &mut [f32]| {
-                let mut m = f32::NEG_INFINITY;
-                for &v in row.iter() {
-                    if v > m {
-                        m = v;
-                    }
-                }
-                let mut sum = 0f32;
-                for o in row.iter_mut() {
-                    let e = (*o - m).exp();
-                    *o = e;
-                    sum += e;
-                }
-                for o in row.iter_mut() {
-                    *o /= sum;
-                }
-            };
+            let sm_row = softmax_row_in_place;
             if rows == 1 {
                 sm_row(&mut out);
             } else {
@@ -62,6 +46,27 @@ pub fn softmax_last_dim(x: &Tensor) -> Result<Tensor> {
     let num = xf.broadcast_sub(&max)?.exp()?;
     let den = num.sum_keepdim(D::Minus1)?;
     num.broadcast_div(&den)?.to_dtype(x_dtype)
+}
+
+/// The softmax of one row of F32 values, in place: the row's maximum, then each value's
+/// exponential past it summed in order, then each divided by the sum.
+/// Every host softmax of a row over the last dim is this one.
+pub(crate) fn softmax_row_in_place(row: &mut [f32]) {
+    let mut m = f32::NEG_INFINITY;
+    for &v in row.iter() {
+        if v > m {
+            m = v;
+        }
+    }
+    let mut sum = 0f32;
+    for o in row.iter_mut() {
+        let e = (*o - m).exp();
+        *o = e;
+        sum += e;
+    }
+    for o in row.iter_mut() {
+        *o /= sum;
+    }
 }
 
 /// Scale, causal mask and softmax over the last dim, in one pass.

@@ -486,6 +486,9 @@ pub struct GenericTransformerLayer {
     spec: Option<speculate::LayerPending>,
     /// Whether the forward running now is a verify that records [`Self::spec`].
     spec_record: bool,
+    /// The donor's rows before the verify whose rows the host attention runs now: row `r` reads
+    /// the first `base + r + 1` rows the donor hands. `None` outside such a verify.
+    donor_rows: Option<usize>,
     /// Whether the rows running now are read only for the keys and values they leave in the
     /// caches: the layer stops after its token mixer, and its output is not used.
     kv_only: bool,

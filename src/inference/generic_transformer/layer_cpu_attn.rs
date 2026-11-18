@@ -386,13 +386,317 @@ impl GenericTransformerLayer {
         Ok(Some(t))
     }
 
+    /// The rows of a verify through a layer that reads a donor's cache, each attended as the
+    /// decode step it stands for: `q` `[1, n_head, rows, d]` over `k` and `v`
+    /// `[1, n_kv, base + rows, d]`, row `r` over the first `base + r + 1` rows, the last `w` of
+    /// them on a windowed layer.
+    ///
+    /// The rows of one key-value head share one product of the queries by the keys and one
+    /// product of the weights by the values, reading the donor's rows once, in place.
+    /// A score is the dot of its query and its key alone, so each row's scores are its step's.
+    /// Each row's weights are the softmax of its own scores, the one the step runs.
+    /// The weights a row does not read are zero: each output still sums the row's terms in the
+    /// step's order from zero, and a zero term leaves the sum as it is.
+    fn verify_rows_as_steps(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        base: usize,
+        scale: f64,
+    ) -> Result<Tensor> {
+        use rayon::prelude::*;
+        let (_, _, rows, d) = q.dims4()?;
+        let n_rep = self.n_head / self.n_kv_head;
+        // Row `r` reads the donor's rows `first(r)..base + r + 1`.
+        let first = |r: usize| match self.sliding_window {
+            Some(w) if w > 0 && base + r + 1 > w => base + r + 1 - w,
+            _ => 0,
+        };
+        let lo = first(0);
+        let width = base + rows - lo;
+        let kv_dt = k.dtype();
+        if let Some(out) = self.verify_rows_f32(q, k, v, base, scale, &first)? {
+            return Ok(out);
+        }
+        let qd = if q.dtype() == kv_dt {
+            q.clone()
+        } else {
+            q.to_dtype(kv_dt)?
+        };
+        // Each row's query heads, grouped by the key-value head they read, as the step groups
+        // them.
+        let queries = (0..rows)
+            .map(|r| qd.narrow(2, r, 1)?.reshape((1, self.n_kv_head, n_rep, d)))
+            .collect::<Result<Vec<_>>>()?;
+        let heads = (0..self.n_kv_head)
+            .into_par_iter()
+            .map(|h| -> Result<Tensor> {
+                let kh = k.narrow(1, h, 1)?.narrow(2, lo, width)?;
+                let vh = v.narrow(1, h, 1)?.narrow(2, lo, width)?;
+                let qh = queries
+                    .iter()
+                    .map(|q| q.narrow(1, h, 1))
+                    .collect::<Result<Vec<_>>>()?;
+                let scores = Tensor::cat(&qh.iter().collect::<Vec<_>>(), 2)?.matmul_t(&kh)?;
+                let scores = if (scale - 1.0).abs() < 1e-6 {
+                    scores
+                } else {
+                    scores.affine(scale as f32, 0.0)?
+                };
+                let scores = self
+                    .softcap_scores(scores)?
+                    .to_dtype(DType::F32)?
+                    .flatten_all()?
+                    .to_vec1::<f32>()?;
+                // Each row's weights: the softmax of its own scores, in F32 as the step takes it,
+                // and zero past them.
+                let mut weights = vec![0f32; rows * n_rep * width];
+                for r in 0..rows {
+                    let (from, to) = (first(r) - lo, base + r + 1 - lo);
+                    for e in 0..n_rep {
+                        let at = (r * n_rep + e) * width;
+                        let own = &mut weights[at + from..at + to];
+                        own.copy_from_slice(&scores[at + from..at + to]);
+                        crate::tensor::ops::softmax_row_in_place(own);
+                    }
+                }
+                let weights = Tensor::from_vec(
+                    weights,
+                    (1, 1, rows * n_rep, width),
+                    &crate::tensor::Device::Cpu,
+                )?;
+                let weights = match kv_dt {
+                    DType::F32 => weights,
+                    dt => weights.to_dtype(dt)?,
+                };
+                weights.matmul(&vh)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let rows_out = (0..rows)
+            .map(|r| {
+                let parts = heads
+                    .iter()
+                    .map(|o| o.narrow(2, r * n_rep, n_rep))
+                    .collect::<Result<Vec<_>>>()?;
+                Tensor::cat(&parts.iter().collect::<Vec<_>>(), 1)?.reshape((1, self.n_head, 1, d))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let out = Tensor::cat(&rows_out.iter().collect::<Vec<_>>(), 2)?;
+        if out.dtype() == q.dtype() {
+            Ok(out)
+        } else {
+            out.to_dtype(q.dtype())
+        }
+    }
+
+    /// [`Self::verify_rows_as_steps`] over F32 queries, keys and values on the host, on their
+    /// values in place: the step's products, scale and softmax, without a tensor between them.
+    /// `None`, with nothing done, for any other operands or a layer that caps its scores.
+    ///
+    /// Each score is the dot the step's product sums, and is scaled as the step scales it.
+    /// Each row's weights are its step's softmax of its own scores, and zero past them.
+    /// Each output is the fold over the keys the step's product of weights by values sums.
+    fn verify_rows_f32(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        base: usize,
+        scale: f64,
+        first: &dyn Fn(usize) -> usize,
+    ) -> Result<Option<Tensor>> {
+        if q.dtype() != DType::F32 || k.dtype() != DType::F32 || self.attn_softcap.is_some() {
+            return Ok(None);
+        }
+        let (_, _, rows, d) = q.dims4()?;
+        let n_rep = self.n_head / self.n_kv_head;
+        let lo = first(0);
+        let width = base + rows - lo;
+        let m = rows * n_rep;
+        let queries = q.flatten_all()?.to_vec1::<f32>()?;
+        // Each row reads the keys `starts[r]..base + r + 1`, counted from `lo`.
+        let starts: Vec<usize> = (0..rows).map(|r| first(r) - lo).collect();
+        // The donor's rows of each key-value head, read in place.
+        let heads = (0..self.n_kv_head)
+            .map(|h| -> Result<(Tensor, Tensor)> {
+                Ok((
+                    k.narrow(1, h, 1)?.narrow(2, lo, width)?,
+                    v.narrow(1, h, 1)?.narrow(2, lo, width)?,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if heads
+            .iter()
+            .any(|(kh, vh)| kh.host_f32_in_place().is_none() || vh.host_f32_in_place().is_none())
+        {
+            return Ok(None);
+        }
+        if self.sliding_window.is_some_and(|w| w > 0) {
+            return self
+                .windowed_rows_f32(&queries, &heads, &starts, base - lo, scale, d)
+                .map(Some);
+        }
+        use rayon::prelude::*;
+        let outputs: Vec<Vec<f32>> = heads
+            .par_iter()
+            .enumerate()
+            .map(|(h, (kh, vh))| {
+                let (keys, values) = (
+                    kh.host_f32_in_place().unwrap_or_default(),
+                    vh.host_f32_in_place().unwrap_or_default(),
+                );
+                // The query rows of this key-value head, row-major: row `r`, query head `e`.
+                let mut qh = Vec::with_capacity(m * d);
+                for r in 0..rows {
+                    for e in 0..n_rep {
+                        let at = ((h * n_rep + e) * rows + r) * d;
+                        qh.extend_from_slice(&queries[at..at + d]);
+                    }
+                }
+                let dots = crate::tensor::dots_by_key_f32(&qh, keys, m, d, width);
+                let mut weights = vec![0f32; m * width];
+                for (r, &from) in starts.iter().enumerate() {
+                    let to = base + r + 1 - lo;
+                    for e in 0..n_rep {
+                        let i = r * n_rep + e;
+                        let own = &mut weights[i * width + from..i * width + to];
+                        for (j, w) in own.iter_mut().enumerate() {
+                            let s = dots[(from + j) * m + i];
+                            // The step scales its scores as `x * scale + 0`, and keeps a scale of 1.
+                            *w = if (scale - 1.0).abs() < 1e-6 {
+                                s
+                            } else {
+                                s * scale as f32 + 0.0
+                            };
+                        }
+                        crate::tensor::ops::softmax_row_in_place(own);
+                    }
+                }
+                crate::tensor::gemm_f32_rows(&weights, values, m, width, d)
+            })
+            .collect();
+        let mut out = vec![0f32; self.n_head * rows * d];
+        for (h, y) in outputs.iter().enumerate() {
+            for r in 0..rows {
+                for e in 0..n_rep {
+                    let at = ((h * n_rep + e) * rows + r) * d;
+                    out[at..at + d].copy_from_slice(&y[(r * n_rep + e) * d..][..d]);
+                }
+            }
+        }
+        Ok(Some(Tensor::from_vec(
+            out,
+            (1, self.n_head, rows, d),
+            &crate::tensor::Device::Cpu,
+        )?))
+    }
+
+    /// The verify rows of a windowed layer in 2 regions of the prefill pool.
+    /// The first makes every score: an item is one key of one key-value head, dotted with every
+    /// query row that reads the head, as [`crate::tensor::dots_of_key_f32`] sums them.
+    /// The second makes every output: an item is one row of the query heads of one key-value head,
+    /// each the step's softmax of its own scores and its weighted sum of the values, folded in the
+    /// step's order from zero.
+    ///
+    /// `queries` is `[n_head, rows, d]`; `heads` holds each key-value head's keys and values from
+    /// the first key any row reads; row `r` reads keys `starts[r]..held + r + 1` of them.
+    fn windowed_rows_f32(
+        &self,
+        queries: &[f32],
+        heads: &[(Tensor, Tensor)],
+        starts: &[usize],
+        held: usize,
+        scale: f64,
+        d: usize,
+    ) -> Result<Tensor> {
+        let rows = starts.len();
+        let n_rep = self.n_head / self.n_kv_head;
+        let m = rows * n_rep;
+        let width = held + rows;
+        let slices = heads
+            .iter()
+            .map(
+                |(kh, vh)| match (kh.host_f32_in_place(), vh.host_f32_in_place()) {
+                    (Some(keys), Some(values)) => Ok((keys, values)),
+                    _ => crate::tensor::bail!("the donor's rows are not F32 on the host"),
+                },
+            )
+            .collect::<Result<Vec<_>>>()?;
+        // The query rows of each key-value head, row `r` then query head `e`, laid out for the dots.
+        let lanes = (0..self.n_kv_head)
+            .map(|h| {
+                let mut rows_of_head = Vec::with_capacity(m * d);
+                for r in 0..rows {
+                    for e in 0..n_rep {
+                        let at = ((h * n_rep + e) * rows + r) * d;
+                        rows_of_head.extend_from_slice(&queries[at..at + d]);
+                    }
+                }
+                crate::tensor::dot_lanes_f32(&rows_of_head, m, d)
+            })
+            .collect::<Vec<_>>();
+        // Item `h * width + j` holds the dots of key `j` of key-value head `h` with its `m` rows.
+        let mut dots = vec![0f32; self.n_kv_head * width * m];
+        crate::tensor::quant_cpu::pool_par_chunks_mut_prefill(&mut dots, m, &|item, out| {
+            let (h, j) = (item / width, item % width);
+            let key = &slices[h].0[j * d..][..d];
+            crate::tensor::dots_of_key_f32(&lanes[h], m, d, key, out);
+        });
+        let scaled = (scale - 1.0).abs() >= 1e-6;
+        // Item `h * rows + r` holds the outputs of row `r` of the `n_rep` query heads that read
+        // key-value head `h`: each value row is read once for all of them.
+        let mut items = vec![0f32; self.n_kv_head * rows * n_rep * d];
+        crate::tensor::quant_cpu::pool_par_chunks_mut_prefill(
+            &mut items,
+            n_rep * d,
+            &|item, acc| {
+                let (h, r) = (item / rows, item % rows);
+                let (from, to) = (starts[r], held + r + 1);
+                let span = to - from;
+                let mut weights = vec![0f32; n_rep * span];
+                for (e, own) in weights.chunks_mut(span).enumerate() {
+                    let i = r * n_rep + e;
+                    for (j, w) in own.iter_mut().enumerate() {
+                        let s = dots[(h * width + from + j) * m + i];
+                        // The step scales its scores as `x * scale + 0`, and keeps a scale of 1.
+                        *w = if scaled { s * scale as f32 + 0.0 } else { s };
+                    }
+                    crate::tensor::ops::softmax_row_in_place(own);
+                }
+                // Each output folds its key terms in order from zero, as the step's product.
+                let values = slices[h].1;
+                for j in 0..span {
+                    let row = &values[(from + j) * d..][..d];
+                    for (e, out) in acc.chunks_mut(d).enumerate() {
+                        let w = weights[e * span + j];
+                        for (o, &x) in out.iter_mut().zip(row) {
+                            *o += w * x;
+                        }
+                    }
+                }
+            },
+        );
+        let mut out = vec![0f32; self.n_head * rows * d];
+        for h in 0..self.n_kv_head {
+            for r in 0..rows {
+                for e in 0..n_rep {
+                    let at = ((h * n_rep + e) * rows + r) * d;
+                    out[at..at + d]
+                        .copy_from_slice(&items[((h * rows + r) * n_rep + e) * d..][..d]);
+                }
+            }
+        }
+        Tensor::from_vec(out, (1, self.n_head, rows, d), &crate::tensor::Device::Cpu)
+    }
+
     /// CPU prefill flash-attention (online softmax): no `[seq_q x seq_kv]` scores matrix is
     /// materialised. One work item holds the query heads that read the same key/value head,
     /// for a block of queries, and walks the keys a tile at a time: each key tile is read
     /// once for all of those rows, each row keeps a running max, denominator and output.
     /// F32 CPU only; the runtime `q.device()==Cpu` check at the call site gates it.
     /// `sinks`, one logit per query head, join each row's denominator unscaled.
-    fn flash_attn_prefill_cpu(
+    pub(crate) fn flash_attn_prefill_cpu(
         q: &Tensor,
         k: &Tensor,
         v: &Tensor,
@@ -569,6 +873,14 @@ impl GenericTransformerLayer {
         // Skip the affine launch when scale==1 (gemma4 hardcodes
         // f_attention_scale=1.0). Saves one launch per attention call.
         let scale_is_one = (scale - 1.0).abs() < 1e-6;
+
+        // The rows of a verify through a layer reading a donor's cache, each as its decode step.
+        if let Some(base) = self
+            .donor_rows
+            .filter(|_| q.device().is_cpu() && q.dims()[0] == 1 && mask.is_none())
+        {
+            return self.verify_rows_as_steps(q, &k, &v, base, scale);
+        }
 
         // GPU prefill over a Q8 KV history does not reach this function: it runs as
         // `kernel::fused::flash_prefill_gqa` in `attend`. What arrives here with
