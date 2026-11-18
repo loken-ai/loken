@@ -27,13 +27,16 @@ pub(super) struct Recorder {
     pub(super) blas: OnceLock<CudaBlas>,
     /// The handle's workspace when the card has none pinned, allocated on the card's stream.
     pub(super) workspace: OnceLock<crate::tensor::gpu_runtime::driver::CudaSlice<u8>>,
+    /// The holders of the stream once the handle is made and nothing else holds it.
+    /// A handle of one runtime holds the stream, a handle of the other holds its inner stream.
+    pub(super) alone: OnceLock<usize>,
 }
 
 impl Recorder {
     /// Whether the recorder can take a capture: nothing but itself holds its stream, so no
     /// buffer allocated on it is left, and no capture its thread left open stands on it.
     fn is_idle(&self) -> bool {
-        Arc::strong_count(&self.stream) == 1 + usize::from(self.blas.get().is_some())
+        Arc::strong_count(&self.stream) == self.alone.get().copied().unwrap_or(1)
             && self.stream.context().bind_to_thread().is_ok()
             && unsafe { result::stream::is_capturing(self.stream.cu_stream()) }
                 .is_ok_and(|s| s == sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE)
@@ -161,6 +164,7 @@ impl CudaDevice {
                         stream: self.ctx.new_stream()?,
                         blas: OnceLock::new(),
                         workspace: OnceLock::new(),
+                        alone: OnceLock::new(),
                     }));
                     &**made.last().expect("pushed above") as *const Recorder
                 }

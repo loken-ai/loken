@@ -850,6 +850,8 @@ impl CudaDevice {
             }
         }
         let _ = r.blas.set(b);
+        // The recorder is idle again when only it and its handle hold the stream.
+        let _ = r.alone.set(Arc::strong_count(&r.stream));
         self.recording
             .bytes
             .fetch_max(took, std::sync::atomic::Ordering::Relaxed);
