@@ -1544,9 +1544,13 @@ impl GenericBackend {
             Ok((Some(logits), kept)) => (logits, kept),
             Ok((None, _)) => return Ok(None),
             Err(e) => {
-                tracing::warn!("prefix snapshot advance failed ({e}); prefilling the whole prompt");
                 self.0.trim_kv(0);
                 self.0.set_prefix_covered(0);
+                // An abandoned request reads nothing more.
+                if crate::request_metrics::prefill_cancelled() {
+                    return Err(e);
+                }
+                tracing::warn!("prefix snapshot advance failed ({e}); prefilling the whole prompt");
                 return Ok(None);
             }
         };

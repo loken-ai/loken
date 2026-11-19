@@ -843,3 +843,34 @@ fn a_state_the_cards_have_no_room_for_stays_stored() {
     FORCED_RESTORE_OOM.with(|c| c.set(1));
     assert_eq!(cache.restore(&mut m, &longer), text.len());
 }
+
+/// A request abandoned while its stored state is advanced over its new tokens ends there: the
+/// whole prompt is not read again from the start.
+#[test]
+fn an_abandoned_request_does_not_read_its_prompt_again_from_the_start() {
+    use crate::inference::engine::model_backend::{GenericBackend, ModelBackend};
+    let fx = Fixture::new("advance-cancel");
+    let store = open_store(&fx.store_dir());
+    let mut writer = fx.model();
+    attach(&mut writer, &store, b"");
+    let cache = writer.state_cache().unwrap();
+    let text = prompt(2 * BLOCK + 9);
+    let (_, grid) = prefill(&mut writer, &text, 0);
+    cache.save(&writer, &text, grid, None);
+    wait_for_len(&store, text.len());
+    let mut longer = text.clone();
+    longer.extend(prompt(40));
+    let mut m = fx.model();
+    attach(&mut m, &store, b"");
+    let mut b = GenericBackend(m);
+    let cancel = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let _bound = crate::request_metrics::bind_prefill(None, Some(cancel));
+    let Err(e) = b.try_restore_prefix(&longer) else {
+        panic!("the abandoned request ends with its cancellation");
+    };
+    assert!(
+        e.to_string()
+            .contains(crate::request_metrics::PREFILL_CANCELLED),
+        "{e}"
+    );
+}

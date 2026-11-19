@@ -1410,7 +1410,7 @@ impl LlmEngine {
                                     Err(e) => {
                                         let err_msg =
                                             format!("STREAMING PREFILL: Forward failed: {}", e);
-                                        error!("{}", err_msg);
+                                        log_prefill_failure(&err_msg);
                                         let _ = tx.blocking_send(Err(err_msg));
                                         return;
                                     }
@@ -1419,7 +1419,7 @@ impl LlmEngine {
                             Err(e) => {
                                 let err_msg =
                                     format!("STREAMING PREFILL: prefix restore failed: {}", e);
-                                error!("{}", err_msg);
+                                log_prefill_failure(&err_msg);
                                 let _ = tx.blocking_send(Err(err_msg));
                                 return;
                             }
@@ -4093,6 +4093,16 @@ fn lone_rate(tokens: usize, seconds: f64) -> Option<f64> {
 
 /// True when a stream's first message is an out-of-memory error: the attempt
 /// failed before it delivered anything, so it can be run again unseen.
+/// Logs a failed prompt reading: at error level, or at info level for a request its client
+/// abandoned.
+fn log_prefill_failure(message: &str) {
+    if crate::request_metrics::prefill_cancelled() {
+        info!("{message}");
+    } else {
+        error!("{message}");
+    }
+}
+
 fn opens_out_of_memory(first: &Option<Result<String, String>>) -> bool {
     matches!(first, Some(Err(e)) if is_out_of_memory(e))
 }
