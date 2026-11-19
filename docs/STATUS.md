@@ -130,7 +130,6 @@ They are not measured again yet.
 Ollama runs the file in llama.cpp's layout.
 vLLM could not run it.
 
-<!-- site: widget table id=status-streamed-pieces -->
 | Piece | State |
 |---|---|
 | Prefill | A prompt's token mixers run on the card that keeps them. Its routed experts run on the card that keeps them, and on the host from the file's mapping otherwise. The host tier admits the experts the prompt routes to |
@@ -138,7 +137,6 @@ vLLM could not run it.
 | Decode-state cache | In host memory, or on disk when `state_cache_dir` is set. A stored state is restored only when reading it costs less than prefilling its tokens. A short remainder still reads nearly every expert, which bounds how little it costs |
 | Exactness of streamed experts | Exact at `reference` and `balanced`. `fast` changes the output within a budget. The budget is derived from the model's own noise and chosen against a teacher-forced run of a bundled text, not against a task score |
 | Sharding across nodes | Unmeasured at 2 nodes, see [The cluster](#the-cluster) |
-<!-- site: end -->
 
 A transformer with recurrent layers (a convolution, state-space or delta-rule mixer beside attention) cannot trim its state back to a shorter prefix.
 Its cache therefore stores the states its prefill passes.
@@ -176,7 +174,6 @@ Real checkpoints were measured against the reference implementation (transformer
 - Words are lowercased with punctuation removed on both sides.
 - "On task" leaves out the clips where either side answers or comments instead of transcribing (errors at least the clip's word count).
 
-<!-- site: widget table id=status-audio-in -->
 | Model | Prompt | Side | WER | Errors per clip | WER on task | Clips on task | RTF |
 |---|---|---|---:|---:|---:|---:|---:|
 | Voxtral Mini 3B | Transcribe this audio | reference | 20.4% | 5.05 | 7.4% | 18 | 3.96 |
@@ -185,7 +182,6 @@ Real checkpoints were measured against the reference implementation (transformer
 | Ultravox 0.5 1B | Repeat exactly what the speaker says. | loken | 41.1% | 10.15 | 3.6% | 16 | 1.33 |
 | Ultravox 0.5 1B | Transcribe this audio | reference | 356% | 88.0 | - | 1 | 6.74 |
 | Ultravox 0.5 1B | Transcribe this audio | loken | 370% | 91.4 | - | 1 | 2.77 |
-<!-- site: end -->
 
 On the clips that both sides transcribe, loken is within a quarter of a word per clip of the reference, or better.
 
@@ -307,7 +303,6 @@ On that set, the mean MASE of the median forecast is:
 
 Speed is in the runs of the [benchmarks site](https://loken-ai.github.io/benchmarks/).
 
-<!-- site: widget table id=status-qwen4exp-state -->
 | What | State |
 |---|---|
 | Card against host numerics | The card paths agree with the host to a cosine of 0.9997 per layer on the 160-expert file |
@@ -320,19 +315,16 @@ Speed is in the runs of the [benchmarks site](https://loken-ai.github.io/benchma
 | 256 experts, 1 card | Answers a 72-token prompt coherently. Reads the 4.0k and 14k token prompts of the decode row |
 | 256 experts, 2 cards | Reads the 4.0k and 14k token prompts of the decode row |
 | 512 experts | Loads. Not measured on either envelope |
-<!-- site: end -->
 
 Quality is the mean negative log-likelihood per token (nats) of held-out texts from this repository, scored by the quality harness.
 The code text holds 1500 tokens and the docs text 2200.  
 The chunk is 512, on 2 cards.
 
-<!-- site: widget chart type=bar id=status-qwen4exp-nll -->
 | File | Code | Docs |
 |---|---:|---:|
 | 160 experts, Q4_K_M | 2.18 | 3.37 |
 | 256 experts, IQ1_M | 1.23 | 1.81 |
 | 512 experts, UD-Q4_K_XL | 1.03 | 1.76 |
-<!-- site: end -->
 
 For the 160-expert file, the placements differ by at most 0.01 nat:
 
@@ -477,14 +469,12 @@ sequenceDiagram
 
 Measured on 2 loopback servers, 1 card each, with DeepSeek R1 32B (19.9 GB, 64 layers, does not fit 1 16 GB card):
 
-<!-- site: widget table id=status-cluster-r1-32b -->
 | Setup | Context | Prefill | Decode |
 |---|---|---:|---:|
 | 2 nodes, pipeline | 2k | 1170 tok/s | 26 tok/s |
 | 2 nodes, pipeline | 6k | 1060 tok/s | 21 tok/s |
 | 1 card, 21 layers on the host | not stated | 43 tok/s | 3.3 tok/s |
 | 2 cards of 1 node, tensor-parallel | not stated | 711 tok/s | 27 tok/s |
-<!-- site: end -->
 
 Greedy output matches the 1-card node for 64 tokens on 2 prompts, and for a 6k prompt with its continuation.
 The 1-card node itself varies between runs past about 25 tokens.

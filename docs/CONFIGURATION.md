@@ -59,7 +59,6 @@ The stored voices and their consents are kept beside the first Hugging Face dire
 
 ## `[server]`
 
-<!-- site: widget table id=config-server -->
 | Key | Default | What it does |
 |---|---|---|
 | `host` | `"127.0.0.1"` | Listening address. The address is the security boundary: see [SECURITY.md](../SECURITY.md). |
@@ -69,7 +68,6 @@ The stored voices and their consents are kept beside the first Hugging Face dire
 | `allowed_origins` | `[]` | Browser origins allowed when authentication is on. Empty allows none. |
 | `rate_limit_per_minute` | `0` | Requests per minute per client. `0` is unlimited. |
 | `rate_limit_burst` | `10` | Requests that may arrive back to back before the per-minute rate applies. |
-<!-- site: end -->
 
 ## `[inference]`
 
@@ -87,7 +85,6 @@ The stored voices and their consents are kept beside the first Hugging Face dire
 
 What each level chooses:
 
-<!-- site: widget table id=config-fidelity-levels -->
 | Choice | `reference` | `balanced` | `fast` |
 |---|---|---|---|
 | Float projections of an F32, F16 or BF16 checkpoint | As stored | As stored when the plan fits with them. Otherwise Q8_0, or Q4_K (Q6_K for the feed-forward output) when Q8_0 does not fit. As stored, read from the file's mapping, when neither fits. The float matrices of a checkpoint that also holds block-format projections take Q8_0 when its stack sits on 1 kind of memory and fits, Q4_K otherwise | Q4_K (Q6_K for the feed-forward output) |
@@ -108,7 +105,6 @@ What each level chooses:
 | Exactness the experts streamed from disk may give up | `exact` | `exact` | `fast` |
 | Where a cached layer without exact kernels runs a missing expert | The card, through the transit room | The card, through the transit room | The card or the host, by measured paces |
 | File each expert is read from, for a model served from several files | `largest` | `plan` | `smallest` |
-<!-- site: end -->
 
 The level decides these choices alone.
 The file names none of them.
@@ -463,19 +459,15 @@ The load sizes the cache on each layer's card.
 Every chat route holds a request to caps before its media reach the model.
 The caps follow the decoder's allocation budget: a request past 1 is answered 400 naming the cap and the value it carried.
 
-<!-- site: widget table id=config-media-input -->
 | Key | Default | What it does |
 |---|---|---|
 | `image_fetch_hosts` | none | Hosts, or `host:port` pairs, an image given by URL on the Messages API or `/v1/embeddings` is fetched from. Redirects are followed only to them. Empty fetches nothing. |
-<!-- site: end -->
 
 ## `[energy]`
 
-<!-- site: widget table id=config-energy -->
 | Key | Default | What it does |
 |---|---|---|
 | `carbon_intensity` | `50` | Grid intensity in gCO2eq per kWh, for the CO2 estimate. |
-<!-- site: end -->
 
 ## `[cluster]`
 
@@ -483,7 +475,6 @@ Without this table, the node runs alone and routes no request to a peer.
 `prefill_peer`, under `[inference]`, works without it.  
 See [CLUSTER.md](CLUSTER.md) for the model.
 
-<!-- site: widget table id=config-cluster -->
 | Key | Default | What it does |
 |---|---|---|
 | `name` | `"default"` | Cluster name. Nodes announcing another name are ignored. |
@@ -492,7 +483,6 @@ See [CLUSTER.md](CLUSTER.md) for the model.
 | `join` | `[]` | Seed URLs of peers. Discovery adds to the list. A node routes and plans only when this list is not empty. |
 | `gossip_interval_ms` | `1000` | How often peers exchange state. |
 | `min_speedup` | `1.15` | Predicted speedup below which a request is not handed over. |
-<!-- site: end -->
 
 ## Command line and environment
 
@@ -507,7 +497,6 @@ The options of `lokend serve` are in [Building](BUILDING.md#daemon-options).
 
 ## Build features
 
-<!-- site: widget table id=config-build-features -->
 | Feature | Default | What it adds |
 |---|---|---|
 | `cuda`, `opencl` | on | The device backends. |
@@ -516,4 +505,3 @@ The options of `lokend serve` are in [Building](BUILDING.md#daemon-options).
 | `vulkan` | off | Decoder layers on Vulkan GPUs that no other runtime of the build drives, a mixture's experts included. A build with `vulkan` and without `cuda` and `rocm` drives every GPU. See [Building](BUILDING.md#vulkan-cards). |
 | `metrics` | off | `GET /metrics` in OpenMetrics, behind the same authentication as every other route. |
 | `cpu` | off | Language models on the host only. |
-<!-- site: end -->

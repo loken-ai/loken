@@ -2,14 +2,12 @@
 
 ## Formats and stores
 
-<!-- site: widget table id=models-stores -->
 | Store | Layout | Formats | Named as |
 |---|---|---|---|
 | Ollama | `manifests/` and `blobs/` under `ollama_models_dir` | GGUF, with the template, system prompt and parameters of the manifest | `name:tag`, as in `qwen3:0.6b` |
 | Hugging Face | The cache layout under `huggingface_models_dir`, or its `hub/` subdirectory | safetensors, and the `.pth` archives some media families ship | `owner/repo`, as in `Qwen/Qwen3-0.6B` |
 | Bare file | A GGUF at the root of the Hugging Face store | GGUF | Its file name, with or without a tag |
 | Piper voice | `piper/<voice>/` beside the Hugging Face store, outside its `hub/` | `<voice>.onnx` and its `<voice>.onnx.json` | `piper/<voice>` |
-<!-- site: end -->
 
 | Command | Effect |
 |---|---|
@@ -32,7 +30,6 @@ Quantisations are read as the file carries them.
 On a card, the block formats run through their own kernels.  
 On the host, they need AVX2 (see [Building](BUILDING.md)).
 
-<!-- site: widget table id=models-tensor-formats -->
 | Tensor formats a GGUF may carry | |
 |---|---|
 | Float | `F32`, `F16`, `BF16` |
@@ -40,7 +37,6 @@ On the host, they need AVX2 (see [Building](BUILDING.md)).
 | K-quants | `Q2_K`, `Q3_K`, `Q4_K`, `Q5_K`, `Q6_K`, `Q8_K` |
 | Codebook | `IQ2_XXS`, `IQ2_S`, `IQ3_XXS`, `IQ3_S`, `IQ4_NL`, `IQ4_XS`, `Q2_0` |
 | Others | `MXFP4`, `I8` (raw bytes, the fp8 engram rows and their scales) |
-<!-- site: end -->
 
 The codebook formats run on a card for the experts, in decode and prefill.  
 On the host, they run through integer dot products that need AVX2.
@@ -207,7 +203,6 @@ At load, the loader:
 
 1 generic transformer reads its shape from the checkpoint, so a family is a row.
 
-<!-- site: widget table id=models-architectures -->
 | Line | Architectures as the GGUF header declares them |
 |---|---|
 | Llama and its distils | `llama`, `mistral`, `mistral3`, `yi`, `falcon`, `falcon3`, `internlm2`, `stablelm` |
@@ -218,7 +213,6 @@ At load, the loader:
 | OLMo | `olmo2`, `olmoe` |
 | Others | `gptoss`, `lfm2`, `lfm2moe`, `nemotron_h_moe`, `smollm3`, `starcoder`, `starcoder2`, `glm4`, `chatglm`, `ernie4_5`, `dbrx`, `glm_moe_dsa`, `mpt`, `orion` |
 | DeepSeek V4.1 | `deepseek41`, and `deepseek_v41` for the files loken wrote before |
-<!-- site: end -->
 
 Mixtures route their experts on the card.
 When the model does not fit, only the experts spill.
@@ -396,7 +390,6 @@ A rebuilt stack goes in the conversion ledger, and the load log sums the ledger.
 
 The generic transformer reads the architecture from the file.
 
-<!-- site: widget table id=models-qwen4exp-elements -->
 | Element | Read from the file |
 |---|---|
 | Wide residual (hyper-connections) | The stream count and the low-rank width, with the mixers that replace the layer norms and the output mixer. Mixers and tables stored in BF16 or a block format are read as stored |
@@ -404,17 +397,14 @@ The generic transformer reads the architecture from the file.
 | Indexed attention | The indexer's head count, key length and top-k, and the per-layer compress ratio |
 | Experts | Routed and used counts, expert width, a shared expert with a scalar gate. 160, 256 and 512 routed experts have been loaded |
 | N-gram table | 1 table at the layer `ple.layers` names, 16 heads over bigrams and trigrams. It is read by row from the mapping and never staged on a card |
-<!-- site: end -->
 
 The files measured all load through the generic route:
 
-<!-- site: widget table id=models-qwen4exp-files -->
 | File | Experts | Parts | Size |
 |---|---|---|---|
 | Q4_K_M | 160 | 1 | 28.4 GB |
 | IQ1_M | 256 | 2 | 58.4 GB, 28.8 GB of it the n-gram table |
 | UD-Q4_K_XL | 512 | 4 | 111 GB |
-<!-- site: end -->
 
 The experts stay in the file's mapping.
 
@@ -431,7 +421,6 @@ The `model` of an image request names a checkpoint: a repository id, its name wi
 The checkpoint's own files say which family it is: the diffusers `_class_name` of `model_index.json` or of its denoiser, else the names of its tensors.
 A loader that lacks a file says which one it looked for.
 
-<!-- site: widget table id=models-image -->
 | Family | Declared by | Files |
 |---|---|---|
 | FLUX.1 | `FluxPipeline`, `FluxTransformer2DModel` | `black-forest-labs/FLUX.1-schnell`, with the T5 and CLIP encoders it references |
@@ -440,7 +429,6 @@ A loader that lacks a file says which one it looked for.
 | Qwen-Image | `QwenImagePipeline`, `QwenImageTransformer2DModel` | The Qwen-Image checkpoint and its text encoder |
 | SDXL | `StableDiffusionXLPipeline`, or the tensor names of a single file | An SDXL checkpoint in safetensors, adapters through `/v1/loras` |
 | Boogu | The tensor names of its file | The Boogu checkpoint |
-<!-- site: end -->
 
 An SDXL checkpoint's UNet and text towers are held in the float format it stores.
 Its VAE is held in F32.
@@ -455,7 +443,6 @@ The hash depends on the placement, see [Status](STATUS.md).
 
 ## Audio
 
-<!-- site: widget table id=models-audio -->
 | Task | Family | `model` |
 |---|---|---|
 | Transcription | Whisper | `whisper-1`, `whisper-small`, `whisper-medium`, `whisper-large-v3`, and distil checkpoints in safetensors by their repository. A CTranslate2 conversion is refused |
@@ -466,7 +453,6 @@ The hash depends on the placement, see [Status](STATUS.md).
 | Music | ACE-Step, Stable Audio | `acestep`, `stable-audio` |
 | Sound effects | EzAudio | `ezaudio` |
 | Separation | Mel-Band RoFormer | `/v1/audio/separate` |
-<!-- site: end -->
 
 The OpenAI voice names (`alloy`, `echo`, `fable`, `onyx` and the rest) are accepted and mapped.
 `GET /v1/audio/voices` lists what the resident model offers.
@@ -496,12 +482,10 @@ The same request without `seed` gives the same audio.
 A forecaster answers `POST /v1/forecast` (see [API](API.md)) and is named by its repository.
 Its configuration says which network it is.
 
-<!-- site: widget table id=models-forecasters -->
 | Family | Repositories | Reads | Horizon |
 |---|---|---|---|
 | Chronos-2 | `autogluon/chronos-2-small` and the other sizes | 1 series | What 1 pass answers |
 | Timestral | `mistralai/Timestral-5M`, `-28M`, `-123M`, `-209M` | 1 series, past and known covariates, numeric or categorical | Up to the context length, 1,024 steps per block |
-<!-- site: end -->
 
 A Timestral forecast reads the last 32,768 points and answers 21 quantile levels, 0.01 to 0.99.
 A horizon longer than 1 block is decoded block by block, each block's median read back as context.

@@ -11,7 +11,6 @@ With `[server] require_auth` on, every route needs a key, as `Authorization: Bea
 
 ## Ollama surface
 
-<!-- site: widget table id=api-ollama -->
 | Route | What it does |
 |---|---|
 | `GET /` | Liveness, as Ollama answers it. |
@@ -29,13 +28,11 @@ With `[server] require_auth` on, every route needs a key, as `Authorization: Bea
 | `POST /api/generate` | Completion. Renders `system` and `template`, takes `suffix`, `images`, `logprobs` and `top_logprobs`, returns `context`. The images go before the prompt, as on `/api/chat`. A package with no template layer gets the prompt as given, as in Ollama. |
 | `POST /api/embed` | Embeddings. Honours `dimensions` and `truncate`. |
 | `POST /api/embeddings` | The legacy 1-prompt shape. |
-<!-- site: end -->
 
 ## OpenAI surface
 
 ### Language
 
-<!-- site: widget table id=api-openai-language -->
 | Route | What it does |
 |---|---|
 | `POST /v1/chat/completions`, `POST /api/chat/completions` | Chat. Takes content parts, images, `input_audio` parts, `tools`, `tool_choice`, `parallel_tool_calls`, `response_format`, `reasoning_effort`, `n`, `logprobs`, `top_logprobs`, `logit_bias`, `max_completion_tokens` and [vLLM's extensions](#vllms-extensions). An `input_audio` part is `{"type": "input_audio", "input_audio": {"data": "<base64>", "format": "wav"}}`, in any container the server decodes, for a model with the `audio` capability. A `video_url` part is `{"type": "video_url", "video_url": {"url": "data:video/mp4;base64,..."}}`, in any container `ffmpeg` reads, for a vision model that reads video. `ffmpeg` and `ffprobe` must be on the PATH. A remote URL answers 400. Returns `reasoning_content` apart from `content`, and `finish_reason`. `usage` carries the reasoning tokens, `accepted_prediction_tokens`, `rejected_prediction_tokens` and the [`loken` object](#per-request-figures). A stop sequence is not part of the text. |
@@ -55,7 +52,6 @@ With `[server] require_auth` on, every route needs a key, as `Authorization: Bea
 | `GET /v1/models` | The models on this machine with `max_model_len`, the widest window each takes, then the peers' models with the holder as `owned_by`. A request is served with the window its prompt and `max_tokens` need, up to that limit, and a window that must grow at least doubles. Answers in the Messages API's shape to a client sending its version header. |
 | `GET /v1/models/{id}`, `DELETE /v1/models/{id}` | 1 model. Ids may contain slashes. |
 | `POST /v1/moderations` | Category scores from the configured classifier, with the family's own labels under `hazards`. 501 until `moderation_model` is set. |
-<!-- site: end -->
 
 ### Prompt embeddings
 
@@ -125,7 +121,6 @@ Anything else is refused: compressed or big-endian archives, torch's legacy form
 
 `/v1/completions` and `/v1/chat/completions` read the fields vLLM's server adds to OpenAI's.
 
-<!-- site: widget table id=api-vllm-fields -->
 | Field | What it does |
 |---|---|
 | `repetition_penalty` | Multiplicative penalty, in (0, 4], on every token already in the prompt and the answer. Wins over `frequency_penalty` and `presence_penalty`. |
@@ -148,7 +143,6 @@ Anything else is refused: compressed or big-endian archives, torch's legacy form
 | `continue_final_message` (chat) | The answer continues the final assistant message instead of opening a new turn. |
 | `chat_template_kwargs`, `documents` (chat) | Variables handed to the model's template. `enable_thinking` is also the thinking preference. |
 | `include_reasoning` (chat) | `false` leaves the reasoning out of the answer. |
-<!-- site: end -->
 
 These fields decode 1 token per step, without prompt-lookup drafts, captured graphs or prefix reuse:
 
@@ -196,18 +190,15 @@ It always runs to `max_tokens`.
 
 ### Files and batches
 
-<!-- site: widget table id=api-files-batches -->
 | Route | What it does |
 |---|---|
 | `POST /v1/files`, `GET /v1/files` | Upload and list. `GET`, `DELETE /v1/files/{id}` and `GET /v1/files/{id}/content` read 1 file. |
 | `POST /v1/batches`, `GET /v1/batches` | Run a JSONL of requests through the handlers a client would call, with answers written to an output file. `GET /v1/batches/{id}` and `POST /v1/batches/{id}/cancel` follow 1 batch. |
-<!-- site: end -->
 
 ### Media
 
 A route in the Feature column exists when its Cargo feature is compiled.
 
-<!-- site: widget table id=api-media -->
 | Route | Feature | What it does |
 |---|---|---|
 | `POST /v1/audio/transcriptions`, `POST /v1/audio/translations` | `audio` | Speech to text. |
@@ -226,7 +217,6 @@ A route in the Feature column exists when its Cargo feature is compiled.
 | `POST /v1/video/generations` | `video` | Text- and image-conditioned clips. |
 | `POST /api/video/plan` | `video` | What a clip of a given length will cost, before rendering it. |
 | `GET /v1/renders`, `POST /v1/renders/{id}/cancel` | none | Renders in flight of the calling key, and cancelling 1. See [Naming a render](#naming-a-render). |
-<!-- site: end -->
 
 ### Speech requests
 
@@ -382,14 +372,12 @@ A request past 1 of them is answered 400 naming the cap and the value it carried
 
 ## Messages API surface
 
-<!-- site: widget table id=api-messages -->
 | Route | What it does |
 |---|---|
 | `POST /v1/messages` | Messages. Takes content blocks and images, `tools`, `tool_choice`, `disable_parallel_tool_use`, `thinking` (its `budget_tokens` closes the reasoning once spent), `output_format`, `top_k`, `seed`, `stop_sequences`. `max_tokens` is required. Returns a thinking block before the text, `stop_reason` with the sequence matched, and cache counts and the [`loken` object](#per-request-figures) in `usage`. Streams as the official event stream, with `error` events. |
 | `POST /v1/messages/count_tokens` | Count the prompt with the model's own tokenizer. |
 | `POST /v1/messages/batches`, `GET /v1/messages/batches`, `GET /v1/messages/batches/{id}` | Batches in the Messages API's shape. |
 | `POST /v1/messages/batches/{id}/cancel`, `GET /v1/messages/batches/{id}/results` | Stop 1 batch, and serve its JSONL. |
-<!-- site: end -->
 
 A 401, 429 or 404 under `/v1/messages` carries the Messages API envelope.
 The request id comes back in the `request-id` header.
@@ -472,7 +460,6 @@ A chat answer on `/v1/chat/completions` and `/v1/messages` reports its own figur
 }
 ```
 
-<!-- site: widget table id=api-loken-fields -->
 | Field | Meaning |
 |---|---|
 | `queue_ms` | From the request's arrival at the model to the start of its prompt. |
@@ -485,7 +472,6 @@ A chat answer on `/v1/chat/completions` and `/v1/messages` reports its own figur
 | `energy.share` | `alone` when no other request was active during the request, `work` when others were. |
 | `kv.used_tokens` | The request's sequence in the KV cache when it ended. |
 | `kv.capacity_tokens` | The tokens the cache of the loaded model holds. |
-<!-- site: end -->
 
 The energy meter is read at every start and end of a request.
 Each reading between 2 of them is split among the requests active over it, by the tokens each computed over it (prompt read and answer generated).
@@ -529,7 +515,6 @@ A client that follows the SSE specification ignores comment lines.
 
 ## Server, models and cluster
 
-<!-- site: widget table id=api-server -->
 | Route | What it does |
 |---|---|
 | `GET /health` | `status`, `service`, `version`, `time`, `uptime_seconds`, `loaded_models` and `loaded` (count of language models, and whether image, audio and tts are warm). Exempt from authentication, as is `GET` or `POST /ping` (an empty 200, for SageMaker and vLLM clients). |
@@ -554,4 +539,3 @@ A client that follows the SSE specification ignores comment lines.
 | `POST /api/cluster/measure` | Measure what a layer of `model` costs on this node and publish it. A head asks a peer with no cost for the model before it plans the cut of a dense model. |
 | `POST /api/cluster/prefill` | Read a `prompt` for a peer serving the same model and answer its KV cache as `application/octet-stream`. A node that accepts `application/vnd.loken.prefill-stream` gets the reading as it goes, then the KV cache. |
 | `POST /api/cluster/prefix` | How much of a prompt this node already holds in its KV. |
-<!-- site: end -->
