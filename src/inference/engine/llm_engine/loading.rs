@@ -448,6 +448,8 @@ impl LlmEngine {
         let user_context_length = self.config.context_length;
         let model_state = self.model_state.clone();
         let cached_model_size = self.cached_model_size.clone();
+        let listing = self.listing.clone();
+        let configured_window = self.config.context_length;
         let planned_kv = self.planned_kv.clone();
         planned_kv.store(0, std::sync::atomic::Ordering::Relaxed);
         let model_id_clone = model_id.clone(); // Clone for the closure
@@ -507,6 +509,8 @@ impl LlmEngine {
                 let mut guard = model_state.blocking_lock();
                 crate::inference::place::vram_manager::residency_changed();
                 *guard = Some(state);
+                *listing.lock().unwrap_or_else(|e| e.into_inner()) =
+                    super::query::ModelListing::of(guard.as_ref(), configured_window);
                 drop(guard);
                 let mut size_guard = cached_model_size.blocking_lock();
                 *size_guard = fsz;
@@ -1718,6 +1722,8 @@ impl LlmEngine {
             if let Some(st) = guard.as_mut() {
                 ready_for_requests(st.model.as_mut(), &st.device, warmup);
             }
+            *listing.lock().unwrap_or_else(|e| e.into_inner()) =
+                super::query::ModelListing::of(guard.as_ref(), configured_window);
             drop(guard);  // Release lock early
 
             // Cache file_size for non-blocking stats queries

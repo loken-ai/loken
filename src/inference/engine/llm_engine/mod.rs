@@ -235,6 +235,8 @@ pub struct LlmEngine {
     state_cache: Option<Arc<crate::inference::cache::state_disk::StateStore>>,
     last_error: Arc<Mutex<Option<String>>>,
     cached_model_size: Arc<Mutex<u64>>,
+    /// What the listings report of the loaded model, kept from its last reading.
+    listing: Arc<std::sync::Mutex<query::ModelListing>>,
     /// Session-persistent KV cache tracking. A single model has a single live
     /// KV cache, so only one session can be "resident" at a time - the map
     /// acts as a lookup (is the current cache yours?). When session_id
@@ -281,6 +283,7 @@ impl InferenceEngine for LlmEngine {
             state_cache: None,
             last_error: Arc::new(Mutex::new(None)),
             cached_model_size: Arc::new(Mutex::new(0)),
+            listing: Default::default(),
             sessions: Arc::new(Mutex::new(HashMap::new())),
             last_stream_stats: Arc::new(std::sync::Mutex::new(None)),
             embedding_model: Arc::new(Mutex::new(None)),
@@ -341,6 +344,7 @@ impl LlmEngine {
             draft_engine: Arc::new(Mutex::new(None)),
             last_error: Arc::new(Mutex::new(None)),
             cached_model_size: Arc::new(Mutex::new(0)),
+            listing: Default::default(),
             sessions: Arc::new(Mutex::new(HashMap::new())),
             last_stream_stats: Arc::new(std::sync::Mutex::new(None)),
             embedding_model: Arc::new(Mutex::new(None)),
@@ -1053,21 +1057,16 @@ impl LlmEngine {
     }
 
     /// The context the loaded model is served with, `None` with no model loaded.
+    /// It never waits for a request: see [`Self::listing`].
     pub async fn context_window(&self) -> Option<usize> {
-        let guard = self.model_state.lock().await;
-        let state = guard.as_ref()?;
-        Some(params::effective_kv_window(
-            state.context_length,
-            self.config.context_length,
-            None,
-        ))
+        self.listing().context_window
     }
 
     /// The formats the loaded model's per-layer projections run in, `None` with no model loaded
     /// or a model that does not say.
+    /// It never waits for a request: see [`Self::listing`].
     pub async fn running_format(&self) -> Option<String> {
-        let guard = self.model_state.lock().await;
-        guard.as_ref()?.model.running_format()
+        self.listing().running_format
     }
 
     /// The loaded model's tokens for `text` and each token's text: the special tokens added

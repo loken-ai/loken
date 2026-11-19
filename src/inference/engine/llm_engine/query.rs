@@ -341,65 +341,43 @@ impl LlmEngine {
         }
     }
 
-    /// Get device name
+    /// The name of the loaded model's base device: "cuda" or "cpu".
     pub async fn get_device_name(&self) -> String {
-        let state = self.model_state.lock().await;
-        match state.as_ref() {
-            Some(s) => {
-                if s.device.is_cuda() {
-                    "cuda".to_string()
-                } else {
-                    "cpu".to_string()
-                }
-            }
-            None => "cpu".to_string(),
+        if self.listing().on_cuda {
+            "cuda".to_string()
+        } else {
+            "cpu".to_string()
         }
     }
 
-    /// Get GPU portion size for multi-device models (for PROCESSOR field calculation)
-    /// Returns the portion of model size that's on GPU (CUDA + OpenCL combined)
+    /// The portion of the model size whose layers run on a card, for the PROCESSOR field.
     pub async fn get_gpu_portion_size(&self) -> u64 {
-        let state = self.model_state.lock().await;
-        let Some(s) = state.as_ref() else {
-            return 0;
-        };
-        // What a client reads as the split between card and host, so it has to come from
-        // where the LAYERS are and not from the base device. A model spread over several
-        // cards keeps a CPU base device - that is how the hetero placement addresses the
-        // host side - so asking the base device answers "entirely on the host" for a model
-        // that is entirely on two cards, and every reader of `size_vram` is told the
-        // opposite of the truth.
-        let segs = s.model.device_layer_distribution();
-        if segs.is_empty() {
-            // A variant that publishes no map: the base device is all there is to go on.
-            return if s.device.is_cuda() { s.file_size } else { 0 };
-        }
-        // Counted over the layers that reached a card, NOT summed over segments: a
-        // tensor-parallel model publishes every card across the WHOLE layer range, because
-        // each one holds a slice of every layer. Adding those segments up would report a
-        // model twice its own size. A layer is on the GPU or it is not, so the question is
-        // how many distinct layers are, and each is counted once.
-        let mut on_gpu = vec![false; s.num_layers];
-        for (dtype, _, start, end) in &segs {
-            if dtype == "CPU" {
-                continue;
-            }
-            for layer in (*start as usize)..=(*end as usize).min(s.num_layers.saturating_sub(1)) {
-                on_gpu[layer] = true;
-            }
-        }
-        let n = on_gpu.iter().filter(|held| **held).count() as u64;
-        // Apportioned by layer count, the same way the topology view apportions it - the
-        // two must not answer differently about one model.
-        s.file_size.saturating_mul(n) / (s.num_layers.max(1)) as u64
+        self.listing().gpu_portion
     }
 
     /// Get model size in bytes (actual GGUF file size)
     pub async fn get_model_size(&self) -> u64 {
-        let state = self.model_state.lock().await;
-        match state.as_ref() {
-            Some(model) => model.file_size,
-            None => 0,
+        self.listing().file_size
+    }
+
+    /// What the listings report of the loaded model.
+    ///
+    /// The figures are read from the model when no request holds it, and kept.
+    /// While a request holds it, the figures kept from the last reading are returned.
+    /// A listing never waits for a request.
+    pub(crate) fn listing(&self) -> ModelListing {
+        match self.model_state.try_lock() {
+            Ok(guard) => {
+                let listing = ModelListing::of(guard.as_ref(), self.config.context_length);
+                drop(guard);
+                *self.listing.lock().unwrap_or_else(|e| e.into_inner()) = listing.clone();
+                listing
+            }
+            Err(_) => self
+                .listing
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone(),
         }
     }
 
@@ -423,64 +401,136 @@ impl LlmEngine {
     pub async fn get_layer_distribution(
         &self,
     ) -> Option<(usize, Vec<crate::api::LayerDistribution>)> {
-        use crate::api::LayerDistribution;
-        let state = self.model_state.lock().await;
-        state.as_ref().map(|s| {
-            let total = s.num_layers;
-            // A streamed placement keeps the weights every token reads, and as many routed
-            // experts as fit, resident on the cards, and streams the rest from the host. Its
-            // layers have no fixed device, so the honest report is the bytes resident on each
-            // card - not a layer map that reads as the whole model living on the CPU. The host
-            // remainder is left off: naming it as a device holding layers is what produced the
-            // "everything on the CPU" misread in the first place.
-            if let Some(cards) = s.model.card_residency() {
-                if !cards.is_empty() {
-                    let last = (total.saturating_sub(1)) as u32;
-                    let distributions: Vec<LayerDistribution> = cards
-                        .into_iter()
-                        .map(|(ordinal, bytes)| {
-                            LayerDistribution::new("CUDA".to_string(), ordinal, 0, last, bytes)
-                        })
-                        .collect();
-                    return (total, distributions);
-                }
-            }
-            // Prefer the model's REAL per-layer device map (the multi-GPU /
-            // CPU hetero split). Previously this reported EVERY layer on the
-            // primary device (`s.device`), so the GUI topology showed a
-            // 2-GPU model entirely on GPU0 - the long-standing bug.
-            // Placement comes from the plan, not from the model type: GenericHetero,
-            // the tensor-parallel path and DeepSeek each read back the device their
-            // layers were loaded onto. A variant with no map at all falls through to the single-entry
-            // heuristic below.
-            let segs: Vec<(String, usize, u32, u32)> = s.model.device_layer_distribution();
-            let distributions: Vec<LayerDistribution> = if segs.is_empty() {
-                // Fallback (non-GenericHetero variants): single entry on the
-                // primary device, as before.
-                let dtype = if s.device.is_cuda() { "CUDA" } else { "CPU" };
-                vec![LayerDistribution::new(
-                    dtype.to_string(),
-                    0,
-                    0,
-                    (total.saturating_sub(1)) as u32,
-                    s.file_size,
-                )]
-            } else {
-                // Apportion the model's on-disk size across segments by layer
-                // count (approximate - ignores embed/lm-head weight - but a
-                // faithful device MAP, which is what the topology view needs).
-                let total_layers = (total.max(1)) as u64;
-                segs.into_iter()
-                    .map(|(dtype, did, start, end)| {
-                        let n = (end - start + 1) as u64;
-                        let mem = s.file_size.saturating_mul(n) / total_layers;
-                        LayerDistribution::new(dtype, did, start, end, mem)
-                    })
-                    .collect()
-            };
-            (total, distributions)
-        })
+        self.listing().layers
     }
+}
+
+/// What the listings report of a loaded model, read from it while no request holds it.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ModelListing {
+    pub(crate) file_size: u64,
+    /// The context the model is served with, `None` with no model loaded.
+    pub(crate) context_window: Option<usize>,
+    /// Whether the base device is a card.
+    pub(crate) on_cuda: bool,
+    /// The bytes of the layers that run on a card.
+    pub(crate) gpu_portion: u64,
+    /// The formats the per-layer projections run in.
+    pub(crate) running_format: Option<String>,
+    /// The layer count and where the layers run.
+    pub(crate) layers: Option<(usize, Vec<crate::api::LayerDistribution>)>,
+}
+
+impl ModelListing {
+    /// The listing of `state`, served with the window `configured` asks for.
+    pub(super) fn of(state: Option<&LoadedModelState>, configured: usize) -> Self {
+        let Some(s) = state else {
+            return Self::default();
+        };
+        Self {
+            file_size: s.file_size,
+            context_window: Some(params::effective_kv_window(
+                s.context_length,
+                configured,
+                None,
+            )),
+            on_cuda: s.device.is_cuda(),
+            gpu_portion: gpu_portion(s),
+            running_format: s.model.running_format(),
+            layers: Some(layer_distribution(s)),
+        }
+    }
+}
+
+/// The portion of the model size whose layers run on a card.
+fn gpu_portion(s: &LoadedModelState) -> u64 {
+    // What a client reads as the split between card and host, so it has to come from
+    // where the LAYERS are and not from the base device. A model spread over several
+    // cards keeps a CPU base device - that is how the hetero placement addresses the
+    // host side - so asking the base device answers "entirely on the host" for a model
+    // that is entirely on two cards, and every reader of `size_vram` is told the
+    // opposite of the truth.
+    let segs = s.model.device_layer_distribution();
+    if segs.is_empty() {
+        // A variant that publishes no map: the base device is all there is to go on.
+        return if s.device.is_cuda() { s.file_size } else { 0 };
+    }
+    // Counted over the layers that reached a card, NOT summed over segments: a
+    // tensor-parallel model publishes every card across the WHOLE layer range, because
+    // each one holds a slice of every layer. Adding those segments up would report a
+    // model twice its own size. A layer is on the GPU or it is not, so the question is
+    // how many distinct layers are, and each is counted once.
+    let mut on_gpu = vec![false; s.num_layers];
+    for (dtype, _, start, end) in &segs {
+        if dtype == "CPU" {
+            continue;
+        }
+        for layer in (*start as usize)..=(*end as usize).min(s.num_layers.saturating_sub(1)) {
+            on_gpu[layer] = true;
+        }
+    }
+    let n = on_gpu.iter().filter(|held| **held).count() as u64;
+    // Apportioned by layer count, the same way the topology view apportions it - the
+    // two must not answer differently about one model.
+    s.file_size.saturating_mul(n) / (s.num_layers.max(1)) as u64
+}
+
+/// The layer count of `s` and where its layers run.
+fn layer_distribution(s: &LoadedModelState) -> (usize, Vec<crate::api::LayerDistribution>) {
+    use crate::api::LayerDistribution;
+    let total = s.num_layers;
+    // A streamed placement keeps the weights every token reads, and as many routed
+    // experts as fit, resident on the cards, and streams the rest from the host. Its
+    // layers have no fixed device, so the honest report is the bytes resident on each
+    // card - not a layer map that reads as the whole model living on the CPU. The host
+    // remainder is left off: naming it as a device holding layers is what produced the
+    // "everything on the CPU" misread in the first place.
+    if let Some(cards) = s.model.card_residency() {
+        if !cards.is_empty() {
+            let last = (total.saturating_sub(1)) as u32;
+            let distributions: Vec<LayerDistribution> = cards
+                .into_iter()
+                .map(|(ordinal, bytes)| {
+                    LayerDistribution::new("CUDA".to_string(), ordinal, 0, last, bytes)
+                })
+                .collect();
+            return (total, distributions);
+        }
+    }
+    // Prefer the model's REAL per-layer device map (the multi-GPU /
+    // CPU hetero split). Previously this reported EVERY layer on the
+    // primary device (`s.device`), so the GUI topology showed a
+    // 2-GPU model entirely on GPU0 - the long-standing bug.
+    // Placement comes from the plan, not from the model type: GenericHetero,
+    // the tensor-parallel path and DeepSeek each read back the device their
+    // layers were loaded onto. A variant with no map at all falls through to the single-entry
+    // heuristic below.
+    let segs: Vec<(String, usize, u32, u32)> = s.model.device_layer_distribution();
+    let distributions: Vec<LayerDistribution> = if segs.is_empty() {
+        // Fallback (non-GenericHetero variants): single entry on the
+        // primary device, as before.
+        let dtype = if s.device.is_cuda() { "CUDA" } else { "CPU" };
+        vec![LayerDistribution::new(
+            dtype.to_string(),
+            0,
+            0,
+            (total.saturating_sub(1)) as u32,
+            s.file_size,
+        )]
+    } else {
+        // Apportion the model's on-disk size across segments by layer
+        // count (approximate - ignores embed/lm-head weight - but a
+        // faithful device MAP, which is what the topology view needs).
+        let total_layers = (total.max(1)) as u64;
+        segs.into_iter()
+            .map(|(dtype, did, start, end)| {
+                let n = (end - start + 1) as u64;
+                let mem = s.file_size.saturating_mul(n) / total_layers;
+                LayerDistribution::new(dtype, did, start, end, mem)
+            })
+            .collect()
+    };
+    (total, distributions)
 }
 
 /// The bytes of each layer `blk.i` of a file, its tensors summed.

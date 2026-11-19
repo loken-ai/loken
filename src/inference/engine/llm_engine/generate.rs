@@ -17,6 +17,7 @@ impl LlmEngine {
             info!("🔌 Unloading model: {}", model.name);
             crate::inference::place::vram_manager::residency_changed();
         }
+        *self.listing.lock().unwrap_or_else(|e| e.into_inner()) = Default::default();
         self.dual_encoder
             .lock()
             .unwrap_or_else(|e| e.into_inner())

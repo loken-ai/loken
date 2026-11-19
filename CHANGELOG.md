@@ -6,6 +6,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Fixed
 
+- API: list the running models at once while a request generates.
 - Serving: stop reading a prompt once its client has gone.
 
 ## [0.5.2] - 2026-11-19

@@ -297,6 +297,36 @@ async fn a_slow_prompt_is_reported_as_it_is_read() {
     );
 }
 
+/// The running models are listed at once while a request holds its model, with the figures
+/// the model was listed with before it.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_running_models_are_listed_during_a_request() {
+    let _one = ROUTES.lock().await;
+    let (state, dir, vocab) = server_with_tiny_model().await;
+    let listed = |state: APIServer| async move {
+        let Json(ps) = ollama_ps(State(state)).await.unwrap();
+        let m = &ps.models[0];
+        (m.size, m.size_vram, m.context_length)
+    };
+    let idle = listed(state.clone()).await;
+    assert!(idle.0 > 0 && idle.2 > 0, "{idle:?}");
+    // The request holds its model for this long before its prompt is read.
+    let held = PREFILL_REPORT_PERIOD * 8;
+    crate::request_metrics::PREFILL_PAUSE_MS.store(held.as_millis() as u64, Ordering::Relaxed);
+    let response = openai(&state, LONG_PROMPT_WORDS, vocab, true).await;
+    let mut body = response.into_body().into_data_stream();
+    let mut seen = String::new();
+    while !seen.contains(PREFILL_COMMENT) {
+        let frame = futures::StreamExt::next(&mut body).await.unwrap().unwrap();
+        seen.push_str(&String::from_utf8_lossy(&frame));
+    }
+    let busy = tokio::time::timeout(held / 4, listed(state.clone())).await;
+    crate::request_metrics::PREFILL_PAUSE_MS.store(0, Ordering::Relaxed);
+    drop(body);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(busy.expect("the listing waited for the request"), idle);
+}
+
 /// Reads `response` until its first prefill comment line, then drops it as a client that goes
 /// away does.
 async fn leave_while_reading(response: Response) {

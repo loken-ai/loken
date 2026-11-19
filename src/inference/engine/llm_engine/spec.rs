@@ -18,6 +18,7 @@ impl LlmEngine {
             state_cache: self.state_cache.clone(),
             last_error: self.last_error.clone(),
             cached_model_size: self.cached_model_size.clone(),
+            listing: self.listing.clone(),
             sessions: self.sessions.clone(),
             last_stream_stats: self.last_stream_stats.clone(),
             embedding_model: self.embedding_model.clone(),
