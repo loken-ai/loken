@@ -539,6 +539,54 @@ async fn a_cache_keeps_the_growth_its_load_planned() {
     .await;
 }
 
+/// T7: a model that serves a request is not unloaded for a model that needs more than the card
+/// has free; its answer is the one it gives alone.
+async fn a_busy_model_stays(total: u64, serving: &str, incoming: &str) {
+    let root = scratch("busy");
+    let shape = Shape::weighing(total / 4, 4096);
+    write_model(&root, serving, shape, 23);
+    let state = server(&root, 0, Default::default());
+    state.ensure_loaded(serving, 5).await.unwrap();
+    state
+        .get_engine(serving)
+        .await
+        .unwrap()
+        .hold_lone_requests_on(false);
+    let first = prompt(64, shape.vocab, 5);
+    let tokens = 4096 - 2 * 64;
+    let alone = answer(&state, serving, first.clone(), tokens).await;
+    write_model(
+        &root,
+        incoming,
+        // More than the card has free, whatever the width rounds to.
+        Shape::weighing(card_free() + total / 4, 2048),
+        31,
+    );
+    let decoding = busy_with(&state, serving, first, tokens).await;
+    state.ensure_loaded(incoming, 5).await.unwrap();
+    assert!(
+        loaded(&state, serving).await,
+        "{serving} was unloaded while it served"
+    );
+    let text = decoding.await.unwrap();
+    assert_eq!(
+        text, alone,
+        "{serving} answered otherwise while {incoming} loaded"
+    );
+    assert!(loaded(&state, serving).await, "{serving} was unloaded");
+    finish(&state, &root).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "fills card 0: run alone"]
+async fn a_model_serving_a_request_is_never_unloaded_for_another() {
+    on_card("busy model", |total| async move {
+        a_busy_model_stays(total, "test/mm-a", "test/mm-b").await;
+        a_busy_model_stays(total, "test/mm-b", "test/mm-a").await;
+    })
+    .await;
+}
+
 /// T8: the pressure one model raised after running out of memory moves its own placements, not
 /// those of a model loaded meanwhile, and that load leaves the escalation as it was.
 async fn pressure_stays_with_its_model(raiser: &str, incoming: &str) {

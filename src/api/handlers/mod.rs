@@ -2776,6 +2776,12 @@ impl APIServer {
             if dir.is_file() {
                 return std::fs::metadata(dir).map(|m| m.len()).unwrap_or(0);
             }
+            // A hub checkpoint: its shards.
+            if let Ok(bytes) = crate::inference::engine::llm_engine::checkpoint_bytes(dir) {
+                if bytes > 0 {
+                    return bytes;
+                }
+            }
         }
         let (name, tag) = match model_id.split_once(':') {
             Some((n, t)) => (n.to_string(), t.to_string()),
@@ -3794,12 +3800,12 @@ mod panic_isolation_gate {
 
 #[cfg(test)]
 mod handover_route_tests;
-#[cfg(test)]
-mod multi_model_tests;
 #[cfg(all(test, feature = "gpu"))]
 mod level_tests;
 #[cfg(test)]
 mod logprob_route_tests;
+#[cfg(test)]
+mod multi_model_tests;
 #[cfg(test)]
 mod request_figures_tests;
 #[cfg(test)]

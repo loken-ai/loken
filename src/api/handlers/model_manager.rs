@@ -1021,8 +1021,9 @@ impl APIServer {
 
     /// Makes room for the `need` bytes the incoming model's weights take (or, for a model larger
     /// than any card, for them across the cards), while no card has it: first what the other
-    /// models keep for their later requests, then the least recently used language models,
-    /// other than `incoming_id`.
+    /// models keep for their later requests, then the least recently used language models that
+    /// serve no request, other than `incoming_id`. A model serving a request is never unloaded:
+    /// the incoming model is placed around it.
     /// Resident models hold weights, KV blocks and pools that would otherwise push the new
     /// model's placement onto the host; as many stay resident as the memory allows.
     ///
@@ -1067,6 +1068,7 @@ impl APIServer {
                 engines
                     .iter()
                     .filter(|e| e.model_id != incoming_id && !tried.contains(&e.model_id))
+                    .filter(|e| !e.busy())
                     .min_by_key(|e| e.last_used.load(Ordering::Relaxed))
                     .map(|e| e.model_id.clone())
             };
