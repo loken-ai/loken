@@ -812,3 +812,34 @@ fn a_store_in_memory_gives_back_its_states_for_a_new_one() {
     );
     assert_eq!(store.stats().0, 0, "every state was given back first");
 }
+
+/// A stored state a card has no room to restore stays stored, and the walk tries no shorter
+/// state; room made once from what the cards keep for later requests lets it restore.
+#[test]
+fn a_state_the_cards_have_no_room_for_stays_stored() {
+    let fx = Fixture::new("restore-oom");
+    let store = open_store(&fx.store_dir());
+    let mut writer = fx.model();
+    attach(&mut writer, &store, b"");
+    let cache = writer.state_cache().unwrap();
+    let text = prompt(3 * BLOCK + 9);
+    let (_, grid) = prefill(&mut writer, &text, 0);
+    cache.save(&writer, &text, grid, None);
+    wait_for_len(&store, text.len());
+    let held = store.stats().0;
+    let mut longer = text.clone();
+    longer.extend(prompt(11));
+    let mut m = fx.model();
+    attach(&mut m, &store, b"");
+    let cache = m.state_cache().unwrap();
+    FORCED_RESTORE_OOM.with(|c| c.set(2));
+    assert_eq!(cache.restore(&mut m, &longer), 0);
+    assert_eq!(
+        FORCED_RESTORE_OOM.with(|c| c.get()),
+        0,
+        "1 try and 1 after room was made"
+    );
+    assert_eq!(store.stats().0, held, "no state was dropped");
+    FORCED_RESTORE_OOM.with(|c| c.set(1));
+    assert_eq!(cache.restore(&mut m, &longer), text.len());
+}

@@ -6,6 +6,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Fixed
 
+- Serving: keep a stored state when a full card cannot restore it.
 - Serving: give back only the oldest stored states when memory runs short.
 - Serving: keep a long prompt's stored states within the host's memory.
 - Placement: keep the room a model's prompts were measured to take on each card.

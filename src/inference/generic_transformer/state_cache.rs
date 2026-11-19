@@ -980,6 +980,8 @@ fn cache_dtype(l: &GenericTransformerLayer) -> Result<u8> {
 
 #[cfg(test)]
 thread_local! {
+    /// Restores on this thread that fail as a card out of memory before they read anything.
+    pub(crate) static FORCED_RESTORE_OOM: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// The reads of a layer's rows `live_rows` made on this thread.
     pub(crate) static LIVE_ROWS_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
@@ -1918,7 +1920,28 @@ impl HybridStateCache {
                 continue;
             }
             let started = std::time::Instant::now();
-            match self.restore_entry(model, &entry, prompt) {
+            let mut restored = self.restore_entry(model, &entry, prompt);
+            if restored
+                .as_ref()
+                .is_err_and(crate::inference::place::ladder::is_out_of_memory)
+            {
+                // The room the restore lacked is taken from what the cards keep for later
+                // requests, once: the conversation states of other prompts, and the pools.
+                model.drop_kv_snapshots_for(u64::MAX);
+                model.hand_back_pools();
+                restored = self.restore_entry(model, &entry, prompt);
+            }
+            match restored {
+                Err(e) if crate::inference::place::ladder::is_out_of_memory(&e) => {
+                    // An intact state that a full card cannot take stays stored; a shorter one
+                    // needs the same room a layer at a time, so none is tried.
+                    tracing::info!(
+                        "state cache: a {}-token state is not restored: the cards have no room \
+                         for it ({e})",
+                        entry.len
+                    );
+                    return 0;
+                }
                 Ok(()) => {
                     let secs = started.elapsed().as_secs_f64();
                     self.store.tuning().restored(bytes, secs);
@@ -1946,6 +1969,10 @@ impl HybridStateCache {
         entry: &Entry,
         prompt: &[u32],
     ) -> AnyResult<()> {
+        #[cfg(test)]
+        if FORCED_RESTORE_OOM.with(|c| c.replace(c.get().saturating_sub(1))) > 0 {
+            bail!("[oom] cuda permute: DriverError(CUDA_ERROR_OUT_OF_MEMORY, \"out of memory\")");
+        }
         let layout = &*self.layout;
         let identity = model.cache_scope.mixed_into(&self.identity);
         let point = decode_manifest(&self.store.read(entry)?, &identity, layout)?;

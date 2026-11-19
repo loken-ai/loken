@@ -3017,6 +3017,28 @@ impl GenericTransformerLayer {
 }
 
 #[cfg(test)]
+mod head_major_tests {
+    use crate::tensor::{Device, Tensor};
+
+    /// Rows put head-major on the host are the rows a card transposed.
+    #[test]
+    fn rows_put_head_major_on_the_host_are_the_rows_a_card_transposed() {
+        let (n, n_kv, hd) = (5, 3, 4);
+        let rows: Vec<f32> = (0..n * n_kv * hd).map(|i| i as f32).collect();
+        let t = Tensor::from_vec(rows.clone(), (1, n, n_kv, hd), &Device::Cpu)
+            .unwrap()
+            .permute((0, 2, 1, 3))
+            .unwrap()
+            .contiguous()
+            .unwrap();
+        assert_eq!(
+            t.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            super::head_major(&rows, n, n_kv, hd)
+        );
+    }
+}
+
+#[cfg(test)]
 mod kv_snapshot_tests {
     use super::snapshot_slot;
 
@@ -3141,6 +3163,19 @@ pub(super) fn layer_snapshot_from_whole_rows(
 /// placed where the layer keeps its KV today. A GPU layer keeps its KV in the spec cache; on
 /// a cold server the buffer is not allocated yet, so a like tensor is built on the layer's
 /// own device in `kv_dtype`.
+/// Rows of `n` positions, token-major `[n, n_kv, hd]`, in head-major order `[n_kv, n, hd]`.
+#[cfg_attr(not(feature = "gpu"), allow(dead_code))]
+fn head_major(rows: &[f32], n: usize, n_kv: usize, hd: usize) -> Vec<f32> {
+    let mut out = Vec::with_capacity(rows.len());
+    for h in 0..n_kv {
+        for t in 0..n {
+            let at = (t * n_kv + h) * hd;
+            out.extend_from_slice(&rows[at..at + hd]);
+        }
+    }
+    out
+}
+
 pub(super) fn layer_snapshot_from_rows(
     l: &GenericTransformerLayer,
     k: &[f32],
@@ -3168,10 +3203,10 @@ pub(super) fn layer_snapshot_from_rows(
     #[cfg(feature = "gpu")]
     if let Some(q) = l.quant_kv.as_ref() {
         let dev = l.cos.device();
+        // The rows are put in the cache's head-major order on the host: the card takes 1 copy
+        // of them, not the copy and its transpose.
         let rows = |r: &[f32]| -> crate::tensor::Result<crate::tensor::Tensor> {
-            crate::tensor::Tensor::from_vec(r.to_vec(), (1, n, n_kv, hd), &dev)?
-                .permute((0, 2, 1, 3))?
-                .contiguous()
+            crate::tensor::Tensor::from_vec(head_major(r, n, n_kv, hd), (1, n_kv, n, hd), &dev)
         };
         let quant = q
             .snapshot_of_rows(&rows(k)?, &rows(v)?)
