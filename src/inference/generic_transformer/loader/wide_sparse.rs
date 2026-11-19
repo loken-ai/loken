@@ -1069,6 +1069,8 @@ impl GenericHeteroTransformer {
             graph_instance: super::super::graph::next_graph_instance(),
             graph_state_groups: None,
             workspace_pre_grown: false,
+            #[cfg(feature = "gpu")]
+            blas_leases: Vec::new(),
             graph_pos: 0,
             kv_snapshots: Vec::new(),
             cache_scope: Default::default(),

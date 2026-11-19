@@ -304,8 +304,52 @@ pub struct CudaDevice {
     pub(super) xfer_event: OnceLock<CudaEvent>,
     /// The graph recording of this card (see `begin_capture`).
     pub(super) recording: Recording,
-    /// The cuBLAS workspace pinned for every handle of the card: device address and bytes.
-    pub(super) blas_workspace: std::sync::Mutex<Option<(u64, usize)>>,
+    /// The cuBLAS workspace pinned for every handle of the card, with the leases that hold it.
+    pub(super) blas_workspace: std::sync::Mutex<Option<BlasPin>>,
+    /// The workspace the card's handle uses while none is pinned, of the size cuBLAS
+    /// recommends, made once: the handle then runs the same algorithms before a pin and after
+    /// the last lease.
+    pub(super) own_blas_workspace: OnceLock<crate::tensor::gpu_runtime::driver::CudaSlice<u8>>,
+}
+
+/// A cuBLAS workspace allocated for a card, freed when the last holder drops it: the card while
+/// a lease holds the pin, and every graph that recorded a call with it.
+pub struct PinnedBlas {
+    ctx: Arc<CudaContext>,
+    ptr: u64,
+    bytes: usize,
+}
+
+impl Drop for PinnedBlas {
+    fn drop(&mut self) {
+        use crate::tensor::gpu_runtime::driver::result::free_sync;
+        if self.ctx.bind_to_thread().is_ok() {
+            let _ = unsafe { free_sync(self.ptr) };
+        }
+    }
+}
+
+/// The workspace a card's handles use, and the bytes each lease on it asked for.
+pub(super) struct BlasPin {
+    buffer: Arc<PinnedBlas>,
+    leases: Vec<usize>,
+    /// The workspaces this one replaced, alive while a graph that recorded them lives.
+    replaced: Vec<std::sync::Weak<PinnedBlas>>,
+}
+
+/// A hold on the cuBLAS workspace pinned on a card.
+/// The card's handles use the workspace while a lease is held.
+/// When the last lease goes, they go back to the workspace they had before, and the card drops
+/// the pinned one.
+pub struct BlasLease {
+    dev: Arc<CudaDevice>,
+    bytes: usize,
+}
+
+impl Drop for BlasLease {
+    fn drop(&mut self) {
+        self.dev.release_blas_lease(self.bytes);
+    }
 }
 
 /// The workspace cuBLAS recommends a caller give a handle: 32 MiB from compute capability 9.0
@@ -586,6 +630,7 @@ impl CudaDevice {
             xfer_event: OnceLock::new(),
             recording: Recording::default(),
             blas_workspace: std::sync::Mutex::new(None),
+            own_blas_workspace: OnceLock::new(),
         });
         // Taken HERE because it can only be taken against a pool with nothing spare,
         // and this is the moment that is true: the device has just been opened and
@@ -824,12 +869,10 @@ impl CudaDevice {
         if cell.get().is_none() {
             let b = crate::tensor::gpu_runtime::cublas::CudaBlas::new(stream.clone())
                 .map_err(|e| cublas_err("init", e))?;
-            let pinned = *self
-                .blas_workspace
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            if let Some((ws, bytes)) = pinned {
-                set_blas_workspace(&b, ws, bytes)?;
+            match self.pinned_blas() {
+                Some((ws, bytes)) => set_blas_workspace(&b, ws, bytes)?,
+                None if std::ptr::eq(cell, &self.blas) => self.own_card_workspace(&b)?,
+                None => {}
             }
             let _ = cell.set(b);
         }
@@ -850,22 +893,10 @@ impl CudaDevice {
         let b = crate::tensor::gpu_runtime::cublas::CudaBlas::new(r.stream.clone())
             .map_err(|e| cublas_err("init", e))?;
         let mut took = before.saturating_sub(free());
-        let pinned = *self
-            .blas_workspace
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        match pinned {
+        match self.pinned_blas() {
             Some((ws, bytes)) => set_blas_workspace(&b, ws, bytes)?,
             None => {
-                use crate::tensor::gpu_runtime::driver::DevicePtr;
-                let bytes = recommended_blas_workspace(self.mmq_device_info()?.cc);
-                let ws = self
-                    .stream
-                    .alloc_zeros::<u8>(bytes)
-                    .map_err(|e| Error(format!("recording cuBLAS workspace: {e}")))?;
-                set_blas_workspace(&b, ws.device_ptr(&self.stream).0, bytes)?;
-                let _ = r.workspace.set(ws);
-                took += bytes as u64;
+                took += self.own_recorder_workspace(r, &b)?;
             }
         }
         let _ = r.blas.set(b);
@@ -875,6 +906,15 @@ impl CudaDevice {
             .bytes
             .fetch_max(took, std::sync::atomic::Ordering::Relaxed);
         Ok(())
+    }
+
+    /// The graph recorders the card made; each lives as long as the card.
+    pub fn recorder_count(&self) -> usize {
+        self.recording
+            .made
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len()
     }
 
     /// The most card memory one graph recorder took when it was made, 0 before one was.
@@ -887,31 +927,190 @@ impl CudaDevice {
 
     /// The bytes of the cuBLAS workspace pinned on the card, 0 when none is.
     pub fn pinned_blas_workspace(&self) -> usize {
+        self.pinned_blas().map_or(0, |(_, bytes)| bytes)
+    }
+
+    /// The address and bytes of the cuBLAS workspace pinned on the card.
+    fn pinned_blas(&self) -> Option<(u64, usize)> {
         self.blas_workspace
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .map_or(0, |(_, bytes)| bytes)
+            .as_ref()
+            .map(|p| (p.buffer.ptr, p.buffer.bytes))
     }
 
-    /// Gives every cuBLAS handle of the card the workspace of `bytes` at `ws`: cuBLAS then
-    /// allocates no workspace of its own, which a graph capture forbids. Both handles share it,
-    /// as everything they queue runs in the order of the card's stream.
-    pub fn pin_blas_workspace(&self, ws: u64, bytes: usize) -> Result<()> {
-        let mut pinned = self
+    /// The cuBLAS workspace pinned on the card, for a graph that records a call with it.
+    pub(super) fn pinned_blas_buffer(&self) -> Option<Arc<dyn std::any::Any + Send + Sync>> {
+        let pin = self
             .blas_workspace
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        *pinned = Some((ws, bytes));
+        pin.as_ref()
+            .map(|p| p.buffer.clone() as Arc<dyn std::any::Any + Send + Sync>)
+    }
+
+    /// Gives the recorder `r`'s handle `b` a workspace of its own, of the size cuBLAS
+    /// recommends, made once. Returns the bytes it allocated.
+    fn own_recorder_workspace(
+        &self,
+        r: &Recorder,
+        b: &crate::tensor::gpu_runtime::cublas::CudaBlas,
+    ) -> Result<u64> {
+        use crate::tensor::gpu_runtime::driver::DevicePtr;
+        let mut took = 0;
+        if r.workspace.get().is_none() {
+            let bytes = recommended_blas_workspace(self.mmq_device_info()?.cc);
+            let ws = self
+                .stream
+                .alloc_zeros::<u8>(bytes)
+                .map_err(|e| Error(format!("recording cuBLAS workspace: {e}")))?;
+            let _ = r.workspace.set(ws);
+            took = bytes as u64;
+        }
+        let ws = r.workspace.get().unwrap();
+        set_blas_workspace(b, ws.device_ptr(&self.stream).0, ws.len())?;
+        Ok(took)
+    }
+
+    /// A lease on a cuBLAS workspace of at least `bytes` for every handle of the card: cuBLAS
+    /// then allocates no workspace of its own, which a graph capture forbids.
+    /// Both handles share it, as everything they queue runs in the order of the card's stream.
+    /// A larger request replaces the workspace; a graph that recorded the smaller one keeps it.
+    pub fn lease_blas_workspace(self: &Arc<Self>, bytes: usize) -> Result<BlasLease> {
+        let mut pin = self
+            .blas_workspace
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if pin.as_ref().is_none_or(|p| p.buffer.bytes < bytes) {
+            let mut next = self.pin_blas(bytes, Vec::new())?;
+            if let Some(old) = pin.take() {
+                next.leases = old.leases;
+                next.replaced = old.replaced;
+                next.replaced.push(Arc::downgrade(&old.buffer));
+            }
+            *pin = Some(next);
+        }
+        if let Some(p) = pin.as_mut() {
+            p.leases.push(bytes);
+        }
+        Ok(BlasLease {
+            dev: self.clone(),
+            bytes,
+        })
+    }
+
+    /// A workspace of `bytes` given to every handle of the card, held by `leases`.
+    fn pin_blas(&self, bytes: usize, leases: Vec<usize>) -> Result<BlasPin> {
+        use crate::tensor::gpu_runtime::driver::result::malloc_sync;
+        self.ctx
+            .bind_to_thread()
+            .map_err(|e| Error(format!("cuBLAS workspace: {e}")))?;
+        let ptr =
+            unsafe { malloc_sync(bytes) }.map_err(|e| Error(format!("cuBLAS workspace: {e}")))?;
+        let buffer = Arc::new(PinnedBlas {
+            ctx: self.ctx.clone(),
+            ptr,
+            bytes,
+        });
+        self.set_blas_everywhere(Some((ptr, bytes)))?;
+        Ok(BlasPin {
+            buffer,
+            leases,
+            replaced: Vec::new(),
+        })
+    }
+
+    /// Ends a lease of `bytes`. The workspace shrinks to the largest lease left, and the last
+    /// lease gives the handles their own workspaces back. The card drops its hold on a
+    /// workspace it no longer uses; a graph that recorded it keeps it.
+    fn release_blas_lease(&self, bytes: usize) {
+        let mut pin = self
+            .blas_workspace
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let Some(p) = pin.as_mut() else {
+            return;
+        };
+        if let Some(i) = p.leases.iter().position(|b| *b == bytes) {
+            p.leases.swap_remove(i);
+        }
+        let largest = p.leases.iter().copied().max();
+        if largest.is_some_and(|l| l >= p.buffer.bytes) {
+            return;
+        }
+        // The calls queued with the workspace run before the card drops it.
+        let _ = self.stream.synchronize();
+        let Some(l) = largest else {
+            match self.set_blas_everywhere(None) {
+                Ok(()) => *pin = None,
+                Err(e) => tracing::warn!("cuBLAS workspace kept on card {}: {e}", self.ordinal),
+            }
+            return;
+        };
+        // A smaller workspace a graph still holds serves again before a new one is made.
+        p.replaced.retain(|w| w.strong_count() > 0);
+        let kept = p
+            .replaced
+            .iter()
+            .filter_map(std::sync::Weak::upgrade)
+            .filter(|b| b.bytes >= l)
+            .min_by_key(|b| b.bytes);
+        let next = match kept {
+            Some(buffer) => self
+                .set_blas_everywhere(Some((buffer.ptr, buffer.bytes)))
+                .map(|()| buffer),
+            None => self.pin_blas(l, Vec::new()).map(|n| n.buffer),
+        };
+        match next {
+            Ok(buffer) => {
+                let old = std::mem::replace(&mut p.buffer, buffer);
+                let now = Arc::as_ptr(&p.buffer);
+                p.replaced.retain(|w| !std::ptr::eq(w.as_ptr(), now));
+                p.replaced.push(Arc::downgrade(&old));
+            }
+            Err(e) => tracing::warn!("cuBLAS workspace kept on card {}: {e}", self.ordinal),
+        }
+    }
+
+    /// Gives the card's handle `b` the card's own workspace, of the size cuBLAS recommends, made
+    /// once.
+    fn own_card_workspace(&self, b: &crate::tensor::gpu_runtime::cublas::CudaBlas) -> Result<()> {
+        use crate::tensor::gpu_runtime::driver::DevicePtr;
+        if self.own_blas_workspace.get().is_none() {
+            let bytes = recommended_blas_workspace(self.mmq_device_info()?.cc);
+            let ws = self
+                .stream
+                .alloc_zeros::<u8>(bytes)
+                .map_err(|e| Error(format!("card cuBLAS workspace: {e}")))?;
+            let _ = self.own_blas_workspace.set(ws);
+        }
+        let ws = self.own_blas_workspace.get().unwrap();
+        set_blas_workspace(b, ws.device_ptr(&self.stream).0, ws.len())
+    }
+
+    /// Gives every cuBLAS handle of the card the workspace `ws`, or, for `None`, each handle its
+    /// own.
+    fn set_blas_everywhere(&self, ws: Option<(u64, usize)>) -> Result<()> {
         if let Some(b) = self.blas.get() {
-            set_blas_workspace(b, ws, bytes)?;
+            match ws {
+                Some((ptr, bytes)) => set_blas_workspace(b, ptr, bytes)?,
+                None => self.own_card_workspace(b)?,
+            }
         }
         let made = self
             .recording
             .made
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        for b in made.iter().filter_map(|r| r.blas.get()) {
-            set_blas_workspace(b, ws, bytes)?;
+        for r in made.iter() {
+            if let Some(b) = r.blas.get() {
+                match ws {
+                    Some((ptr, bytes)) => set_blas_workspace(b, ptr, bytes)?,
+                    None => {
+                        self.own_recorder_workspace(r, b)?;
+                    }
+                }
+            }
         }
         Ok(())
     }

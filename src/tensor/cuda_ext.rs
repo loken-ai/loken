@@ -199,20 +199,18 @@ mod cuda {
         tensor::cuda::end_capture(stream, flags).map_err(msg("end_capture"))
     }
 
-    /// Pin a dedicated cuBLAS workspace of `bytes` for `device`'s handle so
-    /// cuBLAS stops allocating per-call workspaces - required before graph
-    /// capture (in-capture cuBLAS allocs invalidate the capture). Leaks the
-    /// workspace by design (lives for the process).
-    /// A card that holds a pinned workspace of `bytes` or more keeps it.
-    pub fn pin_cublas_workspace(device: &Device, bytes: usize) -> Result<()> {
-        use crate::tensor::gpu_runtime::driver::result::malloc_sync;
-        let cd = device.as_cuda_device()?;
-        if cd.native().pinned_blas_workspace() >= bytes {
-            return Ok(());
-        }
-        let ws = unsafe { malloc_sync(bytes) }.map_err(msg("pin_cublas_workspace/malloc"))?;
-        cd.native().pin_blas_workspace(ws, bytes)?;
-        Ok(())
+    /// A lease on a cuBLAS workspace of at least `bytes` for `device`'s handles, so cuBLAS stops
+    /// allocating per-call workspaces: an allocation inside a capture invalidates it.
+    /// The card frees the workspace once the last lease and the last graph that recorded it
+    /// are gone.
+    pub fn pin_cublas_workspace(
+        device: &Device,
+        bytes: usize,
+    ) -> Result<crate::tensor::cuda::BlasLease> {
+        device
+            .as_cuda_device()?
+            .native()
+            .lease_blas_workspace(bytes)
     }
 
     // -- global CUDA-backend switches --------------------------------------

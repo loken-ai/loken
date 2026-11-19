@@ -1603,6 +1603,8 @@ fn release_card_pool(ordinal: i32) -> u64 {
             {
                 let _ = cuCtxPushCurrent_v2(ctx);
                 let _ = cuCtxSynchronize();
+                // What the recorded graphs reserved beyond what the live ones use goes back too.
+                let _ = crate::tensor::gpu_runtime::driver::sys::cuDeviceGraphMemTrim(ordinal);
                 let mut popped: CUcontext = std::ptr::null_mut();
                 let _ = cuCtxPopCurrent_v2(&mut popped);
                 let _ = cuDevicePrimaryCtxRelease_v2(ordinal);

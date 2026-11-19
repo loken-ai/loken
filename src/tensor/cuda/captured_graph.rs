@@ -321,7 +321,12 @@ pub fn begin_capture(
     let target = dev.take_recording()?;
     let begun = unsafe { result::stream::begin_capture(target.cu_stream(), mode) };
     match begun {
-        Ok(()) => start_recorded(),
+        Ok(()) => {
+            start_recorded();
+            if let Some(ws) = dev.pinned_blas_buffer() {
+                keep_while_recorded(ws);
+            }
+        }
         Err(_) => dev.give_back_recording(),
     }
     begun

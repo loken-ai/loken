@@ -104,6 +104,9 @@ struct GhBatched {
     #[cfg(feature = "gpu")]
     graph_failed: bool,
     pace: StepPace,
+    /// The worker's hold on the card's pinned cuBLAS workspace, given back when it stops.
+    #[cfg(feature = "gpu")]
+    _blas: Option<crate::tensor::cuda::BlasLease>,
     /// The most rows 1 forward of a lone long prompt reads.
     chunk: usize,
     /// The probes of the prompts not read yet, by sequence.
@@ -1258,8 +1261,10 @@ impl ContinuousServer {
         // workspace per call (per-call allocs are pure overhead in the hot loop,
         // and are also required to be absent before any future graph capture).
         #[cfg(feature = "gpu")]
+        let mut blas = None;
+        #[cfg(feature = "gpu")]
         if !cdev.is_cpu() {
-            let _ = crate::tensor::cuda_ext::pin_cublas_workspace(&cdev, 256 << 20);
+            blas = crate::tensor::cuda_ext::pin_cublas_workspace(&cdev, 256 << 20).ok();
             // Disable event tracking: the CB worker is single-stream, so the
             // multi-stream sync events aren't needed - and creating CUDA events
             // during allocations INSIDE a graph capture invalidates the capture
@@ -1279,6 +1284,8 @@ impl ContinuousServer {
             #[cfg(feature = "gpu")]
             graph_failed: false,
             pace: StepPace::default(),
+            #[cfg(feature = "gpu")]
+            _blas: blas,
             chunk: prompt_chunk.max(1),
             probes: HashMap::new(),
         };

@@ -987,17 +987,13 @@ impl GenericHeteroTransformer {
                         );
                     }
                 }
-                // Pin a dedicated cuBLAS workspace on the MODEL's handle so
-                // cuBLAS stops allocating per-call workspaces - an
-                // in-capture cuBLAS alloc invalidates the graph capture
-                // (same reason gptoss pins before its capture). Once per
-                // model (the workspace leaks by design, see
-                // pin_cublas_workspace). update_graph_state only runs on
-                // the graph path, so non-graph models never pay this.
-                if let Err(e) = crate::tensor::cuda_ext::pin_cublas_workspace(cuda_dev, 64 << 20) {
-                    tracing::warn!(
+                // A cuBLAS workspace pinned on the card for as long as the model lives: an
+                // allocation of cuBLAS inside a capture invalidates it.
+                match crate::tensor::cuda_ext::pin_cublas_workspace(cuda_dev, 64 << 20) {
+                    Ok(lease) => self.blas_leases.push(lease),
+                    Err(e) => tracing::warn!(
                         "graph: cuBLAS workspace pin failed (capture may be invalidated): {e}"
-                    );
+                    ),
                 }
             }
         }

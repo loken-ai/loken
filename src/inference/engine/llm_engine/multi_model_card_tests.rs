@@ -309,3 +309,61 @@ async fn graphs_survive_a_neighbours_scratch() {
         .await
         .expect("the watchdog: the test stalled");
 }
+
+/// The card's free memory once its pools gave back their free blocks.
+fn card_free(device: &crate::tensor::Device) -> u64 {
+    if let Ok(cd) = device.as_cuda_device() {
+        let _ = cd.0.stream().synchronize();
+        crate::tensor::cuda::trim_pool(cd.0.ordinal());
+    }
+    crate::inference::place::room::free_now(device).unwrap_or(0)
+}
+
+/// T11 for the model of feed-forward `leaving` batched and unloaded beside the model of
+/// feed-forward `staying`, which holds the card open throughout.
+async fn the_card_comes_back(leaving: usize, staying: usize) {
+    let (leaving_dir, staying_dir) = (model_on_disk(leaving), model_on_disk(staying));
+    let device = crate::tensor::Device::new_cuda(0).unwrap();
+    let stays = loaded(&staying_dir, "stays").await;
+    let _ = answer(&stays, &prompt(1), 2)
+        .await
+        .expect("the staying model answers");
+    let before = card_free(&device);
+    let leaves = loaded(&leaving_dir, "leaves").await;
+    let prompts = [prompt(3), prompt(11)];
+    run(&leaves, &prompts, true)
+        .await
+        .expect("the leaving model answers in its batch worker");
+    leaves.unload().await.unwrap();
+    drop(leaves);
+    let after = card_free(&device);
+    // The recorders a card makes live as long as the card, and a free block is given back
+    // a page at a time.
+    let recorders = device.as_cuda_device().map_or(0, |cd| {
+        cd.0.recorder_bytes() * cd.0.recorder_count() as u64 + cd.0.alloc_shape().0
+    });
+    stays.unload().await.unwrap();
+    let _ = std::fs::remove_dir_all(&leaving_dir);
+    let _ = std::fs::remove_dir_all(&staying_dir);
+    assert!(
+        before.saturating_sub(after) <= recorders,
+        "the card kept {:.1} MB after the model left (recorders and a page {:.1} MB; leaving \
+         {leaving}, staying {staying})",
+        before.saturating_sub(after) as f64 / 1048576.0,
+        recorders as f64 / 1048576.0
+    );
+}
+
+/// T11: what a batched model held on the card comes back when it is unloaded, while another
+/// model keeps the card open.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs a card"]
+async fn the_card_comes_back_after_a_batched_model() {
+    let test = async {
+        the_card_comes_back(NARROW, WIDE).await;
+        the_card_comes_back(WIDE, NARROW).await;
+    };
+    tokio::time::timeout(WATCHDOG, test)
+        .await
+        .expect("the watchdog: the test stalled");
+}

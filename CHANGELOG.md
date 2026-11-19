@@ -15,6 +15,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Fixed
 
+- Serving: give the card back the cuBLAS workspace of a model that leaves.
 - Serving: keep a model's graphs whole while another model shares its card.
 - Serving: give a batch worker the room serial models keep on its card.
 - API: keep tool calls when a message quotes a thinking tag.

@@ -186,6 +186,9 @@ pub struct CfgKv {
     cached: [usize; 2],
     #[cfg(feature = "gpu")]
     graph: Option<DecodeGraph>,
+    /// The hold on the card's pinned cuBLAS workspace while this decode records graphs.
+    #[cfg(feature = "gpu")]
+    blas: Option<crate::tensor::cuda::BlasLease>,
 }
 
 impl CfgKv {
@@ -196,6 +199,8 @@ impl CfgKv {
             cached: [0, 0],
             #[cfg(feature = "gpu")]
             graph: None,
+            #[cfg(feature = "gpu")]
+            blas: None,
         }
     }
 }
@@ -1103,23 +1108,20 @@ impl Qwen3Lm {
         }
 
         // -- capture (new bucket) --
-        // Pin a cuBLAS workspace ONCE (process lifetime) so the in-graph F32 attention-
-        // score gemms don't grab a per-call workspace during capture (an in-capture
-        // cuBLAS alloc invalidates it). Guarded so recaptures don't leak a workspace.
-        static CUBLAS_WS_PINNED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-        if CUBLAS_WS_PINNED.get().is_none() {
-            use crate::tensor::gpu_runtime::driver::result::malloc_sync;
+        // A cuBLAS workspace pinned on the card while this decode records graphs, so the
+        // in-graph F32 attention-score GEMMs take no workspace of their own during a capture: an
+        // allocation inside a capture invalidates it.
+        if kv.blas.is_none() {
             // Sized from the bucket the graph is captured at: the workspace backs the
             // score GEMMs of one step, so a wider bucket means wider score matrices and
             // more split-k staging behind them. A fixed figure is right for one bucket.
             let bytes =
                 crate::inference::place::audio_demand::lm_cublas_workspace_bytes(GRAPH_BUCKET)
                     as usize;
-            let ws = unsafe { malloc_sync(bytes) }
-                .map_err(|e| err(format!("cublas ws malloc: {e:?}")))?;
-            cd.pin_blas_workspace(ws, bytes)
-                .map_err(|e| err(format!("cublas set ws: {e}")))?;
-            let _ = CUBLAS_WS_PINNED.set(());
+            kv.blas = Some(
+                cd.lease_blas_workspace(bytes)
+                    .map_err(|e| err(format!("cublas set ws: {e}")))?,
+            );
         }
         // WARMUP eager pass: loads every kernel module (lazy load in capture is illegal)
         // AND computes THIS token's real KV write + hidden (capture only RECORDS).

@@ -738,6 +738,9 @@ pub struct GenericHeteroTransformer {
     ///  tracks whether fast_mmvq workspace has been
     /// pre-grown to max model size. Set on first update_graph_state call.
     workspace_pre_grown: bool,
+    /// The model's holds on the cuBLAS workspaces pinned on its cards.
+    #[cfg(feature = "gpu")]
+    blas_leases: Vec<crate::tensor::cuda::BlasLease>,
     /// The position of the token the decode step in flight carries: what an eagerly run layer
     /// of a captured step reads where a captured one reads the position buffers.
     graph_pos: usize,
