@@ -15,6 +15,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Fixed
 
+- Serving: give a batch worker the room serial models keep on its card.
 - API: keep tool calls when a message quotes a thinking tag.
 - API: say that a non-streamed answer ended on its token budget when it did.
 - Generation: rotate positions as the model was trained when a file omits its rope keys.

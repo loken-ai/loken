@@ -984,12 +984,16 @@ pub(super) fn try_spawn_continuous(
     let sized =
         crate::inference::engine::model_backend::adaptive_prefill_chunk(model.prefill_shape())
             .max(PREFILL_CHUNK_TOKENS);
-    let planned = paged::plan(&model.compute_device(), &shape_for(sized))
-        .map(|plan| (plan, sized))
-        .or_else(|| {
-            paged::plan(&model.compute_device(), &shape_for(PREFILL_CHUNK_TOKENS))
-                .map(|plan| (plan, PREFILL_CHUNK_TOKENS))
-        });
+    let plan_now = || {
+        paged::plan(&model.compute_device(), &shape_for(sized))
+            .map(|plan| (plan, sized))
+            .or_else(|| {
+                paged::plan(&model.compute_device(), &shape_for(PREFILL_CHUNK_TOKENS))
+                    .map(|plan| (plan, PREFILL_CHUNK_TOKENS))
+            })
+    };
+    // A card held by the pools that serial models beside this one keep takes them back first.
+    let planned = plan_now().or_else(|| model.give_back_parked_pools().then(plan_now).flatten());
     let Some((plan, prompt_chunk)) = planned else {
         warn!(
             "CB serve: the card holds fewer than two lanes of {} tokens - staying serial",

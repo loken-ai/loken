@@ -628,8 +628,9 @@ pub struct GenericHeteroTransformer {
     #[cfg(test)]
     pub(crate) failing_checkpoints: std::sync::atomic::AtomicUsize,
     /// The paged pool of the batch worker, kept while the model serves serially.
+    /// Another model on the same cards can have it given back, see `give_back_parked_pools`.
     #[cfg(feature = "gpu")]
-    parked_pool: std::sync::Mutex<Option<crate::inference::serve::continuous_serve::ParkedPool>>,
+    parked_pool: hetero::KeptPool,
     config: Arc<GenericTransformerConfig>,
     embeddings: Embedding, // GPU 0 if table < 1 GB, else CPU
     /// The learned table of absolute positions `[positions, dim]`, F32 on the host, added to
