@@ -367,3 +367,109 @@ async fn the_card_comes_back_after_a_batched_model() {
         .await
         .expect("the watchdog: the test stalled");
 }
+
+/// The blob an ollama tag names in the store, `None` when the store does not hold its weights.
+fn ollama_blob(tag: &str) -> Option<std::path::PathBuf> {
+    let dir = crate::config::Config::load_test().get_ollama_models_dir();
+    let (name, ver) = tag.split_once(':').unwrap_or((tag, "latest"));
+    let text = std::fs::read_to_string(
+        dir.join("manifests/registry.ollama.ai/library")
+            .join(name)
+            .join(ver),
+    )
+    .ok()?;
+    let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let digest = v["layers"]
+        .as_array()?
+        .iter()
+        .find(|l| l["mediaType"] == "application/vnd.ollama.image.model")?["digest"]
+        .as_str()?
+        .replace(':', "-");
+    let blob = dir.join("blobs").join(digest);
+    blob.exists().then_some(blob)
+}
+
+/// An engine that has loaded the store's `tag`.
+async fn loaded_tag(tag: &str) -> LlmEngine {
+    let blob = ollama_blob(tag).unwrap();
+    let engine = LlmEngine::with_config(InferenceConfig {
+        model_id: tag.to_string(),
+        models_dir: Some(blob),
+        context_length: 2048,
+        ..InferenceConfig::default()
+    });
+    engine
+        .load_model()
+        .await
+        .expect("the engine loads the model");
+    engine
+}
+
+/// T9 for `ranking`, whose requests end by moving the host locks of its hot experts, beside
+/// `decoding`, which decodes meanwhile.
+async fn registration_beside(ranking: &str, decoding: &str) {
+    let text = "Write a short story about a lighthouse keeper who finds a message in a bottle.";
+    let alone = loaded_tag(decoding).await;
+    let started = std::time::Instant::now();
+    let want = answer(&alone, text, 96)
+        .await
+        .expect("the model alone answers");
+    let alone_secs = started.elapsed().as_secs_f64();
+    alone.unload().await.unwrap();
+    drop(alone);
+
+    let a = std::sync::Arc::new(loaded_tag(ranking).await);
+    let b = loaded_tag(decoding).await;
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let ranks = {
+        let (a, stop) = (a.clone(), stop.clone());
+        tokio::spawn(async move {
+            let started = std::time::Instant::now();
+            let mut requests = 0;
+            while !stop.load(std::sync::atomic::Ordering::Acquire) {
+                answer(&a, &prompt(requests), 8)
+                    .await
+                    .expect("the ranking model answers");
+                requests += 1;
+            }
+            (requests, started.elapsed().as_secs_f64())
+        })
+    };
+    let started = std::time::Instant::now();
+    let got = answer(&b, text, 96)
+        .await
+        .expect("the decoding model answers");
+    let beside_secs = started.elapsed().as_secs_f64();
+    stop.store(true, std::sync::atomic::Ordering::Release);
+    let (requests, ranking_secs) = ranks.await.unwrap();
+    b.unload().await.unwrap();
+    a.unload().await.unwrap();
+    assert_eq!(got, want, "{decoding} answered otherwise beside {ranking}");
+    // The decode may wait for a registration in progress, never for a whole run of them.
+    let per_request = ranking_secs / requests.max(1) as f64;
+    assert!(
+        beside_secs <= alone_secs * 2.0 + per_request,
+        "{decoding} took {beside_secs:.1} s beside {ranking}'s {requests} requests, {alone_secs:.1} s alone"
+    );
+}
+
+/// T9: a model that locks its hot experts in host memory at each request's end never stalls a
+/// model whose card waits on its tier worker meanwhile.
+/// Both models need expert tiers: they are run on a card of the 16 GB class.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs a card and 2 MoE models in the store"]
+async fn a_registration_never_stalls_another_models_decode() {
+    const A: &str = "gpt-oss:20b";
+    const B: &str = "qwen3-coder:30b";
+    if ollama_blob(A).is_none() || ollama_blob(B).is_none() {
+        eprintln!("{A} or {B} is not in the store: skipped");
+        return;
+    }
+    let test = async {
+        registration_beside(A, B).await;
+        registration_beside(B, A).await;
+    };
+    tokio::time::timeout(WATCHDOG, test)
+        .await
+        .expect("the watchdog: the test stalled");
+}

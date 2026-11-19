@@ -1741,6 +1741,13 @@ impl LlmEngine {
             if let Some(s) = model_state.blocking_lock().as_ref() {
                 s.model.settle_hot_experts();
             }
+            // No model's hot pages are registered or released while this decode's card may
+            // wait on a host tier.
+            #[cfg(feature = "gpu")]
+            let _tier_steps = model_state
+                .blocking_lock()
+                .as_ref()
+                .and_then(|s| s.model.hold_tier_steps());
             let cache_at_start = model_state
                 .blocking_lock()
                 .as_ref()

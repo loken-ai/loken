@@ -794,6 +794,12 @@ pub(crate) trait ModelBackend: Send {
     fn settle_hot_experts(&self) -> bool {
         false
     }
+    /// Marks a decode of the model as running while its cards may wait on a host tier: no
+    /// model's hot pages are registered or released until the hold drops.
+    #[cfg(feature = "gpu")]
+    fn hold_tier_steps(&self) -> Option<crate::inference::generic_transformer::expert_tier::StepHold> {
+        None
+    }
 
     /// Where the model's layers run, when the backend can say.
     fn placement(&self) -> Option<crate::inference::place::Placement> {
@@ -2039,6 +2045,10 @@ impl ModelBackend for GenericBackend {
     #[cfg(feature = "gpu")]
     fn settle_hot_experts(&self) -> bool {
         self.0.settle_hot_experts()
+    }
+    #[cfg(feature = "gpu")]
+    fn hold_tier_steps(&self) -> Option<crate::inference::generic_transformer::expert_tier::StepHold> {
+        self.0.hold_tier_steps()
     }
 
     fn placement(&self) -> Option<crate::inference::place::Placement> {

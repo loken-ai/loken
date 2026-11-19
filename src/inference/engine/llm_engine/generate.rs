@@ -709,6 +709,10 @@ impl LlmEngine {
                 state.model.draft_head_capture(false);
             }
             state.model.settle_hot_experts();
+            // No model's hot pages are registered or released while this decode's card may
+            // wait on a host tier.
+            #[cfg(feature = "gpu")]
+            let _tier_steps = state.model.hold_tier_steps();
             let cache_at_start = state.model.expert_cache_counters();
             let mut head_tokens: Vec<u32> = vec![next_token];
             // What the head's cycles came to: verifies, of them recorded, and steps it had no

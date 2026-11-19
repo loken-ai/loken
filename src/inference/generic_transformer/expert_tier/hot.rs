@@ -137,6 +137,65 @@ fn span(ranges: &[Range]) -> u64 {
 /// tier worker waits on a copy that reads this list.
 static REGISTERED: std::sync::RwLock<Vec<Range>> = std::sync::RwLock::new(Vec::new());
 
+/// The gate between the decodes whose cards wait on a host tier and the registrations of hot
+/// pages, shared by every model of the process.
+/// A registration or a release holds the driver until the cards are idle, and a card that waits
+/// on a tier worker is idle only once the worker answered, which a driver call of the worker
+/// waits for: the two never overlap.
+/// A registration starts once no such decode runs, and a decode waits for a registration that
+/// started.
+struct StepGate {
+    /// The decodes running and whether a registration runs or waits.
+    state: std::sync::Mutex<(usize, bool)>,
+    changed: std::sync::Condvar,
+}
+
+static GATE: StepGate = StepGate {
+    state: std::sync::Mutex::new((0, false)),
+    changed: std::sync::Condvar::new(),
+};
+
+/// A decode whose card waits on a host tier, running: no registration starts until it ends.
+pub struct StepHold(());
+
+impl Drop for StepHold {
+    fn drop(&mut self) {
+        let mut st = GATE.state.lock().unwrap_or_else(|e| e.into_inner());
+        st.0 -= 1;
+        drop(st);
+        GATE.changed.notify_all();
+    }
+}
+
+/// Marks a decode whose card waits on a host tier as running, once no registration runs or
+/// waits.
+pub(crate) fn hold_steps() -> StepHold {
+    let mut st = GATE.state.lock().unwrap_or_else(|e| e.into_inner());
+    while st.1 {
+        st = GATE.changed.wait(st).unwrap_or_else(|e| e.into_inner());
+    }
+    st.0 += 1;
+    StepHold(())
+}
+
+/// Runs `f`, a registration or a release, once no decode whose card waits on a host tier runs.
+/// A decode that would start waits for `f`.
+fn registering<R>(f: impl FnOnce() -> R) -> R {
+    let mut st = GATE.state.lock().unwrap_or_else(|e| e.into_inner());
+    while st.1 {
+        st = GATE.changed.wait(st).unwrap_or_else(|e| e.into_inner());
+    }
+    st.1 = true;
+    while st.0 > 0 {
+        st = GATE.changed.wait(st).unwrap_or_else(|e| e.into_inner());
+    }
+    drop(st);
+    let done = f();
+    GATE.state.lock().unwrap_or_else(|e| e.into_inner()).1 = false;
+    GATE.changed.notify_all();
+    done
+}
+
 /// Calls `f` on the pieces of `[from, to)` cut at the edges of the registered ranges, in order,
 /// while no range is registered or released.
 pub(crate) fn for_each_piece(
@@ -440,26 +499,30 @@ impl HotLocks {
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let target = self.target(&hot);
         let (gone, added) = reregister(&st.ranges, &target);
-        gone.iter().for_each(|&r| unlock(r));
         let mut ranges: Vec<Range> = st
             .ranges
             .iter()
             .filter(|r| !gone.contains(r))
             .copied()
             .collect();
-        if !st.off {
+        let off = registering(|| {
+            gone.iter().for_each(|&r| unlock(r));
+            if st.off {
+                return true;
+            }
             for r in added {
                 if !lock(r) {
                     tracing::warn!(
                         "hot experts: the driver refused to lock {:.1} MB; no more experts are locked in host memory",
                         (r.1 - r.0) as f64 / 1e6
                     );
-                    st.off = true;
-                    break;
+                    return true;
                 }
                 ranges.push(r);
             }
-        }
+            false
+        });
+        st.off = off;
         ranges.sort_unstable();
         st.ranges = ranges;
         st.hot = hot
@@ -492,6 +555,53 @@ impl Drop for HotLocks {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A registration waits for the decodes whose cards wait on a host tier, and a decode
+    /// waits for a registration that started: the two never overlap.
+    #[test]
+    fn a_registration_and_a_tier_decode_never_overlap() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize};
+        let decoding = Arc::new(AtomicUsize::new(0));
+        let overlapped = Arc::new(AtomicBool::new(false));
+        let registering_now = Arc::new(AtomicBool::new(false));
+        let decodes: Vec<_> = (0..4)
+            .map(|_| {
+                let (decoding, overlapped, registering_now) = (
+                    decoding.clone(),
+                    overlapped.clone(),
+                    registering_now.clone(),
+                );
+                std::thread::spawn(move || {
+                    for _ in 0..50 {
+                        let _hold = hold_steps();
+                        decoding.fetch_add(1, Ordering::SeqCst);
+                        if registering_now.load(Ordering::SeqCst) {
+                            overlapped.store(true, Ordering::SeqCst);
+                        }
+                        std::thread::sleep(std::time::Duration::from_micros(200));
+                        decoding.fetch_sub(1, Ordering::SeqCst);
+                    }
+                })
+            })
+            .collect();
+        for _ in 0..20 {
+            registering(|| {
+                registering_now.store(true, Ordering::SeqCst);
+                if decoding.load(Ordering::SeqCst) > 0 {
+                    overlapped.store(true, Ordering::SeqCst);
+                }
+                std::thread::sleep(std::time::Duration::from_micros(300));
+                registering_now.store(false, Ordering::SeqCst);
+            });
+        }
+        for d in decodes {
+            d.join().unwrap();
+        }
+        assert!(
+            !overlapped.load(Ordering::SeqCst),
+            "a registration ran beside a tier decode"
+        );
+    }
 
     #[test]
     fn the_hottest_pairs_of_every_layer_share_the_budget() {

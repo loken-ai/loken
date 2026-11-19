@@ -82,7 +82,7 @@ mod graph;
 mod hot;
 pub(crate) use graph::mapped;
 pub use graph::TierWorker;
-pub use hot::HotLocks;
+pub use hot::{HotLocks, StepHold};
 
 /// Set by the tests that run the kernels of a recorded decode without recording them.
 static GRAPH_WITHOUT_CAPTURE: std::sync::atomic::AtomicBool =
@@ -997,6 +997,12 @@ impl super::GenericHeteroTransformer {
     /// Whether locks were being moved.
     pub fn settle_hot_experts(&self) -> bool {
         self.hot_locks.as_ref().is_some_and(|h| h.settle())
+    }
+    /// Marks a decode of this model as running while its cards may wait on its tier workers: no
+    /// model's hot pages are registered or released until it ends.
+    /// `None` for a model whose cards never wait on the host.
+    pub fn hold_tier_steps(&self) -> Option<hot::StepHold> {
+        (!self.tier_workers.is_empty()).then(hot::hold_steps)
     }
 }
 
