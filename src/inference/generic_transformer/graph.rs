@@ -2197,10 +2197,14 @@ impl GenericHeteroTransformer {
                 .map(|(i, _)| i)
                 .unwrap();
             freed += self.kv_snapshots[i].device_bytes();
-            self.kv_snapshots.swap_remove(i);
+            let dropped = self.kv_snapshots.swap_remove(i);
+            tracing::info!(
+                "kv snapshot of {} tokens dropped: a prefill chunk needs its {} MB",
+                dropped.kv_len,
+                dropped.device_bytes() >> 20
+            );
         }
         if freed > 0 {
-            tracing::debug!("kv snapshots: {freed} bytes dropped for a prefill chunk");
             self.hand_back_pools();
         }
     }
@@ -2244,11 +2248,18 @@ impl GenericHeteroTransformer {
                 .map(|(i, _)| i)
                 .unwrap();
             held -= self.kv_snapshots[i].device_bytes();
-            self.kv_snapshots.swap_remove(i);
+            let dropped = self.kv_snapshots.swap_remove(i);
+            tracing::info!(
+                "kv snapshot of {} tokens dropped: the cards leave {} MB for snapshots",
+                dropped.kv_len,
+                budget >> 20
+            );
         }
         if held > budget {
-            tracing::debug!(
-                "kv snapshot dropped: {held} bytes exceed the {budget} byte budget alone"
+            tracing::info!(
+                "kv snapshots dropped: {} MB exceed the {} MB the cards leave for snapshots",
+                held >> 20,
+                budget >> 20
             );
             self.kv_snapshots.clear();
         }
