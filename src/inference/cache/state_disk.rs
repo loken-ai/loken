@@ -924,6 +924,20 @@ impl StateStore {
     /// Drop manifests, least recently used first and pinned ones last, until the manifests and the
     /// blocks they reference fit the budget. `keep` is never dropped.
     fn evict(&self, keep: &Key) {
+        self.evict_to(keep, |total| self.limit(total));
+    }
+
+    /// Drops states, least recently used first and pinned ones last, until `bytes` are given back
+    /// or none is left. Returns the bytes given back.
+    pub fn free(&self, bytes: u64) -> u64 {
+        let before = self.held_bytes();
+        self.evict_to(&Key::default(), |total| Some(total.saturating_sub(bytes)));
+        before.saturating_sub(self.held_bytes())
+    }
+
+    /// Drops states, least recently used first and pinned ones last, until what the store holds
+    /// is at most `target` of it; `keep` is never dropped. `target` of `None` drops nothing.
+    fn evict_to(&self, keep: &Key, target: impl FnOnce(u64) -> Option<u64>) {
         let mut victims = Vec::new();
         let limit;
         {
@@ -934,7 +948,7 @@ impl StateStore {
                     .filter(|(h, _)| g.refs.contains_key(*h))
                     .map(|(_, n)| *n)
                     .sum::<u64>();
-            limit = match self.limit(total) {
+            limit = match target(total) {
                 Some(l) => l,
                 None => return,
             };
@@ -1184,6 +1198,30 @@ mod tests {
     }
 
     /// A consumer short of host memory empties a store in memory through the registry's hook.
+    /// A store asked for room gives back its least recently used states first, and no more than
+    /// the room asked for needs.
+    #[test]
+    fn a_store_asked_for_room_gives_back_its_oldest_states_first() {
+        let store = StateStore::in_memory(1 << 30, 8);
+        for (i, salt) in [1u32, 2, 3].into_iter().enumerate() {
+            put(&store, &seq(16, salt), 16, &vec![i as u8; 1 << 10]);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let (n, held) = store.stats();
+        assert_eq!(n, 3);
+        let freed = store.free(1);
+        assert!(freed > 0 && freed < held, "{freed} of {held}");
+        assert_eq!(store.stats().0, 2);
+        let (oldest, newest) = (seq(16, 1), seq(16, 3));
+        let gone = store.keys(&SCOPE, &oldest);
+        assert!(
+            store.candidates(&gone, 16).is_empty(),
+            "the oldest went first"
+        );
+        let kept = store.keys(&SCOPE, &newest);
+        assert_eq!(store.candidates(&kept, 16).len(), 1);
+    }
+
     #[test]
     fn releasing_a_store_in_memory_gives_back_everything_it_held() {
         let store = StateStore::in_memory(1 << 20, 8);

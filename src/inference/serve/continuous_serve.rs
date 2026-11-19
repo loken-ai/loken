@@ -745,7 +745,7 @@ impl SequenceBatched {
                 tokens,
                 covered,
                 rest,
-                cache.stride(rest),
+                cache.stride(rest, rest),
                 cache.layout(),
             )?;
             let secs = started.elapsed().as_secs_f64();

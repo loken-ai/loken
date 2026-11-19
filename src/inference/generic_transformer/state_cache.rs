@@ -273,9 +273,14 @@ impl Point {
 }
 
 /// Whether a write of `point` to a store in host memory fits the host's room now.
-/// The write holds the encoded manifest, its sealed form and the store's copy beside the point.
 fn fits_in_memory(point_bytes: u64, room: u64) -> bool {
-    point_bytes.saturating_mul(3) <= room
+    memory_for_write(point_bytes) <= room
+}
+
+/// The host memory a write of a point of `point_bytes` to a store in host memory takes: the
+/// encoded manifest, its sealed form and the store's copy beside the point.
+fn memory_for_write(point_bytes: u64) -> u64 {
+    point_bytes.saturating_mul(3)
 }
 
 fn dtype_code(d: DType) -> Result<u8> {
@@ -1621,6 +1626,9 @@ impl GenericHeteroTransformer {
     /// at the cuts short of the end.
     ///
     /// The probe bound to the thread hears of each chunk, the rows before `from` left out.
+    ///
+    /// A state is kept only while the host has room for it beside the ones kept before it: see
+    /// [`HybridStateCache::host_room_for`].
     pub(crate) fn prefill_with_grid(
         &mut self,
         prompt: &[u32],
@@ -1629,6 +1637,33 @@ impl GenericHeteroTransformer {
         stride: usize,
         layout: &Layout,
     ) -> Result<(Tensor, Vec<Point>)> {
+        let cache = self.hybrid_cache.clone();
+        let first = cache
+            .as_ref()
+            .map_or(0, |c| c.tuning().get().manifest_bytes);
+        let mut room = move |bytes: u64| match &cache {
+            Some(c) => c.host_room_for(bytes),
+            None => crate::inference::place::layer_executor::host_spill_budget_bytes() >= bytes,
+        };
+        self.prefill_with_grid_within(prompt, from, chunk, stride, layout, first, &mut room)
+    }
+
+    /// [`Self::prefill_with_grid`] that keeps a state only when `room` grants its bytes, the
+    /// bytes of the state kept before it, `first` for the first.
+    /// Once `room` refuses a state, the prefill keeps no state past it.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn prefill_with_grid_within(
+        &mut self,
+        prompt: &[u32],
+        from: usize,
+        chunk: usize,
+        stride: usize,
+        layout: &Layout,
+        first: u64,
+        room: &mut dyn FnMut(u64) -> bool,
+    ) -> Result<(Tensor, Vec<Point>)> {
+        let mut point_bytes = first;
+        let mut full = false;
         let stride = stride.max(1);
         let chunk = chunk.max(1);
         let mut grid = Vec::new();
@@ -1657,9 +1692,21 @@ impl GenericHeteroTransformer {
                 pos += n;
                 crate::request_metrics::note_prefill(pos - from, total)?;
             }
-            if end == boundary && end < prompt.len() {
+            if end == boundary && end < prompt.len() && !full {
+                if !room(point_bytes) {
+                    full = true;
+                    tracing::info!(
+                        "state cache: no state kept from token {end}: the host has no room for \
+                         another {} MB state",
+                        point_bytes >> 20
+                    );
+                    continue;
+                }
                 match self.capture_point(end, layout) {
-                    Ok(p) => grid.push(p),
+                    Ok(p) => {
+                        point_bytes = p.host_bytes();
+                        grid.push(p);
+                    }
                     Err(e) => tracing::info!("state cache: no state kept at token {end}: {e}"),
                 }
             }
@@ -1828,6 +1875,20 @@ impl HybridStateCache {
         &self.layout
     }
 
+    /// Whether the host has room for a state of `bytes` now, within the memory a component may
+    /// take.
+    /// A store held in host memory gives back its least recently used states for it first.
+    pub(crate) fn host_room_for(&self, bytes: u64) -> bool {
+        let room = crate::inference::place::layer_executor::host_spill_budget_bytes();
+        if room >= bytes {
+            return true;
+        }
+        if self.store.is_in_memory() {
+            self.store.free(bytes - room);
+        }
+        crate::inference::place::layer_executor::host_spill_budget_bytes() >= bytes
+    }
+
     /// Restores the longest stored state `prompt` extends, shorter than `prompt` by at least a
     /// token so one is left to produce logits, and returns the tokens it covers; zero when none
     /// is usable. A stored state that proves unusable is dropped.
@@ -1904,16 +1965,23 @@ impl HybridStateCache {
             .map_err(|e| anyhow!("{e}"))
     }
 
-    /// The spacing of the states a prefill keeps, from what the store has measured, for a prefill
-    /// that runs forwards of `chunk` tokens. Logged when it changes.
-    pub(crate) fn stride(&self, chunk: usize) -> usize {
+    /// The spacing of the states a prefill of `rest` tokens keeps, from what the store has
+    /// measured, for a prefill that runs forwards of `chunk` tokens.
+    /// The states the spacing gives fit the host memory a component may take now.
+    /// Logged when it changes.
+    pub(crate) fn stride(&self, chunk: usize, rest: usize) -> usize {
         let m = self.store.tuning().get();
-        let stride = state_tune::grid_stride(
-            self.layout.block_tokens,
-            chunk,
+        let stride = state_tune::stride_within_room(
+            state_tune::grid_stride(
+                self.layout.block_tokens,
+                chunk,
+                m.manifest_bytes,
+                m.write.per_sec(),
+                m.prefill.secs_per(),
+            ),
+            rest,
             m.manifest_bytes,
-            m.write.per_sec(),
-            m.prefill.secs_per(),
+            crate::inference::place::layer_executor::host_spill_budget_bytes(),
         );
         if self
             .last_stride
@@ -1962,8 +2030,14 @@ impl HybridStateCache {
         };
         // A store in host memory takes a write only while the host has the room for it now.
         if self.store.is_in_memory() {
-            let room = crate::inference::place::layer_executor::host_spill_budget_bytes();
             let bytes = end.host_bytes();
+            let mut room = crate::inference::place::layer_executor::host_spill_budget_bytes();
+            if !fits_in_memory(bytes, room) {
+                // The oldest states give way to the newest.
+                self.store
+                    .free(memory_for_write(bytes).saturating_sub(room));
+                room = crate::inference::place::layer_executor::host_spill_budget_bytes();
+            }
             if !fits_in_memory(bytes, room) {
                 tracing::info!(
                     "state cache: not stored: a {} MB state does not fit the {} MB of host memory left",

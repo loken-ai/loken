@@ -1491,7 +1491,7 @@ impl GenericBackend {
                             }
                         }
                         replay = true;
-                        let stride = cache.stride(c);
+                        let stride = cache.stride(c, prompt.len() - covered);
                         let (logits, points) =
                             self.0
                                 .prefill_with_grid(prompt, covered, c, stride, cache.layout())?;

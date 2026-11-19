@@ -154,6 +154,27 @@ pub fn grid_stride(
     round_up(needed, base)
 }
 
+/// The spacing `stride` widened so the states a prefill of `rest` tokens keeps, of
+/// `manifest_bytes` each, fit `room` bytes of host memory: a multiple of `stride`.
+/// A room that holds no state gives a spacing past the prompt, so the prefill keeps none.
+/// An unmeasured state size leaves the spacing as it is.
+pub fn stride_within_room(stride: usize, rest: usize, manifest_bytes: u64, room: u64) -> usize {
+    let stride = stride.max(1);
+    if manifest_bytes == 0 {
+        return stride;
+    }
+    let states = (room / manifest_bytes) as usize;
+    if states == 0 {
+        return round_up(rest + 1, stride);
+    }
+    let needed = rest.div_ceil(states);
+    if needed <= stride {
+        stride
+    } else {
+        round_up(needed, stride)
+    }
+}
+
 /// The bytes a store may hold when the operator set none: what it holds already plus what the
 /// filesystem still offers, less room for one more state of the largest size written.
 pub fn derived_budget(held: u64, free: u64, largest_state: u64) -> u64 {
@@ -365,6 +386,33 @@ mod tests {
         );
         let bigger = grid_stride(block, chunk, 4 * manifest, Some(5.0e6), Some(0.02));
         assert!(bigger > slow, "a larger state");
+    }
+
+    /// The states of a prefill fit the host room they are held in, whatever chunk the prefill
+    /// shrank to: the spacing widens as the room falls, and a room that holds none keeps none.
+    #[test]
+    fn the_states_of_a_prefill_fit_the_room_they_are_held_in() {
+        let (chunk, rest, manifest) = (32, 24_432, 62u64 << 20);
+        let room = 4u64 << 30;
+        let stride = stride_within_room(chunk, rest, manifest, room);
+        assert_eq!(stride % chunk, 0, "states fall where the forwards end");
+        assert!(
+            (rest / stride) as u64 * manifest <= room,
+            "{} states of {manifest} bytes in {room}",
+            rest / stride
+        );
+        assert!(stride_within_room(chunk, rest, manifest, room / 4) > stride);
+        assert!(stride_within_room(chunk, rest, manifest, manifest - 1) > rest);
+        assert_eq!(
+            stride_within_room(chunk, rest, 0, room),
+            chunk,
+            "unmeasured"
+        );
+        assert_eq!(
+            stride_within_room(chunk, 64, manifest, room),
+            chunk,
+            "room for every chunk"
+        );
     }
 
     #[test]

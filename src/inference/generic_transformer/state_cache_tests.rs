@@ -758,3 +758,57 @@ fn a_state_reads_each_layers_rows_once_whatever_its_blocks() {
     assert!(short > 0);
     assert_eq!(long, short, "the reads grew with the blocks");
 }
+
+/// A prefill keeps a state only while the host has room for it: once the room refuses one, it
+/// keeps none past it, and the prompt is read whole with the logits of a prefill that kept them
+/// all.
+#[test]
+fn a_prefill_keeps_no_state_the_host_has_no_room_for() {
+    let fx = Fixture::new("grid-room");
+    let text = prompt(5 * CHUNK + 7);
+    let layout = fx.model().state_layout(BLOCK);
+    let mut all = fx.model();
+    let (whole, every) = all
+        .prefill_with_grid_within(&text, 0, CHUNK, CHUNK, &layout, 0, &mut |_| true)
+        .unwrap();
+    assert_eq!(every.len(), 5);
+    let mut granted = 0;
+    let mut asked = Vec::new();
+    let mut short = fx.model();
+    let (logits, kept) = short
+        .prefill_with_grid_within(&text, 0, CHUNK, CHUNK, &layout, 0, &mut |bytes| {
+            asked.push(bytes);
+            granted += 1;
+            granted <= 2
+        })
+        .unwrap();
+    assert_eq!(kept.len(), 2, "the states past the refused one");
+    assert_eq!(asked.len(), 3, "no room is asked again after a refusal");
+    assert!(
+        asked[1] > 0,
+        "a state is asked for at the size of the one before it"
+    );
+    assert_eq!(bits(&logits), bits(&whole));
+}
+
+/// A store in host memory gives back its states, oldest first, for a state the host has no
+/// room for.
+#[test]
+fn a_store_in_memory_gives_back_its_states_for_a_new_one() {
+    let fx = Fixture::new("room-evicts");
+    let store = Arc::new(StateStore::in_memory(0, BLOCK));
+    let mut m = fx.model();
+    attach(&mut m, &store, b"");
+    let cache = m.state_cache().unwrap();
+    let text = prompt(2 * BLOCK + 5);
+    let (_, grid) = prefill(&mut m, &text, 0);
+    cache.save(&m, &text, grid, None);
+    wait_for_len(&store, text.len());
+    assert!(store.stats().0 > 0);
+    assert!(cache.host_room_for(1), "a byte fits");
+    assert!(
+        !cache.host_room_for(u64::MAX),
+        "nothing holds the whole address space"
+    );
+    assert_eq!(store.stats().0, 0, "every state was given back first");
+}
