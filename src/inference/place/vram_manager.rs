@@ -994,7 +994,9 @@ pub async fn ensure_gpu_headroom(caller: &'static str, hot_bytes: u64, reserve: 
 // requested amount is recovered. Dropped caches simply re-fill on their next use.
 // ---------------------------------------------------------------------------------------------
 
-type HostCacheHook = Box<dyn Fn() -> u64 + Send + Sync>;
+/// Gives back at least the bytes asked for, or all the cache holds, and returns the bytes it
+/// gave back.
+type HostCacheHook = Box<dyn Fn(u64) -> u64 + Send + Sync>;
 
 struct HostCache {
     hook: HostCacheHook,
@@ -1034,7 +1036,7 @@ pub fn reclaim_host_ram(needed_bytes: u64) -> u64 {
         let hook_freed = {
             let map = host_caches().lock().unwrap_or_else(|e| e.into_inner());
             match map.get(name) {
-                Some(c) => (c.hook)(),
+                Some(c) => (c.hook)(needed_bytes - freed),
                 None => 0,
             }
         };

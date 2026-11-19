@@ -171,7 +171,7 @@ fn register_umt5_cache_reclaim() {
     crate::inference::place::vram_manager::register_host_cache(
         "wan-umt5-f16-staging",
         staged,
-        Box::new(move || {
+        Box::new(move |_| {
             let Some(m) = UMT5_CPU_CACHE.get() else {
                 return 0;
             };
@@ -898,7 +898,7 @@ pub fn render_many_sampled(
             crate::inference::place::vram_manager::register_host_cache(
                 "wan-vae-cpu-staging",
                 vae_file,
-                Box::new(move || {
+                Box::new(move |_| {
                     let Some(m) = WAN_VAE_CPU_CACHE.get() else {
                         return 0;
                     };

@@ -1948,11 +1948,12 @@ fn open_state_cache(
         ));
         // A state is recomputable, so it is the first thing a consumer short of host memory
         // takes back: the estimate puts it ahead of every other registered cache.
+        // The store gives back its least recently used states, as many as the consumer needs.
         let weak = Arc::downgrade(&store);
         crate::inference::place::vram_manager::register_host_cache(
             "state-cache",
             u64::MAX,
-            Box::new(move || weak.upgrade().map_or(0, |s| s.release_all())),
+            Box::new(move |needed| weak.upgrade().map_or(0, |s| s.free(needed))),
         );
         return Some(store);
     };

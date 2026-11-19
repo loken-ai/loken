@@ -6,6 +6,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Fixed
 
+- Serving: give back only the oldest stored states when memory runs short.
 - Serving: keep a long prompt's stored states within the host's memory.
 - Placement: keep the room a model's prompts were measured to take on each card.
 - Placement: move layers off the card that ran out of memory at the first re-plan.

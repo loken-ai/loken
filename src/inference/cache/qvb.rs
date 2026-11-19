@@ -124,7 +124,7 @@ fn insert(key: String, vb: QVarBuilder, mtime: SystemTime) {
     crate::inference::place::vram_manager::register_host_cache(
         name,
         bytes,
-        Box::new(move || {
+        Box::new(move |_| {
             let Ok(mut map) = cache().try_lock() else {
                 return 0;
             };
