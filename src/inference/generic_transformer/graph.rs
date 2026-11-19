@@ -1891,7 +1891,7 @@ impl GenericHeteroTransformer {
                 .sum::<u64>();
         let reserve = self.snapshot_reserve();
         loop {
-            let free = self.free_device_memory();
+            let free = self.free_for_snapshots();
             let host_fits = host_need == 0
                 || snapshot_fits(
                     host_need,
@@ -2286,7 +2286,26 @@ impl GenericHeteroTransformer {
                 let free = crate::inference::place::room::free_now(d)?;
                 let ordinal = d.as_cuda_device().ok()?.0.ordinal();
                 let (reserved, used) = crate::tensor::cuda::pool_use(ordinal);
-                Some(free + reserved.saturating_sub(used))
+                // What the owners declared on the card stays free for them.
+                let declared = crate::inference::place::vram_manager::card_demand(ordinal);
+                Some((free + reserved.saturating_sub(used)).saturating_sub(declared))
+            })
+            .min();
+        #[cfg(not(feature = "gpu"))]
+        self.free_device_memory()
+    }
+
+    /// [`Self::free_device_memory`] less what the owners declared on each card.
+    fn free_for_snapshots(&self) -> Option<u64> {
+        #[cfg(feature = "gpu")]
+        return self
+            .cuda_devices
+            .values()
+            .filter_map(|d| {
+                let free = crate::inference::place::room::free_now(d)?;
+                let ordinal = d.as_cuda_device().ok()?.0.ordinal();
+                let declared = crate::inference::place::vram_manager::card_demand(ordinal);
+                Some(free.saturating_sub(declared))
             })
             .min();
         #[cfg(not(feature = "gpu"))]

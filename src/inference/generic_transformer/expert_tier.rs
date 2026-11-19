@@ -1296,7 +1296,14 @@ impl super::GenericHeteroTransformer {
             };
             // The room is read from the card before each layer.
             // The card reports what each restore took, its pool's rounding included.
-            let room = stager.free_after_queued_work().saturating_sub(reserve);
+            // What the owners declared on the card stays free for them.
+            let declared = stager.dev.as_cuda_device().map_or(0, |d| {
+                crate::inference::place::vram_manager::card_demand(d.0.ordinal())
+            });
+            let room = stager
+                .free_after_queued_work()
+                .saturating_sub(reserve)
+                .saturating_sub(declared);
             if room == 0 {
                 continue;
             }

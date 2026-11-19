@@ -108,6 +108,15 @@ impl QuantKv {
         }
     }
 
+    /// Device bytes the cache takes as it grows from its capacity now to `up_to` positions,
+    /// never past its ceiling.
+    pub fn growth_bytes(&self, up_to: usize) -> u64 {
+        match self {
+            QuantKv::Q8(c) => c.growth_bytes(up_to),
+            QuantKv::Q4(c) => c.growth_bytes(up_to),
+        }
+    }
+
     /// Device bytes a raw snapshot of the first `len` positions takes.
     pub fn raw_bytes(&self, len: usize) -> usize {
         match self {

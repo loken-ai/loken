@@ -448,6 +448,8 @@ impl LlmEngine {
         let user_context_length = self.config.context_length;
         let model_state = self.model_state.clone();
         let cached_model_size = self.cached_model_size.clone();
+        let planned_kv = self.planned_kv.clone();
+        planned_kv.store(0, std::sync::atomic::Ordering::Relaxed);
         let model_id_clone = model_id.clone(); // Clone for the closure
                                                // Resolve the projector blob (vision tower) for dual-blob Ollama
                                                // packages like moondream. None for text-only models. Moved into
@@ -1189,6 +1191,13 @@ impl LlmEngine {
                         )
                     };
                     let demand = demand_at(ctx_for_planning);
+                    // The caches' growth the plan counts, declared once the model is loaded.
+                    if matches!(kv_quant, KvQuant::Q4 | KvQuant::Q8) {
+                        planned_kv.store(
+                            ctx_for_planning as usize,
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                    }
                     // A model the cards hold whole with room for a full prefill chunk beside each
                     // card's layers keeps that room: its prompts then cross every layer in whole
                     // chunks. One the room would push onto the host or onto more cards keeps the

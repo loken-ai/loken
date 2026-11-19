@@ -28,7 +28,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 type ReclaimFuture = Pin<Box<dyn Future<Output = u64> + Send>>;
 /// Returns an estimate of the bytes it released (0 if it held nothing).
@@ -547,8 +547,10 @@ pub fn try_load_admission() -> Option<tokio::sync::MutexGuard<'static, ()>> {
 /// peak is not, so a model loading mid-render reads the card as far emptier than it is
 /// about to be. A declared demand makes that peak visible for as long as the work runs.
 struct Demand {
-    owner: &'static str,
-    bytes: u64,
+    owner: String,
+    /// The card the bytes are on, `None` for whichever card the owner's work lands on.
+    card: Option<usize>,
+    bytes: Arc<AtomicU64>,
 }
 
 static DEMANDS: OnceLock<Mutex<HashMap<u64, Demand>>> = OnceLock::new();
@@ -562,6 +564,14 @@ fn demands() -> &'static Mutex<HashMap<u64, Demand>> {
 /// an aborted or panicking request cannot leave the machine looking permanently full.
 pub struct DemandLease {
     id: u64,
+    bytes: Arc<AtomicU64>,
+}
+
+impl DemandLease {
+    /// Makes the demand `bytes` from now on.
+    pub fn set(&self, bytes: u64) {
+        self.bytes.store(bytes, Ordering::Relaxed);
+    }
 }
 
 impl Drop for DemandLease {
@@ -573,26 +583,63 @@ impl Drop for DemandLease {
     }
 }
 
-/// Announce that `owner` is about to need `bytes` of VRAM, until the lease drops.
-pub fn declare_demand(owner: &'static str, bytes: u64) -> DemandLease {
+fn declare(owner: &str, card: Option<usize>, bytes: u64) -> DemandLease {
     let id = DEMAND_ID.fetch_add(1, Ordering::Relaxed);
-    demands()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert(id, Demand { owner, bytes });
-    DemandLease { id }
+    let bytes = Arc::new(AtomicU64::new(bytes));
+    demands().lock().unwrap_or_else(|e| e.into_inner()).insert(
+        id,
+        Demand {
+            owner: owner.to_string(),
+            card,
+            bytes: bytes.clone(),
+        },
+    );
+    DemandLease { id, bytes }
 }
 
-/// Bytes other subsystems have announced. A caller never subtracts its OWN demand -
-/// it is the one about to use it, and counting it twice would spill its own work to
-/// the host.
+/// Announce that `owner` is about to need `bytes` of VRAM, until the lease drops.
+pub fn declare_demand(owner: &str, bytes: u64) -> DemandLease {
+    declare(owner, None, bytes)
+}
+
+/// Announce that `owner` is about to need `bytes` of card `card`, until the lease drops.
+pub fn declare_card_demand(owner: &str, card: usize, bytes: u64) -> DemandLease {
+    declare(owner, Some(card), bytes)
+}
+
+/// Bytes other subsystems have announced on no card in particular. A caller never subtracts
+/// its OWN demand - it is the one about to use it, and counting it twice would spill its own
+/// work to the host.
 pub fn pending_demand_excluding(owner: &str) -> u64 {
     demands()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .values()
-        .filter(|d| d.owner != owner)
-        .map(|d| d.bytes)
+        .filter(|d| d.owner != owner && d.card.is_none())
+        .map(|d| d.bytes.load(Ordering::Relaxed))
+        .sum()
+}
+
+/// Bytes every owner has announced on card `card`, to be left free by what serves only later
+/// requests.
+pub fn card_demand(card: usize) -> u64 {
+    demands()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .values()
+        .filter(|d| d.card == Some(card))
+        .map(|d| d.bytes.load(Ordering::Relaxed))
+        .sum()
+}
+
+/// Bytes owners other than `owner` have announced on card `card`.
+pub fn card_demand_excluding(owner: &str, card: usize) -> u64 {
+    demands()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .values()
+        .filter(|d| d.owner != owner && d.card == Some(card))
+        .map(|d| d.bytes.load(Ordering::Relaxed))
         .sum()
 }
 
@@ -1412,8 +1459,7 @@ struct OwnerPressure {
 /// The owner of the pressure the media engines raise and read.
 pub const SHARED: &str = "";
 
-static PRESSURE: std::sync::Mutex<Vec<(String, OwnerPressure)>> =
-    std::sync::Mutex::new(Vec::new());
+static PRESSURE: std::sync::Mutex<Vec<(String, OwnerPressure)>> = std::sync::Mutex::new(Vec::new());
 
 /// Runs `f` on the pressure of `owner`, made when absent; owners left with none are dropped.
 fn with_pressure<T>(owner: &str, f: impl FnOnce(&mut OwnerPressure) -> T) -> T {

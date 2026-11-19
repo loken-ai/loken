@@ -267,6 +267,8 @@ pub struct LlmEngine {
     load_report: Arc<std::sync::Mutex<Option<crate::inference::serve::progress::SharedProgressFn>>>,
     /// The loaded model as `place::reclaim` lists it, while it is loaded.
     kept_memory: Arc<std::sync::Mutex<Option<Arc<dyn crate::inference::place::reclaim::Holder>>>>,
+    /// The context the last load planned the quantised caches at, in positions; 0 for none.
+    planned_kv: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl InferenceEngine for LlmEngine {
@@ -289,6 +291,7 @@ impl InferenceEngine for LlmEngine {
             drafter_choice: Arc::default(),
             load_report: Arc::default(),
             kept_memory: Arc::default(),
+            planned_kv: Arc::default(),
             draft_length: Arc::default(),
             pld_cost: Arc::default(),
         }
@@ -348,6 +351,7 @@ impl LlmEngine {
             drafter_choice: Arc::default(),
             load_report: Arc::default(),
             kept_memory: Arc::default(),
+            planned_kv: Arc::default(),
             draft_length: Arc::default(),
             pld_cost: Arc::default(),
         }
@@ -430,7 +434,7 @@ impl LlmEngine {
         let model = &self.config.model_id;
         let gb = |b: u64| b as f64 / 1e9;
         let need = loading::card_needs(target)?.layers;
-        let cards = room::card_rooms_for(crate::inference::place::llm::OWNER);
+        let cards = room::card_rooms_for(&self.config.model_id);
         let alone = need.spill(&cards);
         if alone == 0 {
             info!(
@@ -543,7 +547,7 @@ impl LlmEngine {
         }
         let model = &self.config.model_id;
         let gb = |b: u64| b as f64 / 1e9;
-        let cards = room::card_rooms_for(crate::inference::place::llm::OWNER);
+        let cards = room::card_rooms_for(&self.config.model_id);
         let needs: Vec<_> = candidates.iter().map(|(_, n)| n.whole).collect();
         let (chosen, verdicts) = match held {
             Some(n) => (Some(n), Vec::new()),
@@ -1592,99 +1596,99 @@ fn release_card_pool(ordinal: i32) -> u64 {
         CUmemoryPool,
     };
     let mut released = 0u64;
-        unsafe {
-            // Drain THIS device's streams before trimming its pool. A single
-            // current-context cuCtxSynchronize only drains GPU0 - GPU1's
-            // stream-ordered frees stayed queued and its pool showed
-            // "used 3 MB, reserved 15456 MB, trim CUDA_SUCCESS, nothing
-            // released" (a campaign: every gemma4:31b retry then
-            // OOM'd against the phantom-full GPU1 -> all-CPU at 1.2 tok/s).
-            // A card with no context has nothing queued, and retaining one would open it.
-            let mut ctx: CUcontext = std::ptr::null_mut();
-            if crate::tensor::cuda::card_context_active(ordinal as usize)
-                && cuDevicePrimaryCtxRetain(&mut ctx, ordinal) == cudaError_enum::CUDA_SUCCESS
-                && !ctx.is_null()
-            {
-                let _ = cuCtxPushCurrent_v2(ctx);
-                let _ = cuCtxSynchronize();
-                // What the recorded graphs reserved beyond what the live ones use goes back too.
-                let _ = crate::tensor::gpu_runtime::driver::sys::cuDeviceGraphMemTrim(ordinal);
-                let mut popped: CUcontext = std::ptr::null_mut();
-                let _ = cuCtxPopCurrent_v2(&mut popped);
-                let _ = cuDevicePrimaryCtxRelease_v2(ordinal);
-            }
-            let mut pool: CUmemoryPool = std::ptr::null_mut();
-            let r = cuDeviceGetDefaultMemPool(&mut pool, ordinal);
-            if r != cudaError_enum::CUDA_SUCCESS || pool.is_null() {
-                return 0;
-            }
-            // Read current release threshold for diagnostic.
-            let mut threshold_before: u64 = 999;
-            let _ = cuMemPoolGetAttribute(
-                pool,
-                CUmemPool_attribute::CU_MEMPOOL_ATTR_RELEASE_THRESHOLD,
-                &mut threshold_before as *mut u64 as *mut std::ffi::c_void,
-            );
-            // Reset the release threshold to 0. `enable_graph_capture_mode`
-            // (called when CUDA graphs are in use) sets this to u64::MAX so
-            // the pool never returns memory to the OS - that's correct
-            // during capture, but on unload we want VRAM back. Without this
-            // reset, cuMemPoolTrimTo(0) is a no-op.
-            let zero: u64 = 0;
-            let r_set = cuMemPoolSetAttribute(
-                pool,
-                CUmemPool_attribute::CU_MEMPOOL_ATTR_RELEASE_THRESHOLD,
-                &zero as *const u64 as *mut std::ffi::c_void,
-            );
-            tracing::info!(
-                "  GPU{}: threshold was {} (set->0 returned {:?})",
-                ordinal,
-                threshold_before,
-                r_set,
-            );
-            // Diagnostic: dump pool stats so we can tell whether the
-            // memory is still in use (live CudaSlice somewhere) vs cached
-            // and the trim is failing to release.
-            let mut used_before: u64 = 0;
-            let mut reserved_before: u64 = 0;
-            let _ = cuMemPoolGetAttribute(
-                pool,
-                CUmemPool_attribute::CU_MEMPOOL_ATTR_USED_MEM_CURRENT,
-                &mut used_before as *mut u64 as *mut std::ffi::c_void,
-            );
-            let _ = cuMemPoolGetAttribute(
-                pool,
-                CUmemPool_attribute::CU_MEMPOOL_ATTR_RESERVED_MEM_CURRENT,
-                &mut reserved_before as *mut u64 as *mut std::ffi::c_void,
-            );
-            // Trim the pool to keep at most 0 bytes - return everything to
-            // the OS. CUDA may still retain a small accounting overhead.
-            let r = cuMemPoolTrimTo(pool, 0);
-            let mut used_after: u64 = 0;
-            let mut reserved_after: u64 = 0;
-            let _ = cuMemPoolGetAttribute(
-                pool,
-                CUmemPool_attribute::CU_MEMPOOL_ATTR_USED_MEM_CURRENT,
-                &mut used_after as *mut u64 as *mut std::ffi::c_void,
-            );
-            let _ = cuMemPoolGetAttribute(
-                pool,
-                CUmemPool_attribute::CU_MEMPOOL_ATTR_RESERVED_MEM_CURRENT,
-                &mut reserved_after as *mut u64 as *mut std::ffi::c_void,
-            );
-            tracing::info!(
-                "  GPU{}: pool used {}->{} MB, reserved {}->{} MB (trim {:?})",
-                ordinal,
-                used_before / (1024 * 1024),
-                used_after / (1024 * 1024),
-                reserved_before / (1024 * 1024),
-                reserved_after / (1024 * 1024),
-                r
-            );
-            if r == cudaError_enum::CUDA_SUCCESS {
-                released += 1;
-            }
+    unsafe {
+        // Drain THIS device's streams before trimming its pool. A single
+        // current-context cuCtxSynchronize only drains GPU0 - GPU1's
+        // stream-ordered frees stayed queued and its pool showed
+        // "used 3 MB, reserved 15456 MB, trim CUDA_SUCCESS, nothing
+        // released" (a campaign: every gemma4:31b retry then
+        // OOM'd against the phantom-full GPU1 -> all-CPU at 1.2 tok/s).
+        // A card with no context has nothing queued, and retaining one would open it.
+        let mut ctx: CUcontext = std::ptr::null_mut();
+        if crate::tensor::cuda::card_context_active(ordinal as usize)
+            && cuDevicePrimaryCtxRetain(&mut ctx, ordinal) == cudaError_enum::CUDA_SUCCESS
+            && !ctx.is_null()
+        {
+            let _ = cuCtxPushCurrent_v2(ctx);
+            let _ = cuCtxSynchronize();
+            // What the recorded graphs reserved beyond what the live ones use goes back too.
+            let _ = crate::tensor::gpu_runtime::driver::sys::cuDeviceGraphMemTrim(ordinal);
+            let mut popped: CUcontext = std::ptr::null_mut();
+            let _ = cuCtxPopCurrent_v2(&mut popped);
+            let _ = cuDevicePrimaryCtxRelease_v2(ordinal);
         }
+        let mut pool: CUmemoryPool = std::ptr::null_mut();
+        let r = cuDeviceGetDefaultMemPool(&mut pool, ordinal);
+        if r != cudaError_enum::CUDA_SUCCESS || pool.is_null() {
+            return 0;
+        }
+        // Read current release threshold for diagnostic.
+        let mut threshold_before: u64 = 999;
+        let _ = cuMemPoolGetAttribute(
+            pool,
+            CUmemPool_attribute::CU_MEMPOOL_ATTR_RELEASE_THRESHOLD,
+            &mut threshold_before as *mut u64 as *mut std::ffi::c_void,
+        );
+        // Reset the release threshold to 0. `enable_graph_capture_mode`
+        // (called when CUDA graphs are in use) sets this to u64::MAX so
+        // the pool never returns memory to the OS - that's correct
+        // during capture, but on unload we want VRAM back. Without this
+        // reset, cuMemPoolTrimTo(0) is a no-op.
+        let zero: u64 = 0;
+        let r_set = cuMemPoolSetAttribute(
+            pool,
+            CUmemPool_attribute::CU_MEMPOOL_ATTR_RELEASE_THRESHOLD,
+            &zero as *const u64 as *mut std::ffi::c_void,
+        );
+        tracing::info!(
+            "  GPU{}: threshold was {} (set->0 returned {:?})",
+            ordinal,
+            threshold_before,
+            r_set,
+        );
+        // Diagnostic: dump pool stats so we can tell whether the
+        // memory is still in use (live CudaSlice somewhere) vs cached
+        // and the trim is failing to release.
+        let mut used_before: u64 = 0;
+        let mut reserved_before: u64 = 0;
+        let _ = cuMemPoolGetAttribute(
+            pool,
+            CUmemPool_attribute::CU_MEMPOOL_ATTR_USED_MEM_CURRENT,
+            &mut used_before as *mut u64 as *mut std::ffi::c_void,
+        );
+        let _ = cuMemPoolGetAttribute(
+            pool,
+            CUmemPool_attribute::CU_MEMPOOL_ATTR_RESERVED_MEM_CURRENT,
+            &mut reserved_before as *mut u64 as *mut std::ffi::c_void,
+        );
+        // Trim the pool to keep at most 0 bytes - return everything to
+        // the OS. CUDA may still retain a small accounting overhead.
+        let r = cuMemPoolTrimTo(pool, 0);
+        let mut used_after: u64 = 0;
+        let mut reserved_after: u64 = 0;
+        let _ = cuMemPoolGetAttribute(
+            pool,
+            CUmemPool_attribute::CU_MEMPOOL_ATTR_USED_MEM_CURRENT,
+            &mut used_after as *mut u64 as *mut std::ffi::c_void,
+        );
+        let _ = cuMemPoolGetAttribute(
+            pool,
+            CUmemPool_attribute::CU_MEMPOOL_ATTR_RESERVED_MEM_CURRENT,
+            &mut reserved_after as *mut u64 as *mut std::ffi::c_void,
+        );
+        tracing::info!(
+            "  GPU{}: pool used {}->{} MB, reserved {}->{} MB (trim {:?})",
+            ordinal,
+            used_before / (1024 * 1024),
+            used_after / (1024 * 1024),
+            reserved_before / (1024 * 1024),
+            reserved_after / (1024 * 1024),
+            r
+        );
+        if r == cudaError_enum::CUDA_SUCCESS {
+            released += 1;
+        }
+    }
     released
 }
 
@@ -1871,9 +1875,9 @@ use std::io::Cursor;
 use std::time::Instant;
 
 mod batching;
+pub(crate) use batching::requests_of_the_process;
 pub use batching::ActiveRequest;
 pub use batching::Arrived;
-pub(crate) use batching::requests_of_the_process;
 mod beam;
 pub use beam::{BeamAnswer, BeamOutcome, BeamSearch, EarlyStopping};
 pub(crate) mod discover;

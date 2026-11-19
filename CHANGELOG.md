@@ -15,6 +15,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Fixed
 
+- Placement: keep a model's planned cache growth and prompt memory from other models.
 - Placement: give a model's kept pools, graphs and states to a model beside it.
 - Serving: leave a load in progress its room when a batch worker starts.
 - Placement: keep a model's out-of-memory escalation to its own placements.

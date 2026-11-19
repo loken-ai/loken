@@ -42,6 +42,8 @@ pub trait Holder: Send + Sync {
     /// Gives back what the model keeps of `kind` on `card`, at least `bytes` of it when it holds
     /// that much. True when anything was given back.
     fn give_back(&self, kind: Kind, card: usize, bytes: u64) -> bool;
+    /// Brings what the holder declared on its cards up to date, when it can without waiting.
+    fn refresh(&self) {}
 }
 
 fn holders() -> &'static Mutex<Vec<Weak<dyn Holder>>> {
@@ -54,6 +56,18 @@ pub fn register(holder: &Arc<dyn Holder>) {
     let mut list = holders().lock().unwrap_or_else(|e| e.into_inner());
     list.retain(|w| w.strong_count() > 0);
     list.push(Arc::downgrade(holder));
+}
+
+/// Has every live holder bring its declarations up to date, before a placement reads them.
+pub fn refresh() {
+    let live: Vec<Arc<dyn Holder>> = {
+        let mut list = holders().lock().unwrap_or_else(|e| e.into_inner());
+        list.retain(|w| w.strong_count() > 0);
+        list.iter().filter_map(Weak::upgrade).collect()
+    };
+    for holder in live {
+        holder.refresh();
+    }
 }
 
 /// The live holders other than `except` that run on `card`.

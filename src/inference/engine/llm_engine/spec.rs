@@ -30,6 +30,7 @@ impl LlmEngine {
             pld_cost: self.pld_cost.clone(),
             load_report: self.load_report.clone(),
             kept_memory: self.kept_memory.clone(),
+            planned_kv: self.planned_kv.clone(),
         }
     }
 }

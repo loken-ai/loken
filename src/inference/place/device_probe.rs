@@ -791,7 +791,13 @@ pub fn probe_cuda_devices(_reserve: u64) -> Vec<(usize, u64, crate::tensor::Devi
 /// Taken GREEDILY from the fastest card down, because that is the order every planner
 /// in this process fills cards in: the declaring subsystem's hot component sits on the
 /// fastest card that holds it, so that is where its peak lands.
+/// A demand declared on a card is taken from that card alone.
 fn apply_pending_demand(owner: &str, cards: &mut [CudaGpuInfo]) {
+    for g in cards.iter_mut() {
+        let held = crate::inference::place::vram_manager::card_demand_excluding(owner, g.index);
+        g.stable_free = g.stable_free.saturating_sub(held);
+        g.available = g.stable_free;
+    }
     let mut pending = crate::inference::place::vram_manager::pending_demand_excluding(owner);
     if pending == 0 {
         return;
@@ -809,6 +815,7 @@ fn apply_pending_demand(owner: &str, cards: &mut [CudaGpuInfo]) {
 
 /// [`probe_cuda_gpus`], minus what other subsystems have declared they are about to use.
 pub fn probe_cuda_gpus_for(owner: &str) -> Vec<CudaGpuInfo> {
+    crate::inference::place::reclaim::refresh();
     let mut cards = probe_cuda_gpus();
     apply_pending_demand(owner, &mut cards);
     cards

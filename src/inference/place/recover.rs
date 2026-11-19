@@ -41,7 +41,7 @@ pub fn shrink_on_oom<T, E: std::fmt::Display>(
 
 /// Makes the `bytes` a request is about to allocate beside its resident weights visible to
 /// every other owner's placement for as long as the returned lease lives.
-pub fn hold_scratch(owner: &'static str, bytes: u64) -> super::vram_manager::DemandLease {
+pub fn hold_scratch(owner: &str, bytes: u64) -> super::vram_manager::DemandLease {
     super::vram_manager::declare_demand(owner, bytes)
 }
 
@@ -230,8 +230,11 @@ where
             break;
         }
         release();
-        if let Some(stop) =
-            replan(super::vram_manager::degrade_level_for(owner), message.clone()).await
+        if let Some(stop) = replan(
+            super::vram_manager::degrade_level_for(owner),
+            message.clone(),
+        )
+        .await
         {
             return stop;
         }

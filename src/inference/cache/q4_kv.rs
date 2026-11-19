@@ -935,6 +935,13 @@ impl Q4KvCache {
         (k, residual, v)
     }
 
+    /// Device bytes the cache takes as it grows from its capacity now to `up_to` positions,
+    /// never past its ceiling.
+    pub fn growth_bytes(&self, up_to: usize) -> u64 {
+        self.raw_bytes(up_to.min(self.core.max()))
+            .saturating_sub(self.raw_bytes(self.core.cap())) as u64
+    }
+
     /// Device bytes a raw snapshot of the first `len` positions holds.
     pub fn raw_bytes(&self, len: usize) -> usize {
         let (k, residual, v) = self.raw_extent(len);

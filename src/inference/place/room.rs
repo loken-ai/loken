@@ -251,6 +251,12 @@ pub fn hold(owner: &'static str, bytes: u64) -> super::vram_manager::DemandLease
     super::vram_manager::declare_demand(owner, bytes)
 }
 
+/// Holds `bytes` of card `card` for `owner` until the lease drops: every placement made
+/// meanwhile, but the owner's own, is planned around it.
+pub fn hold_on(owner: &str, card: usize, bytes: u64) -> super::vram_manager::DemandLease {
+    super::vram_manager::declare_card_demand(owner, card, bytes)
+}
+
 /// The highest memory bandwidth among the cards, in GB/s; zero without a card.
 pub fn fastest_bandwidth_gbs() -> f64 {
     probe_cuda_gpus()

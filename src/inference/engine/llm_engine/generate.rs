@@ -101,6 +101,8 @@ impl LlmEngine {
             cache_scope: crate::inference::engine::cache_scope::CacheScope::current(),
             ..params
         };
+        // The prompt's memory is declared to the other placements while the request runs.
+        let _work = self.declare_request_work().await;
         crate::inference::place::recover::retry_on_oom_for(
             &self.config.model_id,
             &self.config.model_id,

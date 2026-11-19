@@ -22,6 +22,32 @@ impl GenericHeteroTransformer {
         cards
     }
 
+    /// The card memory each card of the model takes as its quantised caches grow to `planned`
+    /// positions, the context the load planned: what the plan counted and the cards do not
+    /// hold yet.
+    #[cfg(feature = "gpu")]
+    pub fn kv_growth_by_card(&self, planned: usize) -> Vec<(usize, u64)> {
+        let mut out: Vec<(usize, u64)> = Vec::new();
+        for (layer, dev) in self.layers.iter().zip(&self.layer_devs) {
+            let (LayerDevice::Cuda(card), Some(cache)) = (dev, layer.quant_kv.as_ref()) else {
+                continue;
+            };
+            let bytes = cache.growth_bytes(planned);
+            match out.iter_mut().find(|(c, _)| c == card) {
+                Some(entry) => entry.1 += bytes,
+                None => out.push((*card, bytes)),
+            }
+        }
+        out
+    }
+
+    /// The card memory each card of the model takes as its quantised caches grow: none without a
+    /// card runtime.
+    #[cfg(not(feature = "gpu"))]
+    pub fn kv_growth_by_card(&self, _planned: usize) -> Vec<(usize, u64)> {
+        Vec::new()
+    }
+
     /// Gives back the extra expert slots of the layers on card `card`, the coldest first, until
     /// `bytes` of them are freed or none is left. True when a layer gave its slots back.
     /// The next request's prefill decides again what they hold.

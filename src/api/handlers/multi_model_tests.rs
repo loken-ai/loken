@@ -459,6 +459,86 @@ async fn a_batch_worker_leaves_the_room_a_load_declared() {
     .await;
 }
 
+/// Starts a long answer of `model` in the background, and returns once the engine runs it.
+async fn busy_with(
+    state: &APIServer,
+    model: &str,
+    prompt: String,
+    tokens: usize,
+) -> tokio::task::JoinHandle<String> {
+    let engine = state.get_engine(model).await.unwrap();
+    let task = {
+        let (state, model) = (state.clone(), model.to_string());
+        tokio::spawn(async move { answer(&state, &model, prompt, tokens).await })
+    };
+    while engine.in_flight() == 0 {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    task
+}
+
+/// T6: a model loaded beside another that decodes leaves the growth that model's cache was
+/// planned for; the decode reaches its planned context without running out of memory, and the
+/// model loaded beside it stays loaded.
+async fn planned_growth_stays(total: u64, grower: &str, incoming: &str) {
+    use crate::inference::engine::llm_engine::KvQuant;
+    let root = scratch("growth");
+    let window = crate::inference::cache::KV_WORKING_WINDOW_TOKENS;
+    let context = 3 * window;
+    // The cache grows past its window by about a quarter of the card.
+    let grows = Shape::caching(total / 4 / (context - window) as u64, context);
+    write_model(&root, grower, grows, 17);
+    let state = server(&root, context, KvQuant::Q8);
+    state.ensure_loaded(grower, 5).await.unwrap();
+    state
+        .get_engine(grower)
+        .await
+        .unwrap()
+        .hold_lone_requests_on(false);
+    let first = prompt(64, grows.vocab, 3);
+    let tokens = context - 2 * 64;
+    let alone = answer(&state, grower, first.clone(), tokens).await;
+    eprintln!(
+        "{grower} alone wrote {} words past a window of {window}",
+        alone.split_whitespace().count()
+    );
+    // The grower forgets the conversation: its cache starts again from the window.
+    state.unload_model(grower).await.unwrap();
+    state.ensure_loaded(grower, 5).await.unwrap();
+    state
+        .get_engine(grower)
+        .await
+        .unwrap()
+        .hold_lone_requests_on(false);
+    // The incoming model takes what the card reads free, less a margin.
+    write_model(
+        &root,
+        incoming,
+        Shape::weighing(card_free() - total / 16, 2048),
+        19,
+    );
+    let decoding = busy_with(&state, grower, first, tokens).await;
+    state.ensure_loaded(incoming, 5).await.unwrap();
+    let text = decoding.await.unwrap();
+    assert_eq!(text, alone, "{grower} answered otherwise beside {incoming}");
+    assert!(
+        loaded(&state, incoming).await,
+        "{incoming} was unloaded for {grower}'s cache"
+    );
+    assert!(loaded(&state, grower).await, "{grower} was unloaded");
+    finish(&state, &root).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "fills card 0: run alone"]
+async fn a_cache_keeps_the_growth_its_load_planned() {
+    on_card("planned growth", |total| async move {
+        planned_growth_stays(total, "test/mm-a", "test/mm-b").await;
+        planned_growth_stays(total, "test/mm-b", "test/mm-a").await;
+    })
+    .await;
+}
+
 /// T8: the pressure one model raised after running out of memory moves its own placements, not
 /// those of a model loaded meanwhile, and that load leaves the escalation as it was.
 async fn pressure_stays_with_its_model(raiser: &str, incoming: &str) {
