@@ -269,6 +269,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             if cuda_available {
                 info!("🚀 CUDA Available: Yes (GPU acceleration enabled)");
+                // The kernels the first prompt runs compile while the server starts.
+                #[cfg(feature = "gpu")]
+                loken::inference::quantized_cuda::compile_ahead(
+                    loken::inference::place::device_probe::probe_cuda_gpus()
+                        .iter()
+                        .map(|g| g.index)
+                        .collect(),
+                );
             } else {
                 info!("🚀 CUDA Available: No (running in CPU-only mode)");
                 #[cfg(not(feature = "gpu"))]

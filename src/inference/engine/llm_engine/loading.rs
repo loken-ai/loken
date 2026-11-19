@@ -913,6 +913,11 @@ impl LlmEngine {
             };
             crate::inference::place::device_probe::debug_vram_by_card("after-offer");
             let cuda_devices: Vec<(usize, u64)> = offer.cards.clone();
+            // The kernels the first prompt runs compile beside the load.
+            #[cfg(feature = "gpu")]
+            crate::inference::quantized_cuda::compile_ahead(
+                cuda_devices.iter().map(|(card, _)| *card).collect(),
+            );
             info!(
                 "📊 cards offered (free less staging): {}; staging {:.2} GB, runtime reserve {:.2} GB",
                 cuda_devices

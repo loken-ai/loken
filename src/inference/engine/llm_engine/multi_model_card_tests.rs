@@ -473,3 +473,35 @@ async fn a_registration_never_stalls_another_models_decode() {
         .await
         .expect("the watchdog: the test stalled");
 }
+
+/// A load for a request compiles the kernels its first prompt runs, with no prompt read.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_load_compiles_the_kernels_of_the_first_prompt() {
+    let dir = model_on_disk(NARROW);
+    let engine = LlmEngine::with_config(InferenceConfig {
+        model_id: "kernels-ahead".to_string(),
+        models_dir: Some(dir.join("model.gguf")),
+        context_length: 256,
+        ..InferenceConfig::default()
+    });
+    engine
+        .load_model_for_request()
+        .await
+        .expect("the engine loads the file");
+    let cards: Vec<usize> = crate::inference::place::device_probe::probe_cuda_gpus()
+        .iter()
+        .map(|g| g.index)
+        .collect();
+    let started = std::time::Instant::now();
+    while !cards
+        .iter()
+        .any(|&c| crate::inference::quantized_cuda::compiled_for(c))
+    {
+        assert!(
+            started.elapsed() < WATCHDOG,
+            "no card's kernels compiled ahead of the first prompt"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}

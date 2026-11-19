@@ -211,6 +211,39 @@ pub(crate) fn get_mmvq_ptx_for_ordinal(
     compiled.ok_or_else(|| anyhow!("mmvq_gguf.cu failed to NVRTC-compile for {key}"))
 }
 
+/// Compiles the quantised and mat-vec modules for the cards `ordinals` on a thread of its own.
+///
+/// Each module is compiled once per architecture.
+/// A launcher that needs a module while it compiles waits for that compile.
+pub fn compile_ahead(ordinals: Vec<usize>) {
+    if ordinals.is_empty() {
+        return;
+    }
+    let spawned = std::thread::Builder::new()
+        .name("kernel-compile".into())
+        .spawn(move || {
+            for ordinal in ordinals {
+                let _ = get_quantized_ptx_for_ordinal(ordinal);
+                let _ = get_mmvq_ptx_for_ordinal(ordinal);
+            }
+        });
+    if let Err(e) = spawned {
+        tracing::debug!("kernels not compiled ahead: {e}");
+    }
+}
+
+/// Whether both modules [`compile_ahead`] compiles are compiled for card `ordinal`.
+/// False while one of them compiles.
+#[cfg(test)]
+pub(crate) fn compiled_for(ordinal: usize) -> bool {
+    let key = nvrtc_arch_of_ordinal(ordinal).unwrap_or("default");
+    [&QUANTIZED_PTX, &MMVQ_PTX].iter().all(|map| {
+        map.get()
+            .and_then(|m| m.try_lock().ok().map(|g| g.contains_key(key)))
+            .unwrap_or(false)
+    })
+}
+
 mod ptx;
 pub use ptx::*;
 mod awq;

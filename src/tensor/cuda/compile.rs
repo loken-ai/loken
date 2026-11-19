@@ -3,9 +3,9 @@
 //! The kernels are compiled to PTX, which the driver turns into machine code for the card and
 //! keeps in its own cache. A driver older than the NVRTC library cannot read the PTX that library
 //! writes, so for such a driver an NVIDIA card's kernels are compiled to the card's machine code
-//! instead, which any driver of the same major version loads. That machine code is kept in the
-//! user's cache directory, keyed by the source, the options and the NVRTC version, so a later
-//! start loads it instead of compiling it again.
+//! instead, which any driver of the same major version loads. The PTX or the machine code of an
+//! NVIDIA card is kept in the user's cache directory, keyed by the source, the options and the
+//! NVRTC version, so a later start loads it instead of compiling it again, whatever build runs.
 
 use crate::tensor::gpu_runtime::nvrtc::{CompileOptions, Ptx};
 
@@ -17,8 +17,61 @@ pub fn compile(src: impl AsRef<str>, opts: CompileOptions) -> Result<Ptx, String
         if driver_older_than_nvrtc() {
             return cubin(src.as_ref(), opts, &sm);
         }
+        return ptx(src.as_ref(), opts);
     }
     crate::tensor::gpu_runtime::nvrtc::compile_ptx_with_opts(src, opts).map_err(|e| e.to_string())
+}
+
+/// `src` compiled to the PTX of the NVIDIA architecture `opts.arch` names: read from the cache
+/// when an earlier compile of the same source and options left it there.
+#[cfg(feature = "cuda")]
+fn ptx(src: &str, opts: CompileOptions) -> Result<Ptx, String> {
+    let mut args = option_args(&opts);
+    args.extend(opts.arch.map(|a| format!("--gpu-architecture={a}")));
+    let cached = cache_path(src, &args, "ptx");
+    if let Some(text) = cached
+        .as_ref()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .filter(|t| !t.is_empty())
+    {
+        return Ok(Ptx::from_src(text));
+    }
+    let code = crate::tensor::gpu_runtime::nvrtc::compile_ptx_with_opts(src, opts)
+        .map_err(|e| e.to_string())?;
+    let text = code.to_src();
+    if let (Some(path), false) = (cached, text.is_empty()) {
+        store(&path, text.as_bytes());
+    }
+    Ok(code)
+}
+
+/// The NVRTC arguments `opts` asks for, the target architecture left out.
+#[cfg(feature = "cuda")]
+fn option_args(opts: &CompileOptions) -> Vec<String> {
+    let mut args: Vec<String> = Vec::new();
+    for (flag, v) in [
+        ("ftz", opts.ftz),
+        ("prec-sqrt", opts.prec_sqrt),
+        ("prec-div", opts.prec_div),
+        ("fmad", opts.fmad),
+    ] {
+        if let Some(v) = v {
+            args.push(format!("--{flag}={v}"));
+        }
+    }
+    if opts.use_fast_math == Some(true) {
+        args.push("--fmad=true".into());
+    }
+    if let Some(n) = opts.maxrregcount {
+        args.push(format!("--maxrregcount={n}"));
+    }
+    args.extend(
+        opts.include_paths
+            .iter()
+            .map(|p| format!("--include-path={p}")),
+    );
+    args.extend(opts.options.iter().cloned());
+    args
 }
 
 /// The machine architecture of an NVIDIA virtual one: `sm_89` for `compute_89`.
@@ -57,32 +110,10 @@ pub fn driver_older_than_nvrtc() -> bool {
 /// when an earlier compile of the same source and options left it there.
 #[cfg(feature = "cuda")]
 fn cubin(src: &str, opts: CompileOptions, sm: &str) -> Result<Ptx, String> {
-    let mut args: Vec<String> = Vec::new();
-    for (flag, v) in [
-        ("ftz", opts.ftz),
-        ("prec-sqrt", opts.prec_sqrt),
-        ("prec-div", opts.prec_div),
-        ("fmad", opts.fmad),
-    ] {
-        if let Some(v) = v {
-            args.push(format!("--{flag}={v}"));
-        }
-    }
-    if opts.use_fast_math == Some(true) {
-        args.push("--fmad=true".into());
-    }
-    if let Some(n) = opts.maxrregcount {
-        args.push(format!("--maxrregcount={n}"));
-    }
-    args.extend(
-        opts.include_paths
-            .iter()
-            .map(|p| format!("--include-path={p}")),
-    );
+    let mut args = option_args(&opts);
     args.push(format!("--gpu-architecture={sm}"));
-    args.extend(opts.options.iter().cloned());
 
-    let cached = cache_path(src, &args);
+    let cached = cache_path(src, &args, "cubin");
     if let Some(image) = cached.as_ref().and_then(|p| std::fs::read(p).ok()) {
         return Ok(Ptx::from_binary(image));
     }
@@ -93,10 +124,11 @@ fn cubin(src: &str, opts: CompileOptions, sm: &str) -> Result<Ptx, String> {
     Ok(Ptx::from_binary(image))
 }
 
-/// Where the machine code of `src` compiled with `args` is kept: a file named by the digest of
-/// the NVRTC version, the arguments and the source. `None` without a user cache directory.
+/// Where the code of `src` compiled with `args` is kept: a file named by the digest of the NVRTC
+/// version, the arguments and the source, with the extension `kind`. `None` without a user
+/// cache directory.
 #[cfg(feature = "cuda")]
-fn cache_path(src: &str, args: &[String]) -> Option<std::path::PathBuf> {
+fn cache_path(src: &str, args: &[String], kind: &str) -> Option<std::path::PathBuf> {
     use sha2::{Digest, Sha256};
     let (mut major, mut minor) = (0, 0);
     let _ = unsafe { cudarc::nvrtc::sys::nvrtcVersion(&mut major, &mut minor) };
@@ -112,7 +144,7 @@ fn cache_path(src: &str, args: &[String]) -> Option<std::path::PathBuf> {
         dirs::cache_dir()?
             .join("loken")
             .join("kernels")
-            .join(format!("{name}.cubin")),
+            .join(format!("{name}.{kind}")),
     )
 }
 
@@ -173,12 +205,50 @@ mod tests {
     #[test]
     fn the_cache_names_the_source_and_the_options() {
         let args = |a: &str| vec![a.to_string()];
-        let Some(a) = cache_path("src", &args("-x")) else {
+        let Some(a) = cache_path("src", &args("-x"), "cubin") else {
             return;
         };
-        assert_eq!(cache_path("src", &args("-x")), Some(a.clone()));
-        assert_ne!(cache_path("src2", &args("-x")), Some(a.clone()));
-        assert_ne!(cache_path("src", &args("-y")), Some(a));
+        assert_eq!(cache_path("src", &args("-x"), "cubin"), Some(a.clone()));
+        assert_ne!(cache_path("src2", &args("-x"), "cubin"), Some(a.clone()));
+        assert_ne!(cache_path("src", &args("-y"), "cubin"), Some(a.clone()));
+        assert_ne!(cache_path("src", &args("-x"), "ptx"), Some(a));
+    }
+
+    /// A module compiled once is read back from the cache by the next compile of the same
+    /// source and options: a new build of the server does not compile it again.
+    #[test]
+    fn a_compiled_module_is_kept_for_the_next_start() {
+        let Some(arch) = crate::inference::quantized_cuda::nvrtc_arch_of_ordinal(0) else {
+            eprintln!("no NVIDIA card: the kept module is NOT covered by this run");
+            return;
+        };
+        let src = format!(
+            "extern \"C\" __global__ void kept_{}(float* x) {{ x[threadIdx.x] = 2.0f; }}",
+            std::process::id()
+        );
+        let opts = || CompileOptions {
+            arch: Some(arch),
+            ..Default::default()
+        };
+        let first = compile(&src, opts()).expect("the module compiles");
+        let mut args = option_args(&opts());
+        let kind = if driver_older_than_nvrtc() {
+            args.push(format!(
+                "--gpu-architecture={}",
+                machine_arch(arch).unwrap()
+            ));
+            "cubin"
+        } else {
+            args.push(format!("--gpu-architecture={arch}"));
+            "ptx"
+        };
+        let Some(path) = cache_path(&src, &args, kind) else {
+            return;
+        };
+        assert!(path.exists(), "{} was not kept", path.display());
+        let again = compile(&src, opts()).expect("the kept module loads");
+        assert_eq!(again.to_src(), first.to_src());
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
