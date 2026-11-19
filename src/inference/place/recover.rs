@@ -45,18 +45,30 @@ pub fn hold_scratch(owner: &'static str, bytes: u64) -> super::vram_manager::Dem
     super::vram_manager::declare_demand(owner, bytes)
 }
 
-/// One request's escalation of the placement pressure, at most [`PRESSURE_RUNGS`] rungs.
-/// Dropping it takes back the rungs it raised.
+/// One request's escalation of the placement pressure of its owner, at most
+/// [`PRESSURE_RUNGS`] rungs. Dropping it takes back the rungs it raised.
 #[derive(Debug, Default)]
 pub struct Pressure {
+    /// Whose placements the rungs move: the media engines' shared owner by default.
+    owner: String,
     raised: u64,
     /// The bytes each card was made to keep back, taken back when the request ends.
     cards: Vec<(usize, u64)>,
 }
 
 impl Pressure {
+    /// An escalation of the media engines' shared pressure.
     pub fn new() -> Self {
-        Self::default()
+        Self::of(super::vram_manager::SHARED)
+    }
+
+    /// An escalation of the pressure of `owner`, which moves `owner`'s placements alone.
+    pub fn of(owner: &str) -> Self {
+        Self {
+            owner: owner.to_string(),
+            raised: 0,
+            cards: Vec::new(),
+        }
     }
 
     /// Raises the pressure one rung for `what`, which ran out of memory with `err`, and
@@ -66,7 +78,7 @@ impl Pressure {
             return None;
         }
         self.raised += 1;
-        let level = super::vram_manager::vram_degrade();
+        let level = super::vram_manager::degrade_for(&self.owner);
         tracing::warn!(
             "{what}: out of memory ({err}); re-planning further off the cards at pressure {level}"
         );
@@ -80,7 +92,7 @@ impl Pressure {
         if self.cards.iter().filter(|(c, _)| *c == card).count() >= CARD_RUNGS {
             return false;
         }
-        let added = super::vram_manager::raise_card_pressure(card);
+        let added = super::vram_manager::raise_card_pressure_for(&self.owner, card);
         self.cards.push((card, added));
         tracing::warn!(
             "{what}: card {card} out of memory ({err}); re-planning with {:.2} GB more kept free there and the other cards unchanged",
@@ -98,9 +110,9 @@ impl Pressure {
 impl Drop for Pressure {
     fn drop(&mut self) {
         for &(card, bytes) in &self.cards {
-            super::vram_manager::lower_card_pressure(card, bytes);
+            super::vram_manager::lower_card_pressure_for(&self.owner, card, bytes);
         }
-        super::vram_manager::vram_degrade_lower(self.raised);
+        super::vram_manager::degrade_lower_for(&self.owner, self.raised);
     }
 }
 
@@ -115,7 +127,44 @@ impl Drop for Pressure {
 ///
 /// A flagged outcome is dropped before the next await: one that carries a `Box<dyn Error>`
 /// is not `Send`, and holding it across the await would make the caller's future non-`Send`.
+///
+/// The pressure it raises is the media engines' shared pressure; [`retry_on_oom_for`] raises
+/// a model's own.
 pub async fn retry_on_oom<T, A, AF, O, R, E, EF, P, PF>(
+    what: &str,
+    attempt: A,
+    oom: O,
+    release: R,
+    evict_idle: E,
+    replan: P,
+) -> T
+where
+    A: FnMut() -> AF,
+    AF: std::future::Future<Output = T>,
+    O: Fn(&T) -> Option<String>,
+    R: Fn(),
+    E: FnMut() -> EF,
+    EF: std::future::Future<Output = u64>,
+    P: FnMut(u64, String) -> PF,
+    PF: std::future::Future<Output = Option<T>>,
+{
+    retry_on_oom_for(
+        super::vram_manager::SHARED,
+        what,
+        attempt,
+        oom,
+        release,
+        evict_idle,
+        replan,
+    )
+    .await
+}
+
+/// [`retry_on_oom`] for a model that owns its pressure: the rungs it raises move the
+/// placements of `owner` alone.
+#[allow(clippy::too_many_arguments)]
+pub async fn retry_on_oom_for<T, A, AF, O, R, E, EF, P, PF>(
+    owner: &str,
     what: &str,
     mut attempt: A,
     oom: O,
@@ -160,7 +209,7 @@ where
         };
         tracing::warn!("{what}: still out of memory after unloading an idle resident");
     }
-    let mut pressure = Pressure::new();
+    let mut pressure = Pressure::of(owner);
     // The card that ran out keeps more back first, the others unchanged: the blocks that leave
     // it go to a card with room, or to the host only for what no card holds.
     while let Some(card) = super::vram_manager::take_oom_card() {
@@ -168,7 +217,8 @@ where
             break;
         }
         release();
-        if let Some(stop) = replan(super::vram_manager::vram_degrade_level(), message.clone()).await
+        if let Some(stop) =
+            replan(super::vram_manager::degrade_level_for(owner), message.clone()).await
         {
             return stop;
         }

@@ -591,7 +591,8 @@ impl LlmEngine {
             cache_scope: crate::inference::engine::cache_scope::CacheScope::current(),
             ..params
         };
-        let started = crate::inference::place::recover::retry_on_oom(
+        let started = crate::inference::place::recover::retry_on_oom_for(
+            &self.config.model_id,
             &self.config.model_id,
             || async {
                 let mut rx = self.generate_stream_once(prompt, params.clone()).await?;

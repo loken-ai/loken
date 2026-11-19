@@ -191,8 +191,15 @@ pub(crate) async fn calibrate_model(
         let place = |ckpt: &BlockScaledCheckpoint, meta: &WideSparseMeta, context: usize| {
             let bytes = engine::checkpoint_bytes(&ckpt.dir)
                 .map_err(|e| crate::tensor::Error::msg(e.to_string()))?;
-            engine::place_wide_checkpoint(ckpt, meta, bytes, context, engine::KvQuant::Off)
-                .map_err(|e| crate::tensor::Error::msg(e.to_string()))
+            engine::place_wide_checkpoint(
+                crate::inference::place::llm::OWNER,
+                ckpt,
+                meta,
+                bytes,
+                context,
+                engine::KvQuant::Off,
+            )
+            .map_err(|e| crate::tensor::Error::msg(e.to_string()))
         };
         wide_sparse_calibrate::calibrate_checkpoint(&dir, &asked, &out, place, &|done, total| {
             progress(done, total, "calibrating layers")

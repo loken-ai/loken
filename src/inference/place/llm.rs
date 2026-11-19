@@ -4,7 +4,8 @@
 
 use super::ladder::{on_one_card, Demand};
 
-/// The owner a language model's placement reads the cards as.
+/// The owner the language models' expert tiers read the other owners' demands as.
+/// A language model's placement reads the cards as its model id instead, see [`offer`].
 pub(crate) const OWNER: &str = "llm";
 
 /// The cards a language model is offered.
@@ -27,18 +28,19 @@ impl Offer {
     }
 }
 
-/// The cards a language model is offered, read under the fleet's pressure. `whole` is what
-/// one card must hold for the model to live on it alone, beside the loader's `staging`.
+/// The cards the language model `owner` is offered, read under its own pressure and less what
+/// other owners declared they are about to take. `whole` is what one card must hold for the
+/// model to live on it alone, beside the loader's `staging`.
 ///
 /// Every card an offer lists had its context made before it was measured, so a card reads
 /// the same on every load: the fastest card first, and the others only once the model does
 /// not sit whole on one card and the spread needs their budgets.
-pub fn offer(pin: Option<usize>, whole: u64, staging: u64) -> Offer {
-    let fastest = pin.or_else(|| super::room::fastest_card(OWNER));
+pub fn offer(owner: &str, pin: Option<usize>, whole: u64, staging: u64) -> Offer {
+    let fastest = pin.or_else(|| super::room::fastest_card(owner));
     if let Some(card) = fastest {
         warm(card);
     }
-    let cards = read(staging);
+    let cards = read(owner, staging);
     let whole_on = holder(&cards, pin, whole);
     if whole_on.is_some() || cards.len() < 2 {
         return Offer {
@@ -49,7 +51,7 @@ pub fn offer(pin: Option<usize>, whole: u64, staging: u64) -> Offer {
     for (idx, _) in &cards {
         warm(*idx);
     }
-    let cards = read(staging);
+    let cards = read(owner, staging);
     Offer {
         whole_on: holder(&cards, pin, whole),
         cards: super::ladder::prefer(&cards, pin),
@@ -70,12 +72,12 @@ fn holder(cards: &[(usize, u64)], pin: Option<usize>, whole: u64) -> Option<usiz
     }
 }
 
-/// Free bytes each card offers after the pools are handed back, under the fleet's
-/// pressure, less `staging`; cards offering nothing are left out.
-fn read(staging: u64) -> Vec<(usize, u64)> {
+/// Free bytes each card offers `owner` after the pools are handed back, under its pressure,
+/// less `staging`; cards offering nothing are left out.
+fn read(owner: &str, staging: u64) -> Vec<(usize, u64)> {
     crate::inference::engine::llm_engine::release_cuda_pools();
-    let boost = super::vram_manager::vram_reserve_boost();
-    super::device_probe::probe_cuda_gpus_for(OWNER)
+    let boost = super::vram_manager::reserve_boost_for(owner);
+    super::device_probe::probe_cuda_gpus_for(owner)
         .into_iter()
         .map(|g| {
             (
@@ -83,7 +85,7 @@ fn read(staging: u64) -> Vec<(usize, u64)> {
                 g.stable_free
                     .saturating_sub(boost)
                     .saturating_sub(staging)
-                    .saturating_sub(super::vram_manager::card_pressure(g.index)),
+                    .saturating_sub(super::vram_manager::card_pressure_for(owner, g.index)),
             )
         })
         .filter(|(_, free)| *free > 0)

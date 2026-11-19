@@ -899,6 +899,7 @@ impl LlmEngine {
                 crate::inference::place::llm::Offer::default()
             } else {
                 crate::inference::place::llm::offer(
+                    &model_id_clone,
                     device_index,
                     file_size.saturating_add(runtime_reserve_bytes),
                     staging,

@@ -100,7 +100,8 @@ impl LlmEngine {
             cache_scope: crate::inference::engine::cache_scope::CacheScope::current(),
             ..params
         };
-        crate::inference::place::recover::retry_on_oom(
+        crate::inference::place::recover::retry_on_oom_for(
+            &self.config.model_id,
             &self.config.model_id,
             || self.generate_once(prompt, params.clone()),
             crate::inference::place::recover::oom_message,

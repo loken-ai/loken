@@ -429,7 +429,8 @@ pub(super) fn load_wide_checkpoint(
     } else {
         declared_context(dir)
     };
-    let mut model = place_wide_checkpoint(&checkpoint, &meta, file_size, context_length, kv_quant)?;
+    let mut model =
+        place_wide_checkpoint(model_id, &checkpoint, &meta, file_size, context_length, kv_quant)?;
     if quality != QualityLevel::Exact {
         let ids = crate::inference::generic_transformer::routing_calibration::calibration_ids(
             &tokenizer,
@@ -555,6 +556,7 @@ pub(crate) fn checkpoint_bytes(dir: &std::path::Path) -> AnyResult<u64> {
 /// `meta` describes the checkpoint.
 /// `file_size` is the bytes of its shards.
 pub(crate) fn place_wide_checkpoint(
+    owner: &str,
     checkpoint: &crate::inference::generic_transformer::BlockScaledCheckpoint,
     meta: &crate::inference::generic_transformer::wide_sparse_config::WideSparseMeta,
     file_size: u64,
@@ -572,7 +574,7 @@ pub(crate) fn place_wide_checkpoint(
     let demand =
         crate::inference::place::llm::wide_sparse_demand(meta, file_size, 0, planned_ctx, reserve);
     let offer = if crate::gpu::cards_allowed() {
-        crate::inference::place::llm::offer(None, file_size.saturating_add(reserve), 0)
+        crate::inference::place::llm::offer(owner, None, file_size.saturating_add(reserve), 0)
     } else {
         crate::inference::place::llm::Offer::default()
     };

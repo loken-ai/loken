@@ -216,8 +216,13 @@ impl WideSubject {
         // Without the cards the ladder plans every held layer on the host.
         let cards = match cards_wanted {
             true => {
-                crate::inference::place::llm::offer(None, demand.whole(), mixers.largest_upload)
-                    .cards
+                crate::inference::place::llm::offer(
+                    crate::inference::place::llm::OWNER,
+                    None,
+                    demand.whole(),
+                    mixers.largest_upload,
+                )
+                .cards
             }
             false => Vec::new(),
         };

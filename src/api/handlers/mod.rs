@@ -1782,26 +1782,17 @@ impl APIServer {
         // every card's usable budget, which moves layers off the GPU rather than
         // re-packing the starved one, and the last notch places on the host, which
         // always fits. Slower is a result; a 404 is not.
-        // START FROM NO PRESSURE. The degrade level is a PER-REQUEST escalation - its own
-        // documentation says it is reset "at the START of a render invocation so each run
-        // begins at the pack-first no-pressure path" - but it lives in a process-wide
-        // atomic that only ever counts up. So a notch raised by some earlier failure,
-        // possibly in another subsystem entirely, was still shrinking every card by 4 GB
-        // per notch when this placement ran, and the model went to the host with VRAM
-        // sitting free. Reported exactly that way: "on a de la VRAM disponible mais le
-        // traitement reste sur CPU".
-        //
-        // Resetting here rather than after a success is the difference between an
-        // escalation and a memory of an old failure.
-        #[cfg(feature = "audio")]
-        crate::inference::place::vram_manager::vram_degrade_reset();
+        // The load starts from no pressure of its own.
+        // The pressure another model or the media engines raised moves their placements only.
+        crate::inference::place::vram_manager::degrade_reset_for(model_id);
         let woke_at = self
             .sleepers
             .sleeping(model_id)
             .then(std::time::Instant::now);
         // Each attempt loads a fresh engine: the pools come back first, then idle residents
         // give way, then every re-plan loads one pressure rung further off the cards.
-        let loaded = crate::inference::place::recover::retry_on_oom(
+        let loaded = crate::inference::place::recover::retry_on_oom_for(
+            model_id,
             model_id,
             || {
                 let config = config.clone();
@@ -3802,6 +3793,8 @@ mod panic_isolation_gate {
 
 #[cfg(test)]
 mod handover_route_tests;
+#[cfg(test)]
+mod multi_model_tests;
 #[cfg(all(test, feature = "gpu"))]
 mod level_tests;
 #[cfg(test)]

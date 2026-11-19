@@ -1387,60 +1387,161 @@ mod tiered_tests {
 // retry loop and by every media loader, which is why it lives with the VRAM authority
 // rather than in the family whose loader first needed it.
 
-/// Process-global VRAM-degradation level for the ACE-Step render. Zero on the
-/// no-pressure path (placement unchanged -> numerics bit-identical). A render stage
-/// that hits CUDA OOM under memory pressure (e.g. a concurrent VRAM consumer) bumps
-/// this so the NEXT (re)placement reserves more headroom or falls back to CPU  -
-/// graceful degradation instead of a crash. Read by `probe_under_pressure` (shared by
-/// the LM / DiT / VAE placement probes). This is automatic internal state, not an
-/// env-var knob.
-static VRAM_DEGRADE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// Escalate degradation one notch and return the new level. Each notch widens the
-/// per-card reserve so the next placement spills layers across GPU0->GPU1->CPU (a real
-/// multi-GPU split); only once the GPUs are exhausted (see `vram_force_cpu`) does
-/// placement fall back to all-CPU (the guaranteed-to-fit floor).
-pub fn vram_degrade() -> u64 {
-    VRAM_DEGRADE.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
+/// The pressure each owner raised after running out of card memory: a level of degradation
+/// and the bytes each card keeps back for it.
+///
+/// An owner's escalation moves that owner's next placement off the cards and no other.
+/// The media engines share one owner, [`SHARED`]: they compete for the same cards and respect
+/// each other's pressure.
+/// A language model is its own owner, named by its model id.
+#[derive(Debug, Default, Clone)]
+struct OwnerPressure {
+    level: u64,
+    cards: Vec<(usize, u64)>,
 }
 
-/// Extra reserve bytes the degradation level adds to a placement probe. Sized so each
-/// degrade notch shrinks every card's usable budget enough to push a chunk of layers
-/// onto the next device - first GPU0->GPU1 (a real 2-GPU split), then GPU->CPU - rather
-/// than re-packing the starved GPU0 and OOM-looping: the placement estimate omits the
-/// runtime peak (activations + cuBLAS workspace + graph arena, several GB), so a coarse
+/// The owner of the pressure the media engines raise and read.
+pub const SHARED: &str = "";
+
+static PRESSURE: std::sync::Mutex<Vec<(String, OwnerPressure)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Runs `f` on the pressure of `owner`, made when absent; owners left with none are dropped.
+fn with_pressure<T>(owner: &str, f: impl FnOnce(&mut OwnerPressure) -> T) -> T {
+    let mut table = PRESSURE.lock().unwrap_or_else(|e| e.into_inner());
+    let i = match table.iter().position(|(o, _)| o == owner) {
+        Some(i) => i,
+        None => {
+            table.push((owner.to_string(), OwnerPressure::default()));
+            table.len() - 1
+        }
+    };
+    let out = f(&mut table[i].1);
+    table.retain(|(_, p)| p.level > 0 || !p.cards.is_empty());
+    out
+}
+
+/// The pressure of `owner`, none when it raised none.
+fn pressure_of(owner: &str) -> OwnerPressure {
+    PRESSURE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .find(|(o, _)| o == owner)
+        .map(|(_, p)| p.clone())
+        .unwrap_or_default()
+}
+
+/// Escalate the degradation of `owner` one notch and return its new level. Each notch widens
+/// the per-card reserve so the owner's next placement spills layers across GPU0->GPU1->CPU;
+/// only once the GPUs are exhausted (see [`force_cpu_for`]) does it fall back to all-CPU.
+pub fn degrade_for(owner: &str) -> u64 {
+    with_pressure(owner, |p| {
+        p.level += 1;
+        p.level
+    })
+}
+
+/// The degradation level of `owner` (0 = none).
+pub fn degrade_level_for(owner: &str) -> u64 {
+    pressure_of(owner).level
+}
+
+/// Takes back `rungs` notches an escalation of `owner` raised, never below zero.
+pub fn degrade_lower_for(owner: &str, rungs: u64) {
+    with_pressure(owner, |p| p.level = p.level.saturating_sub(rungs));
+}
+
+/// Reset the degradation level of `owner` to 0.
+pub fn degrade_reset_for(owner: &str) {
+    with_pressure(owner, |p| p.level = 0);
+}
+
+/// Extra reserve bytes the degradation level of `owner` adds to its placement probes. Sized
+/// so each notch shrinks every card's usable budget enough to push a chunk of layers onto the
+/// next device rather than re-packing the starved card and running out again: the placement
+/// estimate omits the runtime peak (activations, cuBLAS workspace, graph arena), so a coarse
 /// reserve is what actually moves layers off a card.
-/// Current degradation level (0 = none).
-pub fn vram_degrade_level() -> u64 {
-    VRAM_DEGRADE.load(std::sync::atomic::Ordering::Relaxed)
-}
-
-pub fn vram_reserve_boost() -> u64 {
+pub fn reserve_boost_for(owner: &str) -> u64 {
+    let level = degrade_level_for(owner);
     // The ladder of reserves an escalation walks. Its table lives with the audio
     // demand model; without that family the escalation still has to move, so it falls
     // back to doubling - coarse, and coarse is what makes layers leave a card.
     #[cfg(feature = "audio")]
     {
-        crate::inference::place::audio_demand::degrade_reserve_bytes(vram_degrade_level())
+        crate::inference::place::audio_demand::degrade_reserve_bytes(level)
     }
     #[cfg(not(feature = "audio"))]
     {
-        (1u64 << 30) * vram_degrade_level()
+        (1u64 << 30) * level
     }
 }
 
-/// Whether degradation has escalated past the multi-GPU-split attempts to forcing
-/// all-CPU placement. Deferred well past the first OOM so the DiT/LM/VAE first spread
-/// across every GPU (HeteroPlan greedy-fill under the escalating reserve); only when
-/// even a 2-GPU split can't hold the weights do layers land on CPU.
-pub fn vram_force_cpu() -> bool {
-    vram_degrade_level() >= crate::inference::place::ladder::PRESSURE_RUNGS
+/// Whether the degradation of `owner` has escalated past the multi-GPU-split attempts to
+/// forcing all-CPU placement.
+pub fn force_cpu_for(owner: &str) -> bool {
+    degrade_level_for(owner) >= crate::inference::place::ladder::PRESSURE_RUNGS
 }
 
-/// Bytes a card keeps back on top of the global pressure: raised for the card that ran out of
-/// memory, so the next placement takes blocks off that card alone and leaves the others as
-/// they are.
-static CARD_PRESSURE: std::sync::Mutex<Vec<(usize, u64)>> = std::sync::Mutex::new(Vec::new());
+/// What card `card` keeps back for the out-of-memory errors `owner` has had there.
+pub fn card_pressure_for(owner: &str, card: usize) -> u64 {
+    pressure_of(owner)
+        .cards
+        .iter()
+        .find(|(idx, _)| *idx == card)
+        .map_or(0, |(_, bytes)| *bytes)
+}
+
+/// Raises what card `card` keeps back for `owner`: doubled, and at least a sixteenth of its
+/// memory. Returns the bytes added.
+pub fn raise_card_pressure_for(owner: &str, card: usize) -> u64 {
+    let total = crate::inference::place::device_probe::probe_cuda_gpus()
+        .iter()
+        .find(|g| g.index == card)
+        .map_or(0, |g| g.total);
+    with_pressure(owner, |p| {
+        let entry = match p.cards.iter_mut().position(|(idx, _)| *idx == card) {
+            Some(i) => &mut p.cards[i],
+            None => {
+                p.cards.push((card, 0));
+                p.cards.last_mut().expect("pushed above")
+            }
+        };
+        let added = entry.1.max(total / 16).max(1);
+        entry.1 = entry.1.saturating_add(added);
+        added
+    })
+}
+
+/// Takes back `bytes` card `card` was made to keep back for `owner`.
+pub fn lower_card_pressure_for(owner: &str, card: usize, bytes: u64) {
+    with_pressure(owner, |p| {
+        if let Some(entry) = p.cards.iter_mut().find(|(idx, _)| *idx == card) {
+            entry.1 = entry.1.saturating_sub(bytes);
+        }
+        p.cards.retain(|(_, bytes)| *bytes > 0);
+    });
+}
+
+/// [`degrade_for`] for the media engines' shared pressure.
+pub fn vram_degrade() -> u64 {
+    degrade_for(SHARED)
+}
+
+/// [`degrade_level_for`] the media engines' shared pressure.
+pub fn vram_degrade_level() -> u64 {
+    degrade_level_for(SHARED)
+}
+
+/// [`reserve_boost_for`] the media engines' shared pressure.
+pub fn vram_reserve_boost() -> u64 {
+    reserve_boost_for(SHARED)
+}
+
+/// [`force_cpu_for`] the media engines' shared pressure.
+pub fn vram_force_cpu() -> bool {
+    force_cpu_for(SHARED)
+}
 
 /// The card that last ran out of memory, `usize::MAX` for none since it was read.
 static LAST_OOM_CARD: std::sync::atomic::AtomicUsize =
@@ -1457,58 +1558,28 @@ pub fn take_oom_card() -> Option<usize> {
     (card != usize::MAX).then_some(card)
 }
 
-/// What card `card` keeps back for the out-of-memory errors it has had.
+/// [`card_pressure_for`] the media engines' shared pressure.
 pub fn card_pressure(card: usize) -> u64 {
-    CARD_PRESSURE
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .iter()
-        .find(|(idx, _)| *idx == card)
-        .map_or(0, |(_, bytes)| *bytes)
+    card_pressure_for(SHARED, card)
 }
 
-/// Raises what card `card` keeps back: doubled, and at least a sixteenth of its memory. Returns
-/// the bytes added.
+/// [`raise_card_pressure_for`] the media engines' shared pressure.
 pub fn raise_card_pressure(card: usize) -> u64 {
-    let total = crate::inference::place::device_probe::probe_cuda_gpus()
-        .iter()
-        .find(|g| g.index == card)
-        .map_or(0, |g| g.total);
-    let mut table = CARD_PRESSURE.lock().unwrap_or_else(|e| e.into_inner());
-    let entry = match table.iter_mut().find(|(idx, _)| *idx == card) {
-        Some(entry) => entry,
-        None => {
-            table.push((card, 0));
-            table.last_mut().expect("pushed above")
-        }
-    };
-    let added = entry.1.max(total / 16).max(1);
-    entry.1 = entry.1.saturating_add(added);
-    added
+    raise_card_pressure_for(SHARED, card)
 }
 
-/// Takes back `bytes` card `card` was made to keep back.
+/// [`lower_card_pressure_for`] the media engines' shared pressure.
 pub fn lower_card_pressure(card: usize, bytes: u64) {
-    let mut table = CARD_PRESSURE.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(entry) = table.iter_mut().find(|(idx, _)| *idx == card) {
-        entry.1 = entry.1.saturating_sub(bytes);
-    }
-    table.retain(|(_, bytes)| *bytes > 0);
+    lower_card_pressure_for(SHARED, card, bytes)
 }
 
-/// Reset the degradation level to 0 (optimistic placement). Called at the START of a
-/// render invocation so each run begins at the pack-first no-pressure path; a fresh
-/// process already starts at 0, but this makes multi-clip single-process renders (which
-/// load models once and never re-enter) explicitly begin un-degraded.
+/// Reset the media engines' shared degradation level to 0 (optimistic placement). Called at
+/// the START of a render invocation so each run begins at the pack-first no-pressure path.
 pub fn vram_degrade_reset() {
-    VRAM_DEGRADE.store(0, std::sync::atomic::Ordering::Relaxed);
+    degrade_reset_for(SHARED)
 }
 
-/// Takes back `rungs` notches one escalation raised, never below zero.
+/// [`degrade_lower_for`] the media engines' shared pressure.
 pub fn vram_degrade_lower(rungs: u64) {
-    let _ = VRAM_DEGRADE.try_update(
-        std::sync::atomic::Ordering::Relaxed,
-        std::sync::atomic::Ordering::Relaxed,
-        |level| Some(level.saturating_sub(rungs)),
-    );
+    degrade_lower_for(SHARED, rungs)
 }

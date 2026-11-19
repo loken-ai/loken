@@ -137,7 +137,7 @@ pub(super) fn card_demand(facts: &Facts, meta: &WideSparseMeta, ids: usize) -> D
 pub(super) fn card_plan(facts: &Facts, meta: &WideSparseMeta, ids: usize) -> HeteroPlan {
     let layers = facts.mixer_bytes.len();
     let demand = card_demand(facts, meta, ids);
-    let cards = offer(None, demand.whole(), 0);
+    let cards = offer(crate::inference::place::llm::OWNER, None, demand.whole(), 0);
     assert!(
         !cards.cards.is_empty(),
         "no CUDA card offers free memory: this test needs a card"
