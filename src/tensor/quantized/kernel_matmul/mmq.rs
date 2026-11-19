@@ -45,16 +45,6 @@ impl QKernelMatMul {
         let mut ws_guard = ws_map.lock().unwrap_or_else(|e| e.into_inner());
         let slot = ws_guard.entry(dev.ordinal()).or_default();
         if slot.main.as_ref().map(|s| s.len()) < Some(ws_bytes) || slot.main.is_none() {
-            // A workspace a captured graph writes into stays allocated; the new one at least
-            // doubles it, so the ones kept never add up to more than the one in use.
-            let mut ws_bytes = ws_bytes;
-            if slot.main_in_graph {
-                if let Some(old) = slot.main.take() {
-                    ws_bytes = ws_bytes.max(2 * old.len());
-                    slot.held.push(old);
-                }
-                slot.main_in_graph = false;
-            }
             // RELEASE THE OLD ONE FIRST. `slot.main = Some(alloc(..))` evaluates the
             // allocation before the assignment, so the previous (smaller) buffer was
             // still live while the bigger one was being carved out - double peak at
@@ -67,18 +57,18 @@ impl QKernelMatMul {
             // trimmed the pools and retried. Safe under the guard we hold: the reclaim
             // try_locks this same map and skips a contended device, which is the locking
             // invariant it documents.
-            slot.main = Some(crate::tensor::cuda::with_oom_retry(
+            slot.main = Some(std::sync::Arc::new(crate::tensor::cuda::with_oom_retry(
                 dev,
                 "mmq workspace",
                 || stream.alloc_zeros::<u8>(ws_bytes),
-            )?);
+            )?));
         }
         if slot.fixup.is_none() {
-            slot.fixup = Some(crate::tensor::cuda::with_oom_retry(
+            slot.fixup = Some(std::sync::Arc::new(crate::tensor::cuda::with_oom_retry(
                 dev,
                 "mmq fixup workspace",
                 || stream.alloc_zeros::<u8>(FIXUP_BYTES),
-            )?);
+            )?));
         }
         // Queue behind whoever used these buffers last. Releasing the mutex when this
         // function returns orders the host, and the host is finished here - the kernels it
@@ -151,7 +141,9 @@ impl QKernelMatMul {
         // Publish our own mark before the mutex goes: from here the buffers are ours until
         // these two kernels retire, and the next taker waits on this.
         if recording {
-            slot.main_in_graph = true;
+            for buffer in [&slot.main, &slot.fixup].into_iter().flatten() {
+                crate::tensor::cuda::keep_while_recorded(buffer.clone());
+            }
             return Ok(launched.then_some(out));
         }
         let ev = match slot.last_use.take() {

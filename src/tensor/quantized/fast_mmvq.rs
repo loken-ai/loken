@@ -44,6 +44,9 @@ fn workspace_ensure(dev: &tensor::cuda::CudaDevice, min_bytes: usize) -> Result<
         g.insert(key, Arc::new(fresh));
     }
     let slice = g[&key].clone();
+    // A graph that records this scratch keeps it, so a growth or a release by another user of
+    // the card never frees what the graph replays.
+    crate::tensor::cuda::keep_while_recorded(slice.clone());
     Ok(Workspace { _order: g, slice })
 }
 
@@ -61,7 +64,8 @@ pub fn max_scratch_bytes_for_k(max_k: usize) -> usize {
     pad(max_k, MATRIX_ROW_PADDING) / Q8_1_BLOCK_SIZE * Q8_1_TYPE_SIZE
 }
 
-/// Drops the scratch of card `ordinal`, released. False when the map is busy.
+/// Drops the scratch of card `ordinal`; a graph that recorded it keeps it. False when the map
+/// is busy.
 pub fn release_workspaces_of(ordinal: usize) -> bool {
     match WORKSPACE.get().map(|m| m.try_lock()) {
         Some(Ok(mut g)) => {

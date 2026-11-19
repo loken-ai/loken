@@ -22,12 +22,18 @@ pub fn reclaim_pool(dev: &CudaDevice) {
     emergency_reclaim(dev)
 }
 
+/// Gives back the scratch of the card that ran out, and its pool's free blocks.
+/// A graph that recorded a scratch keeps it; the other cards keep theirs.
 pub(super) fn emergency_reclaim(dev: &CudaDevice) {
-    crate::tensor::quantized::fast_mmvq::release_workspaces();
-    crate::tensor::quantized::release_mmq_workspaces();
-    super::quant::release_dequant_scratch();
-    let _ = dev.stream().synchronize();
-    trim_pool(dev.ordinal());
+    let ordinal = dev.ordinal();
+    let _ = crate::tensor::quantized::fast_mmvq::release_workspaces_of(ordinal);
+    let _ = crate::tensor::quantized::release_mmq_workspaces_of(ordinal);
+    let _ = super::quant::release_dequant_scratch_of(ordinal);
+    // A graph another thread records on the card would be invalidated by the wait and the trim.
+    dev.outside_recordings(|| {
+        let _ = dev.stream().synchronize();
+        trim_pool(ordinal);
+    });
 }
 
 /// Gives the device's default memory pool back every block it holds free, so memory the pool
@@ -373,6 +379,19 @@ pub(super) fn shared_card_of(stream: &Arc<CudaStream>) -> Option<Arc<CudaDevice>
         .values()
         .filter_map(std::sync::Weak::upgrade)
         .find(|d| Arc::ptr_eq(&d.stream, stream))
+}
+
+/// Runs `f` while no thread records a graph on card `ordinal`, see
+/// [`CudaDevice::outside_recordings`]. A card no model holds records nothing.
+pub fn outside_recordings_on<R>(ordinal: usize, f: impl FnOnce() -> R) -> R {
+    let card = cards()
+        .shared
+        .get(&ordinal)
+        .and_then(std::sync::Weak::upgrade);
+    match card {
+        Some(card) => card.outside_recordings(f),
+        None => f(),
+    }
 }
 
 /// How many times card `ordinal` has been released: a figure kept about the card's context is

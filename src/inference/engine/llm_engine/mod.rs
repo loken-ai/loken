@@ -1552,6 +1552,7 @@ pub fn release_cuda_pools() {
     // their backing memory pinned in the pool and trim does nothing
     // visible at the nvidia-smi level. Each quantized-kernel module
     // exposes a `release_workspaces()` for exactly this teardown step.
+    // A graph keeps the scratch it recorded: the release drops the maps' entries only.
     crate::tensor::quantized::fast_mmvq::release_workspaces();
     crate::tensor::quantized::release_mmq_workspaces();
     crate::tensor::cuda::release_dequant_scratch();
@@ -1559,18 +1560,34 @@ pub fn release_cuda_pools() {
     // its one shared device and stream; a card nobody uses is released by
     // `release_idle_cards`.
     crate::tensor::cuda_ext::clear_device_cache();
-    use crate::tensor::gpu_runtime::driver::sys::{
-        cuCtxPopCurrent_v2, cuCtxPushCurrent_v2, cuCtxSynchronize, cuDeviceGetDefaultMemPool,
-        cuDevicePrimaryCtxRelease_v2, cuDevicePrimaryCtxRetain, cuMemPoolGetAttribute,
-        cuMemPoolSetAttribute, cuMemPoolTrimTo, cudaError_enum, CUcontext, CUmemPool_attribute,
-        CUmemoryPool,
-    };
     // Iterate over physical CUDA devices. cuDeviceGetCount is safer than
     // querying via crate::tensor::gpu_runtime::driver::CudaContext (which would create a new
     // context just to count). We use the raw FFI directly.
     let device_count = crate::inference::place::device_probe::card_count() as i32;
     let mut released = 0u64;
     for ordinal in 0..device_count {
+        // The synchronize and the trim wait for a graph another thread records on the card:
+        // either would invalidate its capture.
+        released += crate::tensor::cuda::outside_recordings_on(ordinal as usize, || {
+            release_card_pool(ordinal)
+        });
+    }
+    if released > 0 {
+        tracing::info!("🧹 Trimmed CUDA memory pools on {} device(s)", released);
+    }
+}
+
+/// Drains card `ordinal`'s context and gives its default pool's free blocks back to the
+/// driver. Returns 1 when the pool was trimmed, 0 otherwise.
+#[cfg(feature = "gpu")]
+fn release_card_pool(ordinal: i32) -> u64 {
+    use crate::tensor::gpu_runtime::driver::sys::{
+        cuCtxPopCurrent_v2, cuCtxPushCurrent_v2, cuCtxSynchronize, cuDeviceGetDefaultMemPool,
+        cuDevicePrimaryCtxRelease_v2, cuDevicePrimaryCtxRetain, cuMemPoolGetAttribute,
+        cuMemPoolSetAttribute, cuMemPoolTrimTo, cudaError_enum, CUcontext, CUmemPool_attribute,
+        CUmemoryPool,
+    };
+    let mut released = 0u64;
         unsafe {
             // Drain THIS device's streams before trimming its pool. A single
             // current-context cuCtxSynchronize only drains GPU0 - GPU1's
@@ -1593,7 +1610,7 @@ pub fn release_cuda_pools() {
             let mut pool: CUmemoryPool = std::ptr::null_mut();
             let r = cuDeviceGetDefaultMemPool(&mut pool, ordinal);
             if r != cudaError_enum::CUDA_SUCCESS || pool.is_null() {
-                continue;
+                return 0;
             }
             // Read current release threshold for diagnostic.
             let mut threshold_before: u64 = 999;
@@ -1662,10 +1679,7 @@ pub fn release_cuda_pools() {
                 released += 1;
             }
         }
-    }
-    if released > 0 {
-        tracing::info!("🧹 Trimmed CUDA memory pools on {} device(s)", released);
-    }
+    released
 }
 
 /// Lazily get or build the llguidance ParserFactory for the loaded model.
@@ -1827,6 +1841,8 @@ fn _assert_generate_future_send(e: &LlmEngine, prompt: &str, params: GenerationP
 mod block_draft_tests;
 #[cfg(all(test, feature = "gpu"))]
 mod kept_pool_tests;
+#[cfg(all(test, feature = "gpu"))]
+mod multi_model_card_tests;
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) mod quality;
 #[cfg(test)]

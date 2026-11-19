@@ -130,6 +130,26 @@ impl Recording {
 }
 
 impl CudaDevice {
+    /// Runs `f` while no other thread records a graph on this card: a capture in flight ends
+    /// first, and one that would start waits for `f`.
+    /// A synchronize of the whole context, or a free, from another thread invalidates a capture.
+    pub fn outside_recordings<R>(&self, f: impl FnOnce() -> R) -> R {
+        let me = thread_token();
+        let mut held = self
+            .recording
+            .held
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        while *held != 0 && *held != me {
+            held = self
+                .recording
+                .ended
+                .wait(held)
+                .unwrap_or_else(|e| e.into_inner());
+        }
+        f()
+    }
+
     /// Gives the calling thread this card's recording once no other thread holds it, on a
     /// recorder no buffer is left on, and answers the stream to capture on.
     fn take_recording(self: &Arc<Self>) -> Result<Arc<CudaStream>, DriverError> {
@@ -252,6 +272,37 @@ pub struct CapturedGraph {
     cu_graph_exec: sys::CUgraphExec,
     flags: sys::CUgraphInstantiate_flags,
     stream: Arc<CudaStream>,
+    /// The shared buffers the capture recorded, kept for as long as the graph replays them.
+    /// Dropped after the executable, see `Drop`.
+    kept: Vec<Arc<dyn std::any::Any + Send + Sync>>,
+}
+
+thread_local! {
+    /// The shared buffers the capture in flight on this thread recorded, `None` outside one.
+    static RECORDED: std::cell::RefCell<Option<Vec<Arc<dyn std::any::Any + Send + Sync>>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Keeps `buffer` alive for as long as the graph the calling thread is capturing lives.
+/// Nothing outside a capture.
+/// A buffer shared by several users, which another user may drop or replace, calls it each time
+/// a capture addresses it.
+pub fn keep_while_recorded(buffer: Arc<dyn std::any::Any + Send + Sync>) {
+    RECORDED.with(|r| {
+        if let Some(kept) = r.borrow_mut().as_mut() {
+            kept.push(buffer);
+        }
+    });
+}
+
+/// Starts the list of the buffers the calling thread's capture records.
+fn start_recorded() {
+    RECORDED.with(|r| *r.borrow_mut() = Some(Vec::new()));
+}
+
+/// Ends the list of the buffers the calling thread's capture recorded, and returns it.
+fn take_recorded() -> Vec<Arc<dyn std::any::Any + Send + Sync>> {
+    RECORDED.with(|r| r.borrow_mut().take().unwrap_or_default())
 }
 
 /// Begin capturing `stream` into a graph.
@@ -261,12 +312,17 @@ pub fn begin_capture(
 ) -> Result<(), DriverError> {
     stream.context().bind_to_thread()?;
     let Some(dev) = card_of(stream) else {
-        return unsafe { result::stream::begin_capture(stream.cu_stream(), mode) };
+        let begun = unsafe { result::stream::begin_capture(stream.cu_stream(), mode) };
+        if begun.is_ok() {
+            start_recorded();
+        }
+        return begun;
     };
     let target = dev.take_recording()?;
     let begun = unsafe { result::stream::begin_capture(target.cu_stream(), mode) };
-    if begun.is_err() {
-        dev.give_back_recording();
+    match begun {
+        Ok(()) => start_recorded(),
+        Err(_) => dev.give_back_recording(),
     }
     begun
 }
@@ -279,7 +335,9 @@ pub fn end_capture(
 ) -> Result<Option<CapturedGraph>, DriverError> {
     let ctx = stream.context();
     ctx.bind_to_thread()?;
-    let cu_graph = end_on(stream)?;
+    let ended = end_on(stream);
+    let kept = take_recorded();
+    let cu_graph = ended?;
     if cu_graph.is_null() {
         return Ok(None);
     }
@@ -295,6 +353,7 @@ pub fn end_capture(
         cu_graph_exec,
         flags,
         stream: stream.clone(),
+        kept,
     }))
 }
 
@@ -423,10 +482,15 @@ impl CapturedGraph {
     pub fn end_capture_or_reinstantiate(&mut self) -> Result<UpdateOutcome, DriverError> {
         let ctx = self.stream.context();
         ctx.bind_to_thread()?;
-        let new_graph = end_on(&self.stream)?;
+        let ended = end_on(&self.stream);
+        let kept = take_recorded();
+        let new_graph = ended?;
         if new_graph.is_null() {
             return Err(DriverError(sys::CUresult::CUDA_ERROR_INVALID_VALUE));
         }
+        // The executable replays the new graph's buffers from here.
+        // A buffer of the old graph is freed in the stream's order, after the replays queued.
+        self.kept = kept;
         let mut info = sys::CUgraphExecUpdateResultInfo_st {
             result: sys::CUgraphExecUpdateResult::CU_GRAPH_EXEC_UPDATE_SUCCESS,
             errorNode: std::ptr::null_mut(),

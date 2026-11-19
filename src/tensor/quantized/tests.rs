@@ -1756,12 +1756,12 @@ fn the_tiled_matmul_reads_half_activations_as_floats() {
 }
 
 /// A graph captured over the tiled matmul writes into the workspace it was recorded with: a
-/// later call over many more rows grows the workspace and keeps that one, and the graph replays
-/// the answer it was captured with.
+/// later call over many more rows grows the workspace, another user releases it, and the graph
+/// still replays the answer it was captured with.
 #[cfg(feature = "gpu")]
 #[test]
 fn a_larger_matmul_keeps_the_workspace_a_graph_writes_into() {
-    use crate::tensor::{cuda::CudaDevice, gpu_runtime::driver::DevicePtr, DType, Tensor};
+    use crate::tensor::{cuda::CudaDevice, DType, Tensor};
     let Ok(dev) = CudaDevice::new(0) else {
         eprintln!("no CUDA device; the workspace a graph holds is NOT covered by this run");
         return;
@@ -1790,27 +1790,18 @@ fn a_larger_matmul_keeps_the_workspace_a_graph_writes_into() {
     let graph = crate::tensor::cuda_ext::end_capture(&stream)
         .unwrap()
         .expect("a graph");
-    let ptrs = |main: bool| -> Vec<u64> {
-        let map = super::mmq::MMQ_WORKSPACES.get().unwrap().lock().unwrap();
-        let slot = &map[&dev.ordinal()];
-        match main {
-            true => slot.main.iter().collect::<Vec<_>>(),
-            false => slot.held.iter().collect(),
-        }
-        .into_iter()
-        .map(|b| b.device_ptr(&stream).0)
-        .collect()
-    };
-    let addressed = ptrs(true);
-    // Far more rows than any other test of this suite runs through the tiled matmul.
+    // Far more rows than any other test of this suite runs through the tiled matmul: the
+    // workspace grows past the one the graph writes into.
     let _ = qm.forward(&rows_of(8192)).unwrap().to_vec_f32();
-    let held = ptrs(false);
-    assert!(
-        addressed.iter().all(|p| held.contains(p)),
-        "the workspace the graph writes into was freed when a larger call grew it"
-    );
+    // Another user of the card releases the scratch; the graph keeps what it recorded.
+    super::release_mmq_workspaces();
+    // Allocations that would land on freed memory.
+    let filler: Vec<Tensor> = (0..4)
+        .map(|_| Tensor::ones((8192usize, k), DType::F32, &device).unwrap())
+        .collect();
     graph.launch().unwrap();
     assert_eq!(out.to_vec_f32(), want, "the replay gave another answer");
+    drop(filler);
 }
 
 /// A second dequantised GEMM of the same shape on the same stream runs in the same scratch:
