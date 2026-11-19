@@ -101,6 +101,18 @@ impl Pressure {
         true
     }
 
+    /// Keeps what the cards were made to keep back past the end of the request: the placement
+    /// they gave served it, and the next placement of the owner starts from it.
+    pub fn keep_cards(&mut self) {
+        if !self.cards.is_empty() {
+            tracing::info!(
+                "{}: the cards that ran out keep what they were made to keep back for later loads",
+                self.owner
+            );
+        }
+        self.cards.clear();
+    }
+
     /// Whether this request has walked every rung.
     pub fn spent(&self) -> bool {
         self.raised >= PRESSURE_RUNGS
@@ -226,10 +238,11 @@ where
     // The card that ran out keeps more back first, the others unchanged: the blocks that leave
     // it go to a card with room, or to the host only for what no card holds.
     while let Some(card) = super::vram_manager::take_oom_card() {
+        // The card's free bytes are read with the pools handed back.
+        release();
         if !pressure.raise_card(what, card, &message) {
             break;
         }
-        release();
         if let Some(stop) = replan(
             super::vram_manager::degrade_level_for(owner),
             message.clone(),
@@ -242,7 +255,10 @@ where
             let outcome = attempt().await;
             match oom(&outcome) {
                 Some(message) => message,
-                None => return outcome,
+                None => {
+                    pressure.keep_cards();
+                    return outcome;
+                }
             }
         };
     }
@@ -449,6 +465,56 @@ mod card_pressure_tests {
             );
         }
         assert_eq!(vm::card_pressure(CARD), before);
+    }
+
+    /// A card the placement left 1 GB free on, that ran out of memory, is offered less than its
+    /// layers held at the next placement: the re-plan moves layers off it.
+    #[test]
+    fn the_next_placement_holds_less_on_the_card_that_ran_out() {
+        const GB: u64 = 1 << 30;
+        let total = 16 * GB;
+        let layers = 15 * GB - GB / 32;
+        let free = GB;
+        // What the card offers once the model left it, before and after the raise.
+        let offered = layers + free;
+        let raised = vm::card_pressure_step(0, total, free);
+        assert!(
+            offered - raised + total / 16 <= layers,
+            "offered {} of the {} the layers held",
+            offered - raised,
+            layers
+        );
+        assert!(
+            vm::card_pressure_step(raised, total, 0) >= raised,
+            "a later raise doubles"
+        );
+    }
+
+    /// A request that a card's raise let finish leaves the raise in force for the owner's later
+    /// placements; one that ends without that keeps nothing.
+    #[test]
+    fn a_raise_that_served_its_request_stays_for_the_next_load() {
+        const CARD: usize = 7_100;
+        let owner = "card-pressure-kept";
+        {
+            let mut pressure = Pressure::of(owner);
+            assert!(pressure.raise_card("test", CARD, &"oom"));
+        }
+        assert_eq!(
+            vm::card_pressure_for(owner, CARD),
+            0,
+            "a request that gave up"
+        );
+        let kept = {
+            let mut pressure = Pressure::of(owner);
+            assert!(pressure.raise_card("test", CARD, &"oom"));
+            let raised = vm::card_pressure_for(owner, CARD);
+            pressure.keep_cards();
+            raised
+        };
+        assert!(kept > 0);
+        assert_eq!(vm::card_pressure_for(owner, CARD), kept);
+        vm::lower_card_pressure_for(owner, CARD, kept);
     }
 
     /// The card that ran out is read once.

@@ -1547,13 +1547,14 @@ pub fn card_pressure_for(owner: &str, card: usize) -> u64 {
         .map_or(0, |(_, bytes)| *bytes)
 }
 
-/// Raises what card `card` keeps back for `owner`: doubled, and at least a sixteenth of its
-/// memory. Returns the bytes added.
+/// Raises what card `card` keeps back for `owner` by [`card_pressure_step`], from the bytes the
+/// card has free now. Returns the bytes added.
 pub fn raise_card_pressure_for(owner: &str, card: usize) -> u64 {
     let total = crate::inference::place::device_probe::probe_cuda_gpus()
         .iter()
         .find(|g| g.index == card)
         .map_or(0, |g| g.total);
+    let free = free_on(card).unwrap_or(0);
     with_pressure(owner, |p| {
         let entry = match p.cards.iter_mut().position(|(idx, _)| *idx == card) {
             Some(i) => &mut p.cards[i],
@@ -1562,10 +1563,21 @@ pub fn raise_card_pressure_for(owner: &str, card: usize) -> u64 {
                 p.cards.last_mut().expect("pushed above")
             }
         };
-        let added = entry.1.max(total / 16).max(1);
+        let added = card_pressure_step(entry.1, total, free);
         entry.1 = entry.1.saturating_add(added);
         added
     })
+}
+
+/// What a card of `total` bytes that ran out of memory keeps back on top of the `held` bytes it
+/// keeps back already, with `free` bytes free once the pools are handed back.
+///
+/// The `free` bytes are what the placement that ran out left unused on the card.
+/// The step adds them to the larger of `held` and a sixteenth of the card.
+/// The next placement then holds at least that sixteenth less on the card: it never repeats the
+/// placement that ran out.
+pub fn card_pressure_step(held: u64, total: u64, free: u64) -> u64 {
+    held.max(total / 16).max(1).saturating_add(free)
 }
 
 /// Takes back `bytes` card `card` was made to keep back for `owner`.
