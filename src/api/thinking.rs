@@ -204,15 +204,13 @@ fn partial_tag_suffix(s: &str, tag: &str) -> usize {
         .unwrap_or(0)
 }
 
-/// Whether a rendered prompt ends inside a thinking block: an opener with no closer after
-/// it. A template that pre-closes the block, as qwen3 does when reasoning is off, does not
+/// Whether a rendered prompt ends inside a thinking block: its generation prompt ends with
+/// the opener.
+/// A template that pre-closes the block, as qwen3 does when reasoning is off, does not
 /// count, and neither does one that leaves the opener to the model.
+/// An opener quoted in a message or a tool result, earlier in the prompt, does not count.
 pub fn prompt_opens_thinking(prompt: &str) -> bool {
-    match (prompt.rfind(OPEN), prompt.rfind(CLOSE)) {
-        (Some(open), Some(close)) => open > close,
-        (Some(_), None) => true,
-        _ => false,
-    }
+    prompt.trim_end().ends_with(OPEN)
 }
 
 /// The whole-text form: the reasoning, if any, and the answer. `by_prompt` is true when the
@@ -393,6 +391,12 @@ mod tests {
             "<|im_start|>assistant\n<think>\n\n</think>\n\n"
         ));
         assert!(!prompt_opens_thinking("<|im_start|>assistant\n"));
+        assert!(!prompt_opens_thinking(
+            "<|im_start|>user\nwhat does <think> mean here?<|im_end|>\n<|im_start|>assistant\n"
+        ));
+        assert!(!prompt_opens_thinking(
+            "<|im_start|>tool\nlet open = \"<think>\";<|im_end|>\n<|im_start|>assistant\n"
+        ));
         assert_eq!(
             split_thinking_opened(true, "weigh it up\n</think>\n\nthe answer"),
             (Some("weigh it up".to_string()), "the answer".to_string())
