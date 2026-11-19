@@ -725,3 +725,36 @@ fn a_restored_draft_head_drafts_like_one_that_read_the_prompt() {
     let logits = forward_chunks(&mut restored, &tokens, cut, chunk);
     assert_eq!(head_after(&mut restored, &logits, tokens.len()), want);
 }
+
+/// A state is stored with one read of each layer's rows, however many blocks it writes: a long
+/// prompt's blocks are cut from that read.
+/// The blocks cut from it are the blocks read one by one.
+#[test]
+fn a_state_reads_each_layers_rows_once_whatever_its_blocks() {
+    let fx = Fixture::new("one-read");
+    let store = open_store(&fx.store_dir());
+    let reads_to_store = |tokens: usize, salt: &[u8]| {
+        let mut m = fx.model();
+        attach(&mut m, &store, salt);
+        let cache = m.state_cache().unwrap();
+        let text = prompt(tokens);
+        let (_, grid) = prefill(&mut m, &text, 0);
+        let layout = m.state_layout(BLOCK);
+        let one_by_one: Vec<Vec<u8>> = (0..tokens / BLOCK)
+            .map(|b| m.capture_block(b, &layout).unwrap())
+            .collect();
+        assert_eq!(
+            m.capture_blocks(0..tokens / BLOCK, &layout).unwrap(),
+            one_by_one,
+            "the blocks of 1 read are the blocks read one by one"
+        );
+        LIVE_ROWS_READS.with(|c| c.set(0));
+        cache.save(&m, &text, grid, None);
+        wait_for_len(&store, tokens);
+        LIVE_ROWS_READS.with(|c| c.get())
+    };
+    let short = reads_to_store(2 * BLOCK + 5, b"short");
+    let long = reads_to_store(9 * BLOCK + 5, b"long");
+    assert!(short > 0);
+    assert_eq!(long, short, "the reads grew with the blocks");
+}

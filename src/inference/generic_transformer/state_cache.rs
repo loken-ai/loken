@@ -973,9 +973,17 @@ fn cache_dtype(l: &GenericTransformerLayer) -> Result<u8> {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// The reads of a layer's rows `live_rows` made on this thread.
+    pub(crate) static LIVE_ROWS_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Tokens `[from, to)` of a layer's resident KV as host f32 rows, with the element type the
 /// cache holds them in.
 fn live_rows(l: &GenericTransformerLayer, from: usize, to: usize) -> Result<Rows> {
+    #[cfg(test)]
+    LIVE_ROWS_READS.with(|c| c.set(c.get() + 1));
     let (n_kv, head_dim) = (l.n_kv_head, l.head_dim);
     if from == to {
         return Ok(Rows {
@@ -1299,46 +1307,76 @@ impl GenericHeteroTransformer {
 
     /// Block `b` of the global layers' rows and of the band layers' compressed rows and index
     /// keys, encoded.
+    #[cfg(test)]
     pub(crate) fn capture_block(&self, b: usize, layout: &Layout) -> Result<Vec<u8>> {
+        let mut one = self.capture_blocks(b..b + 1, layout)?;
+        Ok(one.pop().unwrap_or_default())
+    }
+
+    /// The blocks `blocks` of the global layers' rows and of the band layers' compressed rows
+    /// and index keys, each encoded.
+    ///
+    /// Each global layer's rows of all the blocks are read from its cache once.
+    pub(crate) fn capture_blocks(
+        &self,
+        blocks: std::ops::Range<usize>,
+        layout: &Layout,
+    ) -> Result<Vec<Vec<u8>>> {
         let g = layout.block_tokens;
-        let mut rows = Vec::new();
-        for (l, kind) in self.layers.iter().zip(&layout.kinds) {
-            match *kind {
-                StateKind::Global => {
-                    let r = live_rows(l, b * g, (b + 1) * g)?;
-                    rows.push((r.k, r.v));
-                }
-                StateKind::Band {
-                    ratio,
-                    compressed,
-                    index,
-                    ..
-                } => {
-                    let Mixer::CompressedBand(band) = &l.mixer else {
-                        return Err(crate::tensor::Error::msg(
-                            "state cache: a band layer without its mixer".to_string(),
-                        ));
-                    };
-                    let empty = BandState::default();
-                    let s = band.state.as_ref().unwrap_or(&empty);
-                    // The groups of block `b`.
-                    let per_block = g / ratio;
-                    let groups = b * per_block..(b + 1) * per_block;
-                    let cut = |all: &[f32], width: usize| -> Result<Vec<f32>> {
-                        all.get(groups.start * width..groups.end * width)
-                            .map(<[f32]>::to_vec)
-                            .ok_or_else(|| {
-                                crate::tensor::Error::msg(format!(
-                                    "state cache: a band layer holds no rows for block {b}"
-                                ))
-                            })
-                    };
-                    rows.push((cut(&s.compressed, compressed)?, cut(&s.index_keys, index)?));
-                }
-                _ => {}
-            }
+        if blocks.is_empty() {
+            return Ok(Vec::new());
         }
-        Ok(encode_block(&rows, layout))
+        let mut read = Vec::with_capacity(self.layers.len());
+        for (l, kind) in self.layers.iter().zip(&layout.kinds) {
+            read.push(match kind {
+                StateKind::Global => Some(live_rows(l, blocks.start * g, blocks.end * g)?),
+                _ => None,
+            });
+        }
+        let mut out = Vec::with_capacity(blocks.len());
+        for b in blocks.clone() {
+            let mut rows = Vec::new();
+            for ((l, kind), held) in self.layers.iter().zip(&layout.kinds).zip(&read) {
+                match *kind {
+                    StateKind::Global => {
+                        let r = held.as_ref().expect("read above");
+                        let width = g * r.n_kv * r.head_dim;
+                        let at = (b - blocks.start) * width;
+                        rows.push((r.k[at..at + width].to_vec(), r.v[at..at + width].to_vec()));
+                    }
+                    StateKind::Band {
+                        ratio,
+                        compressed,
+                        index,
+                        ..
+                    } => {
+                        let Mixer::CompressedBand(band) = &l.mixer else {
+                            return Err(crate::tensor::Error::msg(
+                                "state cache: a band layer without its mixer".to_string(),
+                            ));
+                        };
+                        let empty = BandState::default();
+                        let s = band.state.as_ref().unwrap_or(&empty);
+                        // The groups of block `b`.
+                        let per_block = g / ratio;
+                        let groups = b * per_block..(b + 1) * per_block;
+                        let cut = |all: &[f32], width: usize| -> Result<Vec<f32>> {
+                            all.get(groups.start * width..groups.end * width)
+                                .map(<[f32]>::to_vec)
+                                .ok_or_else(|| {
+                                    crate::tensor::Error::msg(format!(
+                                        "state cache: a band layer holds no rows for block {b}"
+                                    ))
+                                })
+                        };
+                        rows.push((cut(&s.compressed, compressed)?, cut(&s.index_keys, index)?));
+                    }
+                    _ => {}
+                }
+            }
+            out.push(encode_block(&rows, layout));
+        }
+        Ok(out)
     }
 
     /// The per-layer snapshots of `point` with the rows of `blocks` before its tail.
@@ -1937,16 +1975,13 @@ impl HybridStateCache {
         let keys = self.store.keys(&identity, prompt);
         let nblocks = prompt.len() / g;
         let first = self.store.first_missing_block(&keys, nblocks);
-        let mut blocks = Vec::with_capacity(nblocks - first);
-        for b in first..nblocks {
-            match model.capture_block(b, layout) {
-                Ok(bytes) => blocks.push(bytes),
-                Err(e) => {
-                    tracing::info!("state cache: not stored: {e}");
-                    return;
-                }
+        let blocks = match model.capture_blocks(first..nblocks, layout) {
+            Ok(blocks) => blocks,
+            Err(e) => {
+                tracing::info!("state cache: not stored: {e}");
+                return;
             }
-        }
+        };
         let m = self.store.tuning().get();
         let bytes = blocks.iter().map(|b| b.len() as u64).sum::<u64>()
             + m.manifest_bytes * (grid.len() as u64 + 1);
