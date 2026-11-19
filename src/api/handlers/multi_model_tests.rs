@@ -8,7 +8,7 @@
 
 use super::*;
 use crate::inference::place::device_probe::probe_cuda_gpus;
-use serde_json::json;
+use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -24,6 +24,12 @@ fn card_total() -> Option<u64> {
         .into_iter()
         .find(|g| g.index == 0)
         .map(|g| g.total)
+}
+
+/// What card 0 has free now, its queued work run and its pool handed back.
+fn card_free() -> u64 {
+    crate::inference::place::room::settle(0);
+    crate::inference::place::vram_manager::free_on(0).unwrap_or(0)
 }
 
 /// The shape of a generated llama checkpoint.
@@ -45,6 +51,23 @@ impl Shape {
             hidden: 128,
             kv_heads: 1,
             ffn: 256,
+            vocab: 256,
+            context,
+        }
+    }
+
+    /// A model whose weights take about `bytes`.
+    fn weighing(bytes: u64, context: usize) -> Self {
+        let layers = 4;
+        // F16 weights of a layer: q, k, v and o at the model width, gate, up and down at twice it.
+        let per_width_squared = (4 + 3 * 2) * 2 * layers as u64;
+        let hidden =
+            (((bytes / per_width_squared) as f64).sqrt() as usize / HEAD_DIM).max(1) * HEAD_DIM;
+        Self {
+            layers,
+            hidden,
+            kv_heads: 1,
+            ffn: 2 * hidden,
             vocab: 256,
             context,
         }
@@ -186,6 +209,46 @@ fn server(
     state
 }
 
+/// A prompt of `words` words of a vocabulary of `vocab`, starting at word `first`.
+fn prompt(words: usize, vocab: usize, first: usize) -> String {
+    (0..words)
+        .map(|i| format!("t{}", 3 + (i * 7 + first) % (vocab - 3)))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// The answer of `state`'s `model` to `prompt`, at most `tokens` tokens, greedy.
+async fn answer(state: &APIServer, model: &str, prompt: String, tokens: usize) -> String {
+    let mut request = OllamaGenerateRequest::new(model.to_string(), prompt);
+    request.stream = false;
+    request.options = Some(json!({"temperature": 0, "num_predict": tokens}));
+    let response = super::ollama_generate(
+        axum::extract::State(state.clone()),
+        axum::http::HeaderMap::new(),
+        OllamaJson(request),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("{model} answers: {e:?}"));
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let whole: Value = serde_json::from_slice(&bytes).unwrap();
+    whole["response"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{model} answered {whole}"))
+        .to_string()
+}
+
+/// Whether `model` is loaded in `state`.
+async fn loaded(state: &APIServer, model: &str) -> bool {
+    state
+        .engines
+        .read()
+        .await
+        .iter()
+        .any(|e| e.model_id == model)
+}
+
 /// Unloads every model of `state` and removes `root`: the next scenario starts from an empty
 /// card.
 async fn finish(state: &APIServer, root: &Path) {
@@ -229,6 +292,50 @@ async fn on_card<F: std::future::Future<Output = ()>>(name: &str, body: impl FnO
     tokio::time::timeout(WATCHDOG, body(total))
         .await
         .unwrap_or_else(|_| panic!("{name}: the watchdog fired"));
+}
+
+/// T5: a batch worker sized while another component loads leaves the room that load declared,
+/// and a model loaded after it still loads.
+async fn a_load_keeps_its_room(total: u64, batched: &str, incoming: &str) {
+    let root = scratch("admission");
+    let shape = Shape::tiny(4096);
+    write_model(&root, batched, shape, 5);
+    let state = server(&root, 0, Default::default());
+    state.ensure_loaded(batched, 5).await.unwrap();
+    state
+        .get_engine(batched)
+        .await
+        .unwrap()
+        .hold_lone_requests_on(true);
+    let declared = card_free() / 2;
+    {
+        // A loader holds the admission and has declared what it is about to take.
+        let _admission = crate::inference::place::vram_manager::load_admission().await;
+        let _demand =
+            crate::inference::place::vram_manager::declare_demand("test-loader", declared);
+        answer(&state, batched, prompt(16, shape.vocab, 1), 4).await;
+        assert!(
+            card_free() >= declared,
+            "the worker of {batched} took the room a load declared: {} MB free of {} MB",
+            card_free() >> 20,
+            declared >> 20
+        );
+    }
+    answer(&state, batched, prompt(16, shape.vocab, 2), 4).await;
+    write_model(&root, incoming, Shape::weighing(total / 4, 2048), 9);
+    state.ensure_loaded(incoming, 5).await.unwrap();
+    assert!(loaded(&state, batched).await, "{batched} was unloaded");
+    finish(&state, &root).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "fills card 0: run alone"]
+async fn a_batch_worker_leaves_the_room_a_load_declared() {
+    on_card("load admission", |total| async move {
+        a_load_keeps_its_room(total, "test/mm-a", "test/mm-b").await;
+        a_load_keeps_its_room(total, "test/mm-b", "test/mm-a").await;
+    })
+    .await;
 }
 
 /// T8: the pressure one model raised after running out of memory moves its own placements, not

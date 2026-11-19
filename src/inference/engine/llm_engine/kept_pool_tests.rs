@@ -62,7 +62,7 @@ fn a_serial_prefill_takes_the_room_of_the_pool_the_worker_kept() {
     let layers = arch_value(&blob, "block_count");
     let context = arch_value(&blob, "context_length");
     let model = crate::inference::generic_transformer::tiny_model::load_on_card(&blob, layers);
-    let Ok(server) = try_spawn_continuous(model, Vec::new(), context) else {
+    let Ok(server) = try_spawn_continuous(MODEL, model, Vec::new(), context) else {
         eprintln!("the card holds no batch worker for {MODEL}: skipped");
         return;
     };
@@ -116,7 +116,7 @@ fn handed_over_prompts_land_beside_the_pool_the_worker_kept() {
     let layers = arch_value(&blob, "block_count");
     let context = arch_value(&blob, "context_length");
     let model = crate::inference::generic_transformer::tiny_model::load_on_card(&blob, layers);
-    let Ok(server) = try_spawn_continuous(model, Vec::new(), context) else {
+    let Ok(server) = try_spawn_continuous(MODEL, model, Vec::new(), context) else {
         eprintln!("the card holds no batch worker for {MODEL}: skipped");
         return;
     };

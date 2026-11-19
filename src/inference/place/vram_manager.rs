@@ -531,6 +531,15 @@ pub async fn load_admission() -> tokio::sync::MutexGuard<'static, ()> {
     }
 }
 
+/// The load admission when no load holds it, for a caller that must not wait: one sizing what
+/// is left of a card, which a load in progress is taking.
+pub fn try_load_admission() -> Option<tokio::sync::MutexGuard<'static, ()>> {
+    LOAD_ADMISSION
+        .get_or_init(|| tokio::sync::Mutex::new(()))
+        .try_lock()
+        .ok()
+}
+
 /// VRAM a subsystem is about to need but has not allocated yet.
 ///
 /// The admission lock covers loader against loader. It cannot cover a loader against a

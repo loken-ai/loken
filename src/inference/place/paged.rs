@@ -86,6 +86,36 @@ pub fn plan(device: &crate::tensor::Device, shape: &PagedShape) -> Option<PagedP
     plan_in(super::room::free_now(device)?, shape)
 }
 
+/// The least a card must offer for [`plan_in`] to plan two lanes.
+pub fn least_room(shape: &PagedShape) -> u64 {
+    let lane_blocks = shape.window.div_ceil(shape.block_size.max(1)) as u64;
+    shape
+        .block_bytes
+        .saturating_mul(lane_blocks)
+        .saturating_mul(2)
+        .saturating_add(shape.lane_step_bytes.saturating_mul(captured_widths(2)))
+        .saturating_add(shape.work_reserve)
+}
+
+/// [`plan_in`] for the batch worker of `owner` on the card `device` runs on, at what the card
+/// offers it: its free memory less what other owners declared they are about to take there.
+/// `shapes` are tried in order, the first that plans two lanes taken, with its index.
+/// `None` off a card. The caller holds the load admission until the pool is allocated.
+pub fn plan_for(
+    owner: &str,
+    device: &crate::tensor::Device,
+    shapes: &[PagedShape],
+) -> Option<(PagedPlan, usize)> {
+    let card = super::room::card_of(device)?;
+    let first = |offered: u64| {
+        shapes
+            .iter()
+            .enumerate()
+            .find_map(|(i, shape)| plan_in(offered, shape).map(|plan| (plan, i)))
+    };
+    first(super::room::offered(card, owner))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -118,6 +148,13 @@ mod tests {
     #[test]
     fn a_card_that_holds_one_lane_stays_serial() {
         assert_eq!(plan_in(1024 * MB, &shape()), None);
+    }
+
+    #[test]
+    fn the_least_room_plans_two_lanes_and_less_plans_none() {
+        let least = least_room(&shape());
+        assert_eq!(plan_in(least, &shape()).map(|p| p.lanes), Some(2));
+        assert_eq!(plan_in(least - 1, &shape()), None);
     }
 
     #[test]

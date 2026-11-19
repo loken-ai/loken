@@ -913,6 +913,7 @@ pub(super) fn sequence_cap(
 /// `sequence_cap` sequences decoding together.
 #[cfg(feature = "gpu")]
 pub(super) fn try_spawn_continuous(
+    owner: &str,
     model: GenericHeteroTransformer,
     eos: Vec<u32>,
     context_length: usize,
@@ -986,15 +987,19 @@ pub(super) fn try_spawn_continuous(
     let sized =
         crate::inference::engine::model_backend::adaptive_prefill_chunk(model.prefill_shape())
             .max(PREFILL_CHUNK_TOKENS);
-    let plan_now = || {
-        paged::plan(&model.compute_device(), &shape_for(sized))
-            .map(|plan| (plan, sized))
-            .or_else(|| {
-                paged::plan(&model.compute_device(), &shape_for(PREFILL_CHUNK_TOKENS))
-                    .map(|plan| (plan, PREFILL_CHUNK_TOKENS))
-            })
+    // The pool is sized while no other component loads: a load in progress is taking room
+    // that the card still reports free. The next request tries again.
+    let Some(_admission) = crate::inference::place::vram_manager::try_load_admission() else {
+        warn!("CB serve: another component is loading - staying serial");
+        return Err(model);
     };
+    // The card's room less what other owners declared.
     // A card held by the pools that serial models beside this one keep takes them back first.
+    let chunks = [sized, PREFILL_CHUNK_TOKENS];
+    let plan_now = || {
+        paged::plan_for(owner, &model.compute_device(), &chunks.map(shape_for))
+            .map(|(plan, i)| (plan, chunks[i]))
+    };
     let planned = plan_now().or_else(|| model.give_back_parked_pools().then(plan_now).flatten());
     let Some((plan, prompt_chunk)) = planned else {
         warn!(
@@ -1072,7 +1077,8 @@ pub(super) fn promote_to_batched(state: &mut LoadedModelState) -> bool {
         let mut ends = state.eos_token_ids_extra.clone();
         ends.push(eos);
         let format = m.running_format();
-        let (model, batched): (BoxedModelBackend, bool) = match try_spawn_continuous(m, ends, ctx) {
+        let spawned = try_spawn_continuous(&state.name, m, ends, ctx);
+        let (model, batched): (BoxedModelBackend, bool) = match spawned {
             Ok(s) => (
                 Box::new(ContinuousBackend(std::sync::Arc::new(s), format)),
                 true,

@@ -273,6 +273,42 @@ pub fn free_now(device: &crate::tensor::Device) -> Option<u64> {
     None
 }
 
+/// Settles card `card`: the work queued on it runs, so the buffers freed in its order are freed,
+/// and its pool hands the free blocks back to the driver. A card no context holds is left alone.
+pub fn settle(card: usize) {
+    #[cfg(feature = "gpu")]
+    if crate::tensor::cuda::card_context_active(card) {
+        // A graph another thread records on the card is left whole: the card settles after it.
+        crate::tensor::cuda::outside_recordings_on(card, || {
+            if let Ok(device) = crate::tensor::Device::new_cuda(card) {
+                let _ = device.synchronize();
+            }
+            crate::tensor::cuda::trim_pool(card);
+        });
+    }
+    super::ladder::release_pools();
+}
+
+/// What `card` offers `owner` now: its free memory once settled, less what other owners declared
+/// they are about to take there.
+pub fn offered(card: usize, owner: &str) -> u64 {
+    settle(card);
+    super::device_probe::probe_cuda_gpus_for(owner)
+        .into_iter()
+        .find(|g| g.index == card)
+        .map_or(0, |g| g.stable_free)
+}
+
+/// The ordinal of the card `device` runs on, `None` for the host.
+pub fn card_of(device: &crate::tensor::Device) -> Option<usize> {
+    #[cfg(feature = "gpu")]
+    if let Ok(cd) = device.as_cuda_device() {
+        return Some(cd.0.ordinal());
+    }
+    let _ = device;
+    None
+}
+
 /// [`free_now`] for a caller holding the card's context rather than a device.
 #[cfg(feature = "gpu")]
 pub fn free_in(ctx: &crate::tensor::gpu_runtime::driver::CudaContext) -> Option<u64> {
