@@ -1597,7 +1597,7 @@ impl GenericHeteroTransformer {
         let mut pos = from;
         let mut last = None;
         let total = prompt.len().saturating_sub(from);
-        crate::request_metrics::note_prefill(0, total);
+        crate::request_metrics::note_prefill(0, total)?;
         while pos < prompt.len() {
             let boundary = (pos / stride + 1) * stride;
             let end = boundary.min(prompt.len());
@@ -1615,7 +1615,7 @@ impl GenericHeteroTransformer {
                 let x = Tensor::new(&prompt[pos..pos + n], &Device::Cpu)?.unsqueeze(0)?;
                 last = Some(self.forward(&x, pos)?);
                 pos += n;
-                crate::request_metrics::note_prefill(pos - from, total);
+                crate::request_metrics::note_prefill(pos - from, total)?;
             }
             if end == boundary && end < prompt.len() {
                 match self.capture_point(end, layout) {

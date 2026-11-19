@@ -50,6 +50,8 @@ struct Submission {
     tx: Sender<CbToken>,
     /// The probe the prompt reports its reading to.
     probe: Option<Arc<RequestProbe>>,
+    /// Raised when the request is abandoned: the worker drops it at its next step.
+    cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 /// The paged KV pool of a stopped worker, kept for its next start.
@@ -631,6 +633,14 @@ impl GhBatched {
         let mut off = it.cached_len;
         let mut logits = None;
         while off < it.tokens.len() {
+            if it.cancelled() {
+                // The engine drops the request after the step: the token is never sent.
+                tracing::info!(
+                    "prompt reading stopped at {} of {total} tokens: the request was cancelled",
+                    off - it.cached_len
+                );
+                return Ok(0);
+            }
             if let Some(p) = probe.as_ref() {
                 report_read(p, off - it.cached_len, total);
             }
@@ -664,8 +674,9 @@ impl GhBatched {
 
 /// Tells `probe` that `done` of the `total` prompt rows to read are read.
 fn report_read(probe: &Arc<RequestProbe>, done: usize, total: usize) {
-    let _bound = crate::request_metrics::bind_prefill(Some(Arc::clone(probe)));
-    crate::request_metrics::note_prefill(done, total);
+    let _bound = crate::request_metrics::bind_prefill(Some(Arc::clone(probe)), None);
+    // No flag is bound: the report cannot fail.
+    let _ = crate::request_metrics::note_prefill(done, total);
 }
 
 /// The model-side adapter of a model whose layers keep each sequence's state beside the paged
@@ -721,9 +732,9 @@ impl SequenceBatched {
         seq: &mut SequenceMixers,
     ) -> crate::tensor::Result<(Tensor, usize)> {
         let Some(cache) = self.model.state_cache().filter(|_| tokens.len() > 1) else {
-            crate::request_metrics::note_prefill(0, tokens.len());
+            crate::request_metrics::note_prefill(0, tokens.len())?;
             let logits = self.model.prefill_sequence(tokens, seq)?;
-            crate::request_metrics::note_prefill(tokens.len(), tokens.len());
+            crate::request_metrics::note_prefill(tokens.len(), tokens.len())?;
             return Ok((logits, 0));
         };
         self.model.with_sequence(seq, |model| {
@@ -757,13 +768,16 @@ impl BatchedModel for SequenceBatched {
     fn step(&mut self, items: &[StepItem]) -> crate::tensor::Result<Vec<u32>> {
         let mut out = vec![0u32; items.len()];
         for (i, it) in items.iter().enumerate().filter(|(_, it)| it.is_prefill) {
-            let _bound = crate::request_metrics::bind_prefill(self.probes.remove(&it.seq));
+            let _bound = crate::request_metrics::bind_prefill(
+                self.probes.remove(&it.seq),
+                it.cancel.clone(),
+            );
             let mut first = Some(self.model.sequence_mixers()?);
             // A prompt that runs out of card memory runs again once the lent card room is given
             // back.
             // The room is given back at the start of the run after the one that ran out.
             let give_back = std::cell::Cell::new(false);
-            let ((logits, covered, mixers), _) = crate::inference::place::recover::shrink_on_oom(
+            let read = crate::inference::place::recover::shrink_on_oom(
                 "batch prefill",
                 it.tokens.len(),
                 |_| None,
@@ -782,7 +796,12 @@ impl BatchedModel for SequenceBatched {
                     let (logits, covered) = self.prefill(&it.tokens, &mut mixers)?;
                     Ok::<_, crate::tensor::Error>((logits, covered, mixers))
                 },
-            )?;
+            );
+            // An abandoned request ends alone: the engine drops it after the step.
+            let ((logits, covered, mixers), _) = match read {
+                Err(_) if it.cancelled() => continue,
+                read => read?,
+            };
             out[i] = sample_row(&logits, 0, &it.sampling, &it.recent_tokens)?;
             let seq = Sequence {
                 mixers,
@@ -1439,6 +1458,18 @@ impl ContinuousServer {
         sampling: SamplingParams,
         probe: Option<Arc<RequestProbe>>,
     ) -> Receiver<CbToken> {
+        self.submit_cancellable(prompt, max_new, sampling, probe, None)
+    }
+
+    /// [`Self::submit_watched`] with the flag raised when the request is abandoned.
+    pub fn submit_cancellable(
+        &self,
+        prompt: Vec<u32>,
+        max_new: usize,
+        sampling: SamplingParams,
+        probe: Option<Arc<RequestProbe>>,
+        cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
+    ) -> Receiver<CbToken> {
         let (tx, rx) = mpsc::channel();
         // If the worker is gone, the receiver just yields nothing.
         let _ = self.submit_tx.send(Submission {
@@ -1447,6 +1478,7 @@ impl ContinuousServer {
             sampling,
             tx,
             probe,
+            cancel,
         });
         rx
     }
@@ -1458,12 +1490,14 @@ impl ContinuousServer {
 /// route, not one per model.
 pub trait BatchedServer: Send + Sync {
     /// Submits a request whose prompt reports its reading to `probe`.
+    /// The worker drops the request at its next step once `cancel` is raised.
     fn submit_cb(
         &self,
         prompt: Vec<u32>,
         max_new: usize,
         sampling: SamplingParams,
         probe: Option<Arc<RequestProbe>>,
+        cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
     ) -> Receiver<CbToken>;
 
     /// The tokens the cache of the worker holds, its sequences together.
@@ -1477,8 +1511,9 @@ impl BatchedServer for ContinuousServer {
         max_new: usize,
         sampling: SamplingParams,
         probe: Option<Arc<RequestProbe>>,
+        cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
     ) -> Receiver<CbToken> {
-        self.submit_watched(prompt, max_new, sampling, probe)
+        self.submit_cancellable(prompt, max_new, sampling, probe, cancel)
     }
 
     fn cache_tokens(&self) -> usize {
@@ -1549,6 +1584,9 @@ fn worker_loop<M: BatchedModel>(
                     if let Some(probe) = sub.probe {
                         engine.watch(id, probe);
                     }
+                    if let Some(cancel) = sub.cancel {
+                        engine.cancel_on(id, cancel);
+                    }
                     engine.submit(GenReq {
                         id,
                         prompt: sub.prompt,
@@ -1577,6 +1615,9 @@ fn worker_loop<M: BatchedModel>(
                     if let Some(probe) = sub.probe {
                         engine.watch(id, probe);
                     }
+                    if let Some(cancel) = sub.cancel {
+                        engine.cancel_on(id, cancel);
+                    }
                     engine.submit(GenReq {
                         id,
                         prompt: sub.prompt,
@@ -1590,7 +1631,15 @@ fn worker_loop<M: BatchedModel>(
             continue;
         }
 
-        let (emits, done) = match engine.step_stream() {
+        let stepped = engine.step_stream();
+        let mut batch = Vec::new();
+        for id in engine.take_cancelled() {
+            if let Some(tx) = chans.remove(&id) {
+                batch.push((tx, CbToken::Failed("the request was cancelled".to_string())));
+            }
+        }
+        emit(batch);
+        let (emits, done) = match stepped {
             Ok(v) => {
                 fails = 0;
                 v

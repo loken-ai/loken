@@ -412,7 +412,7 @@ fn a_slowed_serial_forward_reports_its_layers() {
             })
         };
         {
-            let _bound = crate::request_metrics::bind_prefill(Some(Arc::clone(&probe)));
+            let _bound = crate::request_metrics::bind_prefill(Some(Arc::clone(&probe)), None);
             backend.forward_prefill_chunked(&ids(&prompt), 0).unwrap();
         }
         read.store(true, Ordering::Relaxed);
@@ -699,7 +699,7 @@ fn serial_watched(model: GenericHeteroTransformer, prompt: &[u32]) -> (u32, Vec<
         })
     };
     let logits = {
-        let _bound = crate::request_metrics::bind_prefill(Some(Arc::clone(&probe)));
+        let _bound = crate::request_metrics::bind_prefill(Some(Arc::clone(&probe)), None);
         match cached {
             true => backend.try_restore_prefix(prompt).unwrap(),
             false => Some(backend.forward_prefill_chunked(&ids(prompt), 0).unwrap()),

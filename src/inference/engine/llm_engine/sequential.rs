@@ -287,7 +287,8 @@ impl LlmEngine {
         let probe = params.probe.clone();
         let arrived = std::time::Instant::now();
         let inner = tokio::task::spawn_blocking(move || -> AnyResult<GenerationResult> {
-            let _prefill = crate::request_metrics::bind_prefill(probe.clone());
+            let _prefill =
+                crate::request_metrics::bind_prefill(probe.clone(), Some(cancel.clone()));
             let mut guard = model_state.blocking_lock();
             let queue_s = arrived.elapsed().as_secs_f64();
             let state = guard
@@ -339,7 +340,8 @@ impl LlmEngine {
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<String, String>>(64);
         let arrived = std::time::Instant::now();
         std::thread::spawn(move || {
-            let _prefill = crate::request_metrics::bind_prefill(probe.clone());
+            let _prefill =
+                crate::request_metrics::bind_prefill(probe.clone(), Some(cancel.clone()));
             let mut guard = model_state.blocking_lock();
             let queue_s = arrived.elapsed().as_secs_f64();
             let Some(state) = guard.as_mut() else {

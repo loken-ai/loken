@@ -196,6 +196,7 @@ fn items_with_clones(plan: &BatchPlan, reqs: &mut HashMap<SeqId, Request>) -> Ve
             sampling: r.sampling.clone(),
             recent_tokens: recent,
             cached_len: 0,
+            cancel: None,
         });
     }
     items

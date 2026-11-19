@@ -260,3 +260,28 @@ fn a_late_failure_goes_on_from_the_chunk_that_failed() {
     // smaller one.
     assert_close(&logits, &cold(&f, &second, &[50, 170]));
 }
+
+/// A request abandoned while the kept state of its conversation is advanced over its new tokens
+/// ends there with its cancellation: the turn is not read again from the start.
+#[test]
+fn an_abandoned_next_turn_ends_with_its_cancellation() {
+    let f = Fixture::new("conv-cancel");
+    let mut b = GenericBackend(f.model());
+    let first = prompt(60);
+    read(&mut b, &first, 50);
+    let second = next_turn(&first, 50, 40, 3);
+    b.set_prefix_boundary(Some(80));
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let _bound = crate::request_metrics::bind_prefill(None, Some(cancel));
+    PREFILL_ROWS_READ.with(|c| c.set(0));
+    let Err(e) = b.try_restore_prefix(&second) else {
+        panic!("the abandoned turn ends with its cancellation");
+    };
+    let rows = PREFILL_ROWS_READ.with(|c| c.get());
+    assert!(
+        e.to_string()
+            .contains(crate::request_metrics::PREFILL_CANCELLED),
+        "{e}"
+    );
+    assert!(rows <= 40, "{rows} rows read, more than the turn added");
+}

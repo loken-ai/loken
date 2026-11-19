@@ -167,7 +167,8 @@ pub(super) fn pull_prompt_from_peer(
     }
     // The request's probe hears that its prompt is being read while the peer reads it.
     let total = prompt_tokens.len() - held;
-    crate::request_metrics::note_prefill(0, total);
+    // An abandoned request reads nothing more, here or on the local path.
+    crate::request_metrics::note_prefill(0, total).ok()?;
     let started = std::time::Instant::now();
     // A long prompt takes the peer as long as it takes: the request has no deadline of its own.
     let reply = reqwest::blocking::Client::builder()

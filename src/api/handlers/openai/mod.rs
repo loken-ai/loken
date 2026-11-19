@@ -584,6 +584,10 @@ pub(crate) async fn chat_completion_at(
         // here to the end of its answer.
         let probe = std::sync::Arc::new(crate::request_metrics::RequestProbe::default());
         let energy = crate::energy_report::begin_with(Some(probe.clone()));
+        // The stream holds the guard: a client that goes away stops the request, prompt
+        // reading included.
+        let mut params = params;
+        let cancel = engine.cancel_guard(&mut params);
         let start = {
             let (engine, prompt) = (engine.clone(), prompt.clone());
             let params = GenerationParams {
@@ -609,6 +613,7 @@ pub(crate) async fn chat_completion_at(
                 let created_at = crate::timestamp::now_secs();
                 let stream = async_stream::stream! {
                     let _admitted = admission;
+                    let _cancel = cancel;
                     // First chunk: role indicator
                     let mut role_chunk = ChatCompletionChunk::new_delta_at(
                         &completion_id,
@@ -1337,10 +1342,12 @@ pub(crate) async fn text_completions_at(
         let stream_started = std::time::Instant::now();
         // The request's own counts come back through its probe.
         let probe = std::sync::Arc::new(crate::request_metrics::RequestProbe::default());
-        let params = GenerationParams {
+        let mut params = GenerationParams {
             probe: Some(probe.clone()),
             ..params
         };
+        // A client that goes away stops the request, prompt reading included.
+        let cancel = engine.cancel_guard(&mut params);
         let drawn_logprobs = params.drawn_logprobs.clone();
         let rx = engine
             .generate_stream(&prompt, params.clone())
@@ -1353,6 +1360,7 @@ pub(crate) async fn text_completions_at(
         let mut holdback = vllm::StopHoldback::new(&stops, keep_stop);
         let stream = async_stream::stream! {
             let _admitted = admission;
+            let _cancel = cancel;
             let mut rx = rx;
             let mut tokens: u32 = 0;
             let mut first_token_at: Option<std::time::Instant> = None;

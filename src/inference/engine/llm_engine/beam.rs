@@ -551,7 +551,8 @@ impl LlmEngine {
         let prompt = prompt.to_string();
         let arrived = std::time::Instant::now();
         let inner = tokio::task::spawn_blocking(move || -> AnyResult<BeamOutcome> {
-            let _prefill = crate::request_metrics::bind_prefill(probe.clone());
+            let _prefill =
+                crate::request_metrics::bind_prefill(probe.clone(), Some(cancel.clone()));
             let mut guard = model_state.blocking_lock();
             let queue_s = arrived.elapsed().as_secs_f64();
             let state = guard

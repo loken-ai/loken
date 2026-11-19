@@ -171,6 +171,16 @@ impl Scheduler {
         self.waiting.clear();
     }
 
+    /// Drops `seq`, running or waiting, and frees its blocks.
+    /// Its blocks are not published to the prefix cache.
+    pub fn abort(&mut self, seq: SeqId) {
+        if let Some(i) = self.running.iter().position(|s| s.id == seq) {
+            let s = self.running.remove(i);
+            let _ = self.alloc.free(s.id);
+        }
+        self.waiting.retain(|s| s.id != seq);
+    }
+
     /// Publish a finished prefill's fresh full prompt blocks to the prefix cache so
     /// later requests reuse them (no-op when caching is disabled).
     pub fn commit_prefix(&mut self, seq: SeqId, prompt: &[u32]) {

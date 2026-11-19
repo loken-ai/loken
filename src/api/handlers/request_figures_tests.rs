@@ -297,6 +297,49 @@ async fn a_slow_prompt_is_reported_as_it_is_read() {
     );
 }
 
+/// Reads `response` until its first prefill comment line, then drops it as a client that goes
+/// away does.
+async fn leave_while_reading(response: Response) {
+    let mut body = response.into_body().into_data_stream();
+    let mut seen = String::new();
+    while let Some(frame) = futures::StreamExt::next(&mut body).await {
+        seen.push_str(&String::from_utf8_lossy(&frame.unwrap()));
+        if seen.contains(PREFILL_COMMENT) {
+            return;
+        }
+    }
+    panic!("the stream ended before a prefill comment: {seen}");
+}
+
+/// A client that leaves a stream while its prompt is read stops the request: no answer is
+/// written and the request never finishes as one.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_client_that_leaves_during_the_prompt_stops_the_request() {
+    let _one = ROUTES.lock().await;
+    let (state, dir, vocab) = server_with_tiny_model().await;
+    let engine = state.engines.read().await[0].engine.clone();
+    let model_id = dir.to_string_lossy().to_string();
+    let finished = || {
+        crate::request_metrics::snapshot()
+            .get(&model_id)
+            .map_or(0, |m| m.requests())
+    };
+    let pause = PREFILL_REPORT_PERIOD * SLOW_PREFILL_PERIODS;
+    crate::request_metrics::PREFILL_PAUSE_MS.store(pause.as_millis() as u64, Ordering::Relaxed);
+    leave_while_reading(openai(&state, LONG_PROMPT_WORDS, vocab, true).await).await;
+    leave_while_reading(anthropic(&state, LONG_PROMPT_WORDS, vocab, true).await).await;
+    crate::request_metrics::PREFILL_PAUSE_MS.store(0, Ordering::Relaxed);
+    // The model is taken in turn: this count runs once both left requests have ended.
+    let counted = engine.count_tokens("t1").await;
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(counted.is_some());
+    assert_eq!(
+        finished(),
+        0,
+        "a left request was read to its end and answered"
+    );
+}
+
 /// A long prompt with token rules, read slowly on the sequential path, is reported as it is read,
 /// and the answer's figures are in its usage.
 #[tokio::test(flavor = "multi_thread")]

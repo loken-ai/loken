@@ -607,7 +607,8 @@ pub struct GenerationParams {
     pub top_logprobs: Option<usize>,
     /// Where a stream puts the log-probabilities of its tokens for its handler.
     pub drawn_logprobs: DrawnLogprobs,
-    /// Raised when the request's client goes away; the generation loops read it between tokens.
+    /// Raised when the request's client goes away.
+    /// The generation loops read it between tokens, the prompt reading after each chunk.
     /// Each request carries its own, so a request that ends never stops another.
     pub cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// The token rules, stop tokens and prompt cut a request adds to the knobs above.
@@ -693,6 +694,13 @@ impl RequestRules {
 }
 
 impl GenerationParams {
+    /// Whether the request was abandoned.
+    pub fn cancelled(&self) -> bool {
+        self.cancel
+            .as_ref()
+            .is_some_and(|f| f.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
     /// The model's stop sequences when the request names none of its own. A request that
     /// ignores the model's end keeps none of them: they are that end written as text.
     pub fn with_default_stops(mut self, stops: &[String]) -> Self {

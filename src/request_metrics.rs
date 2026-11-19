@@ -8,7 +8,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -292,23 +292,37 @@ thread_local! {
     static PREFILL_PROBE: RefCell<Option<Arc<RequestProbe>>> = const { RefCell::new(None) };
     /// The prompt rows read and to read that this thread last reported to its probe.
     static PREFILL_READ: Cell<(u64, u64)> = const { Cell::new((0, 0)) };
+    /// The flag raised when the request whose prompt this thread reads is abandoned.
+    static PREFILL_CANCEL: RefCell<Option<Arc<AtomicBool>>> = const { RefCell::new(None) };
 }
 
-/// Binds `probe` to this thread until the guard drops: the chunked prefill run on the thread
-/// reports its progress to it.
-pub fn bind_prefill(probe: Option<Arc<RequestProbe>>) -> PrefillBinding {
+/// The error of a prompt read stopped because its request was abandoned.
+/// It is not an out-of-memory error: no recovery runs the request again.
+pub const PREFILL_CANCELLED: &str = "prompt reading stopped: the request was cancelled";
+
+/// Binds `probe` and `cancel` to this thread until the guard drops.
+///
+/// The chunked prefill run on the thread reports its progress to `probe`.
+/// It stops at its next report once `cancel` is raised.
+pub fn bind_prefill(
+    probe: Option<Arc<RequestProbe>>,
+    cancel: Option<Arc<AtomicBool>>,
+) -> PrefillBinding {
     let previous = PREFILL_PROBE.with(|p| p.replace(probe));
     let previous_read = PREFILL_READ.replace((0, 0));
+    let previous_cancel = PREFILL_CANCEL.with(|c| c.replace(cancel));
     PrefillBinding {
         previous,
         previous_read,
+        previous_cancel,
     }
 }
 
-/// Restores the thread's previous probe when dropped.
+/// Restores the thread's previous probe and flag when dropped.
 pub struct PrefillBinding {
     previous: Option<Arc<RequestProbe>>,
     previous_read: (u64, u64),
+    previous_cancel: Option<Arc<AtomicBool>>,
 }
 
 impl Drop for PrefillBinding {
@@ -316,7 +330,18 @@ impl Drop for PrefillBinding {
         let previous = self.previous.take();
         PREFILL_PROBE.with(|p| *p.borrow_mut() = previous);
         PREFILL_READ.set(self.previous_read);
+        let previous_cancel = self.previous_cancel.take();
+        PREFILL_CANCEL.with(|c| *c.borrow_mut() = previous_cancel);
     }
+}
+
+/// Whether the request whose prompt this thread reads was abandoned.
+pub fn prefill_cancelled() -> bool {
+    PREFILL_CANCEL.with(|c| {
+        c.borrow()
+            .as_ref()
+            .is_some_and(|f| f.load(Ordering::Relaxed))
+    })
 }
 
 /// Milliseconds a prefill reporting to a bound probe pauses after each report short of the
@@ -335,7 +360,17 @@ pub static LAYER_PAUSE_MS: AtomicU64 = AtomicU64::new(0);
 pub static PREFILL_PAUSE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Reports `done` of `total` prompt tokens read to the probe bound to this thread, if any.
-pub fn note_prefill(done: usize, total: usize) {
+///
+/// Every prefill path reports after each chunk it reads.
+/// The report fails with [`PREFILL_CANCELLED`] once the flag bound to the thread is raised, and
+/// the path stops there.
+pub fn note_prefill(done: usize, total: usize) -> crate::tensor::Result<()> {
+    if prefill_cancelled() {
+        tracing::info!(
+            "prompt reading stopped at {done} of {total} tokens: the request was cancelled"
+        );
+        return Err(crate::tensor::Error::msg(PREFILL_CANCELLED.to_string()));
+    }
     PREFILL_PROBE.with(|p| {
         if let Some(probe) = p.borrow().as_ref() {
             probe.note_prefill(done as u64, total as u64);
@@ -348,6 +383,7 @@ pub fn note_prefill(done: usize, total: usize) {
             }
         }
     });
+    Ok(())
 }
 
 /// Reports to the probe bound to this thread that `layers_done` of the `layers` layers of a
@@ -538,13 +574,13 @@ mod tests {
     #[test]
     fn a_bound_probe_hears_the_prefill_and_the_outcome() {
         let probe = Arc::new(RequestProbe::default());
-        note_prefill(1, 9);
+        note_prefill(1, 9).unwrap();
         assert_eq!(probe.prefill(), (0, 0));
         {
-            let _bound = bind_prefill(Some(probe.clone()));
-            note_prefill(4, 9);
+            let _bound = bind_prefill(Some(probe.clone()), None);
+            note_prefill(4, 9).unwrap();
         }
-        note_prefill(7, 9);
+        note_prefill(7, 9).unwrap();
         assert_eq!(probe.prefill(), (4, 9));
         let outcome = RequestOutcome {
             drafted: 5,
@@ -564,10 +600,10 @@ mod tests {
         let probe = Arc::new(RequestProbe::default());
         note_layers(8, 1, 4);
         {
-            let _bound = bind_prefill(Some(probe.clone()));
+            let _bound = bind_prefill(Some(probe.clone()), None);
             note_layers(8, 1, 4);
             assert_eq!(probe.prefill(), (0, 0));
-            note_prefill(4, 20);
+            note_prefill(4, 20).unwrap();
             note_layers(8, 1, 4);
             assert_eq!(probe.prefill(), (6, 20));
             note_layers(8, 3, 4);
@@ -577,11 +613,37 @@ mod tests {
             note_layers(1, 1, 2);
             note_layers(17, 1, 2);
             assert_eq!(probe.prefill(), (10, 20));
-            note_prefill(20, 20);
+            note_prefill(20, 20).unwrap();
             note_layers(3, 1, 2);
             assert_eq!(probe.prefill(), (20, 20));
         }
         note_layers(8, 2, 4);
         assert_eq!(probe.prefill(), (20, 20));
+    }
+
+    /// A prompt reading stops at its next report once the flag bound with it is raised.
+    /// The flag of a binding that ended stops nothing.
+    #[test]
+    fn a_raised_flag_stops_the_reading_at_its_next_report() {
+        let probe = Arc::new(RequestProbe::default());
+        let cancel = Arc::new(AtomicBool::new(false));
+        {
+            let _bound = bind_prefill(Some(probe.clone()), Some(cancel.clone()));
+            note_prefill(4, 20).unwrap();
+            cancel.store(true, Ordering::Relaxed);
+            let e = note_prefill(8, 20).unwrap_err();
+            assert!(e.to_string().contains(PREFILL_CANCELLED), "{e}");
+            assert!(
+                !crate::inference::place::ladder::is_out_of_memory(&e),
+                "a cancelled reading is not run again"
+            );
+            assert_eq!(probe.prefill(), (4, 20));
+            {
+                let _inner = bind_prefill(None, None);
+                note_prefill(1, 2).unwrap();
+            }
+            assert!(note_prefill(9, 20).is_err());
+        }
+        note_prefill(10, 20).unwrap();
     }
 }

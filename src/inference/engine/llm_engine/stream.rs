@@ -352,7 +352,7 @@ impl LlmEngine {
         let cache_tokens = server.cache_tokens();
         // A resumed answer reported its prompt on the serial path.
         let watch = probe.clone().filter(|_| prior.is_none());
-        let cb_rx = server.submit_cb(tokens, max_new, sampling, watch);
+        let cb_rx = server.submit_cb(tokens, max_new, sampling, watch, params.cancel.clone());
         std::thread::spawn(move || {
             let resumed = prior.is_some();
             let mut gen: Vec<u32> = prior.unwrap_or_default();
@@ -604,7 +604,9 @@ impl LlmEngine {
                 }
                 Ok::<_, Box<dyn std::error::Error>>((first, rx))
             },
+            // An abandoned request is not run again.
             |outcome| match outcome {
+                _ if params.cancelled() => None,
                 Err(e) if is_out_of_memory(e) => Some(e.to_string()),
                 Ok((first @ Some(Err(e)), _)) if opens_out_of_memory(first) => Some(e.clone()),
                 _ => None,
@@ -702,13 +704,14 @@ impl LlmEngine {
         let spec_engine = self.clone_for_spec();
         let spec_rt = tokio::runtime::Handle::current();
         let probe = params.probe.clone();
+        let cancel = params.cancel.clone();
         // A lone request moves into the batch worker when another request arrives.
         // A request that reads log-probabilities stays where they are drawn.
         let mut hand_over = params.top_logprobs.is_none() && self.hands_over_to_worker().await;
         let hand_over_params = params.clone();
 
         std::thread::spawn(move || {
-            let _prefill = crate::request_metrics::bind_prefill(probe.clone());
+            let _prefill = crate::request_metrics::bind_prefill(probe.clone(), cancel);
             let stream_start = std::time::Instant::now();
             let locked;
             #[allow(unused_assignments)]
@@ -4141,6 +4144,7 @@ mod tests {
             _max_new: usize,
             _sampling: SamplingParams,
             _probe: Option<Arc<RequestProbe>>,
+            _cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
         ) -> std::sync::mpsc::Receiver<CbToken> {
             let (tx, rx) = std::sync::mpsc::channel();
             for &t in &self.tokens {

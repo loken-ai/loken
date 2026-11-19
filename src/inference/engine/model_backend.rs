@@ -478,14 +478,14 @@ pub(crate) trait ModelBackend: Send {
         let chunk_tokens = chunk_tokens.max(1);
         let mut off = *done;
         let mut last: Option<Tensor> = None;
-        crate::request_metrics::note_prefill(off, seq_len);
+        crate::request_metrics::note_prefill(off, seq_len)?;
         while off < seq_len {
             let n = chunk_tokens.min(seq_len - off);
             let chunk = x.narrow(1, off, n)?;
             last = Some(self.forward(&chunk, index_pos + off)?);
             off += n;
             *done = off;
-            crate::request_metrics::note_prefill(off, seq_len);
+            crate::request_metrics::note_prefill(off, seq_len)?;
         }
         last.ok_or_else(|| crate::tensor::Error::msg("empty prefill".to_string()))
     }
@@ -1773,7 +1773,7 @@ impl ModelBackend for GenericBackend {
                 "alloc: DriverError(CUDA_ERROR_OUT_OF_MEMORY, \"out of memory\")".to_string(),
             ));
         }
-        crate::request_metrics::note_prefill(*done, seq_len);
+        crate::request_metrics::note_prefill(*done, seq_len)?;
         if self.0.layer_major_pays(seq_len - *done, chunk_tokens) {
             // Every layer sees every row before the next layer starts: the pass completes
             // whole or not at all.
@@ -1782,7 +1782,7 @@ impl ModelBackend for GenericBackend {
                 self.0
                     .forward_prefill_layer_major(&rest, index_pos + *done, chunk_tokens)?;
             *done = seq_len;
-            crate::request_metrics::note_prefill(seq_len, seq_len);
+            crate::request_metrics::note_prefill(seq_len, seq_len)?;
             return Ok(logits);
         }
         let chunk_tokens = chunk_tokens.max(1);
@@ -1814,7 +1814,7 @@ impl ModelBackend for GenericBackend {
             }
             off += n;
             *done = off;
-            crate::request_metrics::note_prefill(off, seq_len);
+            crate::request_metrics::note_prefill(off, seq_len)?;
         }
         last.ok_or_else(|| crate::tensor::Error::msg("empty prefill".to_string()))
     }

@@ -299,6 +299,10 @@ pub(crate) async fn anthropic_messages_at(
         // here to the end of its answer.
         let probe = std::sync::Arc::new(crate::request_metrics::RequestProbe::default());
         let energy = crate::energy_report::begin_with(Some(probe.clone()));
+        // The stream holds the guard: a client that goes away stops the request, prompt
+        // reading included.
+        let mut params = params;
+        let cancel = engine.cancel_guard(&mut params);
         let start = {
             let (engine, prompt) = (engine.clone(), prompt.clone());
             let params = GenerationParams {
@@ -317,6 +321,7 @@ pub(crate) async fn anthropic_messages_at(
                 let model_clone = model_for_resp.clone();
                 let event_stream = async_stream::stream! {
                     let _admitted = admission;
+                    let _cancel = cancel;
                     let id = format!("msg_{}", uuid::Uuid::new_v4().simple());
                     // Anthropic event prologue: message_start, open text
                     // block 0, a ping.

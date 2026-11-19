@@ -425,6 +425,8 @@ pub(crate) async fn ollama_chat(
         // The request's own counts come back through its probe.
         let probe = std::sync::Arc::new(crate::request_metrics::RequestProbe::default());
         params.probe = Some(probe.clone());
+        // A client that goes away stops the request, prompt reading included.
+        let cancel = engine.cancel_guard(&mut params);
         // Use streaming generation (NDJSON format, matching Ollama's API)
         let drawn_logprobs = params.drawn_logprobs.clone();
         match engine.generate_stream(&prompt, params.clone()).await {
@@ -436,6 +438,7 @@ pub(crate) async fn ollama_chat(
                 let stops = params.stop_sequences.clone();
                 let stream = async_stream::stream! {
                     let _admitted = admission;
+                    let _cancel = cancel;
                     let mut accumulated_text = String::new();
                     let mut chunk_count: usize = 0;
                     let mut errored = false;
@@ -1244,6 +1247,8 @@ pub(crate) async fn ollama_generate(
         // The request's own counts come back through its probe.
         let probe = std::sync::Arc::new(crate::request_metrics::RequestProbe::default());
         params.probe = Some(probe.clone());
+        // A client that goes away stops the request, prompt reading included.
+        let cancel = engine.cancel_guard(&mut params);
         let drawn_logprobs = params.drawn_logprobs.clone();
         // Use streaming generation (NDJSON format, matching Ollama's API)
         match engine
@@ -1260,7 +1265,8 @@ pub(crate) async fn ollama_generate(
                 let engine_for_stats = engine.clone();
                 let stops = params.stop_sequences.clone();
                 let stream = async_stream::stream! {
-                    let _admitted = admission; // released when the stream ends
+                    let _admitted = admission;
+                    let _cancel = cancel; // released when the stream ends
                     let mut splitter = crate::api::thinking::ThinkSplit::opened(thinking_opened);
                     let mut thought = false;
                     let mut thinking_ns: Option<u64> = None;

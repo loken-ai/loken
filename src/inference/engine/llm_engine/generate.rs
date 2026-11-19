@@ -107,7 +107,11 @@ impl LlmEngine {
             &self.config.model_id,
             &self.config.model_id,
             || self.generate_once(prompt, params.clone()),
-            crate::inference::place::recover::oom_message,
+            // An abandoned request is not run again.
+            |outcome| {
+                crate::inference::place::recover::oom_message(outcome)
+                    .filter(|_| !params.cancelled())
+            },
             release_cuda_pools,
             || crate::inference::place::vram_manager::evict_idle_llm(&self.config.model_id),
             |_, oom| async move { (!self.reload_further_off().await).then(|| Err(oom.into())) },
@@ -245,7 +249,7 @@ impl LlmEngine {
 
         let arrived = std::time::Instant::now();
         let inner_result = tokio::task::spawn_blocking(move || -> AnyResult<GenerationResult> {
-            let _prefill = crate::request_metrics::bind_prefill(probe.clone());
+            let _prefill = crate::request_metrics::bind_prefill(probe.clone(), Some(cancel.clone()));
             let mut guard = model_state.blocking_lock();
             // Requests to one model take it in turn: the wait for it is the request's queue.
             let queue_s = arrived.elapsed().as_secs_f64();

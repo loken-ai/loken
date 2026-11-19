@@ -19,6 +19,8 @@ use crate::inference::cache::paged_kv::{PagedKvAllocator, SeqId};
 use crate::inference::serve::scheduler::{BatchPlan, FinishReason, Scheduler, SchedulerConfig};
 use crate::tensor::Result;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 /// One unit of work for the model this step. `tokens` are the inputs to embed:
 /// the whole prompt for a prefill, the single most-recent token for a decode.
@@ -41,6 +43,17 @@ pub struct StepItem {
     /// the model computes only `tokens[cached_len..]`, gathering the prefix KV via
     /// `block_table`. 0 = full prefill (the default).
     pub cached_len: usize,
+    /// Raised when the request is abandoned: a prefill read in chunks stops at its next chunk.
+    pub cancel: Option<Arc<AtomicBool>>,
+}
+
+impl StepItem {
+    /// Whether the request of this item was abandoned.
+    pub fn cancelled(&self) -> bool {
+        self.cancel
+            .as_ref()
+            .is_some_and(|f| f.load(Ordering::Relaxed))
+    }
 }
 
 /// Per-request sampling controls (mirrors the serial path's GenerationParams
@@ -161,6 +174,10 @@ pub struct ContinuousBatchEngine<M: BatchedModel> {
     /// The requests whose prompt a step started since the last [`Self::take_admitted`]: when,
     /// and how many of its tokens the prefix cache served.
     admitted: Vec<(SeqId, std::time::Instant, usize)>,
+    /// The flag each request raises when it is abandoned.
+    cancels: HashMap<SeqId, Arc<AtomicBool>>,
+    /// The requests dropped since the last [`Self::take_cancelled`] because they were abandoned.
+    cancelled: Vec<SeqId>,
 }
 
 impl<M: BatchedModel> ContinuousBatchEngine<M> {
@@ -188,7 +205,40 @@ impl<M: BatchedModel> ContinuousBatchEngine<M> {
             eos,
             reqs: HashMap::new(),
             admitted: Vec::new(),
+            cancels: HashMap::new(),
+            cancelled: Vec::new(),
         })
+    }
+
+    /// Drops `seq` at the next step once `flag` is raised: queued, while its prompt is read, or
+    /// while it decodes.
+    pub fn cancel_on(&mut self, seq: SeqId, flag: Arc<AtomicBool>) {
+        self.cancels.insert(seq, flag);
+    }
+
+    /// The requests dropped since the last call because they were abandoned.
+    pub fn take_cancelled(&mut self) -> Vec<SeqId> {
+        std::mem::take(&mut self.cancelled)
+    }
+
+    /// Drops the abandoned requests: their blocks, what the model keeps for them and their
+    /// state.
+    fn drop_cancelled(&mut self) {
+        let raised: Vec<SeqId> = self
+            .cancels
+            .iter()
+            .filter(|(_, f)| f.load(Ordering::Relaxed))
+            .map(|(&id, _)| id)
+            .collect();
+        for id in raised {
+            self.cancels.remove(&id);
+            if self.reqs.remove(&id).is_none() {
+                continue;
+            }
+            self.sched.abort(id);
+            self.model.release(id);
+            self.cancelled.push(id);
+        }
     }
 
     pub fn submit(&mut self, req: GenReq) {
@@ -250,6 +300,7 @@ impl<M: BatchedModel> ContinuousBatchEngine<M> {
         self.admitted.clear();
         for &id in &started {
             self.model.release(id);
+            self.cancels.remove(&id);
         }
         queued.sort_by_key(|(id, _)| *id);
         for (id, r) in queued {
@@ -269,6 +320,7 @@ impl<M: BatchedModel> ContinuousBatchEngine<M> {
     /// active sequence emits exactly one new token per step (a prefill emits its
     /// first generated token); prompt tokens are never emitted here.
     pub fn step_stream(&mut self) -> Result<(Vec<(SeqId, u32)>, Vec<GenDone>)> {
+        self.drop_cancelled();
         let plan: BatchPlan = self.sched.schedule();
         if plan.is_empty() {
             return Ok((Vec::new(), Vec::new()));
@@ -302,6 +354,7 @@ impl<M: BatchedModel> ContinuousBatchEngine<M> {
                 sampling: r.sampling.clone(),
                 recent_tokens: recent,
                 cached_len: p.cached_len,
+                cancel: self.cancels.get(&p.seq).cloned(),
             });
         }
         for d in &plan.decodes {
@@ -323,11 +376,15 @@ impl<M: BatchedModel> ContinuousBatchEngine<M> {
                 sampling: r.sampling.clone(),
                 recent_tokens: recent,
                 cached_len: 0,
+                cancel: self.cancels.get(&d.seq).cloned(),
             });
         }
 
         let sampled = self.model.step(&items)?;
         debug_assert_eq!(sampled.len(), items.len());
+        // A request abandoned during the step leaves before its token or its prompt blocks are
+        // kept: a prefill it stopped part way wrote only some of its rows.
+        self.drop_cancelled();
         for (seq, _, cached) in &mut self.admitted[admitted_before..] {
             if let Some(read) = self.model.cached_prompt(*seq) {
                 *cached = read;
@@ -350,7 +407,10 @@ impl<M: BatchedModel> ContinuousBatchEngine<M> {
         let mut results = Vec::with_capacity(items.len());
         let mut emits = Vec::with_capacity(items.len());
         for (it, &tok) in items.iter().zip(sampled.iter()) {
-            self.reqs.get_mut(&it.seq).unwrap().generated.push(tok);
+            let Some(r) = self.reqs.get_mut(&it.seq) else {
+                continue;
+            };
+            r.generated.push(tok);
             emits.push((it.seq, tok));
             let ends = it.sampling.ends.as_deref().unwrap_or(&self.eos);
             results.push((it.seq, ends.contains(&tok)));
@@ -358,6 +418,7 @@ impl<M: BatchedModel> ContinuousBatchEngine<M> {
         let finished = self.sched.on_step_done(&results);
         for (id, _) in &finished {
             self.model.release(*id);
+            self.cancels.remove(id);
         }
 
         let done = finished
@@ -691,6 +752,83 @@ mod tests {
         assert!(done.iter().all(|d| d.tokens.len() == 3));
         assert!(e.is_idle());
         assert_eq!(e.sched.free_blocks(), free0, "every block came back");
+    }
+
+    /// Model that raises the flag of the requests whose prompt it reads, as a client that leaves
+    /// during the read does.
+    #[derive(Default)]
+    struct LeftDuringRead {
+        leave: HashMap<SeqId, Arc<AtomicBool>>,
+        released: Vec<SeqId>,
+    }
+    impl BatchedModel for LeftDuringRead {
+        fn step(&mut self, items: &[StepItem]) -> Result<Vec<u32>> {
+            for it in items.iter().filter(|it| it.is_prefill) {
+                if let Some(flag) = self.leave.get(&it.seq) {
+                    assert!(it.cancel.is_some(), "the item carries the flag");
+                    flag.store(true, Ordering::Relaxed);
+                }
+            }
+            Ok(items.iter().map(|_| 1).collect())
+        }
+        fn release(&mut self, seq: SeqId) {
+            self.released.push(seq);
+        }
+    }
+
+    /// A request abandoned while queued or while its prompt is read is dropped: no token of it
+    /// is emitted, its blocks come back and are not kept for a later prompt, and the requests
+    /// beside it get their whole answers.
+    #[test]
+    fn an_abandoned_request_is_dropped_and_the_others_finish() {
+        let read = Arc::new(AtomicBool::new(false));
+        let queued = Arc::new(AtomicBool::new(false));
+        let model = LeftDuringRead {
+            leave: HashMap::from([(1, read.clone())]),
+            ..Default::default()
+        };
+        let mut e = ContinuousBatchEngine::new(model, vec![0], 64, 16, 8, 4096).unwrap();
+        let free0 = e.sched.free_blocks();
+        // The abandoned read has a prompt of its own, longer than 1 block.
+        let left: Vec<u32> = (100..140).collect();
+        let kept: Vec<u32> = (0..40).collect();
+        for (id, prompt) in [(1, &left), (2, &kept), (3, &kept)] {
+            e.submit(GenReq {
+                id,
+                prompt: prompt.clone(),
+                max_new: 3,
+                sampling: SamplingParams::greedy(),
+            });
+        }
+        e.cancel_on(1, read);
+        e.cancel_on(3, queued.clone());
+        queued.store(true, Ordering::Relaxed);
+        let (emits, done) = e.step_stream().unwrap();
+        assert!(emits.iter().all(|(id, _)| *id == 2), "{emits:?}");
+        assert!(done.is_empty());
+        let mut dropped = e.take_cancelled();
+        dropped.sort();
+        assert_eq!(dropped, vec![1, 3]);
+        let mut released = e.model.released.clone();
+        released.sort();
+        assert_eq!(released, vec![1, 3]);
+        let done = e.run_to_idle().unwrap();
+        assert_eq!(done.len(), 1);
+        assert_eq!((done[0].id, done[0].tokens.len()), (2, 3));
+        // The finished prompt keeps its full blocks for reuse, and no other block is held.
+        assert_eq!(e.sched.free_blocks(), free0 - kept.len() / 16);
+        e.take_admitted();
+        // The prompt the abandoned read wrote part of is not kept for reuse.
+        e.submit(GenReq {
+            id: 4,
+            prompt: left,
+            max_new: 1,
+            sampling: SamplingParams::greedy(),
+        });
+        e.step_stream().unwrap();
+        let admitted = e.take_admitted();
+        assert_eq!(admitted.len(), 1, "{admitted:?}");
+        assert_eq!(admitted[0].2, 0, "{admitted:?}");
     }
 
     #[test]
