@@ -172,10 +172,26 @@ pub struct ChooseFloatVariants {
     previous: bool,
 }
 
+thread_local! {
+    /// The weight shapes this thread measured while it chose.
+    static MEASURED: std::cell::RefCell<Vec<Shape>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
 impl ChooseFloatVariants {
     pub fn enter() -> Self {
+        MEASURED.with(|m| m.borrow_mut().clear());
         Self {
             previous: CHOOSING.with(|c| c.replace(true)),
+        }
+    }
+
+    /// Forgets the choices measured while held, so the next warm-up measures them again: their
+    /// timing ran beside another model's work on the card.
+    pub fn forget(&self) {
+        let shapes = MEASURED.with(|m| std::mem::take(&mut *m.borrow_mut()));
+        let mut chosen = chosen().lock().unwrap_or_else(|e| e.into_inner());
+        for shape in shapes {
+            chosen.remove(&shape);
         }
     }
 }
@@ -269,21 +285,26 @@ fn variants_for(card: &Card, x: &Tensor, w: &Tensor) -> Result<FloatVariants> {
     if !CHOOSING.with(Cell::get) || crate::tensor::cuda_ext::capture_active(&card.device) {
         return Ok(FloatVariants::default());
     }
-    // A measurement that fails, for want of memory on a full card, keeps the default variants.
-    let chosen_now = measure_variants(card, x, w).unwrap_or_else(|e| {
-        tracing::debug!(
-            "float product {}x{} {:?} on card {}: variants unmeasured, the default kept: {e}",
-            card.n,
-            card.k,
-            card.dtype,
-            card.ordinal
-        );
-        FloatVariants::default()
-    });
+    // A measurement that fails, for want of memory on a full card, takes the default variants
+    // and keeps no choice: the next warm-up measures again.
+    let chosen_now = match measure_variants(card, x, w) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::debug!(
+                "float product {}x{} {:?} on card {}: variants unmeasured, the default taken: {e}",
+                card.n,
+                card.k,
+                card.dtype,
+                card.ordinal
+            );
+            return Ok(FloatVariants::default());
+        }
+    };
     chosen()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .insert(shape, chosen_now);
+    MEASURED.with(|m| m.borrow_mut().push(shape));
     Ok(chosen_now)
 }
 

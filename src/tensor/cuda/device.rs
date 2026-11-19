@@ -88,9 +88,18 @@ fn default_pool(ordinal: usize) -> Option<crate::tensor::gpu_runtime::driver::sy
     (ok == cudaError_enum::CUDA_SUCCESS && !pool.is_null()).then_some(pool)
 }
 
+/// How many measures of a default pool's peak were started, by every user of the process: a
+/// measure another started meanwhile reset the peak the first one reads.
+pub fn pool_marks() -> u64 {
+    POOL_MARKS.load(std::sync::atomic::Ordering::Acquire)
+}
+
+static POOL_MARKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Starts a measure of the default pool's peak use on `ordinal`: the peak is set to what the
 /// pool holds now, which is returned.
 pub fn pool_mark(ordinal: usize) -> u64 {
+    POOL_MARKS.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     use crate::tensor::gpu_runtime::driver::sys::{
         cuMemPoolGetAttribute, cuMemPoolSetAttribute, CUmemPool_attribute,
     };

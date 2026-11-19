@@ -1869,6 +1869,7 @@ use std::time::Instant;
 mod batching;
 pub use batching::ActiveRequest;
 pub use batching::Arrived;
+pub(crate) use batching::requests_of_the_process;
 mod beam;
 pub use beam::{BeamAnswer, BeamOutcome, BeamSearch, EarlyStopping};
 pub(crate) mod discover;

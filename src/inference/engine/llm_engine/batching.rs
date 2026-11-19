@@ -324,8 +324,23 @@ pub struct ActiveRequest {
     serial: bool,
 }
 
+/// Requests started on every engine of the process, and those running.
+static STARTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static RUNNING: AtomicUsize = AtomicUsize::new(0);
+
+/// The requests started on every engine of the process so far, and those running now.
+/// A measure of one model's use of a card is its own only while these show no other request.
+pub(crate) fn requests_of_the_process() -> (u64, usize) {
+    (
+        STARTED.load(Ordering::Acquire),
+        RUNNING.load(Ordering::Acquire),
+    )
+}
+
 impl ActiveRequest {
     pub fn enter(count: &Arc<AtomicUsize>) -> Self {
+        STARTED.fetch_add(1, Ordering::AcqRel);
+        RUNNING.fetch_add(1, Ordering::AcqRel);
         let others = count.fetch_add(1, Ordering::AcqRel);
         Self {
             count: Arc::clone(count),
@@ -363,6 +378,7 @@ impl ActiveRequest {
 
 impl Drop for ActiveRequest {
     fn drop(&mut self) {
+        RUNNING.fetch_sub(1, Ordering::AcqRel);
         if self.count.fetch_sub(1, Ordering::AcqRel) == 1 {
             let _held = IDLE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
             IDLE.notify_all();
@@ -839,6 +855,23 @@ mod tests {
         let plain: Vec<u32> = (100..150).collect();
         assert_eq!(lookup_share(&prompt, &plain), 0.0);
         assert_eq!(lookup_share(&prompt, &[]), 0.0);
+    }
+
+    /// A request of any engine shows in the process's counts while it runs, and its start stays
+    /// counted: a measure taken across it is not one model's own.
+    #[test]
+    fn a_request_of_another_engine_shows_in_the_process_counts() {
+        let (mine, other) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let own = ActiveRequest::enter(&mine);
+        let (started, running) = requests_of_the_process();
+        assert!(running >= 1);
+        let theirs = ActiveRequest::enter(&other);
+        let (started_then, running_then) = requests_of_the_process();
+        assert!(started_then > started);
+        assert!(running_then >= 2);
+        drop(theirs);
+        assert!(requests_of_the_process().0 > started);
+        drop(own);
     }
 
     #[test]

@@ -332,6 +332,7 @@ impl ChooseFloatVariants {
     pub fn enter() -> Self {
         Self
     }
+    pub fn forget(&self) {}
 }
 pub fn measures_float_variants(_device: &crate::tensor::Device) -> bool {
     false

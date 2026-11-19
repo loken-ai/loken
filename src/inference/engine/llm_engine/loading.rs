@@ -2036,9 +2036,18 @@ fn warm_prefill(
     // The 1-token prompt runs only on a card whose float products offer variants to measure.
     // It leaves what the warmup returns to the prompts below.
     if room >= 1 && crate::inference::moe_cuda::measures_float_variants(device) {
-        let _choose = crate::inference::moe_cuda::ChooseFloatVariants::enter();
+        // A request in flight on the server shares the card's stream with the timing: its
+        // choices are forgotten, and the next warm-up measures again.
+        let idle = std::sync::atomic::AtomicUsize::new(0);
+        let contended = || super::batching::busy(&idle);
+        let choose = crate::inference::moe_cuda::ChooseFloatVariants::enter();
+        let before = contended();
         if let Err(e) = pass(model, 1) {
             debug!("float product variants unmeasured: the 1-token warmup failed: {e}");
+        }
+        if before || contended() {
+            debug!("float product variants measured beside another request: not kept");
+            choose.forget();
         }
     }
     let mut ran = false;

@@ -396,9 +396,10 @@ pub struct CardStager {
     /// The most a decode has taken of the card between a prefill's end and the next prefill,
     /// measured; `None` until one has run. The extra slots come back only within what it leaves.
     decode_need: Mutex<Option<u64>>,
-    /// The card's free memory once the extra slots came back, when a prefill ended, and what
-    /// the card's memory pool held in use then.
-    free_after_return: Mutex<Option<(u64, u64)>>,
+    /// The card's free memory once the extra slots came back, when a prefill ended, what the
+    /// card's memory pool held in use then, and what the process ran then: the peak measures
+    /// started and the requests started and running.
+    free_after_return: Mutex<Option<(u64, u64, u64, (u64, usize))>>,
     /// A prefill lent the slots since then: what the card lost meanwhile is the prefill's.
     lent_since_return: std::sync::atomic::AtomicBool,
     /// What a decode that recorded no graph was seen to take, apart from [`Self::decode_need`].
@@ -3628,7 +3629,17 @@ impl CardStager {
             .take();
         let lent = self.lent_since_return.swap(false, Ordering::AcqRel);
         let decoded = self.routed_at_return.load(Ordering::Acquire) != routed;
-        let Some((then, pool_then)) = then.filter(|_| !lent && decoded) else {
+        // A span in which another user started a peak measure, or another request started or
+        // ran, holds that user's traffic beside this model's: it is not counted.
+        let alone = |&(_, _, marks, (started, running)): &(u64, u64, u64, (u64, usize))| {
+            let (started_now, running_now) =
+                crate::inference::engine::llm_engine::requests_of_the_process();
+            marks == crate::tensor::cuda::pool_marks()
+                && started == started_now
+                && running <= 1
+                && running_now <= 1
+        };
+        let Some((then, pool_then, _, _)) = then.filter(|t| !lent && decoded && alone(t)) else {
             self.recorded_since_return.store(false, Ordering::Release);
             return;
         };
@@ -3737,6 +3748,8 @@ impl CardStager {
             .unwrap_or_else(|e| e.into_inner()) = Some((
             crate::inference::place::expert_cache::free_now(&self.dev),
             pool,
+            crate::tensor::cuda::pool_marks(),
+            crate::inference::engine::llm_engine::requests_of_the_process(),
         ));
     }
 
