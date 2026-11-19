@@ -147,7 +147,7 @@ impl super::GenericHeteroTransformer {
     pub fn set_expert_quality(&mut self, _: crate::inference::engine::llm_engine::QualityLevel) {}
 
     /// No card holds a cache of the experts: no slots to lend a prefill.
-    pub fn lend_expert_cache(&mut self, _tokens: usize) -> usize {
+    pub fn lend_expert_cache(&mut self, _tokens: usize, _history: u64) -> usize {
         0
     }
 

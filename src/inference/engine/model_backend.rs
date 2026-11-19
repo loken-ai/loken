@@ -362,6 +362,23 @@ pub(crate) trait ModelBackend: Send {
         false
     }
 
+    /// Card bytes a layer of a prefill reaching position `upto` reads its cache history into:
+    /// the K and V rows of every position before it, in F16.
+    /// The demand of a prefill chunk grows with it.
+    fn prefill_history_bytes(&self, _upto: usize) -> u64 {
+        0
+    }
+
+    /// The most card bytes a prefill forward of this model was measured to keep live per row;
+    /// 0 before one ran on a card, or for a model that does not measure.
+    fn measured_prefill_row_bytes(&self) -> u64 {
+        0
+    }
+
+    /// Takes `bytes` per row as measured when it is more than this model measured: what an
+    /// earlier load of the same model measured.
+    fn seed_prefill_row_bytes(&self, _bytes: u64) {}
+
     /// Called before a prefill of `tokens` rows from position `from` is planned: a backend that
     /// lends card memory to something else while it is idle takes it back here.
     fn prepare_prefill(&mut self, _from: usize, _tokens: usize) {}
@@ -406,6 +423,7 @@ pub(crate) trait ModelBackend: Send {
             Some(free) => start_chunk(chunk_start, per_token, free),
         };
         let resumes = self.capabilities().trim_kv && !self.is_recurrent();
+        let history = self.prefill_history_bytes(index_pos + seq_len);
         let mut done = 0usize;
         let mut replay = false;
         let mut replay_measures = false;
@@ -417,8 +435,9 @@ pub(crate) trait ModelBackend: Send {
                     .then(|| (chunk / 2).max(PREFILL_CHUNK_TOKENS_MIN))
             },
             |chunk| {
-                // One chunk's activation peak, from what the model keeps live per token.
-                let want = (chunk * per_token.max(1) + fixed) as u64;
+                // One chunk's activation peak, from what the model keeps live per token, beside
+                // the history a layer reads back at the prompt's end.
+                let want = (chunk * per_token.max(1) + fixed) as u64 + history;
                 crate::inference::place::vram_manager::ensure_gpu_headroom_blocking("llm", want)
             },
             |chunk| {
@@ -426,7 +445,7 @@ pub(crate) trait ModelBackend: Send {
                 // and the chunks the pass completed stay.
                 if replay {
                     // A failed pass is answered first by the memory only later requests use.
-                    self.reclaim_prefill_room((chunk * per_token.max(1) + fixed) as u64);
+                    self.reclaim_prefill_room((chunk * per_token.max(1) + fixed) as u64 + history);
                     if !resumes {
                         done = 0;
                     }
@@ -1556,6 +1575,7 @@ impl GenericBackend {
         let free_now = crate::inference::place::vram_manager::free_on_cards(shape.cards) as usize;
         let first = start_chunk(chunk, per_token, free_now).min(rows.max(1));
         let resumes = !self.0.is_recurrent();
+        let history = self.prefill_history_bytes(to);
         let mut done = 0usize;
         let mut replay = false;
         let (logits, used) = crate::inference::place::recover::shrink_on_oom(
@@ -1563,13 +1583,13 @@ impl GenericBackend {
             first,
             |c| (c > PREFILL_CHUNK_TOKENS_MIN).then(|| (c / 2).max(PREFILL_CHUNK_TOKENS_MIN)),
             |c| {
-                let want = (c * per_token.max(1) + fixed) as u64;
+                let want = (c * per_token.max(1) + fixed) as u64 + history;
                 crate::inference::place::vram_manager::ensure_gpu_headroom_blocking("llm", want)
             },
             |c| {
                 if replay {
                     // A failed pass is answered first by the memory only later requests use.
-                    self.reclaim_for_chunk((c * per_token.max(1) + fixed) as u64);
+                    self.reclaim_for_chunk((c * per_token.max(1) + fixed) as u64 + history);
                     if !resumes {
                         done = 0;
                     }
@@ -1591,11 +1611,12 @@ impl GenericBackend {
     /// first, until it fits or none is left; then what the other models on the same cards keep
     /// for their later requests. A kept state is a convenience; a prefill that runs out of
     /// memory costs a reload.
-    fn make_room_for_prefill(&mut self, tokens: usize) {
+    fn make_room_for_prefill(&mut self, from: usize, tokens: usize) {
         let shape = self.prefill_shape();
         let rows = tokens.min(shape.target_chunk.max(2048));
         let need = ((rows * shape.bytes_per_token + shape.fixed_bytes) as u64)
-            .saturating_mul(shape.share.max(1) as u64);
+            .saturating_mul(shape.share.max(1) as u64)
+            .saturating_add(self.prefill_history_bytes(from + tokens));
         // The prompt's rows join the cache beside the chunk's work.
         self.give_back_kept_pool(need.saturating_add(self.kv_rows_bytes(tokens)));
         // Without a card the kept states sit in host memory, which a prefill does not take.
@@ -1712,6 +1733,18 @@ impl ModelBackend for GenericBackend {
         self.reclaim_for_chunk(need)
     }
 
+    fn prefill_history_bytes(&self, upto: usize) -> u64 {
+        self.0.prefill_history_bytes(upto)
+    }
+
+    fn measured_prefill_row_bytes(&self) -> u64 {
+        self.0.measured_prefill_row_bytes()
+    }
+
+    fn seed_prefill_row_bytes(&self, bytes: u64) {
+        self.0.seed_prefill_row_bytes(bytes);
+    }
+
     /// A model whose forwards read routed experts that no card keeps takes the rows the cards
     /// afford, at most `rows`, as the batch worker does.
     /// It takes all `rows` when no card is measured.
@@ -1732,10 +1765,12 @@ impl ModelBackend for GenericBackend {
     }
 
     fn prepare_prefill(&mut self, from: usize, tokens: usize) {
-        self.make_room_for_prefill(tokens);
+        self.make_room_for_prefill(from, tokens);
         self.0.reserve_context(from + tokens);
         let t = std::time::Instant::now();
-        let lent = self.0.lend_expert_cache(tokens);
+        let lent = self
+            .0
+            .lend_expert_cache(tokens, self.prefill_history_bytes(from + tokens));
         if lent > 0 {
             tracing::debug!(
                 "prefill of {tokens} rows: {lent} layers lent their extra expert slots in {:?}",
@@ -1802,7 +1837,9 @@ impl ModelBackend for GenericBackend {
                 PREFILL_ROWS_READ.with(|c| c.set(c.get() + n));
             }
             let chunk = x.narrow(1, off, n)?;
+            let mark = self.0.prefill_forward_mark();
             last = Some(self.forward(&chunk, index_pos + off)?);
+            self.0.note_prefill_forward(&mark, n, index_pos + off + n);
             if tracing::enabled!(tracing::Level::DEBUG) {
                 tracing::debug!(
                     "prefill chunk of {n} rows at {}: {} MB free on the tightest card",

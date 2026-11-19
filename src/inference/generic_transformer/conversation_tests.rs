@@ -129,6 +129,25 @@ fn states_of_a_model_without_a_card_are_not_given_back_for_card_room() {
     assert_eq!(b.0.kv_snapshots.len(), 2);
 }
 
+/// A prefill's demand counts the history a layer reads back: the K and V rows of every
+/// position before the one the prefill reaches, in F16, growing with that position.
+#[test]
+fn a_prefill_counts_the_history_a_layer_reads_back() {
+    let f = Fixture::new("conv-history");
+    let b = GenericBackend(f.model());
+    let (_, n_kv, head_dim) = b.0.kv_layout();
+    assert!(n_kv * head_dim > 0);
+    assert_eq!(b.prefill_history_bytes(0), 0);
+    assert_eq!(
+        b.prefill_history_bytes(20_000),
+        (2 * 20_000 * n_kv * head_dim * 2) as u64
+    );
+    assert_eq!(
+        b.prefill_history_bytes(40_000),
+        2 * b.prefill_history_bytes(20_000)
+    );
+}
+
 /// A prompt the same as the last, read again, reads only what follows the shared point.
 #[test]
 fn the_same_prompt_again_reads_its_tail() {

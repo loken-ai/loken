@@ -15,6 +15,11 @@ impl LlmEngine {
         let mut state = self.model_state.lock().await;
         if let Some(model) = state.take() {
             info!("🔌 Unloading model: {}", model.name);
+            // The next load of the model places it with what its prefill was measured to take.
+            self.prefill_row_bytes.fetch_max(
+                model.model.measured_prefill_row_bytes(),
+                std::sync::atomic::Ordering::Relaxed,
+            );
             crate::inference::place::vram_manager::residency_changed();
         }
         *self.listing.lock().unwrap_or_else(|e| e.into_inner()) = Default::default();

@@ -296,6 +296,59 @@ type Kept = std::sync::Mutex<Option<crate::inference::serve::continuous_serve::P
 #[cfg(feature = "gpu")]
 pub type KeptPool = std::sync::Arc<Kept>;
 
+/// What prefill forwards kept live on a card, fitted by least squares to a part per row and a
+/// part per position reached: `kept = per_row x rows + per_position x position`.
+///
+/// Forwards of the same rows at the same position cannot tell the 2 parts apart.
+/// Their part per row is then the most a forward kept per row.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct PrefillFit {
+    rr: f64,
+    pp: f64,
+    rp: f64,
+    kr: f64,
+    kp: f64,
+    /// The most bytes a forward kept per row.
+    top: f64,
+}
+
+impl PrefillFit {
+    pub(crate) fn add(&mut self, rows: usize, upto: usize, kept: u64) {
+        let (r, p, k) = (rows as f64, upto as f64, kept as f64);
+        self.rr += r * r;
+        self.pp += p * p;
+        self.rp += r * p;
+        self.kr += k * r;
+        self.kp += k * p;
+        if r > 0.0 {
+            self.top = self.top.max(k / r);
+        }
+    }
+
+    /// The bytes per row and per position, `None` before any forward.
+    pub(crate) fn terms(&self) -> Option<(u64, u64)> {
+        if self.rr <= 0.0 {
+            return None;
+        }
+        let det = self.rr * self.pp - self.rp * self.rp;
+        if det <= 0.0 {
+            return Some((self.top as u64, 0));
+        }
+        let per_row = (self.kr * self.pp - self.kp * self.rp) / det;
+        let per_position = (self.kp * self.rr - self.kr * self.rp) / det;
+        Some(match (per_row > 0.0, per_position > 0.0) {
+            (true, true) => (per_row as u64, per_position as u64),
+            // A part the forwards do not show: the other one carries them alone.
+            (true, false) => ((self.kr / self.rr) as u64, 0),
+            (false, _) => (0, (self.kp / self.pp.max(1.0)) as u64),
+        })
+    }
+}
+
+/// The share of the free card memory a prefill chunk may take is one over this, for a shape that
+/// counts every live buffer itself: a wide residual's, a tiered mixture's or a measured one.
+pub(crate) const COUNTED_SHARE: usize = 2;
+
 impl GenericHeteroTransformer {
     /// Keeps the paged pool of the batch worker while the model serves serially.
     #[cfg(feature = "gpu")]
@@ -1102,6 +1155,12 @@ impl GenericHeteroTransformer {
                 .iter()
                 .any(|l| l.moe.as_ref().is_some_and(|m| m.tier.is_some())),
         );
+        // A measured forward counts every buffer it kept live.
+        let measured = self.measured_prefill_row_bytes() as usize;
+        if measured > shape.bytes_per_token {
+            shape.bytes_per_token = measured;
+            shape.share = shape.share.min(COUNTED_SHARE);
+        }
 
         // A model on cards is sized from the cards it uses, and a model with layers on the host
         // from every card, as before.
@@ -1120,6 +1179,98 @@ impl GenericHeteroTransformer {
                 .fold(0, |a, b| a | b);
         }
         shape
+    }
+
+    /// Card bytes a layer of a prefill reaching position `upto` reads its cache history into:
+    /// the K and V rows of every position before it, in F16.
+    /// The prefill forwards' measured share per position, when it is more, stands for it.
+    pub fn prefill_history_bytes(&self, upto: usize) -> u64 {
+        let (_, n_kv, head_dim) = self.kv_layout();
+        let read_back =
+            (2 * upto * n_kv * head_dim * crate::tensor::DType::F16.size_in_bytes()) as u64;
+        let measured = self
+            .prefill_fit
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .terms()
+            .map_or(0, |(_, per_position)| per_position * upto as u64);
+        read_back.max(measured)
+    }
+
+    /// The most card bytes a prefill forward was measured to keep live per row; 0 before one ran
+    /// on a card.
+    pub fn measured_prefill_row_bytes(&self) -> u64 {
+        self.prefill_row_bytes
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Takes `bytes` per row as measured, when it is more than this model measured: what an
+    /// earlier load of the same model measured.
+    pub fn seed_prefill_row_bytes(&self, bytes: u64) {
+        self.prefill_row_bytes
+            .fetch_max(bytes, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// What the pools of the model's cards hold before a prefill forward, for
+    /// [`Self::note_prefill_forward`]; empty for a model on no card.
+    pub fn prefill_forward_mark(&self) -> Vec<(usize, u64)> {
+        #[cfg(feature = "gpu")]
+        return self
+            .card_ordinals()
+            .into_iter()
+            .map(|card| (card, crate::tensor::cuda::pool_mark(card)))
+            .collect();
+        #[cfg(not(feature = "gpu"))]
+        Vec::new()
+    }
+
+    /// Records what a prefill forward of `rows` rows, that reached position `upto`, kept live on
+    /// the card where it kept the most, since `mark`.
+    ///
+    /// A card's share is its pool's peak less what the pool holds after the forward: the model's
+    /// state, its weights and its cache.
+    /// The shares are fitted to a part per row and a part per position, see `PrefillFit`.
+    /// The part per row sizes the chunks: a forward of few rows far into a prompt does not count
+    /// its history's share as rows.
+    pub fn note_prefill_forward(&self, mark: &[(usize, u64)], rows: usize, upto: usize) {
+        if rows < 2 || mark.is_empty() {
+            return;
+        }
+        #[cfg(feature = "gpu")]
+        {
+            let kept = mark
+                .iter()
+                .map(|&(card, _)| {
+                    let (_, held) = crate::tensor::cuda::pool_use(card);
+                    crate::tensor::cuda::pool_peak(card).saturating_sub(held)
+                })
+                .max()
+                .unwrap_or(0);
+            self.note_prefill_kept(rows, upto, kept);
+        }
+        #[cfg(not(feature = "gpu"))]
+        let _ = upto;
+    }
+
+    /// Takes in that a prefill forward of `rows` rows reaching position `upto` kept `kept` bytes
+    /// live on a card, and sets the part per row the chunks are sized from.
+    pub(crate) fn note_prefill_kept(&self, rows: usize, upto: usize, kept: u64) {
+        let mut fit = self.prefill_fit.lock().unwrap_or_else(|e| e.into_inner());
+        fit.add(rows, upto, kept);
+        let Some((per_row, per_position)) = fit.terms() else {
+            return;
+        };
+        drop(fit);
+        let before = self
+            .prefill_row_bytes
+            .swap(per_row, std::sync::atomic::Ordering::Relaxed);
+        if per_row.abs_diff(before) > before / 2 {
+            tracing::info!(
+                "prefill: forwards keep {} KB a row and {} B a position live on a card",
+                per_row >> 10,
+                per_position
+            );
+        }
     }
 
     /// [`Self::prefill_shape`] for a model whose experts do, or do not, run on the card for a wide
@@ -1156,7 +1307,7 @@ impl GenericHeteroTransformer {
                     bytes_per_token: fp.bytes_per_token.max(plain.bytes_per_token),
                     fixed_bytes: fp.fixed_bytes,
                     target_chunk: fp.target_chunk,
-                    share: 2,
+                    share: COUNTED_SHARE,
                     cards: 0,
                 }
             }
@@ -1178,7 +1329,7 @@ impl GenericHeteroTransformer {
                 },
             fixed_bytes: base.fixed_bytes,
             target_chunk: super::hyper::PLANNED_CHUNK_ROWS,
-            share: 2,
+            share: COUNTED_SHARE,
             cards: 0,
         }
     }
@@ -4332,5 +4483,50 @@ impl GenericHeteroTransformer {
             .count();
         tracing::info!("target fit over the prompt: {hits} of {ROWS} rows guessed right");
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod prefill_fit_tests {
+    use super::PrefillFit;
+
+    /// Forwards of few rows far into a prompt keep most of their bytes for the history: the fit
+    /// gives the part per row a forward of many rows shows, not their bytes over their rows.
+    #[test]
+    fn a_short_forward_late_in_a_prompt_does_not_inflate_the_bytes_per_row() {
+        let (per_row, per_position) = (180u64 << 10, 840u64);
+        let mut fit = PrefillFit::default();
+        for (rows, upto) in [
+            (273, 273),
+            (64, 10_432),
+            (2048, 5_000),
+            (32, 29_440),
+            (32, 29_472),
+        ] {
+            fit.add(
+                rows,
+                upto,
+                per_row * rows as u64 + per_position * upto as u64,
+            );
+        }
+        let (row, position) = fit.terms().unwrap();
+        assert!(row.abs_diff(per_row) <= per_row / 100, "{row} per row");
+        assert!(
+            position.abs_diff(per_position) <= per_position / 100,
+            "{position} per position"
+        );
+        let naive = (per_row * 32 + per_position * 29_472) / 32;
+        assert!(naive > 4 * row, "the bytes over the rows were {naive}");
+    }
+
+    /// Forwards that cannot tell the parts apart count all their bytes per row.
+    #[test]
+    fn forwards_from_the_start_count_all_their_bytes_per_row() {
+        let mut fit = PrefillFit::default();
+        assert!(fit.terms().is_none());
+        for n in [64usize, 128, 512] {
+            fit.add(n, n, 1000 * n as u64);
+        }
+        assert_eq!(fit.terms(), Some((1000, 0)));
     }
 }

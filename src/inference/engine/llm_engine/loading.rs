@@ -147,12 +147,28 @@ impl ModelDims {
     /// What a card keeps free so that the prefill's chunk sizing, measured against the card's
     /// free memory, runs a whole chunk of `PREFILL_CHUNK_TOKENS`: the cuBLAS workspace and the
     /// chunk's activations over the share of free memory a chunk may take.
-    pub(crate) fn full_chunk_reserve(&self) -> u64 {
-        if self.wide_prefill.is_some() || self.widest_ffn == 0 {
+    ///
+    /// `measured` is what an earlier load's prefill forwards kept live per row on a card, 0 when
+    /// none was measured.
+    /// A measured row counts every live buffer, as the model's own prefill shape then does.
+    pub(crate) fn full_chunk_reserve(&self, measured: u64) -> u64 {
+        if self.wide_prefill.is_some() || (self.widest_ffn == 0 && measured == 0) {
             return self.work_reserve();
         }
-        let shape =
+        let declared =
             crate::inference::engine::model_backend::PrefillShape::from_widest_ffn(self.widest_ffn);
+        let shape = match measured as usize {
+            m if m > declared.bytes_per_token => {
+                crate::inference::engine::model_backend::PrefillShape {
+                    bytes_per_token: m,
+                    share: declared
+                        .share
+                        .min(crate::inference::generic_transformer::hetero::COUNTED_SHARE),
+                    ..declared
+                }
+            }
+            _ => declared,
+        };
         let chunk = (shape.share * shape.bytes_per_token * PREFILL_CHUNK_TOKENS) as u64;
         crate::inference::place::runtime_demand::CUBLAS_WORKSPACE_BYTES
             .saturating_add(chunk)
@@ -449,6 +465,9 @@ impl LlmEngine {
         let model_state = self.model_state.clone();
         let cached_model_size = self.cached_model_size.clone();
         let listing = self.listing.clone();
+        let prefill_row_bytes = self
+            .prefill_row_bytes
+            .load(std::sync::atomic::Ordering::Relaxed);
         let configured_window = self.config.context_length;
         let planned_kv = self.planned_kv.clone();
         planned_kv.store(0, std::sync::atomic::Ordering::Relaxed);
@@ -1213,7 +1232,7 @@ impl LlmEngine {
                     // smaller reserve.
                     let demand = {
                         let roomy = crate::inference::place::ladder::Demand {
-                            runtime_reserve: dims.full_chunk_reserve(),
+                            runtime_reserve: dims.full_chunk_reserve(prefill_row_bytes),
                             ..demand
                         };
                         let on_cards = |d: &crate::inference::place::ladder::Demand| {
@@ -1720,6 +1739,7 @@ impl LlmEngine {
             let mut guard = model_state.blocking_lock();
             // Free VRAM just changed by the size of a model.
             crate::inference::place::vram_manager::residency_changed();
+            new_state.model.seed_prefill_row_bytes(prefill_row_bytes);
             *guard = Some(new_state);
             // --- Ready the model for its first request ---
             // It runs after the residency epoch moved, so the chunk sizing the warmup memoises

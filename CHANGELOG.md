@@ -6,6 +6,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Fixed
 
+- Placement: keep the room a model's prompts were measured to take on each card.
 - Placement: move layers off the card that ran out of memory at the first re-plan.
 - Generation: keep a quantised cache when a long prompt runs a card out of memory.
 - Loading: compile the kernels before the first request of a start.

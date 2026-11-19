@@ -271,6 +271,9 @@ pub struct LlmEngine {
     kept_memory: Arc<std::sync::Mutex<Option<Arc<dyn crate::inference::place::reclaim::Holder>>>>,
     /// The context the last load planned the quantised caches at, in positions; 0 for none.
     planned_kv: Arc<std::sync::atomic::AtomicUsize>,
+    /// The most card bytes a prefill forward of the model was measured to keep live per row,
+    /// over its loads; 0 before one was measured.
+    prefill_row_bytes: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl InferenceEngine for LlmEngine {
@@ -295,6 +298,7 @@ impl InferenceEngine for LlmEngine {
             load_report: Arc::default(),
             kept_memory: Arc::default(),
             planned_kv: Arc::default(),
+            prefill_row_bytes: Arc::default(),
             draft_length: Arc::default(),
             pld_cost: Arc::default(),
         }
@@ -356,6 +360,7 @@ impl LlmEngine {
             load_report: Arc::default(),
             kept_memory: Arc::default(),
             planned_kv: Arc::default(),
+            prefill_row_bytes: Arc::default(),
             draft_length: Arc::default(),
             pld_cost: Arc::default(),
         }

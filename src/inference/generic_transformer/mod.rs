@@ -764,6 +764,12 @@ pub struct GenericHeteroTransformer {
     prefix_covered: usize,
     /// The most a request's decode took of a card beyond its start, in bytes.
     decode_reserve: u64,
+    /// The most card bytes a prefill forward was measured to keep live per row, beside the
+    /// model's state and the history its layers read back.
+    prefill_row_bytes: std::sync::atomic::AtomicU64,
+    /// The card bytes the prefill forwards kept live, fitted to their rows and the position they
+    /// reached.
+    prefill_fit: std::sync::Mutex<hetero::PrefillFit>,
     /// The disk cache of this model's decode state, when the operator opened a store and the
     /// model carries a recurrent state.
     hybrid_cache: Option<state_cache::HybridStateCache>,

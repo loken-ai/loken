@@ -1040,7 +1040,9 @@ impl super::GenericHeteroTransformer {
     /// Take the memory the caches lent to a prefill of `tokens` rows back to the cards, when the
     /// prefill needs more than they have free: every layer's extra slots are freed. How many
     /// layers lent.
-    pub fn lend_expert_cache(&mut self, tokens: usize) -> usize {
+    /// The prefill needs its chunk's buffers and the `history` bytes a layer reads its cache
+    /// back into.
+    pub fn lend_expert_cache(&mut self, tokens: usize, history: u64) -> usize {
         for stager in self.card_stagers() {
             stager.note_lend();
         }
@@ -1070,7 +1072,8 @@ impl super::GenericHeteroTransformer {
         };
         let need = ((rows * shape.bytes_per_token + shape.fixed_bytes) as u64)
             .saturating_mul(shape.share.max(1) as u64)
-            .saturating_add(room);
+            .saturating_add(room)
+            .saturating_add(history);
         let free = crate::inference::place::vram_manager::tightest_free_on_cards(shape.cards);
         // The prompt's own prefix is restored by now: the snapshots of other prompts give the
         // chunk their room before the expert slots do.

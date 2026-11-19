@@ -1079,6 +1079,8 @@ impl GenericHeteroTransformer {
             prefix_boundary: None,
             prefix_covered: 0,
             decode_reserve: 0,
+            prefill_row_bytes: Default::default(),
+            prefill_fit: Default::default(),
             hybrid_cache: None,
             spliced_vision: None,
             #[cfg(feature = "audio")]
