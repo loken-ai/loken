@@ -4,6 +4,8 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+## [0.5.2] - 2026-11-19
+
 ### Changed
 
 - Experts: give a mixture's first request the whole cache of its cards.
