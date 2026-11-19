@@ -265,6 +265,8 @@ pub struct LlmEngine {
     pld_cost: Arc<std::sync::Mutex<crate::inference::engine::decode_step::PldCost>>,
     /// Where a load reports what it has read, when the caller wants to see it.
     load_report: Arc<std::sync::Mutex<Option<crate::inference::serve::progress::SharedProgressFn>>>,
+    /// The loaded model as `place::reclaim` lists it, while it is loaded.
+    kept_memory: Arc<std::sync::Mutex<Option<Arc<dyn crate::inference::place::reclaim::Holder>>>>,
 }
 
 impl InferenceEngine for LlmEngine {
@@ -286,6 +288,7 @@ impl InferenceEngine for LlmEngine {
             handover_rates: Arc::default(),
             drafter_choice: Arc::default(),
             load_report: Arc::default(),
+            kept_memory: Arc::default(),
             draft_length: Arc::default(),
             pld_cost: Arc::default(),
         }
@@ -344,6 +347,7 @@ impl LlmEngine {
             handover_rates: Arc::default(),
             drafter_choice: Arc::default(),
             load_report: Arc::default(),
+            kept_memory: Arc::default(),
             draft_length: Arc::default(),
             pld_cost: Arc::default(),
         }
@@ -1879,6 +1883,7 @@ mod generate;
 pub(crate) mod generation_defaults;
 mod handover;
 mod handover_rate;
+mod kept_memory;
 mod loading;
 pub(crate) use loading::{per_card_reserve, Warmup};
 // The pool must be sized from `main`, before anything can build rayon's global one.

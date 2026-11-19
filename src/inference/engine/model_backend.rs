@@ -797,7 +797,9 @@ pub(crate) trait ModelBackend: Send {
     /// Marks a decode of the model as running while its cards may wait on a host tier: no
     /// model's hot pages are registered or released until the hold drops.
     #[cfg(feature = "gpu")]
-    fn hold_tier_steps(&self) -> Option<crate::inference::generic_transformer::expert_tier::StepHold> {
+    fn hold_tier_steps(
+        &self,
+    ) -> Option<crate::inference::generic_transformer::expert_tier::StepHold> {
         None
     }
 
@@ -1586,8 +1588,9 @@ impl GenericBackend {
 
     /// Before a prefill is sized: when the cards have less free than one chunk of the size the
     /// model wants needs, the conversation states kept for later turns are given back, oldest
-    /// first, until it fits or none is left. A kept state is a convenience; a prefill that runs
-    /// out of memory costs a reload.
+    /// first, until it fits or none is left; then what the other models on the same cards keep
+    /// for their later requests. A kept state is a convenience; a prefill that runs out of
+    /// memory costs a reload.
     fn make_room_for_prefill(&mut self, tokens: usize) {
         let shape = self.prefill_shape();
         let rows = tokens.min(shape.target_chunk.max(2048));
@@ -1595,37 +1598,52 @@ impl GenericBackend {
             .saturating_mul(shape.share.max(1) as u64);
         // The prompt's rows join the cache beside the chunk's work.
         self.give_back_kept_pool(need.saturating_add(self.kv_rows_bytes(tokens)));
-        let held = self.0.kv_snapshot_bytes();
         // Without a card the kept states sit in host memory, which a prefill does not take.
-        if held == 0 || self.0.free_device_memory().is_none() {
+        if self.0.free_device_memory().is_none() {
             return;
         }
-        // The tightest free memory of the model's own cards, read from the driver after the
-        // pools are handed back, without enumerating every card of the machine.
-        self.0.hand_back_pools();
-        let free = self.0.free_device_memory().unwrap_or(0);
-        tracing::debug!(
-            "prefill of {tokens} rows: {} MB of kept states, {} MB free, {} MB wanted",
-            held >> 20,
-            free >> 20,
-            need >> 20
-        );
+        // The tightest free memory of the model's own cards, read from the driver, again after
+        // the pools are handed back, without enumerating every card of the machine.
+        let mut free = self.0.free_device_memory().unwrap_or(0);
+        if free < need {
+            self.0.hand_back_pools();
+            free = self.0.free_device_memory().unwrap_or(0);
+        }
         if free >= need {
             return;
         }
-        self.0.drop_kv_snapshots_for(need - free);
-        crate::inference::place::vram_manager::residency_changed();
-        tracing::info!(
-            "prefill: {} MB free of the {} MB a chunk needs; kept states went from {} MB to {} MB",
-            free >> 20,
-            need >> 20,
-            held >> 20,
-            self.0.kv_snapshot_bytes() >> 20
-        );
+        let held = self.0.kv_snapshot_bytes();
+        if held > 0 {
+            self.0.drop_kv_snapshots_for(need - free);
+            crate::inference::place::vram_manager::residency_changed();
+            tracing::info!(
+                "prefill: {} MB free of the {} MB a chunk needs; kept states went from {} MB to {} MB",
+                free >> 20,
+                need >> 20,
+                held >> 20,
+                self.0.kv_snapshot_bytes() >> 20
+            );
+        }
+        self.others_make_room(need);
     }
 
-    /// Gives back card memory that only serves later requests - the kept conversation states -
-    /// until `need` bytes are free or none is left; true when anything was given back.
+    /// Has the other models on this model's cards give back what they keep for their later
+    /// requests until each card has `need` bytes free. True when any gave anything back.
+    fn others_make_room(&self, need: u64) -> bool {
+        // This model holds its own state while it runs, so it gives back nothing it uses.
+        let me = "";
+        let mut given = false;
+        for card in self.0.card_ordinals() {
+            given |= crate::inference::place::reclaim::make_room(card, need, me, || {
+                crate::inference::place::reclaim::free_on_card(card)
+            });
+        }
+        given
+    }
+
+    /// Gives back card memory that only serves later requests - the kept conversation states,
+    /// then what the other models on the same cards keep - until `need` bytes are free or none
+    /// is left; true when anything was given back.
     fn reclaim_for_chunk(&mut self, need: u64) -> bool {
         // A pass that ran out of memory takes the kept pool first, whatever the cards read.
         if self.give_back_kept_pool(u64::MAX) {
@@ -1635,13 +1653,15 @@ impl GenericBackend {
             self.prefill_shape().cards,
         );
         let before = self.0.kv_snapshot_bytes();
-        if before == 0 || self.0.free_device_memory().is_none() {
-            return false;
+        if before > 0 && self.0.free_device_memory().is_some() {
+            self.0
+                .drop_kv_snapshots_for(need.saturating_sub(free).max(1));
+            crate::inference::place::vram_manager::residency_changed();
+            if self.0.kv_snapshot_bytes() < before {
+                return true;
+            }
         }
-        self.0
-            .drop_kv_snapshots_for(need.saturating_sub(free).max(1));
-        crate::inference::place::vram_manager::residency_changed();
-        self.0.kv_snapshot_bytes() < before
+        self.others_make_room(need)
     }
 
     /// The bytes `rows` rows of this model's cache take at full width, K and V of every layer.
@@ -2047,7 +2067,9 @@ impl ModelBackend for GenericBackend {
         self.0.settle_hot_experts()
     }
     #[cfg(feature = "gpu")]
-    fn hold_tier_steps(&self) -> Option<crate::inference::generic_transformer::expert_tier::StepHold> {
+    fn hold_tier_steps(
+        &self,
+    ) -> Option<crate::inference::generic_transformer::expert_tier::StepHold> {
         self.0.hold_tier_steps()
     }
 

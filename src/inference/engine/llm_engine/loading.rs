@@ -1820,6 +1820,8 @@ impl LlmEngine {
             }
         }
 
+        // Another component on the model's cards sees what it keeps for later requests.
+        self.list_kept_memory().await;
         Ok(())
     }
 }

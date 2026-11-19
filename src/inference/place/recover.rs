@@ -117,8 +117,9 @@ impl Drop for Pressure {
 }
 
 /// Runs a request, and each time it runs out of card memory frees what can be freed and
-/// runs it again: the pools first, then idle residents one at a time, then the request's
-/// own component re-placed one pressure rung further off the cards, down to the host.
+/// runs it again: the pools first, then what other models keep for their later requests,
+/// then idle residents one at a time, then the request's own component re-placed one
+/// pressure rung further off the cards, down to the host.
 ///
 /// `oom` names the out-of-memory message of an outcome, `release` hands the pools back,
 /// `evict_idle` unloads one idle resident and returns the bytes it freed, and `replan`
@@ -161,7 +162,7 @@ where
 }
 
 /// [`retry_on_oom`] for a model that owns its pressure: the rungs it raises move the
-/// placements of `owner` alone.
+/// placements of `owner` alone, and the other models' room is asked for in its name.
 #[allow(clippy::too_many_arguments)]
 pub async fn retry_on_oom_for<T, A, AF, O, R, E, EF, P, PF>(
     owner: &str,
@@ -198,6 +199,18 @@ where
             Some(message) => message,
         }
     };
+    // What other models keep for their later requests goes before any of them is unloaded.
+    if super::reclaim::give_back_all(owner) {
+        release();
+        message = {
+            let outcome = attempt().await;
+            match oom(&outcome) {
+                None => return outcome,
+                Some(message) => message,
+            }
+        };
+        tracing::warn!("{what}: still out of memory after the other models gave back their room");
+    }
     while evict_idle().await > 0 {
         release();
         message = {

@@ -11,6 +11,7 @@ use crate::inference::engine::decode_step::record_logprobs;
 impl LlmEngine {
     /// Unload the current model
     pub async fn unload(&self) -> Result<(), Box<dyn std::error::Error>> {
+        self.unlist_kept_memory();
         let mut state = self.model_state.lock().await;
         if let Some(model) = state.take() {
             info!("🔌 Unloading model: {}", model.name);

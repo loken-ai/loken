@@ -429,8 +429,14 @@ pub(super) fn load_wide_checkpoint(
     } else {
         declared_context(dir)
     };
-    let mut model =
-        place_wide_checkpoint(model_id, &checkpoint, &meta, file_size, context_length, kv_quant)?;
+    let mut model = place_wide_checkpoint(
+        model_id,
+        &checkpoint,
+        &meta,
+        file_size,
+        context_length,
+        kv_quant,
+    )?;
     if quality != QualityLevel::Exact {
         let ids = crate::inference::generic_transformer::routing_calibration::calibration_ids(
             &tokenizer,
@@ -993,14 +999,11 @@ pub(super) fn try_spawn_continuous(
         warn!("CB serve: another component is loading - staying serial");
         return Err(model);
     };
-    // The card's room less what other owners declared.
-    // A card held by the pools that serial models beside this one keep takes them back first.
+    // The card's room less what other owners declared, and what other models keep for later
+    // requests given back when that holds fewer than two lanes.
     let chunks = [sized, PREFILL_CHUNK_TOKENS];
-    let plan_now = || {
-        paged::plan_for(owner, &model.compute_device(), &chunks.map(shape_for))
-            .map(|(plan, i)| (plan, chunks[i]))
-    };
-    let planned = plan_now().or_else(|| model.give_back_parked_pools().then(plan_now).flatten());
+    let planned = paged::plan_for(owner, &model.compute_device(), &chunks.map(shape_for))
+        .map(|(plan, i)| (plan, chunks[i]));
     let Some((plan, prompt_chunk)) = planned else {
         warn!(
             "CB serve: the card holds fewer than two lanes of {} tokens - staying serial",

@@ -100,6 +100,8 @@ pub fn least_room(shape: &PagedShape) -> u64 {
 /// [`plan_in`] for the batch worker of `owner` on the card `device` runs on, at what the card
 /// offers it: its free memory less what other owners declared they are about to take there.
 /// `shapes` are tried in order, the first that plans two lanes taken, with its index.
+/// When none does, the other models on the card first give back what they keep for later
+/// requests, as much as the last shape needs, and the shapes are tried again.
 /// `None` off a card. The caller holds the load admission until the pool is allocated.
 pub fn plan_for(
     owner: &str,
@@ -113,7 +115,12 @@ pub fn plan_for(
             .enumerate()
             .find_map(|(i, shape)| plan_in(offered, shape).map(|plan| (plan, i)))
     };
-    first(super::room::offered(card, owner))
+    first(super::room::offered(card, owner)).or_else(|| {
+        let least = shapes.last().map_or(0, least_room);
+        super::reclaim::make_room_for(card, least, owner)
+            .then(|| first(super::room::offered(card, owner)))
+            .flatten()
+    })
 }
 
 #[cfg(test)]

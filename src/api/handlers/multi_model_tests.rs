@@ -73,6 +73,20 @@ impl Shape {
         }
     }
 
+    /// A narrow model whose cache takes about `bytes` a position in F16.
+    fn caching(bytes: u64, context: usize) -> Self {
+        let layers = 8;
+        let kv_heads = (bytes / (layers as u64 * 2 * HEAD_DIM as u64 * 2)).max(1) as usize;
+        Self {
+            layers,
+            hidden: 256,
+            kv_heads,
+            ffn: 512,
+            vocab: 256,
+            context,
+        }
+    }
+
     fn heads(&self) -> usize {
         (self.hidden / HEAD_DIM).max(self.kv_heads)
     }
@@ -294,8 +308,110 @@ async fn on_card<F: std::future::Future<Output = ()>>(name: &str, body: impl FnO
         .unwrap_or_else(|_| panic!("{name}: the watchdog fired"));
 }
 
+/// T2: a model whose batch worker serves no request gives its pool back to a model beside it
+/// that batches, and stays loaded.
+async fn an_idle_worker_yields(first: &str, second: &str) {
+    let root = scratch("idle-worker");
+    let shape = Shape::tiny(4096);
+    write_model(&root, first, shape, 11);
+    write_model(
+        &root,
+        second,
+        Shape {
+            hidden: 256,
+            ..shape
+        },
+        29,
+    );
+    let state = server(&root, 0, Default::default());
+    for (model, seed) in [(first, 1), (second, 2)] {
+        state.ensure_loaded(model, 5).await.unwrap();
+        state
+            .get_engine(model)
+            .await
+            .unwrap()
+            .hold_lone_requests_on(true);
+        answer(&state, model, prompt(16, shape.vocab, seed), 4).await;
+    }
+    let engine = |m| {
+        let state = state.clone();
+        async move { state.get_engine(m).await.unwrap() }
+    };
+    assert!(
+        engine(second).await.is_continuous().await,
+        "{second} stayed serial beside the idle worker of {first}"
+    );
+    assert!(loaded(&state, first).await, "{first} was unloaded");
+    finish(&state, &root).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "fills card 0: run alone"]
+async fn an_idle_worker_gives_its_pool_to_the_model_beside_it() {
+    on_card("idle worker", |_| async {
+        an_idle_worker_yields("test/mm-a", "test/mm-b").await;
+        an_idle_worker_yields("test/mm-b", "test/mm-a").await;
+    })
+    .await;
+}
+
+/// T3: the conversation states one model keeps give way to a model loaded beside it, which then
+/// sits whole on the card, and the first model stays loaded.
+async fn snapshots_yield(total: u64, holder: &str, incoming: &str) {
+    let root = scratch("snapshots");
+    // The cache's working window, which the states leave free, takes a sixteenth of the card.
+    let window = crate::inference::cache::KV_WORKING_WINDOW_TOKENS;
+    let held = Shape::caching(total / 16 / window as u64, window);
+    let words = window / 2;
+    write_model(&root, holder, held, 7);
+    let state = server(&root, 0, Default::default());
+    state.ensure_loaded(holder, 5).await.unwrap();
+    state
+        .get_engine(holder)
+        .await
+        .unwrap()
+        .hold_lone_requests_on(false);
+    // Distinct prompts until the states hold a third of the card.
+    let start = card_free();
+    for i in 0..256 {
+        answer(&state, holder, prompt(words, held.vocab, 100 + i), 1).await;
+        if start.saturating_sub(card_free()) >= total / 3 {
+            break;
+        }
+    }
+    assert!(
+        start.saturating_sub(card_free()) >= total / 3,
+        "the states of {holder} took less than a third of the card"
+    );
+    // The incoming model needs more than the card has left beside the states, and less than
+    // the states hold beside it.
+    let incoming_shape = Shape::weighing(card_free() + total / 6, 2048);
+    write_model(&root, incoming, incoming_shape, 13);
+    state.ensure_loaded(incoming, 5).await.unwrap();
+    assert!(
+        loaded(&state, holder).await,
+        "{holder} was unloaded for its states' room"
+    );
+    let p = placement(&state, incoming).await;
+    assert_eq!(
+        p.host_layers, 0,
+        "{incoming} spilled beside the states of {holder}: {p:?}"
+    );
+    finish(&state, &root).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "fills card 0: run alone"]
+async fn kept_states_give_way_to_a_model_loaded_beside_them() {
+    on_card("kept states", |total| async move {
+        snapshots_yield(total, "test/mm-a", "test/mm-b").await;
+        snapshots_yield(total, "test/mm-b", "test/mm-a").await;
+    })
+    .await;
+}
+
 /// T5: a batch worker sized while another component loads leaves the room that load declared,
-/// and a model loaded after it still loads.
+/// and a model loaded after it still sits whole on the card.
 async fn a_load_keeps_its_room(total: u64, batched: &str, incoming: &str) {
     let root = scratch("admission");
     let shape = Shape::tiny(4096);
@@ -324,6 +440,11 @@ async fn a_load_keeps_its_room(total: u64, batched: &str, incoming: &str) {
     answer(&state, batched, prompt(16, shape.vocab, 2), 4).await;
     write_model(&root, incoming, Shape::weighing(total / 4, 2048), 9);
     state.ensure_loaded(incoming, 5).await.unwrap();
+    let p = placement(&state, incoming).await;
+    assert_eq!(
+        p.host_layers, 0,
+        "{incoming} spilled beside the worker of {batched}: {p:?}"
+    );
     assert!(loaded(&state, batched).await, "{batched} was unloaded");
     finish(&state, &root).await;
 }

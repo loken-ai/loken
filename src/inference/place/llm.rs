@@ -40,7 +40,21 @@ pub fn offer(owner: &str, pin: Option<usize>, whole: u64, staging: u64) -> Offer
     if let Some(card) = fastest {
         warm(card);
     }
-    let cards = read(owner, staging);
+    let mut cards = read(owner, staging);
+    // No card holds the model whole: the other models on the cards give back what they keep
+    // for later requests first.
+    if holder(&cards, pin, whole).is_none() {
+        let wanted = whole.saturating_add(staging);
+        let mut given = false;
+        for g in super::device_probe::probe_cuda_gpus() {
+            if pin.is_none_or(|p| p == g.index) {
+                given |= super::reclaim::make_room_for(g.index, wanted, owner);
+            }
+        }
+        if given {
+            cards = read(owner, staging);
+        }
+    }
     let whole_on = holder(&cards, pin, whole);
     if whole_on.is_some() || cards.len() < 2 {
         return Offer {

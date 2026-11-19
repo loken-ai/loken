@@ -1019,9 +1019,10 @@ impl APIServer {
         Ok(UnloadOutcome::NotResident)
     }
 
-    /// Unloads the least recently used language models, other than `incoming_id`, while no
-    /// card has room for the `need` bytes the incoming model's weights take (or, for a model
-    /// larger than any card, while the cards together lack it).
+    /// Makes room for the `need` bytes the incoming model's weights take (or, for a model larger
+    /// than any card, for them across the cards), while no card has it: first what the other
+    /// models keep for their later requests, then the least recently used language models,
+    /// other than `incoming_id`.
     /// Resident models hold weights, KV blocks and pools that would otherwise push the new
     /// model's placement onto the host; as many stay resident as the memory allows.
     ///
@@ -1029,18 +1030,37 @@ impl APIServer {
     /// KV cache, workspaces and staging the loader reserves.
     pub(crate) async fn evict_to_make_room(&self, incoming_id: &str, need: u64, per_card: u64) {
         let mut tried: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut asked = false;
         loop {
             let demand = crate::inference::place::ladder::Demand {
                 block_bytes: need,
                 runtime_reserve: per_card,
                 ..Default::default()
             };
-            let free = crate::inference::place::room::room_for(
-                &demand,
-                &crate::inference::place::room::card_rooms(),
-            );
+            // The cards as the incoming model is offered them, each settled: less what other
+            // owners declared.
+            let cards = crate::inference::place::room::card_rooms_for(incoming_id);
+            for card in &cards {
+                crate::inference::place::room::settle(card.index);
+            }
+            let cards = crate::inference::place::room::card_rooms_for(incoming_id);
+            let free = crate::inference::place::room::room_for(&demand, &cards);
             if need <= free {
                 return;
+            }
+            if !asked {
+                asked = true;
+                let mut given = false;
+                for card in &cards {
+                    given |= crate::inference::place::reclaim::make_room_for(
+                        card.index,
+                        need.saturating_add(per_card),
+                        incoming_id,
+                    );
+                }
+                if given {
+                    continue;
+                }
             }
             let victim = {
                 let engines = self.engines.read().await;

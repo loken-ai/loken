@@ -291,73 +291,23 @@ pub struct EmbeddingStep {
 #[cfg(feature = "gpu")]
 type Kept = std::sync::Mutex<Option<crate::inference::serve::continuous_serve::ParkedPool>>;
 
-/// [`Kept`], shared with the list of kept pools.
+/// [`Kept`], shared with the holder that gives it back for another model, see
+/// `place::reclaim`.
 #[cfg(feature = "gpu")]
 pub type KeptPool = std::sync::Arc<Kept>;
 
-/// The pools kept by the models of the process, with the cards each model runs on.
-/// A model dropped leaves a dead entry, pruned at the next pool kept.
-#[cfg(feature = "gpu")]
-fn kept_pools() -> &'static std::sync::Mutex<Vec<(std::sync::Weak<Kept>, Vec<usize>)>> {
-    static KEPT: std::sync::OnceLock<std::sync::Mutex<Vec<(std::sync::Weak<Kept>, Vec<usize>)>>> =
-        std::sync::OnceLock::new();
-    KEPT.get_or_init(Default::default)
-}
-
 impl GenericHeteroTransformer {
-    /// The ordinals of the cards the model runs on.
-    #[cfg(feature = "gpu")]
-    fn card_ordinals(&self) -> Vec<usize> {
-        self.cuda_devices
-            .values()
-            .filter_map(|d| d.as_cuda_device().ok().map(|c| c.0.ordinal()))
-            .collect()
-    }
-
     /// Keeps the paged pool of the batch worker while the model serves serially.
     #[cfg(feature = "gpu")]
     pub fn park_pool(&self, pool: crate::inference::serve::continuous_serve::ParkedPool) {
         *self.parked_pool.lock().unwrap_or_else(|e| e.into_inner()) = Some(pool);
-        let mut kept = kept_pools().lock().unwrap_or_else(|e| e.into_inner());
-        kept.retain(|(weak, _)| weak.strong_count() > 0);
-        if !kept
-            .iter()
-            .any(|(weak, _)| std::ptr::eq(weak.as_ptr(), std::sync::Arc::as_ptr(&self.parked_pool)))
-        {
-            kept.push((
-                std::sync::Arc::downgrade(&self.parked_pool),
-                self.card_ordinals(),
-            ));
-        }
     }
 
-    /// Gives back the paged pools other models on this model's cards keep while they serve
-    /// serially, so this model's batch worker can size its pool over that room.
-    /// Their next workers size new pools.
-    /// True when a pool was given back.
+    /// The slot the model keeps its batch worker's pool in, for a holder that gives the pool
+    /// back while the model serves serially.
     #[cfg(feature = "gpu")]
-    pub fn give_back_parked_pools(&self) -> bool {
-        let cards = self.card_ordinals();
-        let given: Vec<_> = {
-            let kept = kept_pools().lock().unwrap_or_else(|e| e.into_inner());
-            kept.iter()
-                .filter(|(_, on)| on.iter().any(|c| cards.contains(c)))
-                .filter_map(|(weak, _)| weak.upgrade())
-                .filter(|pool| !std::sync::Arc::ptr_eq(pool, &self.parked_pool))
-                .filter_map(|pool| pool.lock().unwrap_or_else(|e| e.into_inner()).take())
-                .collect()
-        };
-        if given.is_empty() {
-            return false;
-        }
-        let blocks: usize = given.iter().map(|p| p.size().0).sum();
-        drop(given);
-        self.hand_back_pools();
-        crate::inference::place::vram_manager::residency_changed();
-        tracing::info!(
-            "CB serve: {blocks} blocks the serial models beside this one kept are given back"
-        );
-        true
+    pub fn kept_pool(&self) -> KeptPool {
+        self.parked_pool.clone()
     }
 
     /// The paged pool a batch worker left with the model, if one did.

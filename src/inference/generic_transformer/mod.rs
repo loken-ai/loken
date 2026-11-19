@@ -140,6 +140,7 @@ mod opencl_layers;
 mod opencl_parity;
 mod packed_rows;
 pub mod qsa;
+mod reclaim;
 pub mod routing_calibration;
 mod segment;
 mod speculate;
@@ -628,7 +629,7 @@ pub struct GenericHeteroTransformer {
     #[cfg(test)]
     pub(crate) failing_checkpoints: std::sync::atomic::AtomicUsize,
     /// The paged pool of the batch worker, kept while the model serves serially.
-    /// Another model on the same cards can have it given back, see `give_back_parked_pools`.
+    /// Another model on the same cards can have it given back, see `place::reclaim`.
     #[cfg(feature = "gpu")]
     parked_pool: hetero::KeptPool,
     config: Arc<GenericTransformerConfig>,

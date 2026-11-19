@@ -1789,8 +1789,9 @@ impl APIServer {
             .sleepers
             .sleeping(model_id)
             .then(std::time::Instant::now);
-        // Each attempt loads a fresh engine: the pools come back first, then idle residents
-        // give way, then every re-plan loads one pressure rung further off the cards.
+        // Each attempt loads a fresh engine: the pools come back first, then what other models
+        // keep for later requests, then idle residents give way, then every re-plan loads one
+        // pressure rung further off the cards.
         let loaded = crate::inference::place::recover::retry_on_oom_for(
             model_id,
             model_id,
