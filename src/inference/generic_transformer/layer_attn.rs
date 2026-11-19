@@ -2167,6 +2167,9 @@ impl GenericTransformerLayer {
                                 kv
                             }
                             Err(e) => {
+                                if let Some(oom) = kept_under_pressure("dequantize", &e) {
+                                    return Err(oom);
+                                }
                                 tracing::warn!(
                                     "quantised KV dequantize failed, moving to F-dtype: {e}"
                                 );
@@ -2181,6 +2184,9 @@ impl GenericTransformerLayer {
                     Ok(()) => match self.quant_kv.as_ref().unwrap().dequantize_kv(k.dtype()) {
                         Ok(kv) => kv,
                         Err(e) => {
+                            if let Some(oom) = kept_under_pressure("dequantize", &e) {
+                                return Err(oom);
+                            }
                             tracing::warn!(
                                 "quantised KV dequantize failed, moving to F-dtype: {e}"
                             );
@@ -2191,6 +2197,9 @@ impl GenericTransformerLayer {
                         }
                     },
                     Err(e) => {
+                        if let Some(oom) = kept_under_pressure("append", &e) {
+                            return Err(oom);
+                        }
                         tracing::warn!("quantised KV append failed, moving to F-dtype: {e}");
                         self.demote_quant_kv(k.dtype())?;
                         self.kv_cache.append(&k, &v)?
@@ -3034,6 +3043,21 @@ fn splitk_serves(n_head: usize, n_kv_head: usize, head_dim: usize) -> bool {
     }
 }
 
+/// The error a failed `what` of the quantised history ends the pass with, when the card ran out
+/// of memory; `None` for any other failure, which moves the history to the F-dtype cache.
+///
+/// The F-dtype cache takes more bytes than the quantised one.
+/// Under memory pressure the quantised history stays, and the out-of-memory error goes to the
+/// prefill ladder and to the request's re-plan.
+#[cfg_attr(not(feature = "gpu"), allow(dead_code))]
+fn kept_under_pressure(what: &str, e: &dyn std::fmt::Display) -> Option<crate::tensor::Error> {
+    crate::inference::place::ladder::is_out_of_memory(e).then(|| {
+        crate::tensor::Error::msg(format!(
+            "quantised KV {what}: {e}; the quantised history is kept"
+        ))
+    })
+}
+
 /// Moves a layer's history from its quantised store `held` to the F-dtype `cache`.
 ///
 /// `rows` counts the positions the store holds and `read` gives them back as K and V.
@@ -3103,6 +3127,19 @@ mod demote_history_tests {
         );
         assert_eq!(held.as_ref().map(|s| s.0.dims()[2]), Some(8224));
         assert_eq!(cache.current_seq_len(), 0);
+    }
+
+    /// A dequantise or an append of the quantised history that runs out of memory ends the pass
+    /// with an out-of-memory error and moves nothing to the wider F-dtype cache.
+    /// Any other failure moves the history.
+    #[test]
+    fn the_history_stays_quantised_under_memory_pressure() {
+        let oom = "Q8KvCache: V dequantize: alloc: DriverError(CUDA_ERROR_OUT_OF_MEMORY, \"out of memory\")";
+        let err = super::kept_under_pressure("dequantize", &oom).expect("kept");
+        assert!(is_out_of_memory(&err), "{err}");
+        assert!(
+            super::kept_under_pressure("append", &"a shape the kernel does not take").is_none()
+        );
     }
 
     /// A read that succeeds moves every row to the F-dtype cache and drops the store.
