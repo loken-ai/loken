@@ -55,6 +55,8 @@ pub struct KvCore {
     held_limit: Option<usize>,
     /// Times the buffers were made anew: a graph recorded against them is stale once this moves.
     moves: u64,
+    /// [`Self::moves`] when the graph was marked.
+    moves_at_mark: u64,
     /// Padded stride most recently used by a fixed-stride attention chain since the last
     /// capture cycle; 0 = none. Written from `&self` attention calls, hence atomic.
     chain_stride_seen: AtomicUsize,
@@ -74,6 +76,7 @@ impl KvCore {
             seq_limit: None,
             held_limit: None,
             moves: 0,
+            moves_at_mark: 0,
             chain_stride_seen: AtomicUsize::new(0),
             kernel_bound_seen: AtomicUsize::new(0),
         }
@@ -182,6 +185,7 @@ impl KvCore {
     pub fn mark_captured(&mut self) {
         self.held_limit = None;
         self.captured = true;
+        self.moves_at_mark = self.moves;
         let limit = [
             self.chain_stride_seen.load(Ordering::Relaxed),
             self.kernel_bound_seen.load(Ordering::Relaxed),
@@ -235,8 +239,16 @@ impl KvCore {
             });
     }
 
+    /// Longest sequence a recorded graph may replay to: the live graph's ceiling, or the ceiling
+    /// of a graph a trim released, which the decode may still replay.
+    /// Zero once the buffers were made anew under the graph: it replays no step.
     pub fn seq_limit(&self) -> Option<usize> {
-        self.seq_limit
+        let limit = self.seq_limit.or(self.held_limit)?;
+        Some(if self.moves == self.moves_at_mark {
+            limit
+        } else {
+            0
+        })
     }
 
     /// A fixed-stride attention chain ran at `stride`; a graph recorded now is bound by it.
@@ -327,7 +339,25 @@ mod tests {
         assert_eq!(c.len(), 35);
         assert!(!c.is_primed());
         assert!(!c.is_captured());
+        // The decode may replay the released graph: its ceiling still bounds the replays.
+        assert_eq!(c.seq_limit(), Some(64));
+        c.clear_captured();
         assert_eq!(c.seq_limit(), None);
+    }
+
+    #[test]
+    fn a_graph_the_buffers_moved_under_replays_no_step() {
+        let mut c = KvCore::new(64, 1024);
+        c.commit(40);
+        c.mark_captured();
+        c.trim_to(35);
+        c.set_cap(128);
+        assert_eq!(c.seq_limit(), Some(0));
+        c.resume_captured();
+        assert_eq!(c.seq_limit(), Some(0));
+        c.clear_captured();
+        c.mark_captured();
+        assert_eq!(c.seq_limit(), Some(128));
     }
 
     #[test]

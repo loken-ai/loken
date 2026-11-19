@@ -15,6 +15,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Fixed
 
+- Generation: keep a recorded decode within its cache after a rejected draft.
 - API: keep a model that serves a request loaded while another model loads.
 - Placement: keep a model's planned cache growth and prompt memory from other models.
 - Placement: give a model's kept pools, graphs and states to a model beside it.

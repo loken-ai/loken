@@ -635,3 +635,47 @@ async fn out_of_memory_pressure_belongs_to_the_model_that_raised_it() {
     })
     .await;
 }
+
+/// One model decodes alone past its cache's working window, its decode recorded: the recorded
+/// step is dropped and recorded again as the cache grows, and the answer reaches its length.
+async fn a_long_decode_runs(
+    kv: crate::inference::engine::llm_engine::KvQuant,
+    fidelity: crate::inference::engine::llm_engine::Fidelity,
+) {
+    let root = scratch("long-decode");
+    let window = crate::inference::cache::KV_WORKING_WINDOW_TOKENS;
+    let context = 3 * window;
+    let shape = Shape {
+        kv_heads: 16,
+        ..Shape::caching(0, context)
+    };
+    write_model(&root, "test/mm-a", shape, 17);
+    let mut state = server(&root, context, kv);
+    state.default_inference_config.fidelity = fidelity;
+    state.ensure_loaded("test/mm-a", 5).await.unwrap();
+    state
+        .get_engine("test/mm-a")
+        .await
+        .unwrap()
+        .hold_lone_requests_on(false);
+    let tokens = context / 2;
+    let text = answer(&state, "test/mm-a", prompt(64, shape.vocab, 3), tokens).await;
+    assert_eq!(
+        text.split_whitespace().count(),
+        tokens,
+        "the decode stopped before its length"
+    );
+    finish(&state, &root).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "fills card 0: run alone"]
+async fn a_long_decode_grows_its_cache_past_the_window() {
+    use crate::inference::engine::llm_engine::{Fidelity, KvQuant};
+    on_card("long decode", |_| async {
+        a_long_decode_runs(KvQuant::Q8, Fidelity::Balanced).await;
+        // A full-width cache.
+        a_long_decode_runs(KvQuant::Off, Fidelity::Reference).await;
+    })
+    .await;
+}
