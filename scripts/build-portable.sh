@@ -100,7 +100,9 @@ cargo_build() {
 }
 
 if [ "$MODE" = host ]; then
-    CUDA_PATH="$CUDA_PATH" ${with_rocm:+ROCM_PATH="$ROCM_PATH"} cargo_build
+    export CUDA_PATH
+    [ -n "$with_rocm" ] && export ROCM_PATH
+    cargo_build
     RUSTC_VERSION="$(rustc --version)"
 else
     command -v docker >/dev/null || { echo "docker not found (or use --host)" >&2; exit 1; }
