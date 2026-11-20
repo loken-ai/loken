@@ -20,6 +20,16 @@ use std::io::{Read, Seek};
 fn ld<R: Read + Seek>(c: &gguf_file::Content, r: &mut R, name: &str, d: &Device) -> Result<Tensor> {
     c.tensor(r, name, d)?.dequantize(d)?.to_dtype(DType::F32)
 }
+
+/// The card bytes the tower of `c` takes once loaded: every `v.` tensor in F32, the form `ld`
+/// gives it.
+pub fn card_bytes(c: &gguf_file::Content) -> u64 {
+    c.tensor_infos
+        .iter()
+        .filter(|(name, _)| name.starts_with("v."))
+        .map(|(_, t)| (t.shape.elem_count() * DType::F32.size_in_bytes()) as u64)
+        .sum()
+}
 /// How the family reads a clip, as its video processor does: frames sampled at a rate within a
 /// floor and a ceiling, each resized so the clip's pixels over its temporal patches stay within
 /// a range.
@@ -426,6 +436,33 @@ fn merger_mlp(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The tower is counted at the F32 form it is loaded in, whatever form the file stores.
+    #[test]
+    fn the_tower_is_counted_in_the_form_it_is_loaded_in() {
+        use crate::tensor::gguf_write::{write_gguf_with_metadata, GgufEntry};
+        use crate::tensor::quantized::GgmlDType;
+        let dir = std::env::temp_dir().join(format!("loken-tower-bytes-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("tower.gguf");
+        let entry = |name: &str, n: usize| GgufEntry {
+            name: name.to_string(),
+            dims: vec![n],
+            dtype: GgmlDType::F16,
+            data: crate::tensor::quant_cpu::from_float_bytes(GgmlDType::F16, &vec![0.5f32; n])
+                .unwrap(),
+        };
+        let entries = vec![
+            entry("v.patch_embed.weight", 64),
+            entry("v.blk.0.attn_q.weight", 32),
+            entry("blk.0.attn_q.weight", 128),
+        ];
+        write_gguf_with_metadata(&path, &[], &entries).unwrap();
+        let mut f = std::fs::File::open(&path).unwrap();
+        let content = gguf_file::Content::read(&mut f).unwrap();
+        assert_eq!(card_bytes(&content), (64 + 32) * 4);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// The merger activates with the erf GELU, not its tanh approximation.
     #[test]

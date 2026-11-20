@@ -931,7 +931,11 @@ impl LlmEngine {
                 )
             };
             crate::inference::place::device_probe::debug_vram_by_card("after-offer");
-            let cuda_devices: Vec<(usize, u64)> = offer.cards.clone();
+            let cuda_devices: Vec<(usize, u64)> = beside_the_tower(
+                offer.cards.clone(),
+                crate::inference::generic_transformer::splices_vision_tower(&content, &arch)
+                    .then(|| crate::inference::model::qwen35::vision::card_bytes(&content)),
+            );
             // The kernels the first prompt runs compile beside the load.
             #[cfg(feature = "gpu")]
             crate::inference::quantized_cuda::compile_ahead(
@@ -2025,6 +2029,20 @@ pub(crate) enum Warmup {
     ByRequest,
 }
 
+/// The offers of `cards` with the room of the vision tower of `tower` bytes taken from the first:
+/// the tower loads on the card of the first layer, beside the blocks the plan places there.
+fn beside_the_tower(mut cards: Vec<(usize, u64)>, tower: Option<u64>) -> Vec<(usize, u64)> {
+    if let (Some(bytes), Some(first)) = (tower.filter(|&b| b > 0), cards.first_mut()) {
+        first.1 = first.1.saturating_sub(bytes);
+        info!(
+            "card {} keeps {:.2} GB for the vision tower beside its layers",
+            first.0,
+            bytes as f64 / 1e9
+        );
+    }
+    cards
+}
+
 /// Readies a loaded model for its first request.
 /// The prefill path is warmed first when `warmup` asks for it ahead of the requests: the first
 /// prompt of a fresh server otherwise pays for the code objects, the device buffers, the card
@@ -2105,6 +2123,22 @@ fn warm_prefill(
     }
     model.invalidate_graph_state();
     ran
+}
+
+#[cfg(test)]
+mod tower_offer_tests {
+    /// The card of the first layer offers the blocks its room less the vision tower's, the other
+    /// cards their whole room; a model without a tower changes no offer.
+    #[test]
+    fn the_first_card_offers_its_room_less_the_tower() {
+        let cards = vec![(0, 15_000), (1, 16_000)];
+        assert_eq!(
+            super::beside_the_tower(cards.clone(), Some(1_500)),
+            vec![(0, 13_500), (1, 16_000)]
+        );
+        assert_eq!(super::beside_the_tower(cards.clone(), None), cards);
+        assert_eq!(super::beside_the_tower(Vec::new(), Some(1_500)), Vec::new());
+    }
 }
 
 #[cfg(test)]

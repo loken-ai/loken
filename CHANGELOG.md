@@ -6,6 +6,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Fixed
 
+- Placement: count a model's vision tower on the card it loads on.
 - API: count the cached prompt tokens of a prompt read from a stored state.
 - Serving: keep a stored state when a full card cannot restore it.
 - Serving: give back only the oldest stored states when memory runs short.
