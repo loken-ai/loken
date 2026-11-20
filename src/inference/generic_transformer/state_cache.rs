@@ -1689,7 +1689,14 @@ impl GenericHeteroTransformer {
                 }
                 let x = Tensor::new(&prompt[pos..pos + n], &Device::Cpu)?.unsqueeze(0)?;
                 let mark = self.prefill_forward_mark();
-                last = Some(self.forward(&x, pos)?);
+                let out = self.forward(&x, pos);
+                if out
+                    .as_ref()
+                    .is_err_and(crate::inference::place::ladder::is_out_of_memory)
+                {
+                    self.note_prefill_shortfall(n, pos + n);
+                }
+                last = Some(out?);
                 self.note_prefill_forward(&mark, n, pos + n);
                 pos += n;
                 crate::request_metrics::note_prefill(pos - from, total)?;

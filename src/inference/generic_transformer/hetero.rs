@@ -1252,6 +1252,28 @@ impl GenericHeteroTransformer {
         let _ = upto;
     }
 
+    /// Notes, on the card that ran out of memory, what a prefill forward of `rows` rows reaching
+    /// position `upto` lacked there: its measured need less the room the card has.
+    /// The re-plan after it makes the card keep that much more back.
+    pub fn note_prefill_shortfall(&self, rows: usize, upto: usize) {
+        let Some(card) = crate::inference::place::vram_manager::last_oom_card() else {
+            return;
+        };
+        let need = (self.prefill_shape().bytes_per_token as u64)
+            .saturating_mul(rows as u64)
+            .saturating_add(self.prefill_history_bytes(upto));
+        // What the driver has free: a pool's unused blocks may not hold the allocation.
+        let room = crate::inference::place::vram_manager::free_on(card).unwrap_or(0);
+        let lacked = need.saturating_sub(room);
+        tracing::info!(
+            "prefill: a forward of {rows} rows at position {upto} needed {} MB of card {card}, \
+             {} MB short",
+            need >> 20,
+            lacked >> 20
+        );
+        crate::inference::place::vram_manager::note_card_shortfall(card, lacked);
+    }
+
     /// Takes in that a prefill forward of `rows` rows reaching position `upto` kept `kept` bytes
     /// live on a card, and sets the part per row the chunks are sized from.
     pub(crate) fn note_prefill_kept(&self, rows: usize, upto: usize, kept: u64) {

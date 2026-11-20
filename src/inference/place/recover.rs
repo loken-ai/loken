@@ -93,6 +93,13 @@ impl Pressure {
             return false;
         }
         let added = super::vram_manager::raise_card_pressure_for(&self.owner, card);
+        if added == 0 {
+            tracing::warn!(
+                "{what}: card {card} out of memory ({err}); keeping more free there would leave it \
+                 without the model's layers"
+            );
+            return false;
+        }
         self.cards.push((card, added));
         tracing::warn!(
             "{what}: card {card} out of memory ({err}); re-planning with {:.2} GB more kept free there and the other cards unchanged",
@@ -467,27 +474,43 @@ mod card_pressure_tests {
         assert_eq!(vm::card_pressure(CARD), before);
     }
 
-    /// A card the placement left 1 GB free on, that ran out of memory, is offered less than its
-    /// layers held at the next placement: the re-plan moves layers off it.
+    /// Each raise of a card adds the larger of what the failed prefill lacked there and a
+    /// sixteenth of the card: 4 raises keep back 4 steps, never a doubling of what the card kept
+    /// back.
     #[test]
-    fn the_next_placement_holds_less_on_the_card_that_ran_out() {
+    fn raises_add_what_each_failure_lacked() {
         const GB: u64 = 1 << 30;
         let total = 16 * GB;
-        let layers = 15 * GB - GB / 32;
-        let free = GB;
-        // What the card offers once the model left it, before and after the raise.
-        let offered = layers + free;
-        let raised = vm::card_pressure_step(0, total, free);
+        let mut kept = 0;
+        for _ in 0..4 {
+            kept += vm::card_pressure_step(total, Some(2 * GB));
+        }
+        assert_eq!(kept, 8 * GB);
+        assert_eq!(vm::card_pressure_step(total, Some(300 << 20)), total / 16);
+        assert_eq!(vm::card_pressure_step(total, None), total / 16);
+    }
+
+    /// A raise that would make a card keep back all the model holds on it is refused: the card
+    /// keeps some of the model's layers.
+    #[test]
+    fn a_raise_never_empties_the_card() {
+        const GB: u64 = 1 << 30;
+        assert!(vm::raise_leaves_the_card_used(4 * GB, GB, 14 * GB));
+        assert!(!vm::raise_leaves_the_card_used(8 * GB, 9 * GB, 14 * GB));
         assert!(
-            offered - raised + total / 16 <= layers,
-            "offered {} of the {} the layers held",
-            offered - raised,
-            layers
+            !vm::raise_leaves_the_card_used(0, GB, 0),
+            "a card the model does not use"
         );
-        assert!(
-            vm::card_pressure_step(raised, total, 0) >= raised,
-            "a later raise doubles"
-        );
+    }
+
+    /// The shortfall noted for a card is what its next raise adds, once.
+    #[test]
+    fn a_noted_shortfall_is_taken_once() {
+        const CARD: usize = 7_300;
+        vm::note_card_shortfall(CARD, 123);
+        vm::note_card_shortfall(CARD, 456);
+        assert_eq!(vm::take_card_shortfall(CARD), Some(456));
+        assert_eq!(vm::take_card_shortfall(CARD), None);
     }
 
     /// A request that a card's raise let finish leaves the raise in force for the owner's later

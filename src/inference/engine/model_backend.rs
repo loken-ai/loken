@@ -1817,9 +1817,17 @@ impl ModelBackend for GenericBackend {
             // Every layer sees every row before the next layer starts: the pass completes
             // whole or not at all.
             let rest = x.narrow(1, *done, seq_len - *done)?;
-            let logits =
+            let logits = self
+                .0
+                .forward_prefill_layer_major(&rest, index_pos + *done, chunk_tokens);
+            if logits
+                .as_ref()
+                .is_err_and(crate::inference::place::ladder::is_out_of_memory)
+            {
                 self.0
-                    .forward_prefill_layer_major(&rest, index_pos + *done, chunk_tokens)?;
+                    .note_prefill_shortfall(chunk_tokens, index_pos + seq_len);
+            }
+            let logits = logits?;
             *done = seq_len;
             crate::request_metrics::note_prefill(seq_len, seq_len)?;
             return Ok(logits);
@@ -1842,7 +1850,14 @@ impl ModelBackend for GenericBackend {
             }
             let chunk = x.narrow(1, off, n)?;
             let mark = self.0.prefill_forward_mark();
-            last = Some(self.forward(&chunk, index_pos + off)?);
+            let out = self.forward(&chunk, index_pos + off);
+            if out
+                .as_ref()
+                .is_err_and(crate::inference::place::ladder::is_out_of_memory)
+            {
+                self.0.note_prefill_shortfall(n, index_pos + off + n);
+            }
+            last = Some(out?);
             self.0.note_prefill_forward(&mark, n, index_pos + off + n);
             if tracing::enabled!(tracing::Level::DEBUG) {
                 tracing::debug!(

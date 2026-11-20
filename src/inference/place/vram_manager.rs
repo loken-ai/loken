@@ -1549,14 +1549,18 @@ pub fn card_pressure_for(owner: &str, card: usize) -> u64 {
         .map_or(0, |(_, bytes)| *bytes)
 }
 
-/// Raises what card `card` keeps back for `owner` by [`card_pressure_step`], from the bytes the
-/// card has free now. Returns the bytes added.
+/// Raises what card `card` keeps back for `owner` by [`card_pressure_step`]: the bytes the last
+/// prefill that ran out there lacked. Returns the bytes added, 0 when the raise is refused.
+///
+/// A raise that would make the card keep back as much as the model holds on it is refused: the
+/// card would be left without the model's layers while they go to the host.
 pub fn raise_card_pressure_for(owner: &str, card: usize) -> u64 {
     let total = crate::inference::place::device_probe::probe_cuda_gpus()
         .iter()
         .find(|g| g.index == card)
         .map_or(0, |g| g.total);
-    let free = free_on(card).unwrap_or(0);
+    let held_there = total.saturating_sub(free_on(card).unwrap_or(total));
+    let lacked = take_card_shortfall(card);
     with_pressure(owner, |p| {
         let entry = match p.cards.iter_mut().position(|(idx, _)| *idx == card) {
             Some(i) => &mut p.cards[i],
@@ -1565,21 +1569,51 @@ pub fn raise_card_pressure_for(owner: &str, card: usize) -> u64 {
                 p.cards.last_mut().expect("pushed above")
             }
         };
-        let added = card_pressure_step(entry.1, total, free);
+        let added = card_pressure_step(total, lacked);
+        // A card the probe does not see has no measure to refuse by.
+        if total > 0 && !raise_leaves_the_card_used(entry.1, added, held_there) {
+            return 0;
+        }
         entry.1 = entry.1.saturating_add(added);
         added
     })
 }
 
-/// What a card of `total` bytes that ran out of memory keeps back on top of the `held` bytes it
-/// keeps back already, with `free` bytes free once the pools are handed back.
-///
-/// The `free` bytes are what the placement that ran out left unused on the card.
-/// The step adds them to the larger of `held` and a sixteenth of the card.
-/// The next placement then holds at least that sixteenth less on the card: it never repeats the
-/// placement that ran out.
-pub fn card_pressure_step(held: u64, total: u64, free: u64) -> u64 {
-    held.max(total / 16).max(1).saturating_add(free)
+/// What a card of `total` bytes that ran out of memory keeps back on top of what it keeps back
+/// already: the bytes the prefill that ran out there lacked, and at least a sixteenth of the card,
+/// so the next placement differs from the one that ran out.
+/// Each raise adds its own step: raises add up, they do not compound.
+pub fn card_pressure_step(total: u64, lacked: Option<u64>) -> u64 {
+    lacked.unwrap_or(0).max(total / 16).max(1)
+}
+
+/// Whether a card that keeps back `kept` and would keep back `added` more still holds some of the
+/// `held_there` bytes the model has on it at the next placement.
+pub fn raise_leaves_the_card_used(kept: u64, added: u64, held_there: u64) -> bool {
+    kept.saturating_add(added) < held_there
+}
+
+/// What the prefill that last ran out of memory on each card lacked there, in bytes.
+static CARD_SHORTFALL: Mutex<Vec<(usize, u64)>> = Mutex::new(Vec::new());
+
+/// Notes that a prefill on card `card` lacked `bytes` there.
+pub fn note_card_shortfall(card: usize, bytes: u64) {
+    let mut s = CARD_SHORTFALL.lock().unwrap_or_else(|e| e.into_inner());
+    s.retain(|(c, _)| *c != card);
+    s.push((card, bytes));
+}
+
+/// What the last prefill that ran out on card `card` lacked there, once.
+pub fn take_card_shortfall(card: usize) -> Option<u64> {
+    let mut s = CARD_SHORTFALL.lock().unwrap_or_else(|e| e.into_inner());
+    let i = s.iter().position(|(c, _)| *c == card)?;
+    Some(s.swap_remove(i).1)
+}
+
+/// The card that last ran out of memory, left for the recovery to take.
+pub fn last_oom_card() -> Option<usize> {
+    let card = LAST_OOM_CARD.load(std::sync::atomic::Ordering::Relaxed);
+    (card != usize::MAX).then_some(card)
 }
 
 /// Takes back `bytes` card `card` was made to keep back for `owner`.
