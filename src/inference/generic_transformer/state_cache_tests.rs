@@ -874,3 +874,25 @@ fn an_abandoned_request_does_not_read_its_prompt_again_from_the_start() {
         "{e}"
     );
 }
+
+/// A prompt read from a stored state reports the tokens the state spared it.
+#[test]
+fn a_prompt_read_from_a_stored_state_reports_the_tokens_it_spared() {
+    use crate::inference::engine::model_backend::{GenericBackend, ModelBackend};
+    let fx = Fixture::new("covered-report");
+    let store = open_store(&fx.store_dir());
+    let mut writer = fx.model();
+    attach(&mut writer, &store, b"");
+    let cache = writer.state_cache().unwrap();
+    let text = prompt(2 * BLOCK + 9);
+    let (_, grid) = prefill(&mut writer, &text, 0);
+    cache.save(&writer, &text, grid, None);
+    wait_for_len(&store, text.len());
+    let mut longer = text.clone();
+    longer.extend(prompt(40));
+    let mut m = fx.model();
+    attach(&mut m, &store, b"");
+    let mut b = GenericBackend(m);
+    assert!(b.try_restore_prefix(&longer).unwrap().is_some());
+    assert_eq!(b.prefix_covered(), text.len());
+}

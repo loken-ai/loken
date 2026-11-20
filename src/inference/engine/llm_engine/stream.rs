@@ -1387,9 +1387,9 @@ impl LlmEngine {
                         match state.model.try_restore_prefix(&prompt_tokens) {
                             Ok(Some(l)) => {
                                 prefill_skipped = true;
-                                // A state restored from an earlier turn is prompt not read again.
-                                reused_prompt_tokens =
-                                    reused_prompt_tokens.max(state.model.prefix_covered());
+                                // A state restored from an earlier turn is prompt not read again,
+                                // and it alone: the restore replaced the resident state.
+                                reused_prompt_tokens = state.model.prefix_covered();
                                 l
                             }
                             Ok(None) => {

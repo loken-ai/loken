@@ -1428,6 +1428,8 @@ impl GenericBackend {
             None => match &cache {
                 Some(cache) if prompt.len() > 1 => {
                     let covered = cache.restore(&mut self.0, prompt);
+                    // The reply reports the tokens the stored state spared reading.
+                    self.0.set_prefix_covered(covered);
                     if covered == 0 {
                         self.0.trim_kv(0);
                     }
