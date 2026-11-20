@@ -220,4 +220,12 @@ mod tests {
         // Buffer now contains [3, 4, 5, 6]. Query [6] has no match.
         assert!(c.lookup().is_empty());
     }
+
+    #[test]
+    fn a_cache_shorter_than_its_smallest_ngram_drafts_nothing() {
+        let mut c = NgramDraftCache::new_cascade(2, 4, 4, 64);
+        c.push_many(&[7, 8]);
+        assert!(c.lookup().is_empty());
+        assert_eq!(c.lookup_matched(), (vec![], 0));
+    }
 }
