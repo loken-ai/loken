@@ -912,7 +912,7 @@ impl LlmEngine {
                 // common text-tokens prefix from the post-image positions.
                 let is_vision = state.model.is_vision_model() && state.image_embeds.is_some();
                 let cur_image_hash: Option<u64> = if is_vision {
-                    state.image_embed_cache.as_ref().map(|(h, _)| *h)
+                    state.image_embed_cache.last()
                 } else {
                     None
                 };
@@ -3906,7 +3906,7 @@ impl LlmEngine {
                             // A clip is keyed like an image: its rows are not in the tokens.
                             Some(s) if s.audio.is_some() => (s.audio.as_ref().map(|c| c.hash), 0),
                             Some(s) if s.model.is_vision_model() => {
-                                let hash = s.image_embed_cache.as_ref().map(|(h, _)| *h);
+                                let hash = s.image_embed_cache.last();
                                 let prefix = s
                                     .image_embeds
                                     .as_ref()

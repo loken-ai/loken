@@ -1736,7 +1736,7 @@ impl LlmEngine {
                 image_embeds: None,
                 audio: None,
                 qwen35_vision: Vec::new(),
-                image_embed_cache: None,
+                image_embed_cache: super::image_cache::ImageEmbedCache::new(),
                 grammar_factory: std::sync::OnceLock::new(),
                 generation_defaults: generation_defaults.clone(),
             };

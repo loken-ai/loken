@@ -76,6 +76,8 @@ pub(crate) fn reset_adaptive_prefill_chunk() {
 }
 mod params;
 pub use params::*;
+mod image_cache;
+pub(crate) use image_cache::ImageEmbedCache;
 mod load;
 pub(crate) use load::*;
 
@@ -1017,12 +1019,14 @@ impl LlmEngine {
                 let mut hasher = std::collections::hash_map::DefaultHasher::new();
                 base64_str.hash(&mut hasher);
                 let image_hash = hasher.finish();
-                if let Some((cached_hash, cached_embeds)) = state.image_embed_cache.as_ref() {
-                    if *cached_hash == image_hash {
-                        debug!("Vision: cache HIT for image hash {:x}", image_hash);
-                        state.image_embeds = Some(cached_embeds.clone());
-                        return Ok(());
-                    }
+                if let Some(cached_embeds) = state
+                    .image_embed_cache
+                    .get(image_hash, &state.device)
+                    .map_err(crate::tensor::Error::msg)?
+                {
+                    debug!("Vision: cache HIT for image hash {:x}", image_hash);
+                    state.image_embeds = Some(cached_embeds);
+                    return Ok(());
                 }
                 let image_embeds = if state.model.is_pixtral_vision() {
                     // Pixtral: variable-resolution - encode from the RAW image
@@ -1044,7 +1048,10 @@ impl LlmEngine {
                     image_hash,
                     image_embeds.shape()
                 );
-                state.image_embed_cache = Some((image_hash, image_embeds.clone()));
+                state
+                    .image_embed_cache
+                    .put(image_hash, &image_embeds)
+                    .map_err(crate::tensor::Error::msg)?;
                 state.image_embeds = Some(image_embeds);
             }
 

@@ -519,7 +519,7 @@ pub(super) fn load_wide_checkpoint(
         image_embeds: None,
         audio: None,
         qwen35_vision: Vec::new(),
-        image_embed_cache: None,
+        image_embed_cache: super::image_cache::ImageEmbedCache::new(),
         grammar_factory: std::sync::OnceLock::new(),
         generation_defaults,
     })
@@ -1207,7 +1207,7 @@ pub(crate) struct LoadedModelState {
     /// stored projector output - matches Ollama's prompt-cache semantics
     /// for vision. Single-entry to keep memory bounded; a bigger LRU
     /// could ship later if the use case shows up.
-    pub(super) image_embed_cache: Option<(u64, Tensor)>,
+    pub(super) image_embed_cache: super::image_cache::ImageEmbedCache,
     /// Lazily-built llguidance parser factory. Constructed on first
     /// grammar-constrained request from the live tokenizer; cached for reuse
     /// across requests on the same loaded model.
