@@ -739,14 +739,19 @@ mod tests {
         assert_eq!(y.dtype(), DType::F32);
         assert_eq!(y.dims(), &[m, n]);
         let y: Vec<f32> = y.flatten_all().unwrap().to_vec1().unwrap();
+        // A sum of k products in F32, in any order, is within k units of F32 rounding of the
+        // sum of their magnitudes.
+        // A sum kept in BF16 is about 2^16 times further off, so the bound tells the 2 apart.
         for r in 0..m {
             for o in 0..n {
-                let want: f64 = (0..k)
-                    .map(|i| f64::from(xs[r * k + i]) * f64::from(ws[o * k + i]))
-                    .sum();
+                let terms = (0..k).map(|i| f64::from(xs[r * k + i]) * f64::from(ws[o * k + i]));
+                let want: f64 = terms.clone().sum();
+                let size: f64 = terms.map(f64::abs).sum();
+                let bound = k as f64 * f64::from(f32::EPSILON) * size;
                 assert!(
-                    (f64::from(y[r * n + o]) - want).abs() < 1e-3,
-                    "row {r} output {o}"
+                    (f64::from(y[r * n + o]) - want).abs() <= bound,
+                    "row {r} output {o}: {} against {want}, bound {bound}",
+                    y[r * n + o]
                 );
             }
         }
