@@ -4,6 +4,10 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+### Added
+
+- API: return Cohere embeddings as int8, uint8, binary and ubinary vectors.
+
 ### Changed
 
 - Serving: look up the disk cache while a save cleans it.

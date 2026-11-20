@@ -77,7 +77,7 @@ pub(crate) async fn cohere_rerank(
 }
 
 /// The embedding types `/v2/embed` serves.
-const COHERE_TYPES: [&str; 2] = ["float", "base64"];
+const COHERE_TYPES: [&str; 6] = ["float", "base64", "int8", "uint8", "ubinary", "binary"];
 
 /// The OpenAI embeddings body a Cohere `/v2/embed` body stands for: `texts` as `input`;
 /// `images` (data URIs) and `inputs` (content lists) as one conversation each in
@@ -129,7 +129,7 @@ pub(crate) fn cohere_embed_request(body: &serde_json::Value) -> Result<serde_jso
 }
 
 /// Cohere `/v2/embed`: `{model, texts | images | inputs, input_type, embedding_types,
-/// output_dimension}` answered with `{id, embeddings: {float, base64}, texts, meta,
+/// output_dimension}` answered with `{id, embeddings: {float, base64, int8, uint8, ubinary, binary}, texts, meta,
 /// response_type}`. Float and base64 (little-endian f32) embeddings are served.
 pub(crate) async fn cohere_embed(
     State(state): State<APIServer>,
@@ -156,7 +156,7 @@ pub(crate) async fn cohere_embed(
         .unwrap_or_else(|| vec!["float".to_string()]);
     if let Some(other) = types.iter().find(|t| !COHERE_TYPES.contains(&t.as_str())) {
         return ApiError::Validation(format!(
-            "embedding type `{other}` is not served; ask for `float` or `base64`"
+            "embedding type `{other}` is not served; ask for `float`, `base64`, `int8`, `uint8`, `ubinary` or `binary`"
         ))
         .into_response();
     }
@@ -174,6 +174,10 @@ pub(crate) async fn cohere_embed(
     for t in &types {
         let encoded: Vec<serde_json::Value> = match t.as_str() {
             "base64" => vectors.iter().map(base64_vector).collect(),
+            "int8" => vectors.iter().map(int8_vector).collect(),
+            "uint8" => vectors.iter().map(uint8_vector).collect(),
+            "ubinary" => vectors.iter().map(ubinary_vector).collect(),
+            "binary" => vectors.iter().map(binary_vector).collect(),
             _ => vectors.clone(),
         };
         embeddings.insert(t.clone(), serde_json::Value::Array(encoded));
@@ -202,6 +206,75 @@ fn base64_vector(v: &serde_json::Value) -> serde_json::Value {
         .flat_map(|x| (x as f32).to_le_bytes())
         .collect();
     serde_json::Value::String(base64::engine::general_purpose::STANDARD.encode(bytes))
+}
+
+/// The values of a JSON vector, as `f32`.
+fn floats(v: &serde_json::Value) -> Vec<f32> {
+    v.as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_f64)
+        .map(|x| x as f32)
+        .collect()
+}
+
+/// Each value scaled by the largest magnitude of the vector to -127..=127.
+///
+/// A vector of zeros gives zeros.
+fn int8_of(x: &[f32]) -> Vec<i32> {
+    let m = x.iter().fold(0f32, |m, v| m.max(v.abs()));
+    x.iter()
+        .map(|v| {
+            if m == 0.0 {
+                0
+            } else {
+                (v / m * 127.0).round() as i32
+            }
+        })
+        .collect()
+}
+
+/// The sign bits, 1 for a positive value, 8 to a byte, the first value in the highest bit.
+///
+/// The last byte is padded with 0 bits.
+fn ubinary_of(x: &[f32]) -> Vec<i32> {
+    x.chunks(8)
+        .map(|chunk| {
+            chunk
+                .iter()
+                .enumerate()
+                .fold(0, |byte, (i, v)| byte | (i32::from(*v > 0.0) << (7 - i)))
+        })
+        .collect()
+}
+
+fn ints(values: Vec<i32>) -> serde_json::Value {
+    serde_json::Value::Array(values.into_iter().map(serde_json::Value::from).collect())
+}
+
+/// A float vector as int8, Cohere's `int8` type.
+fn int8_vector(v: &serde_json::Value) -> serde_json::Value {
+    ints(int8_of(&floats(v)))
+}
+
+/// A float vector as uint8: the int8 values plus 128.
+fn uint8_vector(v: &serde_json::Value) -> serde_json::Value {
+    ints(int8_of(&floats(v)).into_iter().map(|b| b + 128).collect())
+}
+
+/// A float vector as its packed sign bits, each byte in 0..=255.
+fn ubinary_vector(v: &serde_json::Value) -> serde_json::Value {
+    ints(ubinary_of(&floats(v)))
+}
+
+/// A float vector as its packed sign bits, each byte minus 128.
+fn binary_vector(v: &serde_json::Value) -> serde_json::Value {
+    ints(
+        ubinary_of(&floats(v))
+            .into_iter()
+            .map(|b| b - 128)
+            .collect(),
+    )
 }
 
 /// The pairs a score request names: `text_1` against each of `text_2` when one is a string, or
@@ -343,5 +416,76 @@ mod tests {
         assert!(score_pairs(&json!(["q1", "q2"]), &json!(["a", "b", "c"])).is_err());
         assert!(score_pairs(&json!([]), &json!("a")).is_err());
         assert!(score_pairs(&json!(1), &json!("a")).is_err());
+    }
+
+    /// The integer and bit encodings follow the spec exactly.
+    #[test]
+    fn integer_and_bit_encodings_follow_their_definition() {
+        let v = json!([0.5, -1.0, 0.25, 0.0, 1.0, -0.5, 0.1, -0.1, 0.9]);
+        // int8: m = max |x_i| = 1.0, each value is round(x_i / m * 127)
+        let int8 = int8_vector(&v);
+        assert_eq!(int8, json!([64, -127, 32, 0, 127, -64, 13, -13, 114]));
+        // uint8: int8 + 128
+        let uint8 = uint8_vector(&v);
+        assert_eq!(uint8, json!([192, 1, 160, 128, 255, 64, 141, 115, 242]));
+        // ubinary: sign bits, 1 when x_i > 0, packed 8 to a byte
+        // [0.5, -1.0, 0.25, 0.0, 1.0, -0.5, 0.1, -0.1] -> [1,0,1,0,1,0,1,0] = 0b1010_1010 = 170
+        // [0.9] -> [1] padded with 7 zeros = 0b1000_0000 = 128
+        let ubinary = ubinary_vector(&v);
+        assert_eq!(ubinary, json!([170, 128]));
+        // binary: each ubinary byte minus 128
+        let binary = binary_vector(&v);
+        assert_eq!(binary, json!([42, 0]));
+    }
+
+    /// Integer vectors rank as the float ones do.
+    #[test]
+    fn integer_vectors_rank_as_the_float_ones_do() {
+        // A fixed linear congruential generator, values in -1..1.
+        let mut state = 42u64;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (state >> 40) as f32 / (1u64 << 23) as f32 - 1.0
+        };
+        let dim = 64;
+        let query: Vec<f32> = (0..dim).map(|_| next()).collect();
+        // Document i is the query plus noise that grows with i, so the float ranking is clear.
+        let docs: Vec<Vec<f32>> = (0..20)
+            .map(|i| {
+                let noise = 0.3 + i as f32 * 0.2;
+                query.iter().map(|q| q + noise * next()).collect()
+            })
+            .collect();
+        let best = |score: &dyn Fn(&Vec<f32>) -> f32| -> Vec<usize> {
+            let mut order: Vec<usize> = (0..docs.len()).collect();
+            order.sort_by(|&a, &b| score(&docs[b]).total_cmp(&score(&docs[a])));
+            order
+        };
+        // Embeddings are compared by cosine, so every ranking is.
+        let cosine = |a: &[f32], b: &[f32]| {
+            let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+            let norm = |v: &[f32]| v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            dot / (norm(a) * norm(b))
+        };
+        let as_f32 = |v: Vec<i32>| v.into_iter().map(|x| x as f32).collect::<Vec<f32>>();
+        let float = best(&|d| cosine(&query, d));
+        let q8 = as_f32(int8_of(&query));
+        let int8 = best(&|d| cosine(&q8, &as_f32(int8_of(d))));
+        let qb = ubinary_of(&query);
+        let bits = best(&|d| {
+            let differ: u32 = qb
+                .iter()
+                .zip(ubinary_of(d))
+                .map(|(q, x)| (q ^ x).count_ones())
+                .sum();
+            (dim as u32 - differ) as f32
+        });
+        assert_eq!(int8[0], float[0], "int8 {int8:?} float {float:?}");
+        assert!(
+            bits[..3].contains(&float[0]),
+            "bits {bits:?} float {float:?}"
+        );
     }
 }
