@@ -1,4 +1,7 @@
 //! The disk tier under the KV snapshots: a resident sequence written as blocks of
+//!
+//! The collector holds the index lock only to copy it and to drop manifests from it.
+//! Its file reads and removals run without the lock, so a lookup never waits on them.
 //! `block_tokens` tokens, each block one safetensors file holding every layer's K and V
 //! quantised to Q8_0, addressed by a hash chained over the tokens so that two
 //! conversations sharing a prefix share its blocks, and one manifest per sequence naming
@@ -92,6 +95,11 @@ pub struct KvDiskStore {
     persist_lock: Mutex<()>,
     index: Mutex<Vec<Manifest>>,
 }
+
+/// Called by the collector before its scan of the blocks, in tests only.
+#[cfg(test)]
+static GC_HOOK: std::sync::Mutex<Option<Box<dyn Fn(&KvDiskStore) + Send + Sync>>> =
+    std::sync::Mutex::new(None);
 
 /// The FNV-1a hash of `bytes` from `seed`: the same bytes give the same hash on any machine.
 pub(crate) fn fnv1a(seed: u64, bytes: &[u8]) -> u64 {
@@ -453,16 +461,24 @@ impl KvDiskStore {
     /// Drops the least recently used manifests until the store fits its budget, then
     /// every block no manifest names.
     fn collect_garbage(&self) -> Result<()> {
-        let mut g = self
-            .index
-            .lock()
-            .map_err(|_| anyhow!("kv disk index poisoned"))?;
+        // The manifests as they stand, copied under the lock.
+        let to_process: Vec<Manifest> = {
+            let g = self
+                .index
+                .lock()
+                .map_err(|_| anyhow!("kv disk index poisoned"))?;
+            g.clone()
+        };
+
+        // The budget pass, on the copy, without the lock.
+        let mut dropped_paths: Vec<PathBuf> = Vec::new();
         if self.budget > 0 {
-            g.sort_by_key(|m| std::cmp::Reverse(m.last_used));
+            let mut sorted = to_process.clone();
+            sorted.sort_by_key(|m| std::cmp::Reverse(m.last_used));
             let mut named: HashSet<u64> = HashSet::new();
             let mut total = 0u64;
             let mut keep = Vec::new();
-            for m in g.drain(..) {
+            for m in sorted {
                 let mut fresh = 0u64;
                 for h in m.blocks.iter().chain(m.window_blob.iter()) {
                     if named.insert(*h) {
@@ -472,16 +488,40 @@ impl KvDiskStore {
                     }
                 }
                 if total + fresh > self.budget && !keep.is_empty() {
-                    let _ = std::fs::remove_file(self.manifest_path(&m));
+                    dropped_paths.push(self.manifest_path(&m));
                     continue;
                 }
                 total += fresh;
                 keep.push(m);
             }
-            *g = keep;
         }
-        let mut named: HashSet<u64> = g.iter().flat_map(|m| m.blocks.iter().copied()).collect();
-        named.extend(g.iter().filter_map(|m| m.window_blob));
+
+        for p in &dropped_paths {
+            let _ = std::fs::remove_file(p);
+        }
+
+        // The dropped manifests leave the index, and the blocks the others name are kept.
+        let block_hashes: HashSet<u64> = {
+            let mut g = self
+                .index
+                .lock()
+                .map_err(|_| anyhow!("kv disk index poisoned"))?;
+            g.retain(|m| !dropped_paths.contains(&self.manifest_path(m)));
+            let mut hashes: HashSet<u64> =
+                g.iter().flat_map(|m| m.blocks.iter().copied()).collect();
+            hashes.extend(g.iter().filter_map(|m| m.window_blob));
+            hashes
+        };
+
+        // The scan of the blocks, without the lock.
+        #[cfg(test)]
+        {
+            if let Ok(hook) = GC_HOOK.lock() {
+                if let Some(f) = hook.as_ref() {
+                    f(self);
+                }
+            }
+        }
         for entry in std::fs::read_dir(self.dir.join("blocks"))? {
             let path = entry?.path();
             if path.extension().and_then(|e| e.to_str()) == Some("tmp") {
@@ -489,7 +529,7 @@ impl KvDiskStore {
             }
             let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
             match u64::from_str_radix(stem, 16) {
-                Ok(h) if named.contains(&h) => {}
+                Ok(h) if block_hashes.contains(&h) => {}
                 _ => {
                     let _ = std::fs::remove_file(&path);
                 }
@@ -571,6 +611,62 @@ mod tests {
         );
         assert!(store.best("m", 2, &prompt).is_none());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The collector leaves the index free while it scans the blocks.
+    #[test]
+    fn a_lookup_is_not_held_by_the_collector() {
+        let hook_called = std::sync::Arc::new(std::sync::Mutex::new(false));
+
+        let temp_dir =
+            std::env::temp_dir().join(format!("loken-gc-no-lock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let store = std::sync::Arc::new(KvDiskStore::open(temp_dir.clone(), 100, 4).unwrap());
+        let store_for_hook = store.clone();
+
+        let hook_for_closure = hook_called.clone();
+        let _ = GC_HOOK
+            .lock()
+            .unwrap()
+            .replace(Box::new(move |_s: &KvDiskStore| {
+                // Verify the lock is not held during block scanning
+                let lock_result = store_for_hook.index.try_lock();
+                assert!(
+                    lock_result.is_ok(),
+                    "index lock should not be held during block scanning"
+                );
+                *hook_for_closure.lock().unwrap() = true;
+            }));
+
+        // Persist 2 prompts to trigger GC with budget
+        let persist_prompt = |tokens: Vec<u32>| {
+            let n_kv = 1;
+            let hd = 32;
+            let row = |t: usize| -> Vec<f32> {
+                (0..n_kv * hd).map(|i| (t * 100 + i) as f32 / 7.0).collect()
+            };
+            store
+                .persist("m", 1, &tokens, tokens.len(), 1, &[], |from, to| {
+                    let mut k = Vec::new();
+                    let mut v = Vec::new();
+                    for t in from..to {
+                        k.extend(row(t));
+                        v.extend(row(t + 1000));
+                    }
+                    Ok(vec![Some((k, v)), None])
+                })
+                .unwrap();
+        };
+
+        persist_prompt((0..10).collect());
+        persist_prompt((1000..1010).collect());
+
+        // Verify hook was called
+        assert!(*hook_called.lock().unwrap());
+
+        // Reset hook
+        let _ = GC_HOOK.lock().unwrap().take();
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
     #[test]
