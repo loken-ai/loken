@@ -239,9 +239,13 @@ struct ReplyShape {
     include_reasoning: bool,
 }
 
-/// The reasoning, the assistant's message and the finish reason of a chat answer's text. When
-/// tools were offered, the tool-call markers become structured tool calls and the finish reason
-/// `tool_calls`; an answer without markers passes through unchanged.
+/// The reasoning, the assistant's message and the finish reason of a chat answer's text.
+///
+/// When tools were offered, the tool-call markers become structured tool calls and the finish
+/// reason `tool_calls`.
+/// An answer without markers passes through unchanged.
+/// An answer cut at the token limit keeps its text and the reason `length`: a cut call is not
+/// a call.
 fn assistant_message(
     shape: &ReplyShape,
     content: &str,
@@ -254,7 +258,7 @@ fn assistant_message(
         if shape.single_tool_call {
             parsed.calls.truncate(1);
         }
-        if parsed.calls.is_empty() {
+        if parsed.calls.is_empty() || finish_reason == "length" {
             (
                 Message::new("assistant".to_string(), content),
                 finish_reason,

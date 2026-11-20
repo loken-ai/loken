@@ -363,3 +363,23 @@ fn prompt_embeds_read_from_base64_or_rows() {
     let rows = serde_json::json!({ "prompt_embeds": [[0.5, -1.25]] });
     assert!(prompt_embeds_list(&rows).is_none());
 }
+
+/// A tool call cut at the token limit is returned as text with the reason `length`.
+#[test]
+fn a_tool_call_cut_at_the_token_limit_is_not_a_call() {
+    let shape = ReplyShape {
+        thinking_opened: false,
+        tools_active: true,
+        tool_format: crate::api::tool_calls::ToolFormat::Hermes,
+        single_tool_call: false,
+        include_reasoning: false,
+    };
+    let text = "<tool_call>\n<function=write_file>\n<parameter=content>\nfn main() {\n    let";
+    let (_, message, reason) = assistant_message(&shape, text, "length".to_string());
+    assert_eq!(reason, "length");
+    assert!(message.tool_calls.as_ref().is_none_or(|c| c.is_empty()));
+    let whole = "<tool_call>{\"name\":\"bash\",\"arguments\":{\"cmd\":\"ls\"}}</tool_call>";
+    let (_, message, reason) = assistant_message(&shape, whole, "stop".to_string());
+    assert_eq!(reason, "tool_calls");
+    assert_eq!(message.tool_calls.map(|c| c.len()), Some(1));
+}

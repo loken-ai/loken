@@ -6,6 +6,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Fixed
 
+- API: end an answer cut at the token limit as cut, even inside a tool call.
 - Serving: keep long prompts from filling the card with causal masks.
 - Placement: count a model's vision tower on the card it loads on.
 - Build: stamp the commit and version of a build made from a git archive export.

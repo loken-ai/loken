@@ -239,6 +239,15 @@ where
         if single_tool_call {
             tool_calls.truncate(1);
         }
+        // An answer cut at the token limit ends as `length` with its text: a cut call is not a
+        // call.
+        let cut = match stats.as_ref() {
+            Some(s) => s.finish_reason.openai() == "length",
+            None => max_tokens_cap.is_some_and(|cap| (token_count as usize) >= cap),
+        };
+        if cut {
+            tool_calls.clear();
+        }
         let used_tools = !tool_calls.is_empty();
         if used_tools {
             let deltas: Vec<_> = tool_calls
