@@ -32,6 +32,33 @@ fn time_to_first_token_ms(
     first_token_at.map_or(0, |t| t.duration_since(stream_started).as_millis())
 }
 
+/// Score a list of documents against a query using late interaction over token vectors.
+/// This is used for embedding models that declare `{architecture}.pooling_type`.
+/// The query vectors are computed once and reused for all documents.
+async fn score_with_late_interaction(
+    query: String,
+    documents: &[String],
+    engine: &LlmEngine,
+) -> Result<Vec<(usize, f32)>, String> {
+    // Compute query token embeddings once
+    let query_vectors = engine
+        .generate_token_embeddings(&query)
+        .await
+        .map_err(|e| format!("query embedding: {e}"))?;
+
+    let mut scored: Vec<(usize, f32)> = Vec::with_capacity(documents.len());
+    for (i, doc) in documents.iter().enumerate() {
+        let doc_vectors = engine
+            .generate_token_embeddings(doc)
+            .await
+            .map_err(|e| format!("document {i} embedding: {e}"))?;
+        let score =
+            crate::inference::model::embedding::late_interaction(&query_vectors, &doc_vectors);
+        scored.push((i, score));
+    }
+    Ok(scored)
+}
+
 /// The decode rate to append to a stream's summary line, or nothing to append.
 ///
 /// Measured from the first token onward, for the reason above. A stream that produced one
@@ -2109,19 +2136,38 @@ pub(crate) async fn openai_rerank(
     };
     state.reset_expiration(&model_name).await;
 
+    // Check if this is an embedding model (declares pooling_type)
+    let is_embedding_model = engine.pools().await;
+
     let t0 = std::time::Instant::now();
     let mut scored: Vec<(usize, f32)> = Vec::with_capacity(documents.len());
-    for (i, doc) in documents.iter().enumerate() {
-        match engine
-            .rerank_score(query.clone(), doc.clone(), instruction.clone())
-            .await
-        {
-            Ok(s) => scored.push((i, s)),
+
+    if is_embedding_model {
+        // Use late interaction for embedding models - instruction field does not apply
+        let late_result = score_with_late_interaction(query, &documents, &engine).await;
+        match late_result {
+            Ok(s) => scored = s,
             Err(e) => {
                 return err(
                     axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("rerank (idx={i}): {e}"),
+                    format!("late interaction: {e}"),
                 )
+            }
+        }
+    } else {
+        // Use cross-encoder for non-embedding models
+        for (i, doc) in documents.iter().enumerate() {
+            match engine
+                .rerank_score(query.clone(), doc.clone(), instruction.clone())
+                .await
+            {
+                Ok(s) => scored.push((i, s)),
+                Err(e) => {
+                    return err(
+                        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("rerank (idx={i}): {e}"),
+                    )
+                }
             }
         }
     }

@@ -104,6 +104,9 @@ pub(super) async fn engine_holding(
         qwen35_vision: Vec::new(),
         image_embed_cache: super::image_cache::ImageEmbedCache::new(),
         grammar_factory: std::sync::OnceLock::new(),
+        // Whether the loaded GGUF declares `{architecture}.pooling_type`: the model is an
+        // embedding model and reranks by late interaction over token vectors.
+        pools: false,
         generation_defaults: Default::default(),
     });
     let prompt = prompt()

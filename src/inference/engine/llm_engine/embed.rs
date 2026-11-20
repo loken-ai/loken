@@ -101,6 +101,15 @@ impl LlmEngine {
         }
     }
 
+    /// Whether the loaded model is an embedding model (GGUF declares `{architecture}.pooling_type`).
+    /// Returns false when no model is loaded.
+    pub async fn pools(&self) -> bool {
+        self.model_state
+            .blocking_lock()
+            .as_ref()
+            .is_some_and(|s| s.pools)
+    }
+
     /// The text-image pair this engine serves, if it serves one.
     fn dual_encoder(&self) -> Option<Arc<crate::inference::model::clip::pair::DualEncoder>> {
         self.dual_encoder

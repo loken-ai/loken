@@ -1738,6 +1738,12 @@ impl LlmEngine {
                 qwen35_vision: Vec::new(),
                 image_embed_cache: super::image_cache::ImageEmbedCache::new(),
                 grammar_factory: std::sync::OnceLock::new(),
+                // Whether the loaded GGUF declares `{architecture}.pooling_type`: the model is an
+                // embedding model and reranks by late interaction over token vectors.
+                pools: crate::inference::engine::llm_engine::load::declares_pooling(
+                    content.metadata.keys().map(|k| k.as_str()),
+                    &arch,
+                ),
                 generation_defaults: generation_defaults.clone(),
             };
             let mut guard = model_state.blocking_lock();

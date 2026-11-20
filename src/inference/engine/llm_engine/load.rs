@@ -521,6 +521,9 @@ pub(super) fn load_wide_checkpoint(
         qwen35_vision: Vec::new(),
         image_embed_cache: super::image_cache::ImageEmbedCache::new(),
         grammar_factory: std::sync::OnceLock::new(),
+        // Whether the loaded GGUF declares `{architecture}.pooling_type`: the model is an
+        // embedding model and reranks by late interaction over token vectors.
+        pools: false,
         generation_defaults,
     })
 }
@@ -1212,6 +1215,9 @@ pub(crate) struct LoadedModelState {
     /// grammar-constrained request from the live tokenizer; cached for reuse
     /// across requests on the same loaded model.
     pub(super) grammar_factory: std::sync::OnceLock<std::sync::Arc<llguidance::ParserFactory>>,
+    /// Whether the loaded GGUF declares `{architecture}.pooling_type`: the model is an
+    /// embedding model and reranks by late interaction over token vectors.
+    pub(super) pools: bool,
     /// The sampling the model recommends, applied to every knob a request leaves unset.
     pub(super) generation_defaults: super::generation_defaults::GenerationDefaults,
 }
@@ -1949,6 +1955,48 @@ mod reuse_tests {
     #[test]
     fn a_cache_that_matches_is_used_as_asked() {
         assert_eq!(reuse_verdict(Some(577), 577), Reuse::AsAsked(577));
+    }
+}
+
+/// Whether a GGUF file declares `{architecture}.pooling_type`, meaning it is an embedding model.
+///
+/// Searches the metadata keys for one matching the pattern `{architecture}.pooling_type`.
+/// Returns true if found, false otherwise.
+pub(crate) fn declares_pooling(
+    metadata_keys: impl IntoIterator<Item = impl AsRef<str>>,
+    architecture: &str,
+) -> bool {
+    let pattern = format!("{architecture}.pooling_type");
+    metadata_keys.into_iter().any(|k| k.as_ref() == pattern)
+}
+
+#[cfg(test)]
+mod declares_pooling_tests {
+    use super::declares_pooling;
+
+    #[test]
+    fn qwen3_with_pooling_type_declared() {
+        let keys = ["qwen3.pooling_type", "general.architecture"];
+        assert!(declares_pooling(keys, "qwen3"));
+    }
+
+    #[test]
+    fn llama_without_pooling_type_declared() {
+        let keys = ["general.architecture", "llama.vocab_size"];
+        assert!(!declares_pooling(keys, "llama"));
+    }
+
+    #[test]
+    fn no_metadata_keys() {
+        let keys: Vec<&str> = vec![];
+        assert!(!declares_pooling(keys, "qwen3"));
+    }
+
+    #[test]
+    fn different_architecture() {
+        let keys = ["qwen3.pooling_type", "general.architecture"];
+        // The architecture must match
+        assert!(!declares_pooling(keys, "llama"));
     }
 }
 
