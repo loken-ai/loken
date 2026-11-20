@@ -251,6 +251,31 @@ pub fn pool_bytes(ordinal: usize) -> Option<(u64, u64)> {
     ))
 }
 
+/// Each card's memory as one line: the driver's free bytes, the default pool's live and cached
+/// bytes, and what the recorded graphs hold.
+pub fn card_memory_report() -> String {
+    #[cfg(feature = "gpu")]
+    {
+        (0..card_count())
+            .map(|card| {
+                let free = super::vram_manager::free_on(card).unwrap_or(0);
+                let (live, held) = pool_bytes(card).unwrap_or((0, 0));
+                let graphs = crate::tensor::cuda::graph_mem(card)[0];
+                format!(
+                    "card {card}: {} MB free, pool {} MB live and {} MB cached, graphs {} MB",
+                    free >> 20,
+                    live >> 20,
+                    held.saturating_sub(live) >> 20,
+                    graphs >> 20
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+    #[cfg(not(feature = "gpu"))]
+    String::new()
+}
+
 /// How many cards this process can open: the ones NVML lists and the process sees on an
 /// NVIDIA runtime, the runtime's own count otherwise.
 pub fn card_count() -> usize {

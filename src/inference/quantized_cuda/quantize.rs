@@ -583,6 +583,33 @@ pub fn dequantize_q4_0_blob_f16(
     dequantize_block32_blob("q4_0", data, elem_count, dev, false)
 }
 
+/// The first `elem_count` values of a view of Q8_0 blocks as F16, each value the one
+/// [`dequantize_block32_blob`] gives for its block.
+pub fn dequantize_q8_0_view_f16(
+    data: &CudaView<u8>,
+    elem_count: usize,
+    dev: &CudaDevice,
+) -> Result<CudaStorage> {
+    if !elem_count.is_multiple_of(32) {
+        anyhow::bail!("dequantize q8_0 view: elem_count {elem_count} must be multiple of 32");
+    }
+    let name = "dequantize_block_q8_0_f16";
+    let func = quantized_kernel(dev, name)?;
+    let cfg = LaunchConfig {
+        grid_dim: (elem_count.div_ceil(256) as u32, 1, 1),
+        block_dim: (32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let nb32 = (elem_count / 32) as i32;
+    let dst = unsafe { dev.alloc::<f16>(elem_count)? };
+    let mut builder = func.builder();
+    builder.arg(data);
+    builder.arg(&dst);
+    barg!(builder, nb32);
+    unsafe { builder.launch(cfg) }.map_err(|e| anyhow!("launch {name}: {e}"))?;
+    Ok(CudaStorage::wrap_cuda_slice(dst, dev.clone()))
+}
+
 /// A packed blob of a 32-value block format (`fmt` as the kernels name it), dequantised in
 /// storage order to F32 when `f32`, else F16. F32 holds every code-times-scale product
 /// exactly; F16 rounds the ones wider than its mantissa.

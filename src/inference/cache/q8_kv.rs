@@ -1009,6 +1009,27 @@ impl Q8KvCache {
         )
     }
 
+    /// What the card of this cache holds when `rows` prompt rows over its history run out of
+    /// memory: the driver's free bytes, the pool's live and cached bytes, the cache's own
+    /// buffers and the F16 K and V of the whole history.
+    pub fn pressure_report(&self, rows: usize) -> String {
+        let card = self.cuda_device.ordinal();
+        let free = crate::inference::place::vram_manager::free_on(card).unwrap_or(0);
+        let (reserved, used) = crate::tensor::cuda::pool_use(card);
+        let history = 2 * self.core.len() * self.n_kv_heads * self.head_dim * 2;
+        format!(
+            "card {card}: {} MB free, pool {} MB live and {} MB cached, \
+             cache {} of {} positions in {} MB, {rows} rows over a history whose F16 K and V take {} MB",
+            free >> 20,
+            used >> 20,
+            reserved.saturating_sub(used) >> 20,
+            self.core.len(),
+            self.core.cap(),
+            self.raw_bytes(self.core.cap()) >> 20,
+            history >> 20
+        )
+    }
+
     /// Bytes one position takes in each of the K and V buffers.
     fn token_bytes(&self) -> usize {
         self.n_kv_heads * (self.head_dim / Q8_0_BLOCK_SIZE) * Q8_0_TYPE_SIZE
@@ -1086,23 +1107,101 @@ impl Q8KvCache {
     /// The current K and V history dequantized to F16, as `[1, n_kv_heads, seq, head_dim]`
     /// views over the stored `[seq, n_kv_heads, head_dim]` order (strided, not copied).
     pub fn dequantize_kv_f16_views(&self) -> Result<(Tensor, Tensor)> {
-        use crate::inference::quantized_cuda::dequantize_q8_0_blob_f16;
-
         let seq = self.core.len();
         if seq == 0 {
             return Err(anyhow!(
                 "Q8KvCache::dequantize_kv_f16_views: cache is empty"
             ));
         }
-        let elem_count = seq * self.n_kv_heads * self.head_dim;
-        let k_f16 = dequantize_q8_0_blob_f16(&self.k_q8, elem_count, &self.cuda_device)
-            .map_err(|e| anyhow!("Q8KvCache: K dequantize: {e}"))?;
-        let v_f16 = dequantize_q8_0_blob_f16(&self.v_q8, elem_count, &self.cuda_device)
-            .map_err(|e| anyhow!("Q8KvCache: V dequantize: {e}"))?;
-        let shape = (1, seq, self.n_kv_heads, self.head_dim);
+        self.dequantize_range_f16_views(0, seq)
+    }
+
+    /// Positions `start..start + len` of the history dequantized to F16, as
+    /// [`Self::dequantize_kv_f16_views`] gives the whole history.
+    fn dequantize_range_f16_views(&self, start: usize, len: usize) -> Result<(Tensor, Tensor)> {
+        use crate::inference::quantized_cuda::dequantize_q8_0_view_f16;
+
+        let tb = self.token_bytes();
+        let range = start * tb..(start + len) * tb;
+        let elem_count = len * self.n_kv_heads * self.head_dim;
+        let k_f16 = dequantize_q8_0_view_f16(
+            &self.k_q8.slice(range.clone()),
+            elem_count,
+            &self.cuda_device,
+        )
+        .map_err(|e| anyhow!("Q8KvCache: K dequantize: {e}"))?;
+        let v_f16 =
+            dequantize_q8_0_view_f16(&self.v_q8.slice(range), elem_count, &self.cuda_device)
+                .map_err(|e| anyhow!("Q8KvCache: V dequantize: {e}"))?;
+        let shape = (1, len, self.n_kv_heads, self.head_dim);
         let k = tensor_from_cuda_storage(k_f16, shape)?.permute((0, 2, 1, 3))?;
         let v = tensor_from_cuda_storage(v_f16, shape)?.permute((0, 2, 1, 3))?;
         Ok((k, v))
+    }
+
+    /// Positions of the history that `rows` prompt rows of `n_head` query heads read back to
+    /// F16 at once; 0 when the card has no kernel that walks a history in tiles.
+    pub fn history_tile(&self, rows: usize, n_head: usize) -> usize {
+        use crate::inference::kernel::fused::{
+            flash_prefill_gqa_carry_floats, flash_prefill_gqa_keys_per_tile,
+        };
+        match flash_prefill_gqa_carry_floats(self.head_dim) {
+            0 => 0,
+            carry_floats => super::history_tile(
+                rows,
+                n_head,
+                self.n_kv_heads,
+                self.head_dim,
+                carry_floats,
+                flash_prefill_gqa_keys_per_tile(),
+            ),
+        }
+    }
+
+    /// The causal attention of the prompt rows `q` `[1, n_head, seq_q, hd]`, the last `seq_q`
+    /// positions of the history, over the whole history, as `[1, seq_q, n_head * hd]` F32.
+    ///
+    /// The history is read back to F16 one tile of [`Self::history_tile`] positions at a time.
+    /// The F16 copy then follows the rows, not the history.
+    /// The result has the bits of one flash call over the whole history read back at once.
+    /// `None` when the card has no kernel for the shape: nothing was computed.
+    pub fn flash_prefill_tiled(&self, q: &Tensor, scale: f32) -> Result<Option<Tensor>> {
+        use crate::inference::kernel::fused::{
+            flash_prefill_gqa_carry, flash_prefill_gqa_carry_floats,
+        };
+        let seq_kv = self.core.len();
+        let (_, n_head, seq_q, hd) = q.dims4()?;
+        let tile = self.history_tile(seq_q, n_head);
+        if tile == 0 || seq_q > seq_kv {
+            return Ok(None);
+        }
+        let q = q.to_dtype(DType::F32)?.contiguous()?;
+        let dev = q.device();
+        let carry_len = seq_q * n_head * flash_prefill_gqa_carry_floats(hd);
+        let carry = unsafe { Tensor::empty((carry_len,), DType::F32, &dev)? };
+        let out = unsafe { Tensor::empty((1, seq_q, n_head * hd), DType::F32, &dev)? };
+        let first_row = (seq_kv - seq_q) as i64;
+        let mut start = 0;
+        while start < seq_kv {
+            let len = tile.min(seq_kv - start);
+            let last = start + len == seq_kv;
+            let (k, v) = self.dequantize_range_f16_views(start, len)?;
+            let ran = flash_prefill_gqa_carry(
+                &q,
+                &k,
+                &v,
+                scale,
+                first_row - start as i64,
+                &carry,
+                last.then_some(&out),
+                start > 0,
+            )?;
+            if !ran {
+                return Ok(None);
+            }
+            start += len;
+        }
+        Ok(Some(out))
     }
 
     /// Compute `attn_out = probs @ V` for the current V cache.
@@ -1781,6 +1880,47 @@ mod dev_pos_tests {
         let v_full = Tensor::randn(0.0f32, 1.0, (1, n_kv_heads, seq_kv, head_dim), dev).unwrap();
         cache.append(&k_full, &v_full).expect("Q8KvCache::append");
         (cache, k_full, v_full)
+    }
+
+    /// Prompt rows over a history of several tiles attend, a tile at a time, to the bits one
+    /// flash call over the whole history read back at once gives.
+    #[test]
+    fn tiled_prefill_matches_the_whole_history_read_back() {
+        let Some(dev) = try_open_cuda() else {
+            eprintln!("skipping: no usable CUDA device");
+            return;
+        };
+        let (n_kv, hd, n_head) = (2usize, 256usize, 16usize);
+        let scale = 1.0 / (hd as f32).sqrt();
+        for rows in [3usize, 40] {
+            let probe = Q8KvCache::new(64, n_kv, hd, &dev).unwrap();
+            let tile = probe.history_tile(rows, n_head);
+            if tile == 0 {
+                eprintln!("skipping: no tiled kernel on this card");
+                return;
+            }
+            // 2 whole tiles and part of a third, the prompt rows at the end of the history.
+            let seq_kv = 2 * tile + tile / 2 + 7;
+            let (cache, _, _) = build_filled_cache(seq_kv, n_kv, hd, &dev);
+            let q = Tensor::randn(0f32, 1.0, (1, n_head, rows, hd), &dev).unwrap();
+            let Some(tiled) = cache.flash_prefill_tiled(&q, scale).unwrap() else {
+                eprintln!("skipping: no tiled kernel for this shape on this card");
+                return;
+            };
+            let (k, v) = cache.dequantize_kv_f16_views().unwrap();
+            let whole = crate::inference::kernel::fused::flash_prefill_gqa(&q, &k, &v, scale, 0)
+                .unwrap()
+                .expect("a card with the kernel attends the whole history");
+            let bits = |t: &Tensor| -> Vec<u32> {
+                let values: Vec<f32> = t.flatten_all().unwrap().to_vec1().unwrap();
+                values.iter().map(|x| x.to_bits()).collect()
+            };
+            assert_eq!(
+                bits(&tiled),
+                bits(&whole),
+                "{rows} rows over {seq_kv} positions"
+            );
+        }
     }
 
     /// The q8_1 row the split-K combine leaves for the output projection is the row the

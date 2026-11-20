@@ -288,6 +288,18 @@ extern "C" int loken_flash_prefill_gqa_parts_f16kv(const void* Q, const void* K,
                     kv_head_stride, scale, 0, pos_off, stream_i64);
 }
 
+// The walk over a history in tiles has no AMD build: it reports an unsupported shape and the
+// caller attends over the whole history at once.
+extern "C" int loken_flash_prefill_gqa_carry_f16kv(const void*, const void*, const void*, void*,
+                                                   float*, int, int, int, int, int, long long,
+                                                   long long, float, int, int, long long) {
+    return 1;
+}
+
+extern "C" int loken_flash_prefill_gqa_keys_per_tile() { return 1; }
+
+extern "C" int loken_flash_prefill_gqa_carry_floats(int) { return 0; }
+
 namespace {
 template <bool OUT_F16>
 int varlen(const void* Q, const void* K, const void* V, void* O, const int* starts,

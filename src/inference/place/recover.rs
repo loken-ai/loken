@@ -26,7 +26,10 @@ pub fn shrink_on_oom<T, E: std::fmt::Display>(
             Err(e) if !is_out_of_memory(&e) => return Err(e),
             Err(e) => match smaller(size) {
                 Some(next) if next < size => {
-                    tracing::warn!("{what}: out of memory at {size} ({e}); retrying at {next}");
+                    tracing::warn!(
+                        "{what}: out of memory at {size} ({e}); retrying at {next}; {}",
+                        super::device_probe::card_memory_report()
+                    );
                     size = next;
                 }
                 _ if !asked_for_room && make_room(size) => {

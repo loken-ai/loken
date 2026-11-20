@@ -1953,10 +1953,11 @@ impl HybridStateCache {
                     let secs = started.elapsed().as_secs_f64();
                     self.store.tuning().restored(bytes, secs);
                     tracing::info!(
-                        "state cache: restored {} tokens ({} MiB) in {:.2} s",
+                        "state cache: restored {} tokens ({} MiB) in {:.2} s; {}",
                         entry.len,
                         bytes >> 20,
-                        secs
+                        secs,
+                        crate::inference::place::device_probe::card_memory_report()
                     );
                     return entry.len;
                 }

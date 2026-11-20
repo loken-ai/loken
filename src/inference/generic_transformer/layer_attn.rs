@@ -2069,6 +2069,9 @@ impl GenericTransformerLayer {
             && n_head.is_multiple_of(n_kv_head);
         #[cfg(feature = "gpu")]
         let mut flash_kv = false;
+        // The prompt's rows attend over the Q8 history one tile of positions at a time.
+        #[cfg(feature = "gpu")]
+        let mut flash_tiled = false;
         #[cfg(feature = "gpu")]
         // A cache cut over several cards holds the history: the rows go to the range they fall
         // in, and each range's part of the attention is combined on this card.
@@ -2160,6 +2163,20 @@ impl GenericTransformerLayer {
                             crate::tensor::Error::msg("dual-populate: kv_cache empty after append")
                         })?
                     }
+                    // A history longer than one tile is read back a tile at a time by the
+                    // attention below, so its F16 copy follows the prompt's rows.
+                    Ok(())
+                        if seq > 1
+                            && flash_prefill_ok
+                            && self.prefill_mask_window.is_none()
+                            && self.q8_kv().is_some_and(|c| {
+                                let tile = c.history_tile(seq, n_head);
+                                tile > 0 && c.current_seq_len() > tile
+                            }) =>
+                    {
+                        flash_tiled = true;
+                        (k, v)
+                    }
                     Ok(()) if seq > 1 && flash_prefill_ok && self.q8_kv().is_some() => {
                         match self.q8_kv().unwrap().dequantize_kv_f16_views() {
                             Ok(kv) => {
@@ -2168,6 +2185,12 @@ impl GenericTransformerLayer {
                             }
                             Err(e) => {
                                 if let Some(oom) = kept_under_pressure("dequantize", &e) {
+                                    if let Some(c) = self.q8_kv() {
+                                        tracing::warn!(
+                                            "prefill attention out of memory: {}",
+                                            c.pressure_report(seq)
+                                        );
+                                    }
                                     return Err(oom);
                                 }
                                 tracing::warn!(
@@ -2331,6 +2354,45 @@ impl GenericTransformerLayer {
         {
             true => (k.narrow(2, 0, kv_len)?, v.narrow(2, 0, kv_len)?),
             false => (k, v),
+        };
+        #[cfg(feature = "gpu")]
+        let (k, v, flash_kv) = if flash_tiled {
+            let scale = self
+                .attention_scale
+                .unwrap_or_else(|| 1.0 / (self.head_dim as f64).sqrt());
+            let cache = self.q8_kv().unwrap();
+            let tiled =
+                cache.flash_prefill_tiled(&q, scale as f32).map_err(
+                    |e| match kept_under_pressure("dequantize", &e) {
+                        Some(oom) => {
+                            tracing::warn!(
+                                "prefill attention out of memory: {}",
+                                cache.pressure_report(seq)
+                            );
+                            oom
+                        }
+                        None => crate::tensor::Error::msg(format!("Q8 tiled prefill: {e}")),
+                    },
+                )?;
+            match tiled {
+                Some(y) => {
+                    let y = if y.dtype() == q.dtype() {
+                        y
+                    } else {
+                        y.to_dtype(q.dtype())?
+                    };
+                    return Ok((y, false));
+                }
+                // No kernel for the shape: the whole history is read back at once.
+                None => {
+                    let (k, v) = cache
+                        .dequantize_kv_f16_views()
+                        .map_err(|e| crate::tensor::Error::msg(format!("{e}")))?;
+                    (k, v, true)
+                }
+            }
+        } else {
+            (k, v, flash_kv)
         };
         #[cfg(feature = "gpu")]
         let (k, v) = if flash_kv {

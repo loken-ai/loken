@@ -38,6 +38,26 @@ crate::tensor::gpu_runtime::aot_kernels! {
             pos_off: i32,
             stream: i64,
         ) -> i32;
+        fn loken_flash_prefill_gqa_carry_f16kv(
+            q: *const c_void,
+            k: *const c_void,
+            v: *const c_void,
+            o: *mut c_void,
+            c: *mut f32,
+            n_head: i32,
+            n_kv: i32,
+            seq_q: i32,
+            seq_kv: i32,
+            head_dim: i32,
+            kv_tok_stride: i64,
+            kv_head_stride: i64,
+            scale: f32,
+            pos_off: i32,
+            carry: i32,
+            stream: i64,
+        ) -> i32;
+        fn loken_flash_prefill_gqa_keys_per_tile() -> i32;
+        fn loken_flash_prefill_gqa_carry_floats(head_dim: i32) -> i32;
         fn loken_flash_prefill_gqa_varlen_f16kv(
             q: *const c_void,
             k: *const c_void,
@@ -136,6 +156,161 @@ pub fn flash_prefill_gqa_parts(
     let (max, sum) = (ml.narrow(3, 0, 1)?, ml.narrow(3, 1, 1)?);
     let out = heads_first(out, hd)?.broadcast_mul(&sum)?;
     Ok(Some((max, sum, out)))
+}
+
+/// Keys the flash prefill kernel stages per tile.
+/// A walk of [`flash_prefill_gqa_carry`] calls cuts the history at multiples of it.
+pub fn flash_prefill_gqa_keys_per_tile() -> usize {
+    let keys = unsafe { loken_flash_prefill_gqa_keys_per_tile() };
+    usize::try_from(keys).unwrap_or(1).max(1)
+}
+
+/// F32 values one query row of one head carries between calls of [`flash_prefill_gqa_carry`].
+pub fn flash_prefill_gqa_carry_floats(head_dim: usize) -> usize {
+    let floats = unsafe { loken_flash_prefill_gqa_carry_floats(head_dim as i32) };
+    usize::try_from(floats).unwrap_or(0)
+}
+
+/// One call of a walk over a history in ranges of keys, in order.
+///
+/// `q` is contiguous F32 `[1, n_head, seq_q, hd]`.
+/// `k` and `v` hold the range's keys as [`flash_prefill_gqa`] reads them.
+/// Token i attends key j of the range iff `j <= i + pos_off`.
+/// `carry` is F32 with [`flash_prefill_gqa_carry_floats`] values per row and head.
+/// With `resume` the rows start from the state in `carry`, else afresh.
+/// With `out` the call is the last: it writes the output `[1, seq_q, n_head * hd]` F32 there.
+/// Without it the call leaves the rows' state in `carry`.
+/// Every call but the last covers a multiple of [`flash_prefill_gqa_keys_per_tile`] keys.
+/// The walk then gives the bits one [`flash_prefill_gqa`] call over the whole history gives.
+/// False when the shape, dtype or device has no kernel.
+#[allow(clippy::too_many_arguments)]
+pub fn flash_prefill_gqa_carry(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    scale: f32,
+    pos_off: i64,
+    carry: &Tensor,
+    out: Option<&Tensor>,
+    resume: bool,
+) -> Result<bool> {
+    use crate::tensor::cuda_ext::DevicePtr;
+    use crate::tensor::StorageView::Cuda as C;
+    let Ok(pos_off) = i32::try_from(pos_off) else {
+        return Ok(false);
+    };
+    if !q.device().is_cuda()
+        || !(q.device().is_nvidia() || q.device().as_cuda_device()?.has_bf16_matrix_cores())
+        || q.dtype() != DType::F32
+        || !q.is_contiguous()
+        || k.dtype() != DType::F16
+        || v.dtype() != DType::F16
+        || carry.dtype() != DType::F32
+        || !carry.is_contiguous()
+    {
+        return Ok(false);
+    }
+    let (b, n_head, seq_q, hd) = q.dims4()?;
+    let (bk, n_kv, seq_kv, hdk) = k.dims4()?;
+    let rows = seq_q * n_head;
+    if b != 1
+        || bk != 1
+        || hd != hdk
+        || v.dims() != k.dims()
+        || !FLASH_PREFILL_GQA_HEAD_DIMS.contains(&hd)
+        || n_kv == 0
+        || !n_head.is_multiple_of(n_kv)
+        || seq_q == 0
+        || seq_kv == 0
+        || i32::try_from(seq_kv).is_err()
+        || carry.elem_count() != rows * flash_prefill_gqa_carry_floats(hd)
+        || out.is_some_and(|o| {
+            o.dtype() != DType::F32 || !o.is_contiguous() || o.elem_count() != rows * hd
+        })
+    {
+        return Ok(false);
+    }
+    let dev = q.device().as_cuda_device()?;
+    dev.cuda_stream()
+        .context()
+        .bind_to_thread()
+        .map_err(|e| crate::tensor::Error::msg(format!("flash_prefill_gqa bind: {e}")))?;
+    let stream = dev.cuda_stream().cu_stream() as i64;
+    let (qs, ql) = q.storage_and_layout();
+    let (ks, kl) = k.storage_and_layout();
+    let (vs, vl) = v.storage_and_layout();
+    let (cs, cl) = carry.storage_and_layout();
+    let (kst, vst) = (kl.stride(), vl.stride());
+    if kst != vst || kst[3] != 1 {
+        return Ok(false);
+    }
+    let (head_stride, tok_stride) = (kst[1], kst[2]);
+    if [
+        head_stride,
+        tok_stride,
+        kl.start_offset(),
+        vl.start_offset(),
+    ]
+    .iter()
+    .any(|s| s % F16_PER_CP_ASYNC != 0)
+    {
+        return Ok(false);
+    }
+    let (C(qc), C(kc), C(vc), C(cc)) = (&*qs, &*ks, &*vs, &*cs) else {
+        return Ok(false);
+    };
+    let f32_ptr = |c: &crate::tensor::cuda_ext::CudaStorage, offset: usize| -> Result<u64> {
+        let s = c.as_cuda_slice::<f32>()?;
+        Ok(s.device_ptr(s.stream()).0 + (offset * 4) as u64)
+    };
+    let ksl = kc.as_cuda_slice::<half::f16>()?;
+    let vsl = vc.as_cuda_slice::<half::f16>()?;
+    let qp = f32_ptr(qc, ql.start_offset())? as *const c_void;
+    let kp = (ksl.device_ptr(ksl.stream()).0 + (kl.start_offset() * 2) as u64) as *const c_void;
+    let vp = (vsl.device_ptr(vsl.stream()).0 + (vl.start_offset() * 2) as u64) as *const c_void;
+    let cp = f32_ptr(cc, cl.start_offset())? as *mut f32;
+    // A call that writes no output is handed the carry as its output pointer, which it never
+    // writes through.
+    let out_storage = out.map(|o| o.storage_and_layout());
+    let op = match &out_storage {
+        Some((os, ol)) => {
+            let C(oc) = &**os else {
+                return Ok(false);
+            };
+            f32_ptr(oc, ol.start_offset())? as *mut c_void
+        }
+        None => cp as *mut c_void,
+    };
+    let mode = i32::from(resume) | (i32::from(out.is_none()) << 1);
+    let rc = unsafe {
+        loken_flash_prefill_gqa_carry_f16kv(
+            qp,
+            kp,
+            vp,
+            op,
+            cp,
+            n_head as i32,
+            n_kv as i32,
+            seq_q as i32,
+            seq_kv as i32,
+            hd as i32,
+            tok_stride as i64,
+            head_stride as i64,
+            scale,
+            pos_off,
+            mode,
+            stream,
+        )
+    };
+    drop((qs, ks, vs, cs, out_storage));
+    match rc {
+        0 => Ok(true),
+        // Unsupported head size or device: the caller keeps its own path.
+        1 | 2 => Ok(false),
+        e => Err(crate::tensor::Error::msg(format!(
+            "flash_prefill_gqa launch failed ({e})"
+        ))),
+    }
 }
 
 /// Causal GQA prefill attention of several sequences laid end to end, each over its own tokens

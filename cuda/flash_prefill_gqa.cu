@@ -27,6 +27,12 @@ namespace {
 constexpr int BN   = 64;  // keys per tile
 constexpr int KPAD = 8;   // halfs of padding per smem row (bank-conflict-free fragment loads)
 
+// A carried row state: HD unscaled output values, the 4 per-thread partial sums of the
+// quad that owns the row, its running maximum, and padding to a 16-byte multiple.
+constexpr int CARRY_EXTRA = 8;
+constexpr int CARRY_IN    = 1;  // the rows resume from C
+constexpr int CARRY_OUT   = 2;  // the rows leave their state in C instead of writing O
+
 __device__ __forceinline__ void mma_16816(float c[4], const uint32_t a[4], uint32_t b0, uint32_t b1) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     asm volatile(
@@ -66,6 +72,12 @@ __device__ __forceinline__ void cp_async_wait_1() {
 #endif
 }
 
+__device__ __forceinline__ void cp_async_wait_all() {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    asm volatile("cp.async.wait_all;\n" ::);
+#endif
+}
+
 __device__ __forceinline__ uint32_t pack_half2(float lo, float hi) {
     __half2 h = __floats2half2_rn(lo, hi);
     return *reinterpret_cast<uint32_t*>(&h);
@@ -96,7 +108,7 @@ flash_prefill_gqa_kernel(const float* __restrict__ Q, const half* __restrict__ K
                          int n_head, int n_kv, int seq_q, int seq_kv, long long q_head_stride,
                          long long kv_tok_stride, long long kv_head_stride,
                          float scale_log2, int window, int pos_off,
-                         float* __restrict__ ML) {
+                         float* __restrict__ ML, float* __restrict__ C, int carry) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     constexpr int NT = NW * 32;
     constexpr int BM = NW * 16;
@@ -172,6 +184,22 @@ flash_prefill_gqa_kernel(const float* __restrict__ Q, const half* __restrict__ K
     for (int n = 0; n < ON; ++n) o[n][0] = o[n][1] = o[n][2] = o[n][3] = 0.f;
     float m_run[2] = {-INFINITY, -INFINITY};
     float l_run[2] = {0.f, 0.f};
+    // A carried state resumes the rows where the call over the keys before these left them.
+    if (carry & CARRY_IN) {
+        #pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            if (!r_ok[h]) continue;
+            const float* c = C + ((long long)r_tok[h] * n_head + r_head[h]) * (HD + CARRY_EXTRA);
+            #pragma unroll
+            for (int n = 0; n < ON; ++n) {
+                const float2 v = *reinterpret_cast<const float2*>(c + n * 8 + 2 * tq);
+                o[n][2 * h] = v.x;
+                o[n][2 * h + 1] = v.y;
+            }
+            l_run[h] = c[HD + tq];
+            m_run[h] = c[HD + 4];
+        }
+    }
 
     const half* Kb = K + (long long)kvh * kv_head_stride;
     const half* Vb = V + (long long)kvh * kv_head_stride;
@@ -283,6 +311,8 @@ flash_prefill_gqa_kernel(const float* __restrict__ Q, const half* __restrict__ K
         if (more) load_tile<HD, NT>(Vs, Vb, t0 + BN, seq_kv, kv_tok_stride, tid);
         cp_async_commit();
     }
+    // A CTA whose rows precede every key ran no tile: its first loads land before it exits.
+    cp_async_wait_all();
 
     #pragma unroll
     for (int h = 0; h < 2; ++h) {
@@ -290,6 +320,18 @@ flash_prefill_gqa_kernel(const float* __restrict__ Q, const half* __restrict__ K
         l += __shfl_xor_sync(0xffffffff, l, 1);
         l += __shfl_xor_sync(0xffffffff, l, 2);
         if (!r_ok[h]) continue;
+        // A state carried on keeps its sums per thread and its values unscaled.
+        if (carry & CARRY_OUT) {
+            float* c = C + ((long long)r_tok[h] * n_head + r_head[h]) * (HD + CARRY_EXTRA);
+            #pragma unroll
+            for (int n = 0; n < ON; ++n) {
+                *reinterpret_cast<float2*>(c + n * 8 + 2 * tq) =
+                    make_float2(o[n][2 * h], o[n][2 * h + 1]);
+            }
+            c[HD + tq] = l_run[h];
+            if (tq == 0) c[HD + 4] = m_run[h];
+            continue;
+        }
         const float inv = l > 0.f ? 1.f / l : 0.f;
         // The row's maximum score, back from base 2, and its sum, for a caller merging ranges.
         if (ML != nullptr && tq == 0) {
@@ -321,7 +363,7 @@ template <int HD, int NW, bool OUT_F16>
 int launch(const float* Q, const half* K, const half* V, void* O, int n_head, int n_kv,
            int seq_q, int seq_kv, long long q_head_stride, long long tok_stride,
            long long head_stride, float scale,
-           int window, int pos_off, float* ML, cudaStream_t stream) {
+           int window, int pos_off, float* ML, float* C, int carry, cudaStream_t stream) {
     constexpr int BM = NW * 16;
     const size_t smem = 2 * (size_t)BN * (HD + KPAD) * sizeof(half);
     auto kern = flash_prefill_gqa_kernel<HD, NW, OUT_F16>;
@@ -335,7 +377,7 @@ int launch(const float* Q, const half* K, const half* V, void* O, int n_head, in
     // The check below reads this launch's error, not one an earlier call left on the thread.
     (void) cudaGetLastError();
     kern<<<grid, NW * 32, smem, stream>>>(Q, K, V, O, n_head, n_kv, seq_q, seq_kv, q_head_stride, tok_stride,
-                                          head_stride, scale * log2e, window, pos_off, ML);
+                                          head_stride, scale * log2e, window, pos_off, ML, C, carry);
     return cudaGetLastError() == cudaSuccess ? 0 : 4;
 }
 
@@ -346,7 +388,7 @@ template <bool OUT_F16>
 int dispatch(const void* Q, const void* K, const void* V, void* O, float* ML, int n_head,
              int n_kv, int seq_q, int seq_kv, int head_dim, long long q_head_stride,
              long long kv_tok_stride, long long kv_head_stride, float scale, int window, int pos_off,
-             long long stream_i64) {
+             float* C, int carry, long long stream_i64) {
     int dev = 0, major = 0;
     cudaGetDevice(&dev);
     cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
@@ -359,15 +401,15 @@ int dispatch(const void* Q, const void* K, const void* V, void* O, float* ML, in
     switch (head_dim) {
         case 64:
             return launch<64, 4, OUT_F16>(q, k, v, o, n_head, n_kv, seq_q, seq_kv, q_head_stride, kv_tok_stride,
-                                 kv_head_stride, scale, window, pos_off, ML, stream);
+                                 kv_head_stride, scale, window, pos_off, ML, C, carry, stream);
         case 128:
             return launch<128, 4, OUT_F16>(q, k, v, o, n_head, n_kv, seq_q, seq_kv, q_head_stride, kv_tok_stride,
-                                  kv_head_stride, scale, window, pos_off, ML, stream);
+                                  kv_head_stride, scale, window, pos_off, ML, C, carry, stream);
         case 256:
             // Half the warps of the narrower sizes: the O accumulator and the Q fragments of a
             // 256-wide head fill the register file at four warps' worth of rows.
             return launch<256, 2, OUT_F16>(q, k, v, o, n_head, n_kv, seq_q, seq_kv, q_head_stride, kv_tok_stride,
-                                  kv_head_stride, scale, window, pos_off, ML, stream);
+                                  kv_head_stride, scale, window, pos_off, ML, C, carry, stream);
         default:
             return 1;
     }
@@ -381,7 +423,7 @@ extern "C" int loken_flash_prefill_gqa_f16kv(
     int seq_kv, int head_dim, long long kv_tok_stride, long long kv_head_stride, float scale,
     int window, long long stream_i64) {
     return dispatch<false>(Q, K, V, O, nullptr, n_head, n_kv, seq_q, seq_kv, head_dim, seq_q, kv_tok_stride,
-                    kv_head_stride, scale, window, seq_kv - seq_q, stream_i64);
+                    kv_head_stride, scale, window, seq_kv - seq_q, nullptr, 0, stream_i64);
 }
 
 // The same attention over keys whose positions start `pos_off` before the first query
@@ -392,8 +434,29 @@ extern "C" int loken_flash_prefill_gqa_parts_f16kv(
     int seq_q, int seq_kv, int head_dim, long long kv_tok_stride, long long kv_head_stride,
     float scale, int pos_off, long long stream_i64) {
     return dispatch<false>(Q, K, V, O, ML, n_head, n_kv, seq_q, seq_kv, head_dim, seq_q, kv_tok_stride,
-                    kv_head_stride, scale, 0, pos_off, stream_i64);
+                    kv_head_stride, scale, 0, pos_off, nullptr, 0, stream_i64);
 }
+
+// The attention of the same rows over keys [s, s + seq_kv) of a longer history, positions as
+// in `loken_flash_prefill_gqa_parts_f16kv`, for calls that walk the history in order.
+// `carry` bit 1 resumes each row from its state in `C`.
+// `carry` bit 2 leaves each row's state in `C` and writes nothing to `O`.
+// `C` holds F32 `[seq_q, n_head, loken_flash_prefill_gqa_carry_floats(head_dim)]`.
+// Every call but the last covers a whole number of `loken_flash_prefill_gqa_keys_per_tile()`
+// keys: the walk then adds the same terms in the same order as one call over the history.
+extern "C" int loken_flash_prefill_gqa_carry_f16kv(
+    const void* Q, const void* K, const void* V, void* O, float* C, int n_head, int n_kv,
+    int seq_q, int seq_kv, int head_dim, long long kv_tok_stride, long long kv_head_stride,
+    float scale, int pos_off, int carry, long long stream_i64) {
+    return dispatch<false>(Q, K, V, O, nullptr, n_head, n_kv, seq_q, seq_kv, head_dim, seq_q, kv_tok_stride,
+                    kv_head_stride, scale, 0, pos_off, C, carry, stream_i64);
+}
+
+// Keys one tile of the kernel stages.
+extern "C" int loken_flash_prefill_gqa_keys_per_tile() { return BN; }
+
+// F32 values one row's carried state takes for a head of `head_dim` values.
+extern "C" int loken_flash_prefill_gqa_carry_floats(int head_dim) { return head_dim + CARRY_EXTRA; }
 
 namespace {
 template <bool OUT_F16>
@@ -409,7 +472,7 @@ int varlen(const void* Q, const void* K, const void* V, void* O, const int* star
                                          (const half*) V + t0 * kv_tok_stride,
                                          (char*) O + t0 * n_head * head_dim * out_bytes, nullptr,
                                          n_head, n_kv, lens[i], lens[i], head_dim, q_head_stride,
-                                         kv_tok_stride, kv_head_stride, scale, 0, 0, stream_i64);
+                                         kv_tok_stride, kv_head_stride, scale, 0, 0, nullptr, 0, stream_i64);
         if (rc != 0) return rc;
     }
     return 0;
