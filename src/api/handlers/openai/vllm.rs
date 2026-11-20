@@ -682,13 +682,111 @@ pub(crate) async fn reset_prefix_cache(State(state): State<APIServer>) -> Json<s
     Json(serde_json::json!({ "success": true }))
 }
 
+/// The texts of an `input`: a string, a list of strings, or a list of objects with a
+/// `"text"` field.
+fn texts_of(input: Option<&serde_json::Value>) -> Result<Vec<String>, String> {
+    let item = |(i, v): (usize, &serde_json::Value)| match v {
+        serde_json::Value::String(s) => Ok(s.clone()),
+        serde_json::Value::Object(o) => o
+            .get("text")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| format!("`input[{i}]` has no `text`")),
+        _ => Err(format!(
+            "`input[{i}]` is neither a string nor an object with `text`"
+        )),
+    };
+    match input {
+        Some(serde_json::Value::String(s)) => Ok(vec![s.clone()]),
+        Some(serde_json::Value::Array(a)) if !a.is_empty() => {
+            a.iter().enumerate().map(item).collect()
+        }
+        Some(serde_json::Value::Array(_)) => Err("`input` is empty".into()),
+        _ => Err("`input` is a string or a list".into()),
+    }
+}
+
+/// One L2-normalized vector per token for each text of the body's `input`, with the total
+/// number of vectors.
+async fn token_vectors(
+    state: &APIServer,
+    body: &serde_json::Value,
+) -> Result<(Vec<Vec<Vec<f32>>>, usize), ApiError> {
+    let model = body
+        .get("model")
+        .and_then(serde_json::Value::as_str)
+        .filter(|m| !m.is_empty())
+        .ok_or_else(|| invalid("`model` is required"))?;
+    let texts = texts_of(body.get("input")).map_err(invalid)?;
+    let engine = state.get_engine(model).await?;
+    state.reset_expiration(model).await;
+    let mut all = Vec::with_capacity(texts.len());
+    for (i, text) in texts.iter().enumerate() {
+        let vectors = engine
+            .generate_token_embeddings(text)
+            .await
+            .map_err(|e| ApiError::Internal(format!("token embeddings of input {i}: {e}")))?;
+        all.push(vectors);
+    }
+    let total = all.iter().map(Vec::len).sum();
+    Ok((all, total))
+}
+
+/// Jina's multi-vector route: one vector per token for each input,
+/// `{model, object: "list", data: [{index, object: "embeddings", embeddings}], usage}`.
+pub(crate) async fn multi_vector(
+    State(state): State<APIServer>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Response, ApiError> {
+    let (all, total) = token_vectors(&state, &body).await?;
+    let data: Vec<serde_json::Value> = all
+        .into_iter()
+        .enumerate()
+        .map(|(index, embeddings)| {
+            serde_json::json!({"index": index, "object": "embeddings", "embeddings": embeddings})
+        })
+        .collect();
+    Ok(Json(serde_json::json!({
+        "model": body["model"],
+        "object": "list",
+        "data": data,
+        "usage": {"total_tokens": total},
+    }))
+    .into_response())
+}
+
 /// vLLM's `/pooling`: the pooled output of an embedding model, `{data: [{index, object:
 /// "pooling", data}]}`, from the embeddings route.
+///
+/// The task `token_embed` answers one vector per token for each input instead.
 pub(crate) async fn pooling(
     State(state): State<APIServer>,
     headers: axum::http::HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> Response {
+    if body.get("task").and_then(serde_json::Value::as_str) == Some("token_embed") {
+        return match token_vectors(&state, &body).await {
+            Ok((all, total)) => {
+                let data: Vec<serde_json::Value> = all
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, data)| {
+                        serde_json::json!({"index": index, "object": "pooling", "data": data})
+                    })
+                    .collect();
+                Json(serde_json::json!({
+                    "id": format!("pool-{}", uuid::Uuid::new_v4()),
+                    "object": "list",
+                    "created": crate::timestamp::now_secs(),
+                    "model": body["model"],
+                    "data": data,
+                    "usage": {"prompt_tokens": total, "total_tokens": total},
+                }))
+                .into_response()
+            }
+            Err(e) => e.into_response(),
+        };
+    }
     let mut adapted = body.clone();
     adapted["encoding_format"] = serde_json::json!("float");
     let resp = openai_embeddings(State(state), headers, Json(adapted)).await;
@@ -1047,5 +1145,20 @@ mod tests {
         tokens_as_ids(&mut lps);
         assert_eq!(lps[0].text, "token_id:7");
         assert_eq!(lps[0].top[0].1, "token_id:9");
+    }
+
+    /// Every shape of `input` the 2 token routes take, and the shapes they refuse.
+    #[test]
+    fn token_routes_read_their_input() {
+        use serde_json::json;
+        let texts = |v: serde_json::Value| texts_of(Some(&v));
+        assert_eq!(texts(json!("a")).unwrap(), vec!["a"]);
+        assert_eq!(texts(json!(["a", "b"])).unwrap(), vec!["a", "b"]);
+        assert_eq!(texts(json!([{"text": "a"}, "b"])).unwrap(), vec!["a", "b"]);
+        assert!(texts(json!([])).is_err());
+        assert!(texts(json!([42])).is_err());
+        assert!(texts(json!([{"image": "x"}])).is_err());
+        assert!(texts(json!(7)).is_err());
+        assert!(texts_of(None).is_err());
     }
 }

@@ -44,7 +44,8 @@ With `[server] require_auth` on, every route needs a key, as `Authorization: Bea
 | `POST /v2/rerank` | Cohere's shape. `documents` are strings or `{text}` objects, with `top_n` and `return_documents`. Answers `{id, results, meta}`. |
 | `POST /v2/embed` | Cohere's shape. Takes exactly 1 of `texts`, `images` (data URIs) or `inputs` (`content` lists of `text` and `image_url` parts), and `output_dimension`. Answers `embeddings.float`, `embeddings.base64`, `embeddings.int8`, `embeddings.uint8`, `embeddings.binary`, `embeddings.ubinary` as `embedding_types` asks, `float` by default. Images need a CLIP or SigLIP model. |
 | `POST /score`, `POST /v1/score` | vLLM's pair scoring: `text_1` against `text_2`, 1 score per pair in `data[].score`. |
-| `POST /pooling` | vLLM's pooling shape over the embeddings route. `data[].data` is the pooled vector. |
+| `POST /pooling` | vLLM's pooling shape over the embeddings route. `data[].data` is the pooled vector. Also supports `task: "token_embed"` for one vector per token, `input` as a string or list of strings, `data[].data` as `[[...], ...]` vectors, `usage.total_tokens` as the total number of vectors. |
+| `POST /v1/multi-vector` | Jina's multi-vector shape. Takes `model` and `input` (a list of strings, or a list of `{text: ...}` objects). Answers `data[].embeddings` as `[[...], ...]` vectors, one per token. `usage.total_tokens` is the total number of vectors. |
 | `POST /tokenize` | vLLM's tokenizer. Takes a `prompt`, or chat `messages` rendered by the model's template (`add_generation_prompt`, `continue_final_message`, `chat_template_kwargs`, `tools`), with `add_special_tokens` and `return_token_strs`. Answers `count`, `max_model_len`, `tokens`, `token_strs`. |
 | `POST /detokenize` | `tokens` back to `prompt`, special tokens kept. |
 | `POST /invocations` | SageMaker's route, as vLLM serves it. A body with `messages` goes to chat, `prompt` to completions, `input` to embeddings. |

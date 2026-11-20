@@ -523,6 +523,14 @@ pub(crate) trait ModelBackend: Send {
         crate::tensor::bail!("embeddings require a dense llama-arch (GenericHetero) model")
     }
 
+    /// Embedding: all-positions final-hidden of a prompt `[1, seq]` -> `[seq, hidden]`
+    /// (caller L2-normalizes each vector). Routes through the loaded generic model
+    /// (like rerank), so any llama-arch GGUF works. Returns one vector per token,
+    /// in order.
+    fn embed_all_hidden(&mut self, _x: &Tensor) -> crate::tensor::Result<Vec<Vec<f32>>> {
+        crate::tensor::bail!("embeddings require a dense llama-arch (GenericHetero) model")
+    }
+
     // --- KV-cache management --------------------------------------------
 
     /// Trim every layer's KV cache to `new_len` valid positions. Used by
@@ -1965,6 +1973,10 @@ impl ModelBackend for GenericBackend {
         self.0.embed_last_hidden(x)
     }
 
+    fn embed_all_hidden(&mut self, x: &Tensor) -> crate::tensor::Result<Vec<Vec<f32>>> {
+        self.0.embed_all_hidden(x)
+    }
+
     fn trim_kv(&mut self, new_len: usize) {
         self.0.trim_kv(new_len)
     }
@@ -2530,6 +2542,10 @@ impl ModelBackend for GenericVisionBackend {
 
     fn embed_last_hidden(&mut self, x: &Tensor) -> crate::tensor::Result<Vec<f32>> {
         self.text.embed_last_hidden(x)
+    }
+
+    fn embed_all_hidden(&mut self, x: &Tensor) -> crate::tensor::Result<Vec<Vec<f32>>> {
+        self.text.embed_all_hidden(x)
     }
 
     fn trim_kv(&mut self, new_len: usize) {

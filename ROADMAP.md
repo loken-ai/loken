@@ -134,7 +134,7 @@ Smaller, by state then by priority:
 | Encoder on its own card or node | Serving | The vision or audio encoder of a model runs on a card or a node other than the one that decodes, and a request that carries media decodes sooner than with both on 1 card. | Planned |
 | Weight types NVFP4, IQ1 and ternary | Models | A GGUF file that holds an NVFP4, an IQ1 or a ternary tensor loads and answers as the reference implementation does. | Planned |
 | Block cache for diffusion transformers | Performance | An image or video model reuses the output of its blocks from one step to the next, renders faster than with whole steps skipped, and the quality score does not fall. | Planned |
-| Multi-vector embeddings | API | The embeddings and rerank routes return one vector for each token and score a query against a document by late interaction, for text and for page images. | Planned |
+| Multi-vector embeddings | API | The embeddings and rerank routes return one vector for each token and score a query against a document by late interaction, for text and for page images. | Started |
 | Embeddings as integers and bits | API | The embeddings routes return a vector as int8 or as binary on request, and a client ranks with them as well as with the float vector. | Done |
 | Word timestamps and long recordings | Audio | The transcription route returns the time of each word, and a recording of any length is read in windows cut at silences. | Planned |
 | Several vision embeddings cached | Serving | The embeddings of several images are kept between requests, and a conversation that comes back to an image does not read it again. | Done |

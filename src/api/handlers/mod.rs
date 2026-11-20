@@ -3034,6 +3034,10 @@ impl APIServer {
             )
             .route("/pooling", axum::routing::post(openai::vllm::pooling))
             .route(
+                "/v1/multi-vector",
+                axum::routing::post(openai::vllm::multi_vector),
+            )
+            .route(
                 "/invocations",
                 axum::routing::post(openai::vllm::invocations),
             )

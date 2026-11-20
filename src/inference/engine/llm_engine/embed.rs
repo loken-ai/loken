@@ -57,6 +57,50 @@ impl LlmEngine {
         }
     }
 
+    /// Generate L2-normalized token embeddings for `input` using this engine's model.
+    ///
+    /// Returns one L2-normalized vector per token, in order. The GGUF backing this
+    /// engine is loaded once and reused. For text-image pairs (dual encoder), returns
+    /// an error since token embeddings need a text-only model. Works with any dense
+    /// llama-arch GGUF - an embedding model (qwen3-embedding, e5-mistral, ...) or a
+    /// chat model as a fallback.
+    pub async fn generate_token_embeddings(
+        &self,
+        input: &str,
+    ) -> Result<Vec<Vec<f32>>, Box<dyn std::error::Error>> {
+        // A text-image pair does not support token embeddings.
+        if self.dual_encoder().is_some() {
+            return Err("token embeddings need a text model".into());
+        }
+        let model_state = self.model_state.clone();
+        let input = input.to_string();
+        let inner = tokio::task::spawn_blocking(move || -> AnyResult<Vec<Vec<f32>>> {
+            let mut guard = model_state.blocking_lock();
+            let state = guard
+                .as_mut()
+                .ok_or_else(|| anyhow!("Embedding model not loaded"))?;
+            let encoding = super::encode_prompt(&state.tokenizer, input.as_str())
+                .map_err(|e| anyhow!("embedding encode: {e}"))?;
+            let ids: Vec<u32> = encoding.get_ids().to_vec();
+            if ids.is_empty() {
+                return Err(anyhow!("embedding: empty token sequence"));
+            }
+            let device = state.device.clone();
+            let x = Tensor::new(ids.as_slice(), &device)?.unsqueeze(0)?;
+            let mut vectors = state.model.embed_all_hidden(&x)?;
+            for v in &mut vectors {
+                crate::inference::model::embedding::l2_normalize(v);
+            }
+            Ok(vectors)
+        })
+        .await;
+        match inner {
+            Ok(Ok(v)) => Ok(v),
+            Ok(Err(e)) => Err(e.into()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// The text-image pair this engine serves, if it serves one.
     fn dual_encoder(&self) -> Option<Arc<crate::inference::model::clip::pair::DualEncoder>> {
         self.dual_encoder

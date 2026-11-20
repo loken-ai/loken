@@ -59,8 +59,12 @@ impl EmbeddingModel {
         })
     }
 
-    /// Embed one text -> L2-normalized vector `[hidden]`.
-    pub fn embed(&self, text: &str) -> crate::tensor::Result<Vec<f32>> {
+    /// Get hidden states for a text and their sequence length.
+    ///
+    /// Returns the row-major hidden states `[S, hidden]` as a `Vec<f32>`
+    /// and the sequence length `S`. The hidden states are produced by
+    /// the causal Qwen3 forward pass without pooling or normalization.
+    fn hidden_states(&self, text: &str) -> crate::tensor::Result<(Vec<f32>, usize)> {
         let encoding = self
             .tokenizer
             .encode(text, true)
@@ -69,11 +73,21 @@ impl EmbeddingModel {
         if ids.is_empty() {
             return Err(crate::tensor::Error::msg("empty token sequence"));
         }
-        // Causal Qwen3 forward -> row-major hidden states `[S, hidden]`.
         let hid = self.encoder.forward(ids)?;
         let s = ids.len();
         let h = self.hidden;
         debug_assert_eq!(hid.len(), s * h, "encoder output shape");
+        Ok((hid, s))
+    }
+
+    /// Embed one text -> L2-normalized vector `[hidden]`.
+    ///
+    /// Returns the pooled and L2-normalized embedding vector of length `hidden`.
+    /// For `Pooling::LastToken`, the last token's hidden state is used.
+    /// For `Pooling::Mean`, the mean over all token hidden states is used.
+    pub fn embed(&self, text: &str) -> crate::tensor::Result<Vec<f32>> {
+        let (hid, s) = self.hidden_states(text)?;
+        let h = self.hidden;
 
         let mut pooled = vec![0f32; h];
         match self.pooling {
@@ -97,6 +111,24 @@ impl EmbeddingModel {
         Ok(pooled)
     }
 
+    /// Embed a text and return one L2-normalized vector per token.
+    ///
+    /// Returns a vector of hidden states, one per token, each L2-normalized.
+    /// The returned vectors are in token order and each has length `hidden`.
+    /// An empty token sequence returns an empty vector.
+    pub fn embed_tokens(&self, text: &str) -> crate::tensor::Result<Vec<Vec<f32>>> {
+        let (hid, s) = self.hidden_states(text)?;
+        let h = self.hidden;
+        let mut result = Vec::with_capacity(s);
+        for t in 0..s {
+            let row = &hid[t * h..(t + 1) * h];
+            let mut v: Vec<f32> = row.to_vec();
+            l2_normalize(&mut v);
+            result.push(v);
+        }
+        Ok(result)
+    }
+
     /// Embed a batch of texts (sequential - the encoder is single-sequence).
     pub fn embed_batch(&self, texts: &[String]) -> crate::tensor::Result<Vec<Vec<f32>>> {
         texts.iter().map(|t| self.embed(t)).collect()
@@ -112,6 +144,29 @@ pub(crate) fn l2_normalize(v: &mut [f32]) {
             *x *= inv;
         }
     }
+}
+
+/// Compute late interaction score between query and document vectors.
+///
+/// For each query vector, computes the largest dot product with any document vector,
+/// and returns the sum over all query vectors. An empty query or document returns 0.
+/// Vectors of different lengths are compared over their common length via `zip`.
+pub fn late_interaction(query: &[Vec<f32>], document: &[Vec<f32>]) -> f32 {
+    if query.is_empty() || document.is_empty() {
+        return 0.0;
+    }
+    let mut score = 0.0f32;
+    for q in query {
+        let mut best = f32::NEG_INFINITY;
+        for d in document {
+            let dot = q.iter().zip(d).map(|(x, y)| x * y).sum::<f32>();
+            if dot > best {
+                best = dot;
+            }
+        }
+        score += best;
+    }
+    score
 }
 
 #[cfg(test)]
@@ -135,9 +190,48 @@ mod tests {
         assert_eq!(z, vec![0.0, 0.0]);
     }
 
-    // End-to-end semantic sanity: synonyms should embed closer than unrelated words.
-    // Reuses the Qwen3-Embedding-0.6B GGUF already present for the ACE-Step text-encoder
-    // parity test (resolved via config, no hardcoded path).
+    #[test]
+    fn late_interaction_sums_the_best_match_of_each_query_vector() {
+        // query [[1,0],[0,1]], document [[1,0],[0.6,0.8]]
+        // first query vector: dot with [1,0] = 1.0, dot with [0.6,0.8] = 0.6 -> best = 1.0
+        // second query vector: dot with [1,0] = 0.0, dot with [0.6,0.8] = 0.8 -> best = 0.8
+        // score = 1.0 + 0.8 = 1.8
+        let query = vec![vec![1.0, 0.0], vec![0.0, 1.0]];
+        let document = vec![vec![1.0, 0.0], vec![0.6, 0.8]];
+        let score = late_interaction(&query, &document);
+        assert!((score - 1.8).abs() < 1e-6);
+    }
+
+    #[test]
+    fn late_interaction_of_nothing_is_zero() {
+        let query: Vec<Vec<f32>> = vec![];
+        let document = vec![vec![1.0, 0.0], vec![0.6, 0.8]];
+        let score = late_interaction(&query, &document);
+        assert_eq!(score, 0.0);
+
+        let query = vec![vec![1.0, 0.0]];
+        let document: Vec<Vec<f32>> = vec![];
+        let score = late_interaction(&query, &document);
+        assert_eq!(score, 0.0);
+    }
+
+    #[test]
+    fn a_document_that_holds_the_query_scores_highest() {
+        // query [[1,0],[0,1]]
+        // document1 [[0,1],[1,0],[0.7,0.7]]:
+        //   q[0] best = max(0.0, 1.0, 0.7) = 1.0
+        //   q[1] best = max(1.0, 0.0, 0.7) = 1.0
+        //   score = 2.0
+        // document2 [[0.7,0.7]]:
+        //   q[0] best = 0.7
+        //   q[1] best = 0.7
+        //   score = 1.4
+        let query = vec![vec![1.0, 0.0], vec![0.0, 1.0]];
+        let doc1 = vec![vec![0.0, 1.0], vec![1.0, 0.0], vec![0.7, 0.7]];
+        let doc2 = vec![vec![0.7, 0.7]];
+        assert!(late_interaction(&query, &doc1) > late_interaction(&query, &doc2));
+    }
+
     #[test]
     #[ignore = "needs Qwen3-Embedding GGUF (config huggingface_models_dir)"]
     fn embedding_semantic_order() {
@@ -158,5 +252,38 @@ mod tests {
             cat_dog > cat_car,
             "synonym pair should be closer than unrelated"
         );
+    }
+
+    #[test]
+    #[ignore = "needs Qwen3-Embedding GGUF (config huggingface_models_dir)"]
+    fn token_vectors_are_unit_and_one_per_token() {
+        let gguf = crate::inference::cache::hf::file(
+            "models--Serveurperso--ACE-Step-1.5-GGUF",
+            "Qwen3-Embedding-0.6B-Q8_0.gguf",
+        );
+        let m = EmbeddingModel::from_gguf(gguf.to_str().unwrap(), Pooling::LastToken).unwrap();
+        let texts = ["a cat", "a cat sat on the mat", "stock prices fell"];
+        let tokens = texts
+            .iter()
+            .map(|t| m.embed_tokens(t).unwrap())
+            .collect::<Vec<_>>();
+        // One vector per token
+        let vecs = &tokens[0];
+        assert_eq!(vecs.len(), 2); // "a cat" = 2 tokens
+        assert!(vecs.iter().all(|v| v.len() == m.dim()));
+        // Each vector has norm 1 within 1e-5
+        assert!(vecs.iter().all(|v| {
+            let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            (norm - 1.0).abs() < 1e-5
+        }));
+        // late_interaction ranks "a cat sat on the mat" higher than "stock prices fell"
+        // for the query "where is the cat"
+        let query_vecs = m.embed_tokens("where is the cat").unwrap();
+        let score_cat = late_interaction(&query_vecs, &tokens[0]);
+        let score_full = late_interaction(&query_vecs, &tokens[1]);
+        let score_stock = late_interaction(&query_vecs, &tokens[2]);
+        println!("score(a cat)={score_cat:.4}, score(a cat sat on the mat)={score_full:.4}, score(stock prices fell)={score_stock:.4}");
+        assert!(score_cat > score_stock);
+        assert!(score_full > score_stock);
     }
 }
