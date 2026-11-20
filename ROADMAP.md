@@ -143,10 +143,10 @@ Fixes, by state then by priority:
 
 | Feature | Category | Done when | State |
 |---|---|---|---|
-| Cluster polling in parallel | Operations | lokpit asks all nodes at the same time, so a slow node delays only its own reading, and a failed endpoint marks the node as degraded. | Planned |
+| Cluster polling in parallel | Operations | lokpit asks all nodes at the same time, so a slow node delays only its own reading, and a failed endpoint marks the node as degraded. | Done |
 | Each tensor parsed once | Performance | Loading a safetensors checkpoint parses the header of each file once. | Done |
 | The disk cache lock held briefly | Performance | Saving a prompt to the disk cache never delays a lookup. | Done |
-| lokpit export serves | Operations | `lokpit export` serves on the address it is given, or the option is removed. | Planned |
+| lokpit export serves | Operations | `lokpit export` serves on the address it is given, or the option is removed. | Done |
 
 ## 0.7.0
 
