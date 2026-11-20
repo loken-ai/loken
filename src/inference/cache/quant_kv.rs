@@ -52,6 +52,9 @@ impl QuantKvSnapshot {
 
     /// Tokens `[from, to)` as host f32 rows, token-major `[n, n_kv, head_dim]`, K then V.
     pub fn host_rows(&self, from: usize, to: usize) -> Result<(Vec<f32>, Vec<f32>)> {
+        if let QuantKvSnapshot::Q8(r) = self {
+            return r.host_rows(from, to);
+        }
         let (k, v) = self.dequantize_kv(DType::F32)?;
         let rows = |t: &Tensor| -> Result<Vec<f32>> {
             Ok(t.narrow(2, from, to - from)?

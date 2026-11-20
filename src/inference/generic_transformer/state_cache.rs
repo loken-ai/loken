@@ -1020,6 +1020,12 @@ fn live_rows(l: &GenericTransformerLayer, from: usize, to: usize) -> Result<Rows
             .as_ref()
             .filter(|q| q.current_seq_len() >= to && q.current_seq_len() > 0)
         {
+            // A Q8 cache's rows are read on the host: the card takes no copy of the history.
+            Some(q) if q.q8().is_some() => {
+                let rows = q.q8().map(|c| c.host_rows(from, to)).transpose();
+                rows.map_err(|e| crate::tensor::Error::msg(e.to_string()))?
+                    .map(|r| (1, r))
+            }
             Some(q) => {
                 let (k, v) = q
                     .dequantize_kv(DType::F32)
@@ -1287,8 +1293,10 @@ impl GenericHeteroTransformer {
                 "the draft head's indexer is not the one it was written with",
             ));
         }
-        let snap = rows_snapshot(&d.layer, &h.rows.k, &h.rows.v, h.rows.dtype)?;
-        super::graph::restore_layers(std::slice::from_mut(&mut d.layer), &[snap])?;
+        if !restore_q8_rows(&mut d.layer, &h.rows.k, &h.rows.v)? {
+            let snap = rows_snapshot(&d.layer, &h.rows.k, &h.rows.v, h.rows.dtype)?;
+            super::graph::restore_layers(std::slice::from_mut(&mut d.layer), &[snap])?;
+        }
         rebuild_host_rows(&mut d.layer);
         if let (Some(s), Some((raw, pooled, lanes, tokens))) = (d.layer.sparse.as_mut(), &h.indexer)
         {
@@ -1392,69 +1400,13 @@ impl GenericHeteroTransformer {
         point: &Point,
         blocks: &[Vec<(Vec<f32>, Vec<f32>)>],
     ) -> Result<Vec<super::LayerKvSnapshot>> {
-        let mut snaps = Vec::with_capacity(self.layers.len());
         // The pair of the next layer with rows in the blocks.
         let mut slot = 0;
-        // The pairs of `slot` in every block, then `tail`.
-        let joined = |slot: usize, tail: (&[f32], &[f32])| -> (Vec<f32>, Vec<f32>) {
-            let mut a = Vec::new();
-            let mut b = Vec::new();
-            for block in blocks {
-                a.extend_from_slice(&block[slot].0);
-                b.extend_from_slice(&block[slot].1);
-            }
-            a.extend_from_slice(tail.0);
-            b.extend_from_slice(tail.1);
-            (a, b)
-        };
-        let with_mixer = |state: MixerState| super::LayerKvSnapshot {
-            spec: None,
-            quant: None,
-            cpu_f16: None,
-            mixer: Some(state),
-            shards: Vec::new(),
-        };
-        for (l, held) in self.layers.iter().zip(&point.layers) {
-            snaps.push(match held {
-                Held::Nothing => super::LayerKvSnapshot {
-                    spec: None,
-                    quant: None,
-                    cpu_f16: None,
-                    mixer: None,
-                    shards: Vec::new(),
-                },
-                Held::Mixer(m) => with_mixer(m.state(&l.cos.device())?),
-                Held::Window(r) => rows_snapshot(l, &r.k, &r.v, r.dtype)?,
-                Held::Global(tail) => {
-                    let (k, v) = joined(slot, (tail.k.as_slice(), tail.v.as_slice()));
-                    slot += 1;
-                    rows_snapshot(l, &k, &v, tail.dtype)?
-                }
-                // A state read back has the name 0: no card holds its rows.
-                Held::Latent(h) => with_mixer(MixerState::LatentMqa(Some(LatentMqaState {
-                    len: h.len,
-                    window: h.window.clone(),
-                    stamp: 0,
-                }))),
-                Held::Band(h) => {
-                    let tail = (h.compressed.as_slice(), h.index.as_slice());
-                    let (compressed, index_keys) = joined(slot, tail);
-                    slot += 1;
-                    with_mixer(MixerState::CompressedBand(Some(BandState {
-                        window: LatentMqaState {
-                            len: h.window.len,
-                            window: h.window.window.clone(),
-                            stamp: 0,
-                        },
-                        groups: h.groups,
-                        compressed: Arc::new(compressed),
-                        index_keys: Arc::new(index_keys),
-                        filling: h.filling.clone(),
-                    })))
-                }
-            });
-        }
-        Ok(snaps)
+        self.layers
+            .iter()
+            .zip(&point.layers)
+            .map(|(l, held)| held_snapshot(l, held, blocks, &mut slot))
+            .collect()
     }
 
     /// Makes `point`, with the rows of `blocks` before its tail, the resident state.
@@ -1474,9 +1426,23 @@ impl GenericHeteroTransformer {
                 tokens.len()
             );
         }
-        let snaps = self.point_snapshots(point, blocks)?;
         self.reserve_context(point.pos);
-        super::graph::restore_layers(&mut self.layers, &snaps)?;
+        // A layer is restored before the next one is read: the card holds 1 layer's copy at most.
+        let mut slot = 0;
+        for (l, held) in self.layers.iter_mut().zip(&point.layers) {
+            let snap = match held {
+                Held::Global(tail) => {
+                    let (k, v) = joined_rows(blocks, slot, (&tail.k, &tail.v));
+                    slot += 1;
+                    if restore_q8_rows(l, &k, &v)? {
+                        continue;
+                    }
+                    rows_snapshot(l, &k, &v, tail.dtype)?
+                }
+                _ => held_snapshot(l, held, blocks, &mut slot)?,
+            };
+            super::graph::restore_layer(l, &snap)?;
+        }
         super::graph::end_windows_at(&mut self.layers, point.pos);
         for l in &mut self.layers {
             rebuild_host_rows(l);
@@ -1845,6 +1811,141 @@ fn rebuild_host_rows(l: &mut GenericTransformerLayer) {
     }
 }
 
+/// The pairs of `slot` in every block, then `tail`.
+fn joined_rows(
+    blocks: &[Vec<(Vec<f32>, Vec<f32>)>],
+    slot: usize,
+    tail: (&[f32], &[f32]),
+) -> (Vec<f32>, Vec<f32>) {
+    let mut a = Vec::new();
+    let mut b = Vec::new();
+    for block in blocks {
+        a.extend_from_slice(&block[slot].0);
+        b.extend_from_slice(&block[slot].1);
+    }
+    a.extend_from_slice(tail.0);
+    b.extend_from_slice(tail.1);
+    (a, b)
+}
+
+/// The snapshot of layer `l` that `held`, with the rows of `blocks` before its tail, makes.
+/// `slot` is the pair of the next layer with rows in the blocks, moved past this layer's.
+fn held_snapshot(
+    l: &GenericTransformerLayer,
+    held: &Held,
+    blocks: &[Vec<(Vec<f32>, Vec<f32>)>],
+    slot: &mut usize,
+) -> Result<super::LayerKvSnapshot> {
+    let with_mixer = |state: Option<MixerState>| super::LayerKvSnapshot {
+        spec: None,
+        quant: None,
+        cpu_f16: None,
+        mixer: state,
+        shards: Vec::new(),
+    };
+    Ok(match held {
+        Held::Nothing => with_mixer(None),
+        Held::Mixer(m) => with_mixer(Some(m.state(&l.cos.device())?)),
+        Held::Window(r) => rows_snapshot(l, &r.k, &r.v, r.dtype)?,
+        Held::Global(tail) => {
+            let (k, v) = joined_rows(blocks, *slot, (&tail.k, &tail.v));
+            *slot += 1;
+            rows_snapshot(l, &k, &v, tail.dtype)?
+        }
+        // A state read back has the name 0: no card holds its rows.
+        Held::Latent(h) => with_mixer(Some(MixerState::LatentMqa(Some(LatentMqaState {
+            len: h.len,
+            window: h.window.clone(),
+            stamp: 0,
+        })))),
+        Held::Band(h) => {
+            let tail = (h.compressed.as_slice(), h.index.as_slice());
+            let (compressed, index_keys) = joined_rows(blocks, *slot, tail);
+            *slot += 1;
+            with_mixer(Some(MixerState::CompressedBand(Some(BandState {
+                window: LatentMqaState {
+                    len: h.window.len,
+                    window: h.window.window.clone(),
+                    stamp: 0,
+                },
+                groups: h.groups,
+                compressed: Arc::new(compressed),
+                index_keys: Arc::new(index_keys),
+                filling: h.filling.clone(),
+            }))))
+        }
+    })
+}
+
+/// Positions `0..n` cut in runs of at most `tile`, longer only when `n` is under twice `tile`.
+/// No run holds 1 position unless `n` is 1: a single position takes another quantise kernel.
+pub(crate) fn position_tiles(n: usize, tile: usize) -> Vec<std::ops::Range<usize>> {
+    if n == 0 {
+        return Vec::new();
+    }
+    let count = n.div_ceil(tile.max(1)).min((n / 2).max(1));
+    let (base, extra) = (n / count, n % count);
+    let mut at = 0;
+    (0..count)
+        .map(|i| {
+            let m = base + usize::from(i < extra);
+            at += m;
+            at - m..at
+        })
+        .collect()
+}
+
+/// Makes host rows `k` and `v`, token-major `[n, n_kv, head_dim]`, the whole KV of a layer whose
+/// cache is Q8, a tile of positions at a time, and resets its mixer.
+/// Returns `false`, the layer untouched, for any other cache.
+///
+/// The card holds 1 tile beside the cache: see `Q8KvCache::restore_tile`.
+/// The cache gets the bytes of 1 append of all the rows: Q8_0 quantises each position alone.
+fn restore_q8_rows(l: &mut GenericTransformerLayer, k: &[f32], v: &[f32]) -> Result<bool> {
+    #[cfg(feature = "gpu")]
+    {
+        if l.context.is_some() || !l.quant_kv.as_ref().is_some_and(|q| q.q8().is_some()) {
+            return Ok(false);
+        }
+        let empty = super::LayerKvSnapshot {
+            spec: None,
+            quant: None,
+            cpu_f16: None,
+            mixer: None,
+            shards: Vec::new(),
+        };
+        super::graph::restore_layer(l, &empty)?;
+        let (n_kv, hd) = (l.n_kv_head, l.head_dim);
+        let row = n_kv * hd;
+        let n = k.len() / row;
+        let dev = l.cos.device();
+        let Some(q) = l.quant_kv.as_mut().and_then(|q| q.q8_mut()) else {
+            return Ok(false);
+        };
+        let err = |e: anyhow::Error| crate::tensor::Error::msg(e.to_string());
+        q.reserve_rows(n).map_err(err)?;
+        for r in position_tiles(n, q.restore_tile(n)) {
+            let m = r.len();
+            let part = |x: &[f32]| -> Result<crate::tensor::Tensor> {
+                let rows = x[r.start * row..r.end * row].to_vec();
+                // 1 position is the same run of values in head-major order.
+                match m {
+                    1 => crate::tensor::Tensor::from_vec(rows, (1, n_kv, 1, hd), &dev),
+                    _ => crate::tensor::Tensor::from_vec(rows, (1, m, n_kv, hd), &dev)?
+                        .permute((0, 2, 1, 3)),
+                }
+            };
+            q.append(&part(k)?, &part(v)?).map_err(err)?;
+        }
+        Ok(true)
+    }
+    #[cfg(not(feature = "gpu"))]
+    {
+        let _ = (l, k, v);
+        Ok(false)
+    }
+}
+
 fn rows_snapshot(
     l: &GenericTransformerLayer,
     k: &[f32],
@@ -2198,6 +2299,23 @@ pub(crate) fn restore_from_bytes(
 
 #[cfg(test)]
 mod in_memory_room_tests {
+    /// The tiles of a restore cover every position once, in order, within the tile, and none
+    /// holds 1 position of a longer run.
+    #[test]
+    fn restore_tiles_cover_the_positions_in_runs_of_2_or_more() {
+        for n in 0..40 {
+            for tile in 1..9 {
+                let tiles = super::position_tiles(n, tile);
+                let flat: Vec<usize> = tiles.iter().flat_map(|r| r.clone()).collect();
+                assert_eq!(flat, (0..n).collect::<Vec<_>>(), "{n} by {tile}");
+                for r in &tiles {
+                    assert!(n < 2 || r.len() >= 2, "{n} by {tile}: {r:?}");
+                    assert!(r.len() <= tile.max(3), "{n} by {tile}: {r:?}");
+                }
+            }
+        }
+    }
+
     /// A write to a store in host memory needs 3 times the state, and is skipped past that.
     #[test]
     fn a_state_is_kept_in_memory_only_within_the_room() {

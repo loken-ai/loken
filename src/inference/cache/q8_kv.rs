@@ -72,6 +72,19 @@ impl Q8KvRaw {
         (self.k.len() + self.v.len()) as u64
     }
 
+    /// Positions `[from, to)` as host F32 rows, token-major `[n, n_kv, head_dim]`, K then V.
+    /// See [`host_rows_of`].
+    pub fn host_rows(&self, from: usize, to: usize) -> Result<(Vec<f32>, Vec<f32>)> {
+        host_rows_of(
+            &self.k,
+            &self.v,
+            self.len,
+            self.n_kv_heads * (self.head_dim / Q8_0_BLOCK_SIZE) * Q8_0_TYPE_SIZE,
+            from..to,
+            &self.cuda_device,
+        )
+    }
+
     /// The held positions as `[1, n_kv, len, head_dim]` K and V in `dtype`.
     pub fn dequantize_kv(&self, dtype: DType) -> Result<(Tensor, Tensor)> {
         dequantize_packed(
@@ -84,6 +97,48 @@ impl Q8KvRaw {
             dtype,
         )
     }
+}
+
+/// Q8_0 blocks as F32 on the host.
+///
+/// Each value is the code times the block's F16 scale, plus 0.
+/// The product is exact in F32, so each value has the bits the card's F32 dequantisation gives.
+pub fn dequantize_q8_0_host(blocks: &[u8]) -> Vec<f32> {
+    let mut out = Vec::with_capacity(blocks.len() / Q8_0_TYPE_SIZE * Q8_0_BLOCK_SIZE);
+    for b in blocks.chunks_exact(Q8_0_TYPE_SIZE) {
+        let d = half::f16::from_le_bytes([b[0], b[1]]).to_f32();
+        out.extend(b[2..].iter().map(|&q| f32::from(q as i8) * d + 0.0));
+    }
+    out
+}
+
+/// Positions `range` of packed Q8_0 K and V buffers holding `len` positions of `token_bytes`
+/// each, as host F32 rows in the buffers' token-major order, K then V.
+///
+/// The codes and scales of the range are copied to the host and dequantised there.
+/// The card allocates nothing, whatever the length of the history.
+fn host_rows_of(
+    k_q8: &CudaSlice<u8>,
+    v_q8: &CudaSlice<u8>,
+    len: usize,
+    token_bytes: usize,
+    range: std::ops::Range<usize>,
+    cuda_device: &CudaDevice,
+) -> Result<(Vec<f32>, Vec<f32>)> {
+    if range.start > range.end || range.end > len {
+        return Err(anyhow!(
+            "Q8KvCache::host_rows: positions {range:?} of a cache holding {len}"
+        ));
+    }
+    let bytes = range.start * token_bytes..range.end * token_bytes;
+    let stream = cuda_device.cuda_stream();
+    let read = |buf: &CudaSlice<u8>| -> Result<Vec<f32>> {
+        let codes = stream
+            .clone_dtoh(&buf.slice(bytes.clone()))
+            .map_err(|e| anyhow!("Q8KvCache::host_rows: copy to the host: {e}"))?;
+        Ok(dequantize_q8_0_host(&codes))
+    };
+    Ok((read(k_q8)?, read(v_q8)?))
 }
 
 /// The first `seq` positions of packed Q8_0 K and V buffers `[seq, n_kv, head_dim]` as
@@ -1048,6 +1103,30 @@ impl Q8KvCache {
         2 * len * self.token_bytes()
     }
 
+    /// Positions `[from, to)` as host F32 rows, token-major `[n, n_kv, head_dim]`, K then V.
+    /// See [`host_rows_of`].
+    pub fn host_rows(&self, from: usize, to: usize) -> Result<(Vec<f32>, Vec<f32>)> {
+        host_rows_of(
+            &self.k_q8,
+            &self.v_q8,
+            self.core.len(),
+            self.token_bytes(),
+            from..to,
+            &self.cuda_device,
+        )
+    }
+
+    /// Positions of host F32 rows to append at once when `n` are written back.
+    ///
+    /// A tile's F32 K and V and its packed staging take no more than the packed codes of
+    /// the `n` positions.
+    /// The card then holds beside the cache no more than the state it receives.
+    pub fn restore_tile(&self, n: usize) -> usize {
+        let row = self.n_kv_heads * self.head_dim;
+        let per_position = 2 * row * std::mem::size_of::<f32>() + self.token_bytes();
+        (self.raw_bytes(n) / per_position).max(1)
+    }
+
     /// The packed codes and scales of the positions held, copied device to device; `None`
     /// for an empty cache.
     pub fn snapshot_raw(&self) -> Result<Option<Q8KvRaw>> {
@@ -1921,6 +2000,84 @@ mod dev_pos_tests {
                 "{rows} rows over {seq_kv} positions"
             );
         }
+    }
+
+    /// A range of positions read on the host has the bits of the card's F32 dequantisation of
+    /// the whole history, in token-major order.
+    #[test]
+    fn host_rows_match_the_cards_dequantisation() {
+        let Some(dev) = try_open_cuda() else {
+            eprintln!("skipping: no usable CUDA device");
+            return;
+        };
+        let (n_kv, hd, seq) = (2usize, 64usize, 50usize);
+        let (cache, _, _) = build_filled_cache(seq, n_kv, hd, &dev);
+        let (from, to) = (5, 37);
+        let (k, v) = cache.dequantize_kv(crate::tensor::DType::F32).unwrap();
+        let card = |t: &Tensor| -> Vec<u32> {
+            let rows = t.narrow(2, from, to - from).unwrap();
+            let rows = rows.permute((0, 2, 1, 3)).unwrap().contiguous().unwrap();
+            let values: Vec<f32> = rows.flatten_all().unwrap().to_vec1().unwrap();
+            values.iter().map(|x| x.to_bits()).collect()
+        };
+        let bits = |x: Vec<f32>| -> Vec<u32> { x.iter().map(|x| x.to_bits()).collect() };
+        let (hk, hv) = cache.host_rows(from, to).unwrap();
+        assert_eq!(bits(hk), card(&k));
+        assert_eq!(bits(hv), card(&v));
+        assert!(cache.host_rows(from, seq + 1).is_err());
+    }
+
+    /// Token-major host rows appended in tiles of positions leave the bytes 1 append of all the
+    /// rows in head-major order leaves.
+    #[test]
+    fn rows_appended_in_tiles_match_one_append() {
+        let Some(dev) = try_open_cuda() else {
+            eprintln!("skipping: no usable CUDA device");
+            return;
+        };
+        let (n_kv, hd, n) = (2usize, 64usize, 23usize);
+        let row = n_kv * hd;
+        let k: Vec<f32> = (0..n * row)
+            .map(|i| ((i * 37 % 101) as f32 - 50.0) / 7.0)
+            .collect();
+        let v: Vec<f32> = (0..n * row)
+            .map(|i| ((i * 53 % 89) as f32 - 44.0) / 3.0)
+            .collect();
+        let head_major = |x: &[f32]| -> Tensor {
+            Tensor::from_vec(x.to_vec(), (1, n, n_kv, hd), &dev)
+                .unwrap()
+                .permute((0, 2, 1, 3))
+                .unwrap()
+                .contiguous()
+                .unwrap()
+        };
+        let mut whole = Q8KvCache::new(n, n_kv, hd, &dev).unwrap();
+        whole.append(&head_major(&k), &head_major(&v)).unwrap();
+        let bytes = |c: &Q8KvCache| {
+            let raw = c.snapshot_raw().unwrap().unwrap();
+            let stream = raw.cuda_device.cuda_stream();
+            (
+                stream.clone_dtoh(&raw.k).unwrap(),
+                stream.clone_dtoh(&raw.v).unwrap(),
+            )
+        };
+        let tiles = crate::inference::generic_transformer::state_cache::position_tiles(n, 4);
+        assert!(tiles.iter().all(|r| r.len() >= 2 && r.len() <= 4));
+        let mut tiled = Q8KvCache::new(n, n_kv, hd, &dev).unwrap();
+        for r in tiles {
+            let part = |x: &[f32]| {
+                Tensor::from_vec(
+                    x[r.start * row..r.end * row].to_vec(),
+                    (1, r.len(), n_kv, hd),
+                    &dev,
+                )
+                .unwrap()
+                .permute((0, 2, 1, 3))
+                .unwrap()
+            };
+            tiled.append(&part(&k), &part(&v)).unwrap();
+        }
+        assert_eq!(bytes(&tiled), bytes(&whole));
     }
 
     /// The q8_1 row the split-K combine leaves for the output projection is the row the

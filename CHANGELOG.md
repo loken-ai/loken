@@ -6,6 +6,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Fixed
 
+- Serving: restore and store a long prompt's state when the card is nearly full.
 - Generation: keep long quantised-cache prompts within the card memory.
 - API: end an answer cut at the token limit as cut, even inside a tool call.
 - Serving: keep long prompts from filling the card with causal masks.
