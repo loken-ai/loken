@@ -46,9 +46,28 @@ fn f8_e5m2_to_f32(b: u8) -> f32 {
     sign * v
 }
 
+/// Information about a tensor stored in a safetensors file.
+#[derive(Clone)]
+struct TensorInfo {
+    dtype: safetensors::Dtype,
+    shape: Vec<usize>,
+    /// Byte offset and end within the data section (which starts at 8 + header_len).
+    data_offsets: (usize, usize),
+}
+
+/// Parsed header data for one safetensors file.
+struct FileParsers {
+    /// Length of the JSON header that follows the 8-byte length prefix.
+    header_len: usize,
+    tensors: HashMap<String, TensorInfo>,
+}
+
 /// Mmapped safetensors files with a name -> file index.
 pub struct SafeTensorsLoader {
     maps: Vec<memmap2::Mmap>,
+    /// Parsed header data for each file, indexed by file index.
+    parsers: Vec<FileParsers>,
+    /// File index of each tensor name
     index: HashMap<String, usize>,
     /// One identity per file: its path, length and modification time.
     identities: Vec<String>,
@@ -62,18 +81,50 @@ pub struct SafeTensorsLoader {
     ///
     /// Shared behind an `Arc` and read from pool threads, hence the atomic.
     read: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    parse_count: std::sync::atomic::AtomicUsize,
 }
 
 impl SafeTensorsLoader {
-    /// Mmap one or more files.
+    /// Parse a single safetensors file's header, building TensorInfo for each tensor.
+    fn parse_file(
+        map: &memmap2::Mmap,
+        counter: &std::sync::atomic::AtomicUsize,
+    ) -> Result<FileParsers> {
+        let (n, meta) = safetensors::SafeTensors::read_metadata(map)
+            .map_err(|e| Error(format!("safetensors header: {e}")))?;
+        let mut tensors = HashMap::new();
+
+        for (name, info) in meta.tensors() {
+            tensors.insert(
+                name.to_string(),
+                TensorInfo {
+                    dtype: info.dtype,
+                    shape: info.shape.clone(),
+                    data_offsets: info.data_offsets,
+                },
+            );
+        }
+        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(FileParsers {
+            header_len: n,
+            tensors,
+        })
+    }
+
+    /// Mmap one or more files, parsing each header once.
     ///
     /// # Safety
     /// The backing files must not be mutated while mapped (same contract as
     /// every mmap-based loader).
     pub unsafe fn multi<P: AsRef<Path>>(paths: &[P]) -> Result<Self> {
         let mut maps = Vec::with_capacity(paths.len());
+        let mut parsers = Vec::with_capacity(paths.len());
         let mut index = HashMap::new();
         let mut identities = Vec::with_capacity(paths.len());
+        // Counter shared with the loader's parse_count field.
+        let counter: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
         for (i, p) in paths.iter().enumerate() {
             let file = std::fs::File::open(p)
                 .map_err(|e| Error(format!("safetensors open {:?}: {e}", p.as_ref())))?;
@@ -86,19 +137,28 @@ impl SafeTensorsLoader {
             ));
             let map = memmap2::Mmap::map(&file)
                 .map_err(|e| Error(format!("safetensors mmap {:?}: {e}", p.as_ref())))?;
-            let (_, meta) = safetensors::SafeTensors::read_metadata(&map)
-                .map_err(|e| Error(format!("safetensors header {:?}: {e}", p.as_ref())))?;
-            for (name, _) in meta.tensors() {
-                index.insert(name.to_string(), i);
+            let parser = Self::parse_file(&map, &counter)
+                .map_err(|e| Error(format!("{:?}: {}", p.as_ref(), e.0)))?;
+            for name in parser.tensors.keys() {
+                index.insert(name.clone(), i);
             }
             maps.push(map);
+            parsers.push(parser);
         }
         Ok(Self {
             maps,
+            parsers,
             index,
             identities,
             read: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            parse_count: counter,
         })
+    }
+
+    #[cfg(test)]
+    fn parse_count(&self) -> usize {
+        self.parse_count.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub fn names(&self) -> Vec<&str> {
@@ -112,11 +172,10 @@ impl SafeTensorsLoader {
     /// Every tensor's size in bytes as stored, read from the headers only.
     pub fn byte_sizes(&self) -> Vec<(String, usize)> {
         let mut out = Vec::with_capacity(self.index.len());
-        for map in &self.maps {
-            if let Ok(st) = safetensors::SafeTensors::deserialize(map) {
-                for (name, view) in st.tensors() {
-                    out.push((name, view.data().len()));
-                }
+        for parser in &self.parsers {
+            for (name, info) in &parser.tensors {
+                let len = info.data_offsets.1 - info.data_offsets.0;
+                out.push((name.clone(), len));
             }
         }
         out
@@ -130,8 +189,7 @@ impl SafeTensorsLoader {
     /// somewhere deep or, worse, succeeding on the wrong file.
     pub fn shape_of(&self, name: &str) -> Option<Vec<usize>> {
         let &fi = self.index.get(name)?;
-        let st = safetensors::SafeTensors::deserialize(&self.maps[fi]).ok()?;
-        Some(st.tensor(name).ok()?.shape().to_vec())
+        self.parsers[fi].tensors.get(name).map(|t| t.shape.clone())
     }
 
     /// A tensor's stored format, as its checkpoint spells it, and its element width in bytes.
@@ -139,8 +197,8 @@ impl SafeTensorsLoader {
     /// Read from the header only.
     pub fn stored_format(&self, name: &str) -> Option<(String, usize)> {
         let &fi = self.index.get(name)?;
-        let st = safetensors::SafeTensors::deserialize(&self.maps[fi]).ok()?;
-        let dtype = st.tensor(name).ok()?.dtype();
+        let info = self.parsers[fi].tensors.get(name)?;
+        let dtype = info.dtype;
         Some((format!("{dtype:?}").to_lowercase(), dtype.bitsize() / 8))
     }
 
@@ -154,9 +212,8 @@ impl SafeTensorsLoader {
         static KNOWN: std::sync::Mutex<Known> = std::sync::Mutex::new(None);
         let missing = || Error(format!("safetensors: no tensor `{name}`"));
         let &fi = self.index.get(name).ok_or_else(missing)?;
-        let st = safetensors::SafeTensors::deserialize(&self.maps[fi])
-            .map_err(|e| Error(format!("safetensors header: {e}")))?;
-        match st.tensor(name).map_err(|_| missing())?.dtype() {
+        let info = self.parsers[fi].tensors.get(name).ok_or_else(missing)?;
+        match info.dtype {
             safetensors::Dtype::BF16 => return Ok(DType::BF16),
             safetensors::Dtype::F16 => return Ok(DType::F16),
             _ => {}
@@ -187,12 +244,18 @@ impl SafeTensorsLoader {
             .index
             .get(name)
             .ok_or_else(|| Error(format!("safetensors: no tensor `{name}`")))?;
-        let st = safetensors::SafeTensors::deserialize(&self.maps[fi])
-            .map_err(|e| Error(format!("safetensors parse: {e}")))?;
-        let view = st
-            .tensor(name)
-            .map_err(|e| Error(format!("safetensors `{name}`: {e}")))?;
-        let dtype = match view.dtype() {
+        let info = self
+            .parsers
+            .get(fi)
+            .and_then(|p| p.tensors.get(name))
+            .ok_or_else(|| Error(format!("safetensors: no tensor `{name}`")))?;
+        let header_len = self.parsers[fi].header_len;
+
+        let slice_start = 8 + header_len + info.data_offsets.0;
+        let slice_end = 8 + header_len + info.data_offsets.1;
+        let data: &[u8] = &self.maps[fi][slice_start..slice_end];
+
+        let dtype = match info.dtype {
             safetensors::Dtype::F32 => super::DType::F32,
             safetensors::Dtype::F16 => super::DType::F16,
             safetensors::Dtype::BF16 => super::DType::BF16,
@@ -208,7 +271,7 @@ impl SafeTensorsLoader {
                 )))
             }
         };
-        let out = (view.data(), view.shape().to_vec(), dtype);
+        let out = (data, info.shape.clone(), dtype);
         self.count_read();
         Ok(out)
     }
@@ -238,14 +301,19 @@ impl SafeTensorsLoader {
             .index
             .get(name)
             .ok_or_else(|| Error(format!("safetensors: no tensor `{name}`")))?;
-        let st = safetensors::SafeTensors::deserialize(&self.maps[fi])
-            .map_err(|e| Error(format!("safetensors parse: {e}")))?;
-        let view = st
-            .tensor(name)
-            .map_err(|e| Error(format!("safetensors `{name}`: {e}")))?;
-        let dims: Vec<usize> = view.shape().to_vec();
-        let data = view.data();
-        let storage = match view.dtype() {
+        let info = self
+            .parsers
+            .get(fi)
+            .and_then(|p| p.tensors.get(name))
+            .ok_or_else(|| Error(format!("safetensors: no tensor `{name}`")))?;
+
+        let header_len = self.parsers[fi].header_len;
+        let slice_start = 8 + header_len + info.data_offsets.0;
+        let slice_end = 8 + header_len + info.data_offsets.1;
+        let data: &[u8] = &self.maps[fi][slice_start..slice_end];
+
+        let dims: Vec<usize> = info.shape.clone();
+        let storage = match info.dtype {
             safetensors::Dtype::F32 => CpuStorage::F32(
                 data.chunks_exact(4)
                     .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
@@ -401,6 +469,18 @@ pub(crate) fn tests_helper_find() -> Option<std::path::PathBuf> {
 mod tests {
     use super::*;
 
+    /// A scratch directory under `target/` for tests.
+    fn test_scratch_dir(tag: &str) -> std::path::PathBuf {
+        let exe = std::env::current_exe().unwrap();
+        let dir = exe
+            .parent()
+            .unwrap()
+            .join(format!("loken-st-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
     pub(crate) fn find_safetensors() -> Option<std::path::PathBuf> {
         let home = std::env::var("HOME").ok()?;
         let hub = std::path::Path::new(&home).join(".cache/huggingface/hub");
@@ -432,8 +512,7 @@ mod tests {
     fn a_read_counts_itself_into_the_render_that_asked_for_it() {
         use crate::inference::serve::progress::{phase, scoped, SharedProgressFn};
 
-        let dir = std::env::temp_dir().join(format!("st_progress_test_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = test_scratch_dir("progress");
         let path = dir.join("counted.safetensors");
         let bytes = [0u8; 8]; // two f32 per tensor
         let tensors: Vec<_> = ["a", "b", "c"]
@@ -502,8 +581,7 @@ mod tests {
         use crate::inference::serve::cancel::CancelToken;
         use crate::inference::serve::progress::{scoped, SharedProgressFn};
 
-        let dir = std::env::temp_dir().join(format!("st_cancel_test_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = test_scratch_dir("cancel");
         let path = dir.join("abandoned.safetensors");
         let names = ["a", "b", "c", "d"];
         write_bundle(&path, &names);
@@ -552,8 +630,7 @@ mod tests {
     fn a_load_nobody_cancelled_is_untouched() {
         use crate::inference::serve::cancel::{scoped as cancelling, CancelToken};
 
-        let dir = std::env::temp_dir().join(format!("st_uncancelled_test_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = test_scratch_dir("uncancelled");
         let path = dir.join("nominal.safetensors");
         let names = ["a", "b", "c", "d"];
         write_bundle(&path, &names);
@@ -688,5 +765,115 @@ mod tests {
             }
         }
         eprintln!("safetensors loader parity OK on {path:?}");
+    }
+
+    /// Test that every tensor reads back the exact same bytes as written.
+    #[test]
+    fn reads_back_the_same_bytes_as_written() {
+        let dir = test_scratch_dir("bytes");
+        let path1 = dir.join("part1.safetensors");
+        let path2 = dir.join("part2.safetensors");
+
+        // File 1: F32 tensors with specific values
+        let data_a: Vec<u8> = [1f32, 2.0, 3.0]
+            .iter()
+            .flat_map(|&v| v.to_le_bytes())
+            .collect();
+        let data_b: Vec<u8> = [4.0f32, 5.0, 6.0]
+            .iter()
+            .flat_map(|&v| v.to_le_bytes())
+            .collect();
+        let tensors1 = vec![
+            (
+                "layer_a".to_string(),
+                safetensors::tensor::TensorView::new(safetensors::Dtype::F32, vec![3], &data_a)
+                    .unwrap(),
+            ),
+            (
+                "layer_b".to_string(),
+                safetensors::tensor::TensorView::new(safetensors::Dtype::F32, vec![3], &data_b)
+                    .unwrap(),
+            ),
+        ];
+        safetensors::serialize_to_file(tensors1, None, &path1).unwrap();
+
+        // File 2: U8 tensor
+        let u8_vals: Vec<u8> = vec![0u8, 1, 2, 3];
+        let u8_view = safetensors::tensor::TensorView::new(
+            safetensors::Dtype::U8,
+            vec![u8_vals.len()],
+            &u8_vals,
+        )
+        .unwrap();
+        safetensors::serialize_to_file([("wq", u8_view)], None, &path2).unwrap();
+
+        let loader = unsafe { SafeTensorsLoader::multi(&[&path1, &path2]) }.unwrap();
+
+        // Read all tensors and verify bytes match
+        let checks: Vec<_> = [
+            ("layer_a", vec![1.0f32, 2.0, 3.0]),
+            ("layer_b", vec![4.0, 5.0, 6.0]),
+        ]
+        .into_iter()
+        .map(|(name, expected)| {
+            let bytes = loader.stored_bytes(name).unwrap();
+            (name, bytes, expected)
+        })
+        .collect();
+
+        for (name, (bytes, _shape, dtype), expected) in checks {
+            assert_eq!(
+                dtype,
+                crate::tensor::DType::F32,
+                "unexpected dtype for {name}"
+            );
+            let expected_bytes: Vec<u8> = expected
+                .iter()
+                .flat_map(|&v: &f32| v.to_le_bytes())
+                .collect();
+            assert_eq!(bytes, expected_bytes.as_slice(), "{name}");
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Test that each file header is parsed exactly once per loader.
+    #[test]
+    fn one_parse_per_file() {
+        let dir = test_scratch_dir("parse");
+        let path1 = dir.join("file1.safetensors");
+        let path2 = dir.join("file2.safetensors");
+
+        // Write two files with one tensor each
+        let view1 =
+            safetensors::tensor::TensorView::new(safetensors::Dtype::U8, vec![3], &[1u8, 2, 3])
+                .unwrap();
+        safetensors::serialize_to_file([("t1", view1)], None, &path1).unwrap();
+
+        let view2 =
+            safetensors::tensor::TensorView::new(safetensors::Dtype::U8, vec![2], &[4u8, 5])
+                .unwrap();
+        safetensors::serialize_to_file([("t2", view2)], None, &path2).unwrap();
+
+        let loader = unsafe { SafeTensorsLoader::multi(&[&path1, &path2]) }.unwrap();
+
+        // Verify parse count is incremented correctly - each file triggers one parse
+        assert_eq!(loader.parse_count(), 2, "two files should yield two parses");
+
+        // Read all tensors - should not increase parse count
+        let _ = loader.load("t1").unwrap();
+        let _ = loader.load("t2").unwrap();
+        let _ = loader.stored_bytes("t1").unwrap();
+        let _ = loader.shape_of("t2").unwrap();
+        let _ = loader.stored_format("t1").unwrap();
+        let _ = loader.narrowest_exact_dtype("t1").unwrap();
+
+        assert_eq!(
+            loader.parse_count(),
+            2,
+            "reads should not increase parse count"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

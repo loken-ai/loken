@@ -4,6 +4,10 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+### Changed
+
+- Loading: parse the header of each safetensors file once.
+
 ## [0.5.3] - 2026-11-20
 
 ### Fixed
