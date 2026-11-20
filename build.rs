@@ -1,6 +1,16 @@
 // Build script for compiling CUDA kernels
 // This script runs during the cargo build process when the cuda feature is enabled
 
+// The commit and the version a build is stamped with.
+#[path = "src/build_stamp.rs"]
+mod build_stamp;
+
+/// The file `git archive` fills with the commit an export was made from.
+const ARCHIVAL: &str = ".git_archival.txt";
+
+/// The length a commit hash is cut to in the stamp.
+const SHORT_COMMIT: usize = 9;
+
 fn main() {
     // The binaries look for shared libraries in lib/ beside themselves before the system's, so a
     // library the release archive carries is the only copy a process opens.
@@ -35,37 +45,51 @@ fn main() {
             watch(format!("{common_dir}/{reference}"));
         }
     }
-    let commit = std::process::Command::new("git")
-        .args(["rev-parse", "--short=9", "HEAD"])
-        .output()
+    // An export's own file names the commit it was made from.
+    // A checkout's file holds placeholders, and the repository is asked instead.
+    // An export unpacked inside another repository is not taken for that repository's commit.
+    watch(ARCHIVAL.to_string());
+    let export = std::fs::read_to_string(ARCHIVAL)
         .ok()
-        .filter(|out| out.status.success())
-        .and_then(|out| String::from_utf8(out.stdout).ok())
-        .map(|text| text.trim().to_string())
-        .filter(|text| !text.is_empty())
-        // A source tarball has no repository, and saying so is better than an empty string
-        // that reads as a build nobody stamped.
-        .unwrap_or_else(|| "unknown".to_string());
-    println!("cargo:rustc-env=LOKEN_COMMIT={commit}");
+        .and_then(|text| build_stamp::parse_archival(&text));
+    let commit = export
+        .as_ref()
+        .map(|e| e.commit.chars().take(SHORT_COMMIT).collect::<String>())
+        .or_else(|| {
+            std::process::Command::new("git")
+                .args(["rev-parse", &format!("--short={SHORT_COMMIT}"), "HEAD"])
+                .output()
+                .ok()
+                .filter(|out| out.status.success())
+                .and_then(|out| String::from_utf8(out.stdout).ok())
+                .map(|text| text.trim().to_string())
+                .filter(|text| !text.is_empty())
+        });
+    // A source tarball with neither is said to be unknown, which is better than an empty
+    // string that reads as a build nobody stamped.
+    println!(
+        "cargo:rustc-env=LOKEN_COMMIT={}",
+        commit.as_deref().unwrap_or("unknown")
+    );
 
-    // The version a build answers with. A commit carrying the release tag `v<version>` is that
-    // release; any other commit is pre-release work on top of it and says so in SemVer form,
-    // `<version>-dev+g<commit>`. A source archive without a repository is taken as the release
-    // it was cut from.
+    // The version a build answers with: the release at its tag, a development version on any
+    // other commit.
+    // An export's tags are the refs its file lists.
     watch(format!("{common_dir}/refs/tags"));
     watch(format!("{common_dir}/packed-refs"));
     let release = env!("CARGO_PKG_VERSION");
-    let at_release_tag = std::process::Command::new("git")
-        .args(["tag", "--points-at", "HEAD"])
-        .output()
-        .ok()
-        .filter(|out| out.status.success())
-        .and_then(|out| String::from_utf8(out.stdout).ok())
-        .map(|tags| tags.lines().any(|t| t.trim() == format!("v{release}")));
-    let version = match at_release_tag {
-        Some(false) if commit != "unknown" => format!("{release}-dev+g{commit}"),
-        _ => release.to_string(),
+    let tag = format!("v{release}");
+    let at_release_tag = match &export {
+        Some(export) => Some(export.tagged(&tag)),
+        None => std::process::Command::new("git")
+            .args(["tag", "--points-at", "HEAD"])
+            .output()
+            .ok()
+            .filter(|out| out.status.success())
+            .and_then(|out| String::from_utf8(out.stdout).ok())
+            .map(|tags| tags.lines().any(|t| t.trim() == tag)),
     };
+    let version = build_stamp::version(release, commit.as_deref(), at_release_tag);
     println!("cargo:rustc-env=LOKEN_VERSION={version}");
 
     link_cxx_runtime_statically();

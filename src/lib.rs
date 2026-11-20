@@ -79,6 +79,9 @@ pub mod inference;
 #[cfg(feature = "microbench")]
 pub mod microbench;
 mod notice_gate;
+// Read by build.rs, and compiled here for its tests only.
+#[cfg(test)]
+mod build_stamp;
 pub mod privacy;
 pub mod request_metrics;
 pub mod stats;
