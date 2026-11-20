@@ -581,6 +581,10 @@ impl GenericHeteroTransformer {
         let seq_kv = index_pos + seq_q;
         let cache_key = (seq_q * 65536 + seq_kv, cuda_idx, sw);
         if !self.mask_cache.contains_key(&cache_key) {
+            // The cache holds the masks of one query and key shape: the segments and windows of
+            // the forward that runs.
+            // A forward of another shape gives back those of the forward before it.
+            self.mask_cache.retain(|key, _| key.0 == cache_key.0);
             let dev = cuda_idx
                 .and_then(|idx| self.cuda_devices.get(&idx))
                 .unwrap_or(&Device::Cpu);

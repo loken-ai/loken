@@ -150,6 +150,29 @@ fn the_toy_logits_match_the_reference_for_a_prompt_inside_and_past_the_budget() 
     }
 }
 
+/// A prompt read in chunks at advancing positions keeps the causal masks of its last chunk
+/// alone.
+#[test]
+fn a_chunked_prompt_keeps_the_masks_of_its_last_chunk_alone() {
+    let bytes = vectors();
+    let v = SafeTensors::deserialize(&bytes).unwrap();
+    let tokens = ids(&v, "a.ids");
+    let mut model = toy();
+    let chunk = 3;
+    assert!(tokens.len() > 2 * chunk, "the prompt spans several chunks");
+    for (i, rows) in tokens.chunks(chunk).enumerate() {
+        let input = Tensor::from_vec(rows.to_vec(), (1, rows.len()), &Device::Cpu).unwrap();
+        model.forward(&input, i * chunk).unwrap();
+        let shapes: std::collections::HashSet<usize> =
+            model.mask_cache.keys().map(|k| k.0).collect();
+        assert!(
+            shapes.len() <= 1,
+            "chunk {i} left masks of {} shapes",
+            shapes.len()
+        );
+    }
+}
+
 #[test]
 fn decoding_one_token_at_a_time_gives_the_logits_of_the_whole_prompt() {
     let bytes = vectors();
