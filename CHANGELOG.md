@@ -4,6 +4,8 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+## [0.5.3] - 2026-11-20
+
 ### Fixed
 
 - Serving: restore and store a long prompt's state when the card is nearly full.
