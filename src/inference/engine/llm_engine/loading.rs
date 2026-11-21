@@ -1272,6 +1272,12 @@ impl LlmEngine {
             model_id,
             load_time_secs * 1000.0
         );
+        // Restore pace measures from disk, if available.
+        if let Some(kept) = pace::Pace::load(&model_id) {
+            self.pace.restore(&kept);
+        }
+        // Set the model id for automatic saving.
+        self.pace.set_model_id(Some(model_id.clone()));
         // What a hand-over is weighed against: a peer already holding the weights is worth
         // the difference between this and nothing. Measured here rather than configured,
         // because it depends on the disk, the model and the placement, none of which a

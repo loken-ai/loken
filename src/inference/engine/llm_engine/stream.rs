@@ -622,7 +622,11 @@ impl LlmEngine {
         )
         .await;
         let (first, rx) = started?;
-        let rx = self.pace.watch(rx, max_tokens);
+        // The request runs beside another engine when the process runs more requests than
+        // this engine does.
+        let (_, running) = super::batching::requests_on(None);
+        let beside = running > self.in_flight();
+        let rx = self.pace.watch(rx, max_tokens, beside);
         Ok(match first {
             Some(first) => prepend_message(first, rx),
             None => rx,

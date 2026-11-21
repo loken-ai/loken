@@ -109,7 +109,13 @@ impl LlmEngine {
         };
         // The prompt's memory is declared to the other placements while the request runs.
         let _work = self.declare_request_work().await;
-        let mut followed = self.pace.follow(params.max_tokens.map(|n| n as u64));
+        // The request runs beside another engine when the process runs more requests than
+        // this engine does.
+        let (_, running) = super::batching::requests_on(None);
+        let beside = running > self.in_flight();
+        let mut followed = self
+            .pace
+            .follow(params.max_tokens.map(|n| n as u64), beside);
         let out = crate::inference::place::recover::retry_on_oom_for(
             &self.config.model_id,
             &self.config.model_id,
