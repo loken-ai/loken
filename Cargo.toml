@@ -110,6 +110,9 @@ safetensors = "0.7.0"
 # Byte manipulation utilities
 bytemuck = { version = "1.15", features = ["derive"] }
 
+# XML parsing for W3C Pronunciation Lexicon Specification
+roxmltree = "0.21.2"
+
 # GGUF format support is built into the native tensor substrate
 
 # System monitoring
@@ -189,6 +192,7 @@ microbench = []
 
 [dev-dependencies]
 criterion = "0.5"
+tempfile = "3.0"
 
 # ---------------------------------------------------------------------------
 # Binaries. `autobins = false` (see [package]): both are listed explicitly, so a stray file

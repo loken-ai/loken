@@ -564,6 +564,13 @@ impl TtsEngine {
         params: TtsSynthParams,
         out: tokio::sync::mpsc::UnboundedSender<Vec<f32>>,
     ) -> AnyResult<()> {
+        // Every speech model reads the prepared text.
+        // Acronyms are spelt, the lexicon's words replaced, inline pronunciations read as their word.
+        let text = crate::inference::media::speech_text::prepare(
+            &text,
+            crate::inference::media::speech_text::lexicon(),
+            false,
+        );
         if !self.is_loaded().await {
             self.load_parler(None).await?;
         }
@@ -622,6 +629,13 @@ impl TtsEngine {
     /// Synthesise `text` and return raw f32 mono PCM at the loaded
     /// checkpoint's native rate (see `TtsResult.sample_rate`).
     pub async fn synthesize(&self, text: String, params: TtsSynthParams) -> AnyResult<TtsResult> {
+        // Every speech model reads the prepared text.
+        // Acronyms are spelt, the lexicon's words replaced, inline pronunciations read as their word.
+        let text = crate::inference::media::speech_text::prepare(
+            &text,
+            crate::inference::media::speech_text::lexicon(),
+            false,
+        );
         if !self.is_loaded().await {
             self.load_parler(None).await?;
         }

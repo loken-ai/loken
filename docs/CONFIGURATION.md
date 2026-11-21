@@ -29,6 +29,7 @@ It reports what was last known.
 | `ollama_models_dir` | `~/.ollama/models` | The Ollama-style store of manifests and blobs. A string, or a list: see [Model directories on several disks](#model-directories-on-several-disks). |
 | `huggingface_models_dir` | `~/.cache/huggingface/hub` | The Hugging Face store, as a string or a list. A bare GGUF at its root, or under its `hub/`, is found by file name. |
 | `lora_dir` | `loras` beside the first Hugging Face store | Where adapters live. Requests name an adapter, never a path. |
+| `speech_lexicons` | none | The pronunciation files read on top of the built-in English lexicon, a string or a list. A file that starts with `<` is read as a W3C PLS lexicon (the format of Amazon Polly, Azure and ElevenLabs), a line with a tab as `TERM<TAB>say|ipa<TAB>TEXT`, any other file as CMUdict. A later file wins. |
 
 ### Model directories on several disks
 

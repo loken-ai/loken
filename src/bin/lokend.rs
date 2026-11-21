@@ -165,6 +165,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         cluster: None,
                         server: None,
                         lora_dir: None,
+                        speech_lexicons: None,
                         inference: Default::default(),
                         ollama_models_dir: None,
                         huggingface_models_dir: None,
@@ -320,6 +321,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "LoRA directory: {} ({n_loras} adapters)",
                 lora_dir.display()
             );
+
+            // Install speech lexicons before accepting any inference requests.
+            let speech_lexicon_paths = config.get_speech_lexicons();
+            if !speech_lexicon_paths.is_empty() {
+                let warnings = loken::inference::media::speech_text::install(&speech_lexicon_paths);
+                for warning in &warnings {
+                    warn!("speech lexicon: {warning}");
+                }
+                info!(
+                    "speech lexicons: {} of {} pronunciation files read",
+                    speech_lexicon_paths.len() - warnings.len(),
+                    speech_lexicon_paths.len()
+                );
+            }
 
             // Create API server with config and optional keep_alive override
             let mut api_server = if let Some(ref keep_alive_str) = keep_alive {

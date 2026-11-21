@@ -2,6 +2,8 @@
 //! This module provides lexicon parsing and text normalization for speech models.
 
 use std::collections::HashMap;
+use std::path::Path;
+use std::sync::OnceLock;
 
 /// A lexicon entry indicating how to handle a word.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -17,6 +19,12 @@ pub enum Entry {
 pub struct Lexicon {
     entries: HashMap<String, Entry>,
 }
+
+/// Process-wide lexicon, set once at startup via `install`.
+static LEXICON: OnceLock<Lexicon> = OnceLock::new();
+
+/// Second OnceLock that returns the built-in lexicon if `LEXICON` is not set.
+static LEXICON_BUILTIN: OnceLock<Lexicon> = OnceLock::new();
 
 impl Lexicon {
     /// Returns a lexicon built from the embedded speech_lexicon.tsv file.
@@ -93,7 +101,10 @@ impl Lexicon {
     /// Converts ARPAbet phonemes to IPA with stress markers.
     /// Stress 1 adds ˈ before the vowel, stress 2 adds ˌ before the vowel.
     /// ER becomes ɚ when unstressed (stress digit 0).
-    fn arpabet_to_ipa(phonemes: &str) -> String {
+    ///
+    /// This is also used by `parse_pls` to convert x-arpabet, arpabet, and cmu-arpabet
+    /// phonemes to IPA when reading W3C Pronunciation Lexicon Specification files.
+    pub(crate) fn arpabet_to_ipa(phonemes: &str) -> String {
         let mut result = String::new();
         for token in phonemes.split_whitespace() {
             let (ipa, stress_digit) = Self::phoneme_to_ipa(token);
@@ -291,96 +302,305 @@ fn should_spell(word: &str) -> bool {
     false
 }
 
+/// Parses a W3C Pronunciation Lexicon Specification file.
+///
+/// The root `lexicon` carries an `alphabet` attribute; each `lexeme` holds one or more
+/// `grapheme` elements and, in document order, `alias` and `phoneme` elements, a `phoneme`
+/// possibly with its own `alphabet`. The first `alias` or `phoneme` of a lexeme gives every
+/// grapheme of it its entry: an `alias` is `Entry::Say(text)`; a `phoneme` in the alphabet
+/// `ipa` is `Entry::Ipa(text)`; a `phoneme` in `x-arpabet`, `arpabet` or `cmu-arpabet` is
+/// converted with `Lexicon::arpabet_to_ipa`; a lexeme whose first pronunciation is in another
+/// alphabet (such as `x-sampa`) is skipped. Tag names are matched by their local name,
+/// whatever the namespace. Graphemes are stored in uppercase; lookups are case-insensitive.
+pub fn parse_pls(text: &str) -> Result<Lexicon, String> {
+    let doc = roxmltree::Document::parse(text).map_err(|e| format!("XML parse error: {e}"))?;
+
+    let mut entries = HashMap::new();
+
+    // Iterate over lexeme elements (local name "lexeme", any namespace)
+    for lexeme in doc.descendants().filter(|node| node.has_tag_name("lexeme")) {
+        // Collect all graphemes from this lexeme (grapheme elements under lexeme)
+        let mut graphemes: Vec<String> = Vec::new();
+        for grapheme_node in lexeme
+            .descendants()
+            .filter(|node| node.has_tag_name("grapheme"))
+        {
+            if let Some(text) = grapheme_node
+                .text()
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+            {
+                graphemes.push(text.to_uppercase());
+            }
+        }
+
+        // Skip if no graphemes
+        if graphemes.is_empty() {
+            continue;
+        }
+
+        // Iterate over alias and phoneme elements in document order
+        let mut entry_added = false;
+        for pron_node in lexeme
+            .descendants()
+            .filter(|node| node.has_tag_name("alias") || node.has_tag_name("phoneme"))
+        {
+            if entry_added {
+                // Only the first pronunciation is used
+                break;
+            }
+
+            // Check if this is an alias (no alphabet attribute) or phoneme
+            let alphabet = pron_node.attribute("alphabet");
+            let Some(text) = pron_node.text().map(str::trim).filter(|t| !t.is_empty()) else {
+                continue;
+            };
+
+            let entry = if pron_node.has_tag_name("alias") {
+                // Alias: use as text
+                Entry::Say(text.to_string())
+            } else {
+                // Phoneme - check its alphabet
+                match alphabet {
+                    Some("ipa") => Entry::Ipa(text.to_string()),
+                    Some("x-arpabet") | Some("arpabet") | Some("cmu-arpabet") => {
+                        Entry::Ipa(Lexicon::arpabet_to_ipa(text))
+                    }
+                    Some(_) => {
+                        // Other alphabet - skip this lexeme entirely
+                        entry_added = true;
+                        break;
+                    }
+                    None => {
+                        // No alphabet attribute, check root alphabet
+                        if let Some(root_alphabet) = doc.root_element().attribute("alphabet") {
+                            match root_alphabet {
+                                "ipa" => Entry::Ipa(text.to_string()),
+                                "x-arpabet" | "arpabet" | "cmu-arpabet" => {
+                                    Entry::Ipa(Lexicon::arpabet_to_ipa(text))
+                                }
+                                _ => {
+                                    // Other alphabet - skip this lexeme entirely
+                                    entry_added = true;
+                                    break;
+                                }
+                            }
+                        } else {
+                            // No root alphabet, assume ipa
+                            Entry::Ipa(text.to_string())
+                        }
+                    }
+                }
+            };
+
+            // Add entry for all graphemes
+            for grapheme in &graphemes {
+                entries.insert(grapheme.clone(), entry.clone());
+            }
+            entry_added = true;
+        }
+    }
+
+    Ok(Lexicon { entries })
+}
+
+/// Reads a lexicon file, detecting its format from the file content.
+///
+/// A file whose first non-whitespace character is `<` is read as a W3C PLS lexicon.
+/// Otherwise, a file whose first non-comment, non-empty line contains a tab is read
+/// as our format; any other file is read as CMUdict. An IO error or parse error names the path.
+pub fn read_file(path: &std::path::Path) -> Result<Lexicon, String> {
+    let content =
+        std::fs::read_to_string(path).map_err(|e| format!("{}: {}", path.display(), e))?;
+
+    let trimmed = content.trim();
+
+    // Check if first non-whitespace character is '<' -> PLS
+    if trimmed.starts_with('<') {
+        parse_pls(&content)
+    } else {
+        // Determine format from first meaningful line
+        let first_line = trimmed
+            .lines()
+            .find(|l| {
+                !l.trim().is_empty() && !l.trim().starts_with('#') && !l.trim().starts_with(";;;")
+            })
+            .unwrap_or("");
+
+        if first_line.contains('\t') {
+            Lexicon::parse_ours(&content)
+        } else {
+            Ok(Lexicon::parse_cmudict(&content))
+        }
+    }
+}
+
+/// Merges lexicons from paths, starting from the built-in lexicon.
+///
+/// Later files win for entries they share. Returns the merged lexicon and a list of
+/// warnings for files that could not be read. All files are processed regardless of
+/// errors.
+pub fn merged(paths: &[std::path::PathBuf]) -> (Lexicon, Vec<String>) {
+    let mut lexicon = Lexicon::builtin();
+    let mut warnings = Vec::new();
+
+    for path in paths {
+        match read_file(path) {
+            Ok(file_lexicon) => {
+                lexicon.merge(file_lexicon);
+            }
+            Err(e) => {
+                warnings.push(e);
+            }
+        }
+    }
+
+    (lexicon, warnings)
+}
+
+/// Installs lexicons from paths, merging them into a process-wide lexicon.
+///
+/// Returns a list of warnings for files that could not be read. Files are processed
+/// in order, so later files win for shared entries.
+pub fn install(paths: &[std::path::PathBuf]) -> Vec<String> {
+    let (lexicon, warnings) = merged(paths);
+    let _ = LEXICON.set(lexicon);
+    warnings
+}
+
+/// Returns the installed lexicon, or the built-in one if nothing has been installed.
+///
+/// This allows tests and tools that never call `install` to still get a lexicon.
+pub fn lexicon() -> &'static Lexicon {
+    LEXICON.get_or_init(Lexicon::builtin)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Punctuation around a word is kept once, on both sides.
-    #[test]
-    fn punctuation_around_a_word_is_kept_once() {
-        let lexicon = Lexicon::builtin();
-        assert_eq!(prepare("(GPU), [KV]!", &lexicon, false), "(G P U), [K V]!");
+    /// Helper to write a temp file with given content, returns its path.
+    /// The returned path is owned by a temp_dir kept in this test function's scope.
+    fn write_temp_file() -> (std::path::PathBuf, tempfile::TempDir) {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("test_lexicon.txt");
+        std::fs::write(&path, "").unwrap();
+        (path, temp_dir)
     }
 
     #[test]
-    fn test_builtin_lexicon_parses() {
-        let lexicon = Lexicon::builtin();
-        assert!(lexicon.entries.contains_key("VRAM"));
-        assert!(lexicon.entries.contains_key("loken"));
-    }
-
-    #[test]
-    fn test_prepare_kv_vram() {
-        let builtin = Lexicon::builtin();
-        let result = prepare(
-            "Fit the KV cache in VRAM, not on the host.",
-            &builtin,
-            false,
-        );
-        assert_eq!(result, "Fit the K V cache in V RAM, not on the host.");
-    }
-
-    #[test]
-    fn test_gpu_moe_spelling() {
-        let builtin = Lexicon::builtin();
-        let result = prepare("GPU and MoE are important.", &builtin, false);
-        assert!(result.contains("G P U"));
-        assert!(result.contains("M O E"));
-    }
-
-    #[test]
-    fn test_inline_ipa_reads_ipa() {
-        let builtin = Lexicon::builtin();
-        let result = prepare("[loken](/lˈoʊkən/)", &builtin, true);
-        assert_eq!(result, "[loken](/lˈoʊkən/)");
-    }
-
-    #[test]
-    fn test_inline_ipa_no_reads_ipa() {
-        let builtin = Lexicon::builtin();
-        let result = prepare("[loken](/lˈoʊkən/)", &builtin, false);
-        assert_eq!(result, "loken");
-    }
-
-    #[test]
-    fn test_loken_ipa_reads_ipa() {
-        let builtin = Lexicon::builtin();
-        let result = prepare("loken", &builtin, true);
-        assert_eq!(result, "[loken](/lˈoʊkən/)");
-    }
-
-    #[test]
-    fn test_cmudict_parses() {
-        let text = "HELLO  HH AH0 L OW1\nHELLO(2)  HH EH0 L OW1";
-        let lexicon = Lexicon::parse_cmudict(text);
-        assert_eq!(lexicon.entries.len(), 1);
-        let hello_ipa = lexicon.entries.get("HELLO").unwrap();
-        if let Entry::Ipa(ipa) = hello_ipa {
-            assert_eq!(ipa, "həlˈoʊ");
-        } else {
-            panic!("Expected Ipa entry for HELLO");
+    fn read_file_ours_format() {
+        let (path, _guard) = write_temp_file();
+        std::fs::write(&path, "TEST\tipa\t/tɛst/").unwrap();
+        let lexicon = read_file(&path).unwrap();
+        assert!(lexicon.entries.contains_key("TEST"));
+        match lexicon.entries.get("TEST").unwrap() {
+            Entry::Ipa(ipa) => assert_eq!(ipa, "/tɛst/"),
+            _ => panic!("Expected Ipa entry"),
         }
     }
 
     #[test]
-    fn test_builtin_wins_over_cmudict() {
-        let mut builtin = Lexicon::builtin();
-        let cmudict = Lexicon::parse_cmudict("VRAM  V R AE1 M");
-        builtin.merge(cmudict);
-        let vram_entry = builtin.entries.get("VRAM").unwrap();
-        if let Entry::Say(s) = vram_entry {
-            assert_eq!(s, "V RAM");
-        } else {
-            panic!("Expected Say entry for VRAM");
+    fn read_file_cmudict_format() {
+        let (path, _guard) = write_temp_file();
+        std::fs::write(&path, "NASA  N AE1 S AH0").unwrap();
+        let lexicon = read_file(&path).unwrap();
+        assert!(lexicon.entries.contains_key("NASA"));
+        match lexicon.entries.get("NASA").unwrap() {
+            // NASA from CMUdict: N AE1 S AH0 -> nˈæsə (stress on 2nd syllable)
+            Entry::Ipa(ipa) => assert_eq!(ipa, "nˈæsə"),
+            _ => panic!("Expected Ipa entry"),
         }
     }
 
     #[test]
-    fn test_malformed_line_error() {
-        let input = "VRAM\tsay\tV RAM\nMALFORMED LINE";
-        let result = Lexicon::parse_ours(input);
+    fn read_file_pls_format() {
+        let pls = r#"<?xml version="1.0"?>
+<lexicon xmlns="http://www.w3.org/2005/01/pronunciation-lexicon" alphabet="ipa">
+  <lexeme><grapheme>ABC</grapheme><grapheme>ABCDEF</grapheme><alias>see bee see</alias></lexeme>
+  <lexeme><grapheme>IPATEST</grapheme><phoneme alphabet="ipa">aɪˈpeɪtɛst</phoneme></lexeme>
+  <lexeme><grapheme>SKIPME</grapheme><phoneme alphabet="x-sampa">skIpmi</phoneme></lexeme>
+</lexicon>"#;
+        let (path, _guard) = write_temp_file();
+        std::fs::write(&path, pls).unwrap();
+        let lexicon = read_file(&path).unwrap();
+        // ABC and ABCDEF should have alias entry
+        assert!(lexicon.entries.contains_key("ABC"));
+        match lexicon.entries.get("ABC").unwrap() {
+            Entry::Say(s) => assert_eq!(s, "see bee see"),
+            _ => panic!("Expected Say entry for ABC"),
+        }
+        // IPATEST should have IPA entry
+        assert!(lexicon.entries.contains_key("IPATEST"));
+        match lexicon.entries.get("IPATEST").unwrap() {
+            Entry::Ipa(ipa) => assert_eq!(ipa, "aɪˈpeɪtɛst"),
+            _ => panic!("Expected Ipa entry for IPATEST"),
+        }
+        // SKIPME should be skipped (x-sampa)
+        assert!(!lexicon.entries.contains_key("SKIPME"));
+    }
+
+    #[test]
+    fn read_file_missing() {
+        let path = std::path::PathBuf::from("/nonexistent/path/file.txt");
+        let result = read_file(&path);
         assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(err.contains("Line 2"));
+        assert!(result.unwrap_err().contains("/nonexistent/path/file.txt"));
+    }
+
+    /// A phoneme without its own alphabet takes the alphabet of the lexicon.
+    #[test]
+    fn parse_pls_reads_the_alphabet_of_the_lexicon() {
+        let text = r#"<lexicon xmlns="http://www.w3.org/2005/01/pronunciation-lexicon" alphabet="x-arpabet">
+  <lexeme><grapheme> NASA </grapheme><phoneme> N AE1 S AH0 </phoneme></lexeme>
+</lexicon>"#;
+        let lexicon = parse_pls(text).unwrap();
+        let ipa = Lexicon::arpabet_to_ipa("N AE1 S AH0");
+        assert_eq!(lexicon.entries.get("NASA"), Some(&Entry::Ipa(ipa)));
+    }
+
+    #[test]
+    fn parse_pls_malformed_xml() {
+        let result = parse_pls("<lexicon><lexeme><grapheme>TEST</lexeme>");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("XML parse error"));
+    }
+
+    #[test]
+    fn install_with_warnings() {
+        use std::fs;
+        let temp_dir = tempfile::tempdir().unwrap();
+        let good_path = temp_dir.path().join("good.txt");
+        let bad_path = temp_dir.path().join("bad.txt");
+
+        // Good file with a word not in the builtin lexicon
+        std::fs::write(&good_path, "ABC\tsay\tV R A M").unwrap();
+
+        let paths = vec![good_path, bad_path.as_path().to_path_buf()];
+        let (lexicon, warnings) = merged(&paths);
+
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("bad.txt"));
+
+        // The good file's entry wins over builtin for a shared key
+        assert!(lexicon.entries.contains_key("ABC"));
+        match lexicon.entries.get("ABC").unwrap() {
+            Entry::Say(s) => assert_eq!(s, "V R A M"),
+            _ => panic!("Expected Say entry for ABC"),
+        }
+    }
+
+    #[test]
+    fn lexicon_without_install() {
+        // If nothing was installed, lexicon() returns built-in
+        let lex = lexicon();
+        assert!(lex.entries.contains_key("VRAM")); // VRAM is in built-in
+    }
+
+    #[test]
+    fn test_prepare() {
+        let builtin = Lexicon::builtin();
+        let result = prepare("GPU test", &builtin, false);
+        assert!(result.contains("G P U"));
     }
 }

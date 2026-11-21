@@ -155,6 +155,9 @@ pub struct Config {
     /// Where LoRA adapters are kept. Requests name an adapter, never a path, and the
     /// name is resolved inside this directory - see `native_lora::resolve`.
     pub lora_dir: Option<String>,
+    /// Pronunciation files read on top of the built-in lexicon, later files winning.
+    #[serde(default)]
+    pub speech_lexicons: Option<DirList>,
     #[serde(default)]
     pub energy: Option<EnergyConfig>,
     /// Clustering policy. Absent = this node runs alone, and every cluster path is skipped.
@@ -427,6 +430,14 @@ impl Config {
             })
     }
 
+    /// The pronunciation files to read on top of the built-in lexicon, as paths.
+    pub fn get_speech_lexicons(&self) -> Vec<PathBuf> {
+        self.speech_lexicons
+            .as_ref()
+            .map(DirList::paths)
+            .unwrap_or_default()
+    }
+
     /// The configured HuggingFace models directories in the order listed, or the default one.
     pub fn get_hf_models_dirs(&self) -> Vec<PathBuf> {
         let dirs = self
@@ -461,6 +472,7 @@ impl Config {
             ollama_models_dir: None,
             huggingface_models_dir: None,
             lora_dir: None,
+            speech_lexicons: None,
             energy: None,
             cluster: None,
         })
@@ -506,6 +518,7 @@ mod tests {
             ollama_models_dir: Some(DirList::one("d")),
             huggingface_models_dir: Some(DirList::one("d")),
             lora_dir: Some("d".to_string()),
+            speech_lexicons: Some(DirList::one("d")),
             energy: Some(EnergyConfig::default()),
             cluster: Some(toml::from_str("").unwrap()),
         };
@@ -541,6 +554,7 @@ mod tests {
             "server.rate_limit_burst",
             "server.rate_limit_per_minute",
             "server.require_auth",
+            "speech_lexicons",
         ];
         agreed.sort();
         assert_eq!(
