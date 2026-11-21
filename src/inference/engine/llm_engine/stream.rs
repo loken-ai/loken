@@ -587,6 +587,7 @@ impl LlmEngine {
         params: GenerationParams,
     ) -> Result<tokio::sync::mpsc::Receiver<Result<String, String>>, Box<dyn std::error::Error>>
     {
+        let max_tokens = params.max_tokens.map(|n| n as u64);
         let params = GenerationParams {
             cache_scope: crate::inference::engine::cache_scope::CacheScope::current(),
             ..params
@@ -617,6 +618,7 @@ impl LlmEngine {
         )
         .await;
         let (first, rx) = started?;
+        let rx = self.pace.watch(rx, max_tokens);
         Ok(match first {
             Some(first) => prepend_message(first, rx),
             None => rx,

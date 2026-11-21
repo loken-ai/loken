@@ -463,10 +463,35 @@ impl LoadedModelEntry {
             .any(|e| e.in_flight() > 0)
     }
 
+    /// Seconds until the requests running on every copy are expected to end, `None` when a copy
+    /// cannot say.
+    pub(crate) fn expected_end_secs(&self) -> Option<f64> {
+        std::iter::once(&self.engine)
+            .chain(self.replicas.iter())
+            .try_fold(0.0_f64, |longest, e| {
+                Some(longest.max(e.pace().expected_end_secs()?))
+            })
+    }
+
+    /// Decode tokens per second for the main engine, or `None` when no rate has been measured.
+    pub(crate) fn decode_tok_s(&self) -> Option<f64> {
+        self.engine.pace().decode_tok_s()
+    }
+
     /// Record activity on this entry (for LRU eviction ordering).
     pub(crate) fn touch(&self) {
         self.last_used.store(now_millis(), Ordering::Relaxed);
     }
+}
+
+/// `secs` as the log says it, "unknown" when it is not known.
+fn seconds(secs: Option<f64>) -> String {
+    secs.map_or_else(|| "unknown".to_string(), |s| format!("{s:.1} s"))
+}
+
+/// `tok_s` as the log says it, "unknown" when it is not known.
+fn rate(tok_s: Option<f64>) -> String {
+    tok_s.map_or_else(|| "unknown".to_string(), |r| format!("{r:.1} tok/s"))
 }
 
 /// Waits `period`, then until no request runs on the model, and returns the engine list locked.
@@ -1022,8 +1047,14 @@ impl APIServer {
     /// Makes room for the `need` bytes the incoming model's weights take (or, for a model larger
     /// than any card, for them across the cards), while no card has it: first what the other
     /// models keep for their later requests, then the least recently used language models that
-    /// serve no request, other than `incoming_id`. A model serving a request is never unloaded:
-    /// the incoming model is placed around it.
+    /// serve no request, other than `incoming_id`.
+    ///
+    /// A model serving a request is never unloaded under it.
+    /// When only busy models are left, the least recently used one that the server's own gate
+    /// admits is waited for once, then unloaded: the incoming model's requests take that gate
+    /// too, so they would wait for it anyway, and the incoming model gets the cards.
+    /// A model still busy after its wait, or one with its own gate, stays, and the incoming
+    /// model is placed around it.
     /// Resident models hold weights, KV blocks and pools that would otherwise push the new
     /// model's placement onto the host; as many stay resident as the memory allows.
     ///
@@ -1031,6 +1062,7 @@ impl APIServer {
     /// KV cache, workspaces and staging the loader reserves.
     pub(crate) async fn evict_to_make_room(&self, incoming_id: &str, need: u64, per_card: u64) {
         let mut tried: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut waited: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut asked = false;
         loop {
             let demand = crate::inference::place::ladder::Demand {
@@ -1073,7 +1105,42 @@ impl APIServer {
                     .map(|e| e.model_id.clone())
             };
             let Some(victim) = victim else {
-                return;
+                let busy = {
+                    let engines = self.engines.read().await;
+                    engines
+                        .iter()
+                        .filter(|e| e.model_id != incoming_id && e.busy())
+                        .filter(|e| !tried.contains(&e.model_id) && !waited.contains(&e.model_id))
+                        .filter(|e| e.gate.is_none())
+                        .min_by_key(|e| e.last_used.load(Ordering::Relaxed))
+                        .map(|e| {
+                            let pace = format!(
+                                "{} at {}",
+                                seconds(e.expected_end_secs()),
+                                rate(e.decode_tok_s())
+                            );
+                            (e.model_id.clone(), e.engine.clone(), pace)
+                        })
+                };
+                let Some((id, engine, pace)) = busy else {
+                    let engines = self.engines.read().await;
+                    if engines
+                        .iter()
+                        .any(|e| e.model_id != incoming_id && e.busy())
+                    {
+                        info!("⚖️  {incoming_id} is placed around the busy models");
+                    }
+                    return;
+                };
+                info!("⚖️  {id} is busy, expected to end in {pace}: {incoming_id} waits for it, then takes its room");
+                let started = std::time::Instant::now();
+                engine.until_no_request().await;
+                info!(
+                    "⚖️  {id} ended after {:.1} s",
+                    started.elapsed().as_secs_f64()
+                );
+                waited.insert(id);
+                continue;
             };
             info!(
                 "⚖️  Evicting LRU model {victim} to make room for {incoming_id} \
@@ -1468,6 +1535,27 @@ mod tests {
                 "the pressure protocol addresses '{name}', which is not on the walk"
             );
         }
+    }
+
+    /// The wait for a busy model returns only once its last request has ended.
+    #[tokio::test]
+    async fn the_wait_for_a_busy_engine_ends_with_its_last_request() {
+        let engine = Arc::new(LlmEngine::with_config(
+            crate::inference::engine::llm_engine::InferenceConfig::default(),
+        ));
+        let first = engine.admit_request().await;
+        let second = engine.admit_request().await;
+        let waiting = engine.until_no_request();
+        tokio::pin!(waiting);
+        let early = tokio::time::timeout(Duration::from_millis(200), &mut waiting).await;
+        assert!(early.is_err(), "returned under 2 running requests");
+        drop(first);
+        let early = tokio::time::timeout(Duration::from_millis(200), &mut waiting).await;
+        assert!(early.is_err(), "returned under 1 running request");
+        drop(second);
+        tokio::time::timeout(Duration::from_secs(5), &mut waiting)
+            .await
+            .expect("the wait ends with the last request");
     }
 
     /// A model with a request running is not unloaded when its keep-alive runs out: a cold

@@ -276,6 +276,8 @@ pub struct LlmEngine {
     /// The most card bytes a prefill forward of the model was measured to keep live per row,
     /// over its loads; 0 before one was measured.
     prefill_row_bytes: Arc<std::sync::atomic::AtomicU64>,
+    /// Pace tracking: decode rate, expected end times for running requests.
+    pace: std::sync::Arc<pace::Pace>,
 }
 
 impl InferenceEngine for LlmEngine {
@@ -303,6 +305,7 @@ impl InferenceEngine for LlmEngine {
             prefill_row_bytes: Arc::default(),
             draft_length: Arc::default(),
             pld_cost: Arc::default(),
+            pace: Default::default(),
         }
     }
 
@@ -365,6 +368,7 @@ impl LlmEngine {
             prefill_row_bytes: Arc::default(),
             draft_length: Arc::default(),
             pld_cost: Arc::default(),
+            pace: Default::default(),
         }
     }
 
@@ -382,6 +386,11 @@ impl LlmEngine {
 
     fn stream_stats_slot(&self) -> Arc<std::sync::Mutex<Option<StreamStats>>> {
         self.last_stream_stats.clone()
+    }
+
+    /// Pace tracking: decode rate and expected end times for running requests.
+    pub fn pace(&self) -> &pace::Pace {
+        &self.pace
     }
 
     /// The models in the store whose ordinary vocabulary is the target's and whose file is
@@ -693,6 +702,12 @@ impl LlmEngine {
     /// Requests admitted and not yet finished.
     pub fn in_flight(&self) -> usize {
         self.active.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Returns once no request runs on this engine.
+    pub async fn until_no_request(&self) {
+        let active = self.active.clone();
+        let _ = tokio::task::spawn_blocking(move || batching::wait_no_request(&active)).await;
     }
 
     /// Which model drafts for this one: chosen when the target loaded, or attached.
@@ -1900,6 +1915,7 @@ mod handover;
 mod handover_rate;
 mod kept_memory;
 mod loading;
+mod pace;
 pub(crate) use loading::{per_card_reserve, Warmup};
 // The pool must be sized from `main`, before anything can build rayon's global one.
 pub use loading::configure_thread_pool;

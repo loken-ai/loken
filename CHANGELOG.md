@@ -16,6 +16,10 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 - Serving: look up the disk cache while a save cleans it.
 - Loading: parse the header of each safetensors file once.
 
+### Fixed
+
+- Serving: wait for a busy model to finish rather than load a new one around it.
+
 ## [0.5.3] - 2026-11-20
 
 ### Fixed

@@ -109,7 +109,8 @@ impl LlmEngine {
         };
         // The prompt's memory is declared to the other placements while the request runs.
         let _work = self.declare_request_work().await;
-        crate::inference::place::recover::retry_on_oom_for(
+        let mut followed = self.pace.follow(params.max_tokens.map(|n| n as u64));
+        let out = crate::inference::place::recover::retry_on_oom_for(
             &self.config.model_id,
             &self.config.model_id,
             || self.generate_once(prompt, params.clone()),
@@ -122,7 +123,11 @@ impl LlmEngine {
             || crate::inference::place::vram_manager::evict_idle_llm(&self.config.model_id),
             |_, oom| async move { (!self.reload_further_off().await).then(|| Err(oom.into())) },
         )
-        .await
+        .await;
+        if let Ok(result) = &out {
+            followed.finished(result.eval_count, result.eval_duration as f64 / 1e9);
+        }
+        out
     }
 
     /// Reloads the model at the pressure in force, for a request that ran out of memory with

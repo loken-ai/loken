@@ -33,6 +33,7 @@ impl LlmEngine {
             kept_memory: self.kept_memory.clone(),
             planned_kv: self.planned_kv.clone(),
             prefill_row_bytes: self.prefill_row_bytes.clone(),
+            pace: self.pace.clone(),
         }
     }
 }
