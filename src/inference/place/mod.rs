@@ -33,6 +33,7 @@ pub mod paged;
 #[cfg(all(test, feature = "image"))]
 pub mod placement_invariants;
 pub mod plan;
+pub mod preview;
 pub mod reclaim;
 pub mod recover;
 pub mod room;

@@ -1916,6 +1916,9 @@ mod handover_rate;
 mod kept_memory;
 mod loading;
 mod pace;
+mod placement;
+#[cfg(test)]
+pub(crate) mod placement_tests;
 pub(crate) use loading::{per_card_reserve, Warmup};
 // The pool must be sized from `main`, before anything can build rayon's global one.
 pub use loading::configure_thread_pool;

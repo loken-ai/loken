@@ -75,6 +75,7 @@ mod metrics;
 mod model_manager;
 mod ollama;
 mod openai;
+mod plan;
 mod prompt_format;
 mod sampling;
 #[cfg(feature = "audio")]
@@ -2947,6 +2948,7 @@ impl APIServer {
             // Custom endpoints
             .route("/api/models/loaded", axum::routing::get(list_loaded_models))
             .route("/api/models/validate", axum::routing::post(validate_model))
+            .route("/api/models/plan", axum::routing::post(plan::plan_model))
             .route("/api/models/repair", axum::routing::post(repair_model))
             .route("/api/swap", axum::routing::post(swap_model_handler))
             .route("/api/layers/swap", axum::routing::post(swap_layers_handler))
@@ -3503,6 +3505,7 @@ fn available_endpoints_list() -> serde_json::Value {
         "GET /api/models",
         "GET /api/models/loaded",
         "POST /api/models/validate",
+        "POST /api/models/plan",
         "POST /api/models/repair",
         "POST /api/swap",
         "POST /api/layers/swap",

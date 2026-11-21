@@ -14,6 +14,7 @@
 | `loken pull <name> --source ollama\|huggingface` | Fetches into the matching store. An Ollama tag comes whole. A Hugging Face repository brings its safetensors, GGUF, bin and JSON files |
 | `loken list` | Prints what both stores hold |
 | `loken delete` | Removes a model |
+| `loken fit <name>` | Prints where a load would put the layers on the daemon's devices, the host's share and the context that fits, without loading. See [Placement preview](API.md#placement-preview) |
 
 A `.pth` archive that a media family needs is placed in the store by hand.  
 A request that names a model not yet loaded loads it.

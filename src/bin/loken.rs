@@ -72,6 +72,12 @@ enum Commands {
         model: String,
     },
 
+    /// Show where a load of a model would put its layers, and the context that fits
+    Fit {
+        /// Model ID
+        model: String,
+    },
+
     /// Re-download whatever a model is missing
     Repair {
         /// Model ID
@@ -552,6 +558,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
+
+        Commands::Fit { model } => match client.plan_model(&model).await {
+            Ok(plan) => print!("{}", plan.table()),
+            Err(e) => {
+                error!("Failed to plan model: {}", e);
+                std::process::exit(1);
+            }
+        },
 
         Commands::Repair { model } => {
             info!("Repairing model: {}", model);

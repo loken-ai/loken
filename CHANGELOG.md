@@ -6,6 +6,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Added
 
+- API: preview a model's placement with loken fit and /api/models/plan.
 - Speech: spell acronyms and read pronunciation lexicons, PLS files included.
 - API: rank documents by late interaction when the rerank model is an embedding model.
 - API: return one vector per token on /pooling with token_embed and on /v1/multi-vector.

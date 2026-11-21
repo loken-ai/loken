@@ -525,6 +525,7 @@ A client that follows the SSE specification ignores comment lines.
 | `GET /metrics` | OpenMetrics, with the `metrics` feature only. Reports uptime, resident models, gate depth, in-flight generations, decode rates, devices and energy totals. Per model, it reports histograms over requests of the wait at the gate, the wait for the model, the prompt's reading, the answer's writing, the prompt and answer tokens and the prompt tokens served from the cache. |
 | `GET /api/models`, `GET /api/models/loaded` | The catalogue, and what is resident with its placement per device. Every family lists its layers by device. A text or image model is 1 entry. A voice, transcription, sound or separation model, and what the video pipeline stages on the host, is 1 entry per part, named `model (part)`. A render in progress is listed the same way, 1 entry per loaded part, with a `status` such as `rendering sound: codes 12/300`. Before its first part loads, the render is 1 entry with the status alone. The free memory published beside these is what the driver has, and a finished job's memory is returned to it when the job ends. |
 | `POST /api/models/validate`, `POST /api/models/repair` | Check a model's files, and fetch what is missing. |
+| `POST /api/models/plan` | Where a load of the language model named by `model` would put its layers, from the plan a load runs, without reading a weight. See [Placement preview](#placement-preview). |
 | `POST /api/swap` | Replace the resident model. |
 | `POST /api/calibrate` | Record the activations of a released checkpoint, named by its Hugging Face id, on the given `texts`, as the calibration `name`. `excerpt`, `tokens` and `rows` size the pass. Streams NDJSON unless `stream: false`. |
 | `POST /api/convert` | Convert a released checkpoint into the model `name:tag`, from the calibration record named by `calibration`. `complete` finishes an existing conversion instead. Streams NDJSON unless `stream: false`. |
@@ -540,3 +541,30 @@ A client that follows the SSE specification ignores comment lines.
 | `POST /api/cluster/measure` | Measure what a layer of `model` costs on this node and publish it. A head asks a peer with no cost for the model before it plans the cut of a dense model. |
 | `POST /api/cluster/prefill` | Read a `prompt` for a peer serving the same model and answer its KV cache as `application/octet-stream`. A node that accepts `application/vnd.loken.prefill-stream` gets the reading as it goes, then the KV cache. |
 | `POST /api/cluster/prefix` | How much of a prompt this node already holds in its KV. |
+
+### Placement preview
+
+`POST /api/models/plan` takes `{"model": "<name>"}` and answers the plan a load of that model would build now.
+`name` is read when `model` is absent.
+The plan comes from the code the load runs: the same offer of the cards, the same context choice and the same first rung of the ladder.
+The cards are read as they are, under the load admission.
+The models already loaded keep the memory they hold for later requests.
+A load can ask them for it, so a load may fit where the preview spills.
+A load that runs out of memory takes a later rung, which the preview does not show.
+
+| Field | What it holds |
+|---|---|
+| `model`, `architecture` | The name asked for and the architecture the header declares. |
+| `layers` | The repeating blocks the plan divides. |
+| `weight_bytes` | The bytes of weights the devices and the host place together. |
+| `context_length` | The tokens the cache is built for, the window a request may open. |
+| `kv_format` | The cache element format: `q8_0`, `q4_0`, `f16` or `f32`. |
+| `devices` | Each device the layers cross, in order: `device` (`CUDA`, `Vulkan`, `OpenCL` or `CPU`), `index`, `layers` as `[first, end)` ranges with the end excluded, `weight_bytes`, `kv_bytes` at the planned context, and `offered_bytes` for a device other than the host. |
+| `host` | What stays in host memory: `layers` it runs, `weight_bytes` no device holds and `share` of all the weights, from 0 to 1. The routed experts the plan keeps in host memory count here, not on the card of their layer. |
+| `refused` | Present when the allowed backends refuse every plan. |
+| `warnings` | Present when a device's `weight_bytes` exceed its `offered_bytes`, 1 line per device. |
+
+A model that is not found answers 404.
+A model the language model route does not place by layers answers 400 with the reason.
+`loken fit <name>` prints the same plan as a table.
+

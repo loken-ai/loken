@@ -314,6 +314,24 @@ impl Client {
         self.handle_response(response).await
     }
 
+    /// Where a load of a model would place its layers (custom endpoint, not part of the
+    /// Ollama API)
+    pub async fn plan_model(
+        &self,
+        model_name: &str,
+    ) -> Result<crate::inference::place::preview::PlacementPreview, ClientError> {
+        let url = format!("{}/api/models/plan", self.base_url);
+
+        let response = self
+            .http_client
+            .post(&url)
+            .json(&serde_json::json!({ "model": model_name }))
+            .send()
+            .await?;
+
+        self.handle_response(response).await
+    }
+
     /// Repair a model (custom endpoint, not part of the Ollama API)
     pub async fn repair_model(
         &self,

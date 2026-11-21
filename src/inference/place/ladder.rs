@@ -761,6 +761,35 @@ fn leaves_the_cards(name: &str) -> bool {
     name == HOST_RUNG || name == HOST_ALONE_RUNG
 }
 
+/// The plan [`load_planned`] builds first: `first_plan` with the blocks it leaves on the host
+/// offered to `accelerators` first.
+pub fn first_rung(
+    first_plan: HeteroPlan,
+    demand: &Demand,
+    accelerators: &[(DeviceKind, u64)],
+) -> HeteroPlan {
+    beside_host(first_plan, demand, accelerators)
+}
+
+/// The plan [`load_planned`] builds when no build runs out of memory: the first rung, else the
+/// first later rung the allowed backends do not refuse.
+/// `None` when the allowed backends refuse every rung.
+pub fn planned_rung(
+    first_plan: HeteroPlan,
+    demand: &Demand,
+    cards: &[(usize, u64)],
+    accelerators: &[(DeviceKind, u64)],
+) -> Option<HeteroPlan> {
+    let first = first_rung(first_plan, demand, accelerators);
+    if !host_refused(&first) {
+        return Some(first);
+    }
+    later_rungs(demand, cards, accelerators)
+        .into_iter()
+        .map(|(_, plan)| plan)
+        .find(|plan| !host_refused(plan))
+}
+
 /// `plan` with the blocks it leaves on the host offered to `accelerators` first, in their
 /// order, each block costing its weights and its cache there.
 fn beside_host(
@@ -888,7 +917,7 @@ pub fn load_planned<T, E: std::fmt::Display + Refusal>(
         crate::tensor::layer::held::rewind(start);
         build(plan)
     };
-    let first_plan = beside_host(first_plan, demand, accelerators);
+    let first_plan = first_rung(first_plan, demand, accelerators);
     let first = if host_refused(&first_plan) {
         E::refusal(HOST_REFUSED.to_string())
     } else {

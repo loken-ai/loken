@@ -119,7 +119,7 @@ Smaller, by state then by priority:
 | Longer sound | Audio | A long sound renders in one piece, with no audible seam. | Planned |
 | Another music family | Music | One more open music family renders through the music route. | Planned |
 | Audio speed published | Performance | The benchmarks show each music and sound family's speed on a named card. | Planned |
-| Placement preview | API | `loken fit` and a plan route tell, for a model file, the layers per device, the host share and the context that fits, from the code a real load runs. | Planned |
+| Placement preview | API | `loken fit` and a plan route tell, for a model file, the layers per device, the host share and the context that fits, from the code a real load runs. | Partial |
 | Authenticated cluster | Cluster | Nodes sign their announcements and their peer calls with a shared secret, and a node without it is refused. | Planned |
 | Model copy between nodes | Cluster | A node fetches a model file from a peer that holds it, checks its digest and resumes after a cut. | Planned |
 | Host tier for the KV cache | Serving | The KV of a long context lives in host memory, a working set stays on the card, and the pages a query selects are fetched, so a long context is no longer bounded by card memory. | Planned |

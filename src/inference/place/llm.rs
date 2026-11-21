@@ -36,6 +36,19 @@ impl Offer {
 /// the same on every load: the fastest card first, and the others only once the model does
 /// not sit whole on one card and the spread needs their budgets.
 pub fn offer(owner: &str, pin: Option<usize>, whole: u64, staging: u64) -> Offer {
+    offer_reading(owner, pin, whole, staging, true)
+}
+
+/// [`offer`], with `reclaim` saying whether the other models on the cards are asked for what
+/// they keep for later requests when no card holds the model whole.
+/// A placement preview reads the cards without asking: it changes nothing a loaded model holds.
+pub fn offer_reading(
+    owner: &str,
+    pin: Option<usize>,
+    whole: u64,
+    staging: u64,
+    reclaim: bool,
+) -> Offer {
     let fastest = pin.or_else(|| super::room::fastest_card(owner));
     if let Some(card) = fastest {
         warm(card);
@@ -43,7 +56,7 @@ pub fn offer(owner: &str, pin: Option<usize>, whole: u64, staging: u64) -> Offer
     let mut cards = read(owner, staging);
     // No card holds the model whole: the other models on the cards give back what they keep
     // for later requests first.
-    if holder(&cards, pin, whole).is_none() {
+    if reclaim && holder(&cards, pin, whole).is_none() {
         let wanted = whole.saturating_add(staging);
         let mut given = false;
         for g in super::device_probe::probe_cuda_gpus() {
