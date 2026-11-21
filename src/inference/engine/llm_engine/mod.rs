@@ -1916,7 +1916,9 @@ mod handover_rate;
 mod kept_memory;
 mod loading;
 mod pace;
+pub(crate) use pace::{Kept, Pace};
 mod placement;
+pub use placement::DryPlan;
 #[cfg(test)]
 pub(crate) mod placement_tests;
 pub(crate) use loading::{per_card_reserve, Warmup};

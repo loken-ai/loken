@@ -409,7 +409,9 @@ A part the server cannot take, such as a document block, is refused with the rea
 - A Responses stream whose source ends without its final marker ends as `response.incomplete`.
 - A request refused by the rate limit carries `Retry-After`: the seconds until the client has a token again.
   A client whose allowance never refills gets none.
+- Each loaded language model has its own inference slots, 1 per copy, so 2 models serve requests at once.
 - A request that waited for an inference slot and got `503` carries `Retry-After` once a request has ended. It counts the requests ahead and the request itself, each holding a slot for the mean time slots were held, over the slots that run at once.
+  When the model's running requests have an expected end, `Retry-After` is that end, never less than the count above.
 - A request with too many messages, an unknown role or too many characters in all is refused with a 400.
   The Messages route applies the same bounds.
 

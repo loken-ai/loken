@@ -54,6 +54,17 @@ impl LlmEngine {
     /// The cards are read as a load reads them, under the load admission.
     /// The other models on the cards are not asked for the memory they keep.
     pub async fn placement_preview(&self) -> Result<PlacementPreview, String> {
+        self.plan_now(preview_of).await
+    }
+
+    /// The plan a load of this engine's model would build now beside the models resident on
+    /// the cards, without reading a weight, as [`Self::placement_preview`] reads it.
+    pub async fn dry_plan(&self) -> Result<DryPlan, String> {
+        self.plan_now(dry_plan_of).await
+    }
+
+    /// What `read` reports of the plan a load of this engine's model would build now.
+    async fn plan_now<T: Send + 'static>(&self, read: Report<T>) -> Result<T, String> {
         let model_id = self.config.model_id.clone();
         let model_file = self
             .find_model_file(&model_id)
@@ -77,19 +88,24 @@ impl LlmEngine {
             .map_err(|e| format!("{}: {e}", model_file.display()))?
             .len();
         let _admission = crate::inference::place::vram_manager::load_admission().await;
-        tokio::task::spawn_blocking(move || preview_file(&model_file, file_len, &ask))
+        tokio::task::spawn_blocking(move || plan_file(&model_file, file_len, &ask, read))
             .await
             .map_err(|e| e.to_string())?
             .map_err(|e| e.to_string())
     }
 }
 
-/// The preview of `model_file`, `file_len` bytes on disk, placed as `ask` says.
-fn preview_file(
+/// What is read of a layered plan: the opened model, the plan and the configuration's ask.
+type Report<T> = fn(&Source<'_>, &Layers, &Ask) -> T;
+
+/// What `read` reports of the plan of `model_file`, `file_len` bytes on disk, placed as `ask`
+/// says.
+fn plan_file<T>(
     model_file: &std::path::Path,
     file_len: u64,
     ask: &Ask,
-) -> AnyResult<PlacementPreview> {
+    read: Report<T>,
+) -> AnyResult<T> {
     let Opened {
         mmap,
         content,
@@ -117,10 +133,51 @@ fn preview_file(
             ask.model_id
         )
     })?;
-    let per_layer = weights
-        .layer_dense_and_expert_bytes(&content, dims.num_layers)
+    Ok(read(&source, layers, ask))
+}
+
+/// The preview of the plan of `layers`.
+fn preview_of(source: &Source<'_>, layers: &Layers, ask: &Ask) -> PlacementPreview {
+    let per_layer = source
+        .weights
+        .layer_dense_and_expert_bytes(source.content, source.dims.num_layers)
         .filter(|_| ask.layer_share.is_none());
-    Ok(layers.preview(&ask.model_id, &arch, file_size, per_layer.as_deref()))
+    layers.preview(
+        &ask.model_id,
+        source.arch,
+        source.file_size,
+        per_layer.as_deref(),
+    )
+}
+
+/// The plan of `layers` as a choice between models reads it.
+fn dry_plan_of(_: &Source<'_>, layers: &Layers, _: &Ask) -> DryPlan {
+    let Some(plan) = layers.planned_rung() else {
+        return DryPlan::default();
+    };
+    let on_host = plan
+        .segments
+        .iter()
+        .any(|s| s.kind == DeviceKind::Cpu && s.layer_end > s.layer_start)
+        || plan
+            .host_experts_from
+            .is_some_and(|from| from < plan.total_layers);
+    DryPlan {
+        on_cards: !on_host,
+        cards: crate::inference::place::ladder::cards_of(&plan),
+        predicted_tok_s: layers.decode_secs(&plan).map(|secs| 1.0 / secs),
+    }
+}
+
+/// A plan a load would build now, read without loading.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct DryPlan {
+    /// No block and no routed expert of the plan sits on the host.
+    pub on_cards: bool,
+    /// The cards the plan uses.
+    pub cards: Vec<usize>,
+    /// The decode rate the plan's estimate predicts, `None` when the estimate cannot say.
+    pub predicted_tok_s: Option<f64>,
 }
 
 /// A model's header and its weights, as the cards will hold them.
@@ -953,6 +1010,27 @@ impl Layers {
             &self.cards,
             &self.accelerators,
         )
+    }
+
+    /// Seconds a decoded token is estimated to take on `plan`, `None` when the estimate cannot
+    /// say.
+    pub(crate) fn decode_secs(&self, plan: &HeteroPlan) -> Option<f64> {
+        let sets = self.routed.map(|r| {
+            crate::inference::place::decode_time::RoutedSets::on(
+                plan,
+                r,
+                self.experts_in_blocks,
+                None,
+            )
+        });
+        self.demand
+            .decode_secs(
+                plan,
+                &crate::inference::place::ladder::card_bandwidth,
+                &crate::inference::place::host_read::host_bandwidth,
+                sets.as_ref(),
+            )
+            .filter(|secs| *secs > 0.0)
     }
 
     /// The report of the plan the load builds.

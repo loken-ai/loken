@@ -1420,10 +1420,9 @@ impl APIServer {
             // actually take. It is the same figure that decides admission here, so a peer
             // reading it sees what this node feels rather than a count it cannot interpret.
             load: {
-                let gates = self.gates().await;
-                let g = crate::api::gate::snapshot_of(&gates).await;
+                let g = crate::api::gate::snapshot_of(&self.gates().await).await;
                 let busy = (g.in_flight + g.queue_depth + self.media_jobs().len()) as f32;
-                (busy / crate::api::gate::capacity_of(&gates).max(1) as f32).min(1.0)
+                (busy / self.lanes().await.max(1) as f32).min(1.0)
             },
             // The raw queue alongside the fraction: routing prices the WAIT as rounds of
             // service, and only a count over a width can say how many rounds there are.
@@ -1436,7 +1435,7 @@ impl APIServer {
                     + crate::distributed::rate_meter::in_flight()
                     + self.media_jobs().len() as u32
             },
-            lanes: crate::api::gate::capacity_of(&self.gates().await) as u32,
+            lanes: self.lanes().await as u32,
             // Probed once at startup and held by the manager, so publishing costs a lock
             // rather than an NVML pass per gossip round.
             devices: self
@@ -1767,7 +1766,8 @@ impl APIServer {
         // Resident language models stay while the cards hold the incoming one too; the
         // least recently used go first when they would push it off the cards.
         let per_card = self.model_load_reserve(model_id, &config);
-        self.evict_to_make_room(model_id, hot, per_card).await;
+        self.evict_to_make_room(model_id, hot, per_card, &config)
+            .await;
         self.evict_for_host_room(model_id).await;
         if hot > 0 {
             crate::inference::place::vram_manager::ensure_gpu_headroom("llm", hot, 0).await;
@@ -2860,12 +2860,22 @@ impl APIServer {
             > 0
     }
 
-    /// The server's gate, then the gates of the loaded models that admit their own requests.
+    /// The server's gate, then the gate of each loaded language model.
     pub(crate) async fn gates(&self) -> Vec<Arc<crate::api::gate::RequestGate>> {
         let engines = self.engines.read().await;
         std::iter::once(self.request_gate.clone())
-            .chain(engines.iter().filter_map(|e| e.gate.clone()))
+            .chain(engines.iter().map(|e| e.gate.clone()))
             .collect()
+    }
+
+    /// The requests the server runs at once: those the gates of the loaded language models
+    /// admit, the server's own gate's while no model is loaded.
+    pub(crate) async fn lanes(&self) -> usize {
+        let engines = self.engines.read().await;
+        match engines.is_empty() {
+            true => self.request_gate.capacity(),
+            false => engines.iter().map(|e| e.gate.capacity()).sum(),
+        }
     }
 
     pub fn create_router(&self) -> axum::Router {
@@ -3443,15 +3453,16 @@ async fn acquire_gate(
     model: String,
     endpoint: &'static str,
 ) -> Result<crate::api::gate::RequestGuard, ApiError> {
-    // A model with copies on several cards admits as many requests as it has copies.
+    // A loaded language model admits its requests on its own gate.
+    // What has no model entry takes the server's gate.
     let own = {
         let engines = state.engines.read().await;
         engines
             .iter()
             .find(|e| e.model_id == model)
-            .and_then(|e| e.gate.clone())
+            .map(|e| (e.gate.clone(), e.copies()))
     };
-    let gate = own.unwrap_or_else(|| state.request_gate.clone());
+    let (gate, copies) = own.unwrap_or_else(|| (state.request_gate.clone(), Vec::new()));
     match gate
         .acquire_with_info_timeout(priority, model, endpoint, GATE_WAIT)
         .await
@@ -3462,8 +3473,21 @@ async fn acquire_gate(
                 "no inference slot became available within {}s ({endpoint}); retry later",
                 GATE_WAIT.as_secs()
             ),
-            gate.retry_after_secs().await,
+            retry_after(
+                model_manager::expected_end_of(&copies),
+                gate.retry_after_secs().await,
+            ),
         )),
+    }
+}
+
+/// The `Retry-After` of a request refused at its gate: the seconds until the model's running
+/// requests are expected to end, and at least what the gate measured, when the end is known.
+/// The gate's figure otherwise.
+fn retry_after(expected_end: Option<f64>, gate: Option<u64>) -> Option<u64> {
+    match expected_end.filter(|s| s.is_finite() && *s > 0.0) {
+        Some(end) => Some((end.ceil() as u64).max(gate.unwrap_or(1))),
+        None => gate,
     }
 }
 

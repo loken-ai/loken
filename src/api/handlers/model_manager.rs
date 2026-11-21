@@ -371,9 +371,9 @@ pub(crate) struct LoadedModelEntry {
     pub(crate) last_used: Arc<AtomicI64>,
     /// Further copies of the model, each whole on a card of its own, served beside `engine`.
     pub(crate) replicas: Vec<Arc<LlmEngine>>,
-    /// Admits as many requests at once as the model has copies; `None` for one copy, which
-    /// the server's own gate admits.
-    pub(crate) gate: Option<Arc<crate::api::gate::RequestGate>>,
+    /// Admits the model's requests, as many at once as the model has copies.
+    /// Each model has its own, so 2 models run their requests at once.
+    pub(crate) gate: Arc<crate::api::gate::RequestGate>,
     /// When a request was last sent to each copy, `engine` first.
     sent: std::sync::Mutex<Vec<std::time::Instant>>,
     /// The copy the last request went to.
@@ -409,7 +409,7 @@ impl LoadedModelEntry {
             chat_format: None,
             last_used: Arc::new(AtomicI64::new(now_millis())),
             replicas: Vec::new(),
-            gate: None,
+            gate: crate::api::gate::RequestGate::new(1),
             sent: std::sync::Mutex::new(Vec::new()),
             last: std::sync::atomic::AtomicUsize::new(0),
         }
@@ -418,7 +418,7 @@ impl LoadedModelEntry {
     /// Serve the model on `replicas` as well as on its own engine.
     pub(crate) fn with_replicas(mut self, replicas: Vec<Arc<LlmEngine>>) -> Self {
         if !replicas.is_empty() {
-            self.gate = Some(crate::api::gate::RequestGate::new(1 + replicas.len()));
+            self.gate = crate::api::gate::RequestGate::new(1 + replicas.len());
             let now = std::time::Instant::now() - PICK_WINDOW;
             *self.sent.lock().unwrap_or_else(|e| e.into_inner()) = vec![now; 1 + replicas.len()];
         }
@@ -463,14 +463,18 @@ impl LoadedModelEntry {
             .any(|e| e.in_flight() > 0)
     }
 
+    /// Every copy of the model, `engine` first.
+    pub(crate) fn copies(&self) -> Vec<Arc<LlmEngine>> {
+        std::iter::once(&self.engine)
+            .chain(self.replicas.iter())
+            .cloned()
+            .collect()
+    }
+
     /// Seconds until the requests running on every copy are expected to end, `None` when a copy
     /// cannot say.
     pub(crate) fn expected_end_secs(&self) -> Option<f64> {
-        std::iter::once(&self.engine)
-            .chain(self.replicas.iter())
-            .try_fold(0.0_f64, |longest, e| {
-                Some(longest.max(e.pace().expected_end_secs()?))
-            })
+        expected_end_of(&self.copies())
     }
 
     /// Decode tokens per second for the main engine, or `None` when no rate has been measured.
@@ -484,6 +488,57 @@ impl LoadedModelEntry {
     }
 }
 
+/// Seconds until the requests running on `copies` are expected to end, `None` when a copy cannot
+/// say.
+pub(crate) fn expected_end_of(copies: &[Arc<LlmEngine>]) -> Option<f64> {
+    copies.iter().try_fold(0.0_f64, |longest, e| {
+        Some(longest.max(e.pace().expected_end_secs()?))
+    })
+}
+
+/// The seconds a load of `model_id` took, `None` before one was measured.
+fn load_secs(model_id: &str) -> Option<f64> {
+    let secs = crate::distributed::rate_meter::snapshot(model_id).model_load_s;
+    (secs.is_finite() && secs > 0.0).then_some(secs)
+}
+
+/// `busy`, the figures of a busy model, with those of the incoming model `incoming_id` loaded
+/// with `config`: what its earlier loads and answers measured, and the plan it would build now
+/// beside the resident models.
+async fn incoming_figures(
+    incoming_id: &str,
+    config: &crate::inference::engine::llm_engine::InferenceConfig,
+    busy: ShareInputs,
+) -> ShareInputs {
+    let kept = crate::inference::engine::llm_engine::Pace::load(incoming_id).unwrap_or_default();
+    let tokens_b = kept.mean_answer_tokens().or_else(|| {
+        let tokens = crate::distributed::rate_meter::expected_output_tokens(incoming_id);
+        (tokens > 0).then_some(tokens as f64)
+    });
+    let dry = LlmEngine::with_config(config.clone()).dry_plan().await;
+    if let Err(e) = &dry {
+        info!("⚖️  {incoming_id}: no plan beside the busy models ({e})");
+    }
+    let dry = dry.ok();
+    let shares_card = dry.as_ref().is_none_or(|d| {
+        d.cards
+            .iter()
+            .any(|&card| crate::inference::engine::llm_engine::requests_on(Some(card)).1 > 0)
+    });
+    ShareInputs {
+        tokens_b,
+        load_b: load_secs(incoming_id),
+        rate_b: kept.decode_tok_s(),
+        rate_b_beside: dry
+            .as_ref()
+            .and_then(|d| d.predicted_tok_s)
+            .and_then(|p| kept.rate_on(p)),
+        beside_on_cards: dry.as_ref().is_some_and(|d| d.on_cards),
+        shares_card,
+        ..busy
+    }
+}
+
 /// `secs` as the log says it, "unknown" when it is not known.
 fn seconds(secs: Option<f64>) -> String {
     secs.map_or_else(|| "unknown".to_string(), |s| format!("{s:.1} s"))
@@ -492,6 +547,128 @@ fn seconds(secs: Option<f64>) -> String {
 /// `tok_s` as the log says it, "unknown" when it is not known.
 fn rate(tok_s: Option<f64>) -> String {
     tok_s.map_or_else(|| "unknown".to_string(), |r| format!("{r:.1} tok/s"))
+}
+
+/// What the choice between a busy model A and an incoming model B reads.
+/// Seconds and tokens per second, each `None` when it is not measured.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub(crate) struct ShareInputs {
+    /// Seconds until A's running requests are expected to end.
+    pub(crate) end_a: Option<f64>,
+    /// Seconds a load of A takes.
+    pub(crate) load_a: Option<f64>,
+    /// A's decode rate alone.
+    pub(crate) rate_a: Option<f64>,
+    /// A's decode rate while another model runs.
+    pub(crate) rate_a_beside: Option<f64>,
+    /// Mean seconds between 2 requests of A.
+    pub(crate) gap_a: Option<f64>,
+    /// Tokens B's request writes.
+    pub(crate) tokens_b: Option<f64>,
+    /// Seconds a load of B takes.
+    pub(crate) load_b: Option<f64>,
+    /// B's decode rate on its full plan.
+    pub(crate) rate_b: Option<f64>,
+    /// B's decode rate on its plan beside A.
+    pub(crate) rate_b_beside: Option<f64>,
+    /// B's plan beside A keeps no block and no routed expert on the host.
+    pub(crate) beside_on_cards: bool,
+    /// B's plan beside A uses a card a running request uses.
+    pub(crate) shares_card: bool,
+}
+
+/// What the incoming model does about a busy model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Share {
+    /// Wait for A's end, unload A, load B on the room A held.
+    WaitEvict,
+    /// Load B beside A now, and run both at once.
+    Beside,
+    /// Wait for A's end, then load B beside A.
+    Wait,
+}
+
+impl Share {
+    /// The choice as the log says it.
+    fn label(self) -> &'static str {
+        match self {
+            Share::WaitEvict => "wait and evict",
+            Share::Beside => "run beside",
+            Share::Wait => "wait",
+        }
+    }
+}
+
+/// The estimated seconds until B's request ends under each choice, in the order of [`Share`]:
+/// wait and evict, run beside, wait; and the choice.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct ShareChoice {
+    pub(crate) costs: [Option<f64>; 3],
+    pub(crate) choice: Share,
+}
+
+/// The choice between waiting for busy model A and loading incoming model B beside it.
+///
+/// Wait and evict costs `T_A + L_B + n_B/r_B + q_A*L_A`.
+/// `q_A = min(1, (L_B + n_B/r_B) / g_A)` is the chance that A is asked for while B runs.
+/// An unknown `g_A` counts A as asked for, and an unknown `L_A` as a free reload.
+/// Run beside costs `L_B + n_B/r_B' + T_A*(r_A/r_A' - 1)`: B on its plan beside A, A slowed.
+/// Wait costs `T_A + L_B + n_B/r_B`, offered only when B's plan beside A holds no host block.
+///
+/// A plan beside A on cards no running request uses runs both at their own rates: B runs beside.
+/// Otherwise the lowest known cost wins.
+/// Wait and evict wins when its own cost is not known, and on a tie.
+pub(crate) fn choose_share(i: &ShareInputs) -> ShareChoice {
+    let alone = i.beside_on_cards && !i.shares_card;
+    let fine = |v: Option<f64>| v.filter(|v| v.is_finite() && *v >= 0.0);
+    let rate = |v: Option<f64>| v.filter(|v| v.is_finite() && *v > 0.0);
+    let run_b = fine(i.tokens_b).zip(rate(i.rate_b)).map(|(n, r)| n / r);
+    let end_a = fine(i.end_a);
+    let load_b = fine(i.load_b);
+    let wait_evict = end_a.zip(load_b).zip(run_b).map(|((t, l), run)| {
+        let asked = rate(i.gap_a).map_or(1.0, |g| ((l + run) / g).min(1.0));
+        t + l + run + asked * fine(i.load_a).unwrap_or(0.0)
+    });
+    let rate_b_beside = match alone {
+        true => rate(i.rate_b_beside).or(rate(i.rate_b)),
+        false => rate(i.rate_b_beside),
+    };
+    let slowed_a = match alone {
+        true => Some(0.0),
+        false => end_a
+            .zip(rate(i.rate_a))
+            .zip(rate(i.rate_a_beside))
+            .map(|((t, r), r_beside)| t * (r / r_beside - 1.0)),
+    };
+    let beside = load_b
+        .zip(fine(i.tokens_b))
+        .zip(rate_b_beside)
+        .zip(slowed_a)
+        .map(|(((l, n), r), slowed)| l + n / r + slowed);
+    let wait = end_a
+        .zip(load_b)
+        .zip(run_b)
+        .filter(|_| i.beside_on_cards)
+        .map(|((t, l), run)| t + l + run);
+    let costs = [wait_evict, beside, wait];
+    let choice = if alone {
+        Share::Beside
+    } else if let Some(first) = wait_evict {
+        [(beside, Share::Beside), (wait, Share::Wait)]
+            .into_iter()
+            .filter_map(|(cost, share)| cost.map(|c| (c, share)))
+            .fold((first, Share::WaitEvict), |best, next| {
+                if next.0 < best.0 {
+                    next
+                } else {
+                    best
+                }
+            })
+            .1
+    } else {
+        Share::WaitEvict
+    };
+    ShareChoice { costs, choice }
 }
 
 /// Waits `period`, then until no request runs on the model, and returns the engine list locked.
@@ -1050,17 +1227,23 @@ impl APIServer {
     /// serve no request, other than `incoming_id`.
     ///
     /// A model serving a request is never unloaded under it.
-    /// When only busy models are left, the least recently used one that the server's own gate
-    /// admits is waited for once, then unloaded: the incoming model's requests take that gate
-    /// too, so they would wait for it anyway, and the incoming model gets the cards.
-    /// A model still busy after its wait, or one with its own gate, stays, and the incoming
-    /// model is placed around it.
+    /// When only busy models are left, [`choose_share`] weighs the least recently used one
+    /// against the incoming model, whose `config` gives the plan it would build beside it:
+    /// wait for its end and unload it, place the incoming model around it now, or wait for
+    /// its end and keep it.
+    /// A model still busy after its wait stays, and the incoming model is placed around it.
     /// Resident models hold weights, KV blocks and pools that would otherwise push the new
     /// model's placement onto the host; as many stay resident as the memory allows.
     ///
     /// `per_card` is what the load keeps free on each card it uses beyond the weights: the
     /// KV cache, workspaces and staging the loader reserves.
-    pub(crate) async fn evict_to_make_room(&self, incoming_id: &str, need: u64, per_card: u64) {
+    pub(crate) async fn evict_to_make_room(
+        &self,
+        incoming_id: &str,
+        need: u64,
+        per_card: u64,
+        config: &crate::inference::engine::llm_engine::InferenceConfig,
+    ) {
         let mut tried: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut waited: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut asked = false;
@@ -1111,7 +1294,6 @@ impl APIServer {
                         .iter()
                         .filter(|e| e.model_id != incoming_id && e.busy())
                         .filter(|e| !tried.contains(&e.model_id) && !waited.contains(&e.model_id))
-                        .filter(|e| e.gate.is_none())
                         .min_by_key(|e| e.last_used.load(Ordering::Relaxed))
                         .map(|e| {
                             let pace = format!(
@@ -1119,10 +1301,18 @@ impl APIServer {
                                 seconds(e.expected_end_secs()),
                                 rate(e.decode_tok_s())
                             );
-                            (e.model_id.clone(), e.engine.clone(), pace)
+                            let figures = ShareInputs {
+                                end_a: e.expected_end_secs(),
+                                load_a: load_secs(&e.model_id),
+                                rate_a: e.decode_tok_s(),
+                                rate_a_beside: e.engine.pace().beside_tok_s(),
+                                gap_a: e.engine.pace().mean_gap_secs(),
+                                ..ShareInputs::default()
+                            };
+                            (e.model_id.clone(), e.copies(), pace, figures)
                         })
                 };
-                let Some((id, engine, pace)) = busy else {
+                let Some((id, copies, pace, figures)) = busy else {
                     let engines = self.engines.read().await;
                     if engines
                         .iter()
@@ -1132,13 +1322,36 @@ impl APIServer {
                     }
                     return;
                 };
-                info!("⚖️  {id} is busy, expected to end in {pace}: {incoming_id} waits for it, then takes its room");
-                let started = std::time::Instant::now();
-                engine.until_no_request().await;
+                let inputs = incoming_figures(incoming_id, config, figures).await;
+                let choice = choose_share(&inputs);
+                let [wait_evict, beside, wait] = choice.costs.map(seconds);
                 info!(
-                    "⚖️  {id} ended after {:.1} s",
+                    "⚖️  {incoming_id} beside busy {id}: wait and evict {wait_evict}, \
+                     run beside {beside}, wait {wait}: {}",
+                    choice.choice.label()
+                );
+                if choice.choice == Share::Beside {
+                    info!("⚖️  {incoming_id} is placed around {id}, both run at once");
+                    return;
+                }
+                info!("⚖️  {id} is busy, expected to end in {pace}: {incoming_id} waits for it");
+                let started = std::time::Instant::now();
+                // The wait is bounded as a request's wait at its gate is.
+                let ended = tokio::time::timeout(super::GATE_WAIT, async {
+                    for copy in &copies {
+                        copy.until_no_request().await;
+                    }
+                })
+                .await
+                .is_ok();
+                info!(
+                    "⚖️  {id} {} after {:.1} s",
+                    if ended { "ended" } else { "still runs" },
                     started.elapsed().as_secs_f64()
                 );
+                if choice.choice == Share::Wait {
+                    return;
+                }
                 waited.insert(id);
                 continue;
             };
@@ -1585,8 +1798,8 @@ mod tests {
         assert_eq!(guard.len(), 1);
     }
 
-    /// The server's figures read its own gate alone while no model has a gate of its own, and
-    /// add a model's gate once it has one.
+    /// The server's figures read its own gate and the gate of each model: a model with one copy
+    /// adds 1 lane, a model with 2 copies 2 lanes.
     #[tokio::test]
     async fn the_gate_figures_add_the_gates_of_the_models() {
         let state = APIServer::new(
@@ -1598,22 +1811,24 @@ mod tests {
                 crate::inference::engine::llm_engine::InferenceConfig::default(),
             ))
         };
+        assert_eq!(state.gates().await.len(), 1);
+        assert_eq!(state.lanes().await, 1);
         state
             .engines
             .write()
             .await
             .push(LoadedModelEntry::new("a".to_string(), engine(), Some(1)));
         let gates = state.gates().await;
-        assert_eq!(gates.len(), 1);
+        assert_eq!(gates.len(), 2);
         assert!(Arc::ptr_eq(&gates[0], &state.request_gate));
-        assert_eq!(crate::api::gate::capacity_of(&gates), 1);
+        assert_eq!(state.lanes().await, 1);
         state.engines.write().await.push(
             LoadedModelEntry::new("b".to_string(), engine(), Some(1)).with_replicas(vec![engine()]),
         );
         let gates = state.gates().await;
-        assert_eq!(gates.len(), 2);
-        assert_eq!(crate::api::gate::capacity_of(&gates), 3);
-        let own = gates[1]
+        assert_eq!(gates.len(), 3);
+        assert_eq!(state.lanes().await, 3);
+        let own = gates[2]
             .acquire_with_info_timeout(
                 crate::api::gate::Priority::Interactive,
                 "b".to_string(),
@@ -1629,6 +1844,224 @@ mod tests {
             "a request on the model's own gate shows in the server's figures"
         );
         drop(own);
+    }
+
+    /// 2 models admit a request each at once on their own gates, and a second request of one
+    /// model waits for its first, while the server's figures count all 3.
+    #[tokio::test]
+    async fn two_models_are_admitted_at_once_on_their_own_gates() {
+        let state = APIServer::new(
+            "/nonexistent-ollama-models".to_string(),
+            "/nonexistent-hf-models".to_string(),
+        );
+        let engine = || {
+            Arc::new(LlmEngine::with_config(
+                crate::inference::engine::llm_engine::InferenceConfig::default(),
+            ))
+        };
+        let (a, b) = (engine(), engine());
+        {
+            let mut engines = state.engines.write().await;
+            engines.push(LoadedModelEntry::new("a".to_string(), a.clone(), Some(1)));
+            engines.push(LoadedModelEntry::new("b".to_string(), b.clone(), Some(1)));
+        }
+        let admit = |engine: Arc<LlmEngine>, model: &'static str| {
+            let state = state.clone();
+            async move {
+                state
+                    .admit(
+                        engine,
+                        model,
+                        crate::api::gate::Priority::Interactive,
+                        "/test",
+                        &[],
+                    )
+                    .await
+            }
+        };
+        let quick = Duration::from_secs(5);
+        let on_a = tokio::time::timeout(quick, admit(a.clone(), "a"))
+            .await
+            .expect("a is admitted at once")
+            .expect("a is admitted");
+        let on_b = tokio::time::timeout(quick, admit(b.clone(), "b"))
+            .await
+            .expect("b is admitted beside a")
+            .expect("b is admitted");
+        let second = tokio::spawn(admit(a.clone(), "a"));
+        let mut queued = false;
+        for _ in 0..100 {
+            let g = crate::api::gate::snapshot_of(&state.gates().await).await;
+            if g.queue_depth == 1 {
+                assert_eq!(g.in_flight, 2);
+                queued = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(queued, "the second request of a waits at a's gate");
+        assert!(!second.is_finished(), "a admits one request at a time");
+        drop(on_b);
+        assert!(!second.is_finished(), "b's end does not admit a's request");
+        drop(on_a);
+        let again = tokio::time::timeout(quick, second)
+            .await
+            .expect("a's second request is admitted once its first ends")
+            .unwrap()
+            .expect("a is admitted");
+        let g = crate::api::gate::snapshot_of(&state.gates().await).await;
+        assert_eq!((g.in_flight, g.queue_depth), (1, 0));
+        drop(again);
+    }
+
+    /// The figures of the F36 measure: A ends in 65 s at 6.1 tok/s, B loads in 7 s and writes
+    /// 16 tokens at 96 tok/s alone and 38 tok/s on its plan beside A, which holds host blocks.
+    fn f36() -> ShareInputs {
+        ShareInputs {
+            end_a: Some(65.0),
+            rate_a: Some(6.1),
+            tokens_b: Some(16.0),
+            load_b: Some(7.0),
+            rate_b: Some(96.0),
+            rate_b_beside: Some(38.0),
+            ..ShareInputs::default()
+        }
+    }
+
+    /// With A's rate beside another model unknown, the F36 measure waits for A and evicts it.
+    #[test]
+    fn the_f36_measure_waits_and_evicts() {
+        let choice = choose_share(&f36());
+        assert_eq!(choice.choice, Share::WaitEvict);
+        let wait_evict = choice.costs[0].unwrap();
+        assert!((wait_evict - (65.0 + 7.0 + 16.0 / 96.0)).abs() < 1e-9);
+        assert_eq!(choice.costs[1], None);
+        assert_eq!(choice.costs[2], None, "the plan beside A holds host blocks");
+    }
+
+    /// Nothing measured waits and evicts, as a server with one gate did.
+    #[test]
+    fn nothing_measured_waits_and_evicts() {
+        let choice = choose_share(&ShareInputs::default());
+        assert_eq!(choice.choice, Share::WaitEvict);
+        assert_eq!(choice.costs, [None; 3]);
+    }
+
+    /// A slowed a little beside B runs beside; A slowed much waits and evicts.
+    #[test]
+    fn run_beside_wins_while_a_slows_less_than_the_wait() {
+        let little = choose_share(&ShareInputs {
+            rate_a_beside: Some(5.5),
+            ..f36()
+        });
+        assert_eq!(little.choice, Share::Beside);
+        let beside = 7.0 + 16.0 / 38.0 + 65.0 * (6.1 / 5.5 - 1.0);
+        assert!((little.costs[1].unwrap() - beside).abs() < 1e-9);
+        let much = choose_share(&ShareInputs {
+            rate_a_beside: Some(3.0),
+            ..f36()
+        });
+        assert_eq!(much.choice, Share::WaitEvict);
+    }
+
+    /// The reload of A is priced by the chance A is asked for while B runs.
+    #[test]
+    fn the_reload_of_a_counts_as_often_as_a_is_asked_for() {
+        let run = 7.0 + 16.0 / 96.0;
+        let often = choose_share(&ShareInputs {
+            load_a: Some(20.0),
+            gap_a: Some(1.0),
+            ..f36()
+        });
+        assert!((often.costs[0].unwrap() - (65.0 + run + 20.0)).abs() < 1e-9);
+        let rare = choose_share(&ShareInputs {
+            load_a: Some(20.0),
+            gap_a: Some(100.0),
+            ..f36()
+        });
+        assert!((rare.costs[0].unwrap() - (65.0 + run + run / 100.0 * 20.0)).abs() < 1e-9);
+        let unknown_gap = choose_share(&ShareInputs {
+            load_a: Some(20.0),
+            ..f36()
+        });
+        assert!((unknown_gap.costs[0].unwrap() - (65.0 + run + 20.0)).abs() < 1e-9);
+    }
+
+    /// A plan beside A without host blocks on a card A shares waits without evicting when
+    /// running both slows them more than the wait costs.
+    #[test]
+    fn a_plan_on_shared_cards_waits_when_both_slow_too_much() {
+        let choice = choose_share(&ShareInputs {
+            beside_on_cards: true,
+            shares_card: true,
+            rate_a_beside: Some(2.0),
+            rate_b_beside: Some(30.0),
+            load_a: Some(20.0),
+            gap_a: Some(10.0),
+            ..f36()
+        });
+        assert_eq!(choice.choice, Share::Wait);
+        let wait = choice.costs[2].unwrap();
+        assert!((wait - (65.0 + 7.0 + 16.0 / 96.0)).abs() < 1e-9);
+        assert!(choice.costs[0].unwrap() > wait);
+        assert!(choice.costs[1].unwrap() > wait);
+    }
+
+    /// A plan beside A on cards no running request uses runs beside with nothing measured.
+    #[test]
+    fn a_plan_on_free_cards_runs_beside_without_a_measure() {
+        let alone = ShareInputs {
+            beside_on_cards: true,
+            ..ShareInputs::default()
+        };
+        assert_eq!(choose_share(&alone).choice, Share::Beside);
+        let measured = choose_share(&ShareInputs {
+            beside_on_cards: true,
+            rate_b_beside: None,
+            ..f36()
+        });
+        assert_eq!(measured.choice, Share::Beside);
+        assert!((measured.costs[1].unwrap() - (7.0 + 16.0 / 96.0)).abs() < 1e-9);
+    }
+
+    /// An unknown input on the side of running beside never chooses it.
+    #[test]
+    fn an_unknown_input_beside_does_not_run_beside() {
+        let known = ShareInputs {
+            rate_a_beside: Some(6.0),
+            ..f36()
+        };
+        assert_eq!(choose_share(&known).choice, Share::Beside);
+        for unknown in [
+            ShareInputs {
+                rate_b_beside: None,
+                ..known
+            },
+            ShareInputs {
+                rate_a: None,
+                ..known
+            },
+            ShareInputs {
+                load_b: None,
+                ..known
+            },
+            ShareInputs {
+                tokens_b: None,
+                ..known
+            },
+        ] {
+            assert_ne!(choose_share(&unknown).choice, Share::Beside, "{unknown:?}");
+        }
+    }
+
+    /// A refused request is told to come back when the model's running requests end, never
+    /// sooner than the gate measured.
+    #[test]
+    fn the_retry_after_follows_the_expected_end() {
+        assert_eq!(super::super::retry_after(Some(12.3), None), Some(13));
+        assert_eq!(super::super::retry_after(Some(12.3), Some(40)), Some(40));
+        assert_eq!(super::super::retry_after(Some(0.0), Some(4)), Some(4));
+        assert_eq!(super::super::retry_after(None, None), None);
     }
 
     /// A server holding nothing frees nothing, and says so - for every engine on the

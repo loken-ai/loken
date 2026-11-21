@@ -17,6 +17,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 - Serving: keep the embeddings of several images between requests.
 - Serving: look up the disk cache while a save cleans it.
 - Loading: parse the header of each safetensors file once.
+- Serving: run 2 models at once when that costs less than waiting.
 
 ### Fixed
 

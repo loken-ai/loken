@@ -35,6 +35,8 @@ struct State {
     next: u64,
     /// The last load whose plan was given a predicted decode rate, until an answer measures it.
     load: Option<Load>,
+    /// The decode rate the plan of the last load predicts, `None` when its estimate cannot say.
+    planned_tok_s: Option<f64>,
 }
 
 /// A load's predicted decode rate, and the decode counts when it ended.
@@ -84,6 +86,7 @@ impl Pace {
     /// `None` clears the mark of an earlier load.
     pub fn loaded(&self, model: &str, predicted_tok_s: Option<f64>) {
         let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        s.planned_tok_s = predicted_tok_s;
         s.load = predicted_tok_s.map(|predicted_tok_s| Load {
             model: model.to_string(),
             predicted_tok_s,
@@ -348,6 +351,33 @@ pub struct Kept {
     pub answer_tokens: u64,
     pub gaps: u64,
     pub gap_secs: f64,
+    /// The decode rate the plan of the last load predicts.
+    #[serde(default)]
+    pub planned_tok_s: Option<f64>,
+}
+
+impl Kept {
+    /// Decode tokens per second of the answers that ran alone, `None` before one was measured.
+    pub fn decode_tok_s(&self) -> Option<f64> {
+        (self.decoded > 0 && self.decode_secs > 0.0).then(|| self.decoded as f64 / self.decode_secs)
+    }
+
+    /// Mean tokens per answer, `None` before an answer finished.
+    pub fn mean_answer_tokens(&self) -> Option<f64> {
+        (self.answers > 0).then(|| self.answer_tokens as f64 / self.answers as f64)
+    }
+
+    /// The decode rate of a plan whose estimate predicts `predicted_tok_s`: the estimate scaled
+    /// by the rate measured against the rate the plan of the last load predicted.
+    /// `None` when a rate is not known.
+    pub fn rate_on(&self, predicted_tok_s: f64) -> Option<f64> {
+        let secs = crate::inference::place::decode_time::calibrated(
+            1.0 / predicted_tok_s,
+            1.0 / self.planned_tok_s?,
+            self.decode_tok_s()?,
+        )?;
+        Some(1.0 / secs)
+    }
 }
 
 impl Pace {
@@ -363,6 +393,7 @@ impl Pace {
             answer_tokens: s.answer_tokens,
             gaps: s.gaps,
             gap_secs: s.gap_secs,
+            planned_tok_s: s.planned_tok_s,
         }
     }
 
@@ -565,6 +596,28 @@ mod tests {
         assert!(pace.state.lock().unwrap().load.is_none());
     }
 
+    /// The rate of another plan scales the measured rate by the plan's estimate against the
+    /// estimate of the plan the rate was measured on, and a load keeps its plan's estimate.
+    #[test]
+    fn the_rate_of_another_plan_follows_its_estimate() {
+        let pace = Pace::default();
+        pace.loaded("m", Some(20.0));
+        pace.restore(&Kept {
+            decoded: 100,
+            decode_secs: 10.0,
+            ..Default::default()
+        });
+        let kept = pace.kept();
+        assert_eq!(kept.planned_tok_s, Some(20.0));
+        assert_eq!(kept.decode_tok_s(), Some(10.0));
+        assert!((kept.rate_on(10.0).unwrap() - 5.0).abs() < 1e-9);
+        let unplanned = Kept {
+            planned_tok_s: None,
+            ..kept
+        };
+        assert_eq!(unplanned.rate_on(10.0), None);
+    }
+
     /// Measures restored after a load leave the load mark measuring only the answers after it.
     #[test]
     fn a_restore_after_a_load_keeps_the_mark_on_the_new_answers() {
@@ -727,6 +780,7 @@ mod tests {
             answer_tokens: 100,
             gaps: 0,
             gap_secs: 0.0,
+            planned_tok_s: None,
         };
         Pace::save_to("model1", &kept1, Some(dir));
 
@@ -744,6 +798,7 @@ mod tests {
             answer_tokens: 200,
             gaps: 1,
             gap_secs: 2.0,
+            planned_tok_s: Some(30.0),
         };
         Pace::save_to("model2", &kept2, Some(dir));
 
