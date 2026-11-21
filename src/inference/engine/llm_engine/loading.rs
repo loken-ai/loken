@@ -473,6 +473,9 @@ impl LlmEngine {
         let configured_window = self.config.context_length;
         let planned_kv = self.planned_kv.clone();
         planned_kv.store(0, std::sync::atomic::Ordering::Relaxed);
+        // The load sets the decode rate its plan predicts, when the plan gives one.
+        let pace = self.pace.clone();
+        pace.loaded(&model_id, None);
         let model_id_clone = model_id.clone(); // Clone for the closure
                                                // Resolve the projector blob (vision tower) for dual-blob Ollama
                                                // packages like moondream. None for text-only models. Moved into
@@ -1561,6 +1564,26 @@ impl LlmEngine {
                                         false => format!(", routed experts of layers {} in host memory", host_experts.join(", ")),
                                     };
                                     info!("✅ {arch} loaded: layers {placement}{host_experts} (kv_quant={kv:?}, kv_ctx={ctx:?})");
+                                    // The decode rate the plan predicts, which the first answer
+                                    // after the load sets against the rate it measures.
+                                    // The block bytes of a wide residual's plan hold no routed expert.
+                                    let sets = routed.map(|r| {
+                                        crate::inference::place::decode_time::RoutedSets::on(plan, r, card_mixers.is_none(), None)
+                                    });
+                                    let predicted = demand
+                                        .decode_secs(
+                                            plan,
+                                            &crate::inference::place::ladder::card_bandwidth,
+                                            &crate::inference::place::host_read::host_bandwidth,
+                                            sets.as_ref(),
+                                        )
+                                        .filter(|secs| *secs > 0.0)
+                                        .map(|secs| 1.0 / secs);
+                                    match predicted {
+                                        Some(rate) => info!("{arch} decode predicted at {rate:.1} tok/s on this plan"),
+                                        None => info!("{arch} decode not predicted on this plan: a device's bandwidth, a measure of the routed experts it runs on the host, or the cost of a split across cards is not known"),
+                                    }
+                                    pace.loaded(&model_id_clone, predicted);
                                     #[cfg(feature = "gpu")]
                                     for card in crate::inference::place::ladder::cards_of(plan) {
                                         if let Some((used, reserved)) = crate::inference::place::device_probe::pool_bytes(card) {

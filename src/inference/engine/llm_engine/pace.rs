@@ -20,6 +20,43 @@ struct State {
     /// The requests running, by the number `begin` gave them.
     running: std::collections::HashMap<u64, Running>,
     next: u64,
+    /// The last load whose plan was given a predicted decode rate, until an answer measures it.
+    load: Option<Load>,
+}
+
+/// A load's predicted decode rate, and the decode counts when it ended.
+struct Load {
+    model: String,
+    predicted_tok_s: f64,
+    decoded: u64,
+    decode_secs: f64,
+}
+
+/// The decode rate the answers after a load measured, against the rate its plan predicted.
+#[derive(Debug, PartialEq)]
+struct LoadMeasure {
+    model: String,
+    predicted_tok_s: f64,
+    measured_tok_s: f64,
+}
+
+impl State {
+    /// The rate decoded since the marked load, once: the mark is then cleared.
+    /// `None` before a decode after the load, or when no load is marked.
+    fn since_load(&mut self) -> Option<LoadMeasure> {
+        let load = self.load.as_ref()?;
+        let decoded = self.decoded.checked_sub(load.decoded)?;
+        let secs = self.decode_secs - load.decode_secs;
+        if decoded == 0 || secs <= 0.0 {
+            return None;
+        }
+        let load = self.load.take()?;
+        Some(LoadMeasure {
+            model: load.model,
+            predicted_tok_s: load.predicted_tok_s,
+            measured_tok_s: decoded as f64 / secs,
+        })
+    }
 }
 
 struct Running {
@@ -28,6 +65,20 @@ struct Running {
 }
 
 impl Pace {
+    /// Marks a load of `model` whose plan was predicted to decode at `predicted_tok_s`.
+    ///
+    /// The first answer after it logs the rate it measured against the prediction.
+    /// `None` clears the mark of an earlier load.
+    pub fn loaded(&self, model: &str, predicted_tok_s: Option<f64>) {
+        let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        s.load = predicted_tok_s.map(|predicted_tok_s| Load {
+            model: model.to_string(),
+            predicted_tok_s,
+            decoded: s.decoded,
+            decode_secs: s.decode_secs,
+        });
+    }
+
     /// Decode tokens per second, or `None` when no rate has been measured yet.
     pub fn decode_tok_s(&self) -> Option<f64> {
         let s = self.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -109,6 +160,15 @@ impl Pace {
                     s.decode_secs += secs;
                 }
             }
+        }
+        if let Some(m) = s.since_load() {
+            tracing::info!(
+                "{}: decode measured at {:.1} tok/s after the load, predicted {:.1} tok/s for its plan ({:.2} of the prediction)",
+                m.model,
+                m.measured_tok_s,
+                m.predicted_tok_s,
+                m.measured_tok_s / m.predicted_tok_s
+            );
         }
     }
 }
@@ -282,6 +342,40 @@ mod tests {
         pace.end(id, Some(5.0));
 
         assert_eq!(pace.mean_answer_tokens(), None);
+    }
+
+    /// The first answer after a marked load measures the rate decoded since that load, once.
+    #[test]
+    fn the_first_answer_after_a_load_measures_its_rate_once() {
+        let pace = Pace::default();
+        let id = pace.begin(None);
+        for _ in 0..11 {
+            pace.token(id);
+        }
+        pace.end(id, Some(1.0));
+        pace.loaded("m", Some(25.0));
+        let mut s = pace.state.lock().unwrap();
+        assert_eq!(s.since_load(), None);
+        s.decoded += 40;
+        s.decode_secs += 2.0;
+        assert_eq!(
+            s.since_load(),
+            Some(LoadMeasure {
+                model: "m".to_string(),
+                predicted_tok_s: 25.0,
+                measured_tok_s: 20.0,
+            })
+        );
+        assert_eq!(s.since_load(), None);
+        drop(s);
+        // A load with no prediction clears the mark.
+        pace.loaded("m", Some(25.0));
+        pace.loaded("m", None);
+        let id = pace.begin(None);
+        pace.token(id);
+        pace.token(id);
+        pace.end(id, Some(1.0));
+        assert!(pace.state.lock().unwrap().load.is_none());
     }
 
     /// A request answered whole counts while it runs and gives its rate at its end.

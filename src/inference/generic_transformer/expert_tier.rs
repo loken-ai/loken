@@ -3844,52 +3844,7 @@ fn transit_experts(experts: usize, link: f64, host: f64) -> usize {
     ((experts as f64 * share).ceil() as usize).clamp(1, experts)
 }
 
-/// Bytes per microsecond the host's threads read a stack of `bytes` bytes at, as the host
-/// computation of an expert does: the best of a few reads of a block of zeros that is not in any
-/// cache. Zero when it could not be measured.
-/// The host bytes a rate probe of `want` bytes takes: all of them while they fit in the burst
-/// headroom and the host's room now, the smallest probe otherwise.
-fn probe_bytes(want: usize) -> usize {
-    use crate::inference::place::layer_executor::{
-        host_burst_headroom_bytes, host_spill_budget_bytes,
-    };
-    probe_size(
-        want,
-        host_spill_budget_bytes().min(host_burst_headroom_bytes()),
-    )
-}
-
-/// [`probe_bytes`] for a host with `room` bytes to give a probe.
-fn probe_size(want: usize, room: u64) -> usize {
-    const SMALLEST: usize = 1 << 20;
-    if want as u64 <= room {
-        want.max(SMALLEST)
-    } else {
-        SMALLEST
-    }
-}
-
-fn host_read_bandwidth(bytes: usize) -> f64 {
-    use rayon::prelude::*;
-    let len = probe_bytes(bytes.min(1 << 28));
-    let block = vec![1u8; len];
-    let mut best = f64::MAX;
-    for _ in 0..3 {
-        let t = std::time::Instant::now();
-        let sum: u64 = block
-            .par_chunks(1 << 16)
-            .map(|c| c.iter().map(|&b| b as u64).sum::<u64>())
-            .sum();
-        let us = t.elapsed().as_secs_f64() * 1e6;
-        std::hint::black_box(sum);
-        best = best.min(us);
-    }
-    if best.is_finite() && best > 0.0 {
-        len as f64 / best
-    } else {
-        0.0
-    }
-}
+use crate::inference::place::host_read::{host_read_bandwidth, probe_bytes};
 
 /// Bytes per microsecond that page-locked host memory reaches the card at: a copy into `arena`,
 /// the best of a few.
@@ -7573,18 +7528,6 @@ mod tests {
                 "{formats:?}: not the bits of the steps: {differ:?}"
             );
         }
-    }
-}
-
-#[cfg(test)]
-mod probe_size_tests {
-    /// A probe takes its bytes while the room holds them, and the smallest probe otherwise.
-    #[test]
-    fn a_probe_fits_the_room_or_takes_the_smallest_size() {
-        assert_eq!(super::probe_size(64 << 20, 1 << 30), 64 << 20);
-        assert_eq!(super::probe_size(64 << 20, 32 << 20), 1 << 20);
-        assert_eq!(super::probe_size(4096, 1 << 30), 1 << 20);
-        assert_eq!(super::probe_size(64 << 20, 0), 1 << 20);
     }
 }
 
