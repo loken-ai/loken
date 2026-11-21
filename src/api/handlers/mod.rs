@@ -1419,9 +1419,10 @@ impl APIServer {
             // actually take. It is the same figure that decides admission here, so a peer
             // reading it sees what this node feels rather than a count it cannot interpret.
             load: {
-                let g = self.request_gate.snapshot().await;
+                let gates = self.gates().await;
+                let g = crate::api::gate::snapshot_of(&gates).await;
                 let busy = (g.in_flight + g.queue_depth + self.media_jobs().len()) as f32;
-                (busy / self.request_gate.capacity().max(1) as f32).min(1.0)
+                (busy / crate::api::gate::capacity_of(&gates).max(1) as f32).min(1.0)
             },
             // The raw queue alongside the fraction: routing prices the WAIT as rounds of
             // service, and only a count over a width can say how many rounds there are.
@@ -1429,12 +1430,12 @@ impl APIServer {
             // idle under any load; the meter's own counter is where generations actually run.
             // A media job never crosses the gate either; it counts as one busy unit.
             busy: {
-                let g = self.request_gate.snapshot().await;
+                let g = crate::api::gate::snapshot_of(&self.gates().await).await;
                 (g.in_flight + g.queue_depth) as u32
                     + crate::distributed::rate_meter::in_flight()
                     + self.media_jobs().len() as u32
             },
-            lanes: self.request_gate.capacity() as u32,
+            lanes: crate::api::gate::capacity_of(&self.gates().await) as u32,
             // Probed once at startup and held by the manager, so publishing costs a lock
             // rather than an NVML pass per gossip round.
             devices: self
@@ -2852,7 +2853,18 @@ impl APIServer {
         if self.media_gate.try_lock().is_err() {
             return true;
         }
-        self.request_gate.snapshot().await.in_flight > 0
+        crate::api::gate::snapshot_of(&self.gates().await)
+            .await
+            .in_flight
+            > 0
+    }
+
+    /// The server's gate, then the gates of the loaded models that admit their own requests.
+    pub(crate) async fn gates(&self) -> Vec<Arc<crate::api::gate::RequestGate>> {
+        let engines = self.engines.read().await;
+        std::iter::once(self.request_gate.clone())
+            .chain(engines.iter().filter_map(|e| e.gate.clone()))
+            .collect()
     }
 
     pub fn create_router(&self) -> axum::Router {

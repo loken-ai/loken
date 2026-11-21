@@ -68,7 +68,7 @@ pub(crate) static SERVER_START: std::sync::OnceLock<std::time::Instant> =
 pub(crate) async fn inflight_status(
     State(state): State<APIServer>,
 ) -> Json<crate::api::gate::GateSnapshot> {
-    Json(state.request_gate.snapshot().await)
+    Json(crate::api::gate::snapshot_of(&state.gates().await).await)
 }
 
 #[derive(Debug, Deserialize)]

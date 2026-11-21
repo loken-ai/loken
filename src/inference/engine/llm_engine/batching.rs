@@ -316,6 +316,8 @@ pub fn lookup_share(prompt: &[u32], generated: &[u32]) -> f64 {
 /// One admitted request, counted until it is dropped.
 pub struct ActiveRequest {
     count: Arc<AtomicUsize>,
+    /// The cards of the request's engine; `None` when they are not known.
+    cards: Option<Vec<usize>>,
     others: usize,
     /// The arrivals call for the batch worker, which this request moves the model into once
     /// it holds the serial gate.
@@ -324,26 +326,99 @@ pub struct ActiveRequest {
     serial: bool,
 }
 
+/// Requests started and running on each card, for the engines whose cards are known, as
+/// `(card, started, running)`.
+static ON_CARDS: std::sync::Mutex<Vec<(usize, u64, usize)>> = std::sync::Mutex::new(Vec::new());
+
+/// Requests started and running on engines whose cards are not known: they count on every card.
+static ANYWHERE: std::sync::Mutex<(u64, usize)> = std::sync::Mutex::new((0, 0));
+
 /// Requests started on every engine of the process, and those running.
 static STARTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static RUNNING: AtomicUsize = AtomicUsize::new(0);
 
-/// The requests started on every engine of the process so far, and those running now.
+/// The requests started so far and those running now that use card `card`: those of the engines
+/// placed on it, and those of the engines whose cards are not known.
+/// For no card, every request of the process.
 /// A measure of one model's use of a card is its own only while these show no other request.
-pub(crate) fn requests_of_the_process() -> (u64, usize) {
-    (
-        STARTED.load(Ordering::Acquire),
-        RUNNING.load(Ordering::Acquire),
-    )
+pub(crate) fn requests_on(card: Option<usize>) -> (u64, usize) {
+    let Some(card) = card else {
+        return (
+            STARTED.load(Ordering::Acquire),
+            RUNNING.load(Ordering::Acquire),
+        );
+    };
+    let (started, running) = placed_on(card);
+    let (anywhere_started, anywhere_running) = *ANYWHERE.lock().unwrap_or_else(|e| e.into_inner());
+    (started + anywhere_started, running + anywhere_running)
+}
+
+/// The requests started so far and those running now of the engines placed on card `card`.
+fn placed_on(card: usize) -> (u64, usize) {
+    ON_CARDS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .find(|(c, _, _)| *c == card)
+        .map_or((0, 0), |&(_, started, running)| (started, running))
+}
+
+/// Counts a request starting on `cards`, or on every card when they are not known.
+fn count_start(cards: Option<&[usize]>) {
+    STARTED.fetch_add(1, Ordering::AcqRel);
+    RUNNING.fetch_add(1, Ordering::AcqRel);
+    let Some(cards) = cards else {
+        let mut anywhere = ANYWHERE.lock().unwrap_or_else(|e| e.into_inner());
+        anywhere.0 += 1;
+        anywhere.1 += 1;
+        return;
+    };
+    let mut on = ON_CARDS.lock().unwrap_or_else(|e| e.into_inner());
+    for &card in cards {
+        match on.iter_mut().find(|(c, _, _)| *c == card) {
+            Some((_, started, running)) => {
+                *started += 1;
+                *running += 1;
+            }
+            None => on.push((card, 1, 1)),
+        }
+    }
+}
+
+/// Counts the end of a request [`count_start`] counted on the same `cards`.
+fn count_end(cards: Option<&[usize]>) {
+    RUNNING.fetch_sub(1, Ordering::AcqRel);
+    let Some(cards) = cards else {
+        let mut anywhere = ANYWHERE.lock().unwrap_or_else(|e| e.into_inner());
+        anywhere.1 = anywhere.1.saturating_sub(1);
+        return;
+    };
+    let mut on = ON_CARDS.lock().unwrap_or_else(|e| e.into_inner());
+    for card in cards {
+        if let Some((_, _, running)) = on.iter_mut().find(|(c, _, _)| c == card) {
+            *running = running.saturating_sub(1);
+        }
+    }
 }
 
 impl ActiveRequest {
+    /// Counts a request of the engine counting `count`, whose cards are not known: it counts on
+    /// every card.
     pub fn enter(count: &Arc<AtomicUsize>) -> Self {
-        STARTED.fetch_add(1, Ordering::AcqRel);
-        RUNNING.fetch_add(1, Ordering::AcqRel);
+        Self::counted(count, None)
+    }
+
+    /// Counts a request of the engine counting `count`, placed on `cards`.
+    pub fn enter_on(count: &Arc<AtomicUsize>, cards: Vec<usize>) -> Self {
+        Self::counted(count, Some(cards))
+    }
+
+    fn counted(count: &Arc<AtomicUsize>, cards: Option<Vec<usize>>) -> Self {
+        count_start(cards.as_deref());
         let others = count.fetch_add(1, Ordering::AcqRel);
         Self {
             count: Arc::clone(count),
+            cards,
             others,
             batched: false,
             serial: false,
@@ -378,7 +453,7 @@ impl ActiveRequest {
 
 impl Drop for ActiveRequest {
     fn drop(&mut self) {
-        RUNNING.fetch_sub(1, Ordering::AcqRel);
+        count_end(self.cards.as_deref());
         if self.count.fetch_sub(1, Ordering::AcqRel) == 1 {
             let _held = IDLE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
             IDLE.notify_all();
@@ -857,21 +932,39 @@ mod tests {
         assert_eq!(lookup_share(&prompt, &[]), 0.0);
     }
 
-    /// A request of any engine shows in the process's counts while it runs, and its start stays
-    /// counted: a measure taken across it is not one model's own.
+    /// A request shows on the cards of its engine and on no other card, and its start stays
+    /// counted after it ends.
     #[test]
-    fn a_request_of_another_engine_shows_in_the_process_counts() {
-        let (mine, other) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
-        let own = ActiveRequest::enter(&mine);
-        let (started, running) = requests_of_the_process();
-        assert!(running >= 1);
-        let theirs = ActiveRequest::enter(&other);
-        let (started_then, running_then) = requests_of_the_process();
-        assert!(started_then > started);
-        assert!(running_then >= 2);
+    fn a_request_shows_on_the_cards_of_its_engine() {
+        // Cards no machine has: the requests of other tests are never placed on them.
+        let (mine, other) = (usize::MAX - 11, usize::MAX - 12);
+        let (a, b) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let own = ActiveRequest::enter_on(&a, vec![mine]);
+        assert_eq!(placed_on(mine), (1, 1));
+        assert_eq!(placed_on(other), (0, 0));
+        assert!(requests_on(Some(mine)).1 >= 1);
+        let theirs = ActiveRequest::enter_on(&b, vec![mine, other]);
+        assert_eq!(placed_on(mine), (2, 2));
+        assert_eq!(placed_on(other), (1, 1));
         drop(theirs);
-        assert!(requests_of_the_process().0 > started);
+        assert_eq!(placed_on(other), (1, 0));
         drop(own);
+        assert_eq!(placed_on(mine), (2, 0));
+    }
+
+    /// A request whose engine's cards are not known counts on every card while it runs.
+    #[test]
+    fn a_request_on_unknown_cards_shows_on_every_card() {
+        let card = usize::MAX - 13;
+        let a = Arc::new(AtomicUsize::new(0));
+        let (started, _) = requests_on(Some(card));
+        let anywhere = ActiveRequest::enter(&a);
+        let (started_then, running_then) = requests_on(Some(card));
+        assert!(started_then > started);
+        assert!(running_then >= 1);
+        assert_eq!(placed_on(card), (0, 0));
+        drop(anywhere);
+        assert!(requests_on(Some(card)).0 > started);
     }
 
     #[test]

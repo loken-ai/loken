@@ -388,6 +388,8 @@ impl LlmEngine {
         // mid-upload. Waiting for the other loader costs seconds; planning against its
         // half-taken card costs the request.
         let _admission = crate::inference::place::vram_manager::load_admission().await;
+        // The models resident on the cards keep their prompt work declared while this one loads.
+        let _arrival = crate::inference::place::reclaim::arrive(&model_id);
         // A load produces an EMPTY KV, so anything the prompt cache remembers about the
         // previous one is a length with nothing behind it. `unload` clears these too;
         // this covers the paths that replace a model without going through it.

@@ -270,7 +270,7 @@ pub struct LlmEngine {
     /// Where a load reports what it has read, when the caller wants to see it.
     load_report: Arc<std::sync::Mutex<Option<crate::inference::serve::progress::SharedProgressFn>>>,
     /// The loaded model as `place::reclaim` lists it, while it is loaded.
-    kept_memory: Arc<std::sync::Mutex<Option<Arc<dyn crate::inference::place::reclaim::Holder>>>>,
+    kept_memory: Arc<std::sync::Mutex<Option<Arc<kept_memory::ModelHolder>>>>,
     /// The context the last load planned the quantised caches at, in positions; 0 for none.
     planned_kv: Arc<std::sync::atomic::AtomicUsize>,
     /// The most card bytes a prefill forward of the model was measured to keep live per row,
@@ -1901,7 +1901,7 @@ use std::io::Cursor;
 use std::time::Instant;
 
 mod batching;
-pub(crate) use batching::requests_of_the_process;
+pub(crate) use batching::requests_on;
 pub use batching::ActiveRequest;
 pub use batching::Arrived;
 mod beam;

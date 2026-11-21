@@ -3646,10 +3646,9 @@ impl CardStager {
         let lent = self.lent_since_return.swap(false, Ordering::AcqRel);
         let decoded = self.routed_at_return.load(Ordering::Acquire) != routed;
         // A span in which another user started a peak measure, or another request started or
-        // ran, holds that user's traffic beside this model's: it is not counted.
+        // ran on the card, holds that user's traffic beside this model's: it is not counted.
         let alone = |&(_, _, marks, (started, running)): &(u64, u64, u64, (u64, usize))| {
-            let (started_now, running_now) =
-                crate::inference::engine::llm_engine::requests_of_the_process();
+            let (started_now, running_now) = self.requests_on_card();
             marks == crate::tensor::cuda::pool_marks()
                 && started == started_now
                 && running <= 1
@@ -3765,8 +3764,14 @@ impl CardStager {
             crate::inference::place::expert_cache::free_now(&self.dev),
             pool,
             crate::tensor::cuda::pool_marks(),
-            crate::inference::engine::llm_engine::requests_of_the_process(),
+            self.requests_on_card(),
         ));
+    }
+
+    /// The requests started so far and those running now that use the card.
+    fn requests_on_card(&self) -> (u64, usize) {
+        let card = self.dev.as_cuda_device().ok().map(|d| d.0.ordinal());
+        crate::inference::engine::llm_engine::requests_on(card)
     }
 
     /// Bytes the transit room takes on the card.

@@ -315,18 +315,8 @@ impl RequestGate {
             };
             by_priority[idx] += 1;
         }
-        // Per-request detail: collect tracked entries, sorted so running ones
-        // come first, then queued by (priority desc, queued_at asc).
         let mut requests: Vec<TrackedRequest> = g.tracked.values().cloned().collect();
-        requests.sort_by(|a, b| {
-            // Running before Queued
-            (b.state == RequestState::Running)
-                .cmp(&(a.state == RequestState::Running))
-                // Higher priority first
-                .then(b.priority.cmp(&a.priority))
-                // Earlier queued first
-                .then(a.queued_at_ms.cmp(&b.queued_at_ms))
-        });
+        sort_requests(&mut requests);
         GateSnapshot {
             in_flight: g.in_flight,
             queue_depth: g.waiters.len(),
@@ -336,6 +326,46 @@ impl RequestGate {
             requests,
         }
     }
+}
+
+/// Sorts tracked requests: running ones first, then by priority, highest first, then by the
+/// time they queued, earliest first.
+fn sort_requests(requests: &mut [TrackedRequest]) {
+    requests.sort_by(|a, b| {
+        (b.state == RequestState::Running)
+            .cmp(&(a.state == RequestState::Running))
+            .then(b.priority.cmp(&a.priority))
+            .then(a.queued_at_ms.cmp(&b.queued_at_ms))
+    });
+}
+
+/// The requests `gates` let run at once, added up.
+pub fn capacity_of(gates: &[Arc<RequestGate>]) -> usize {
+    gates.iter().map(|g| g.capacity()).sum()
+}
+
+/// The snapshots of `gates` added up: their counts summed, their requests in one sorted list.
+/// For a single gate it is that gate's snapshot.
+pub async fn snapshot_of(gates: &[Arc<RequestGate>]) -> GateSnapshot {
+    let mut total = GateSnapshot {
+        in_flight: 0,
+        queue_depth: 0,
+        queued_batch: 0,
+        queued_interactive: 0,
+        queued_fim: 0,
+        requests: Vec::new(),
+    };
+    for gate in gates {
+        let one = gate.snapshot().await;
+        total.in_flight += one.in_flight;
+        total.queue_depth += one.queue_depth;
+        total.queued_batch += one.queued_batch;
+        total.queued_interactive += one.queued_interactive;
+        total.queued_fim += one.queued_fim;
+        total.requests.extend(one.requests);
+    }
+    sort_requests(&mut total.requests);
+    total
 }
 
 /// Read-only view of the gate's queueing state. Used by /api/inflight.
@@ -651,5 +681,42 @@ mod tests {
             let _ = h.await;
         }
         assert_eq!(order.lock().unwrap().clone(), vec![0, 1, 2, 3, 4]);
+    }
+
+    /// One gate reads as itself; 2 gates read as the sum of their counts and requests.
+    #[tokio::test]
+    async fn the_figures_of_several_gates_add_up() {
+        let take = |gate: &Arc<RequestGate>, model: &str| {
+            let gate = gate.clone();
+            let model = model.to_string();
+            async move {
+                gate.acquire_with_info_timeout(
+                    Priority::Interactive,
+                    model,
+                    "/test",
+                    std::time::Duration::from_secs(1),
+                )
+                .await
+                .unwrap()
+            }
+        };
+        let server = RequestGate::new(1);
+        let _held = take(&server, "a").await;
+        let alone = snapshot_of(std::slice::from_ref(&server)).await;
+        let direct = server.snapshot().await;
+        assert_eq!(
+            (alone.in_flight, alone.queue_depth, alone.requests.len()),
+            (direct.in_flight, direct.queue_depth, direct.requests.len())
+        );
+        assert_eq!(capacity_of(std::slice::from_ref(&server)), 1);
+        let own = RequestGate::new(2);
+        let _first = take(&own, "b").await;
+        let _second = take(&own, "b").await;
+        let both = [server.clone(), own.clone()];
+        let total = snapshot_of(&both).await;
+        assert_eq!(total.in_flight, 3);
+        assert_eq!(total.queue_depth, 0);
+        assert_eq!(total.requests.len(), 3);
+        assert_eq!(capacity_of(&both), 3);
     }
 }

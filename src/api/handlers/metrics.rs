@@ -106,7 +106,7 @@ pub(crate) async fn metrics(State(state): State<APIServer>) -> Response {
         &resident,
     );
 
-    let gate = state.request_gate.snapshot().await;
+    let gate = crate::api::gate::snapshot_of(&state.gates().await).await;
     family(
         &mut out,
         "loken_gate_in_flight",

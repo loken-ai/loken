@@ -1585,6 +1585,52 @@ mod tests {
         assert_eq!(guard.len(), 1);
     }
 
+    /// The server's figures read its own gate alone while no model has a gate of its own, and
+    /// add a model's gate once it has one.
+    #[tokio::test]
+    async fn the_gate_figures_add_the_gates_of_the_models() {
+        let state = APIServer::new(
+            "/nonexistent-ollama-models".to_string(),
+            "/nonexistent-hf-models".to_string(),
+        );
+        let engine = || {
+            Arc::new(LlmEngine::with_config(
+                crate::inference::engine::llm_engine::InferenceConfig::default(),
+            ))
+        };
+        state
+            .engines
+            .write()
+            .await
+            .push(LoadedModelEntry::new("a".to_string(), engine(), Some(1)));
+        let gates = state.gates().await;
+        assert_eq!(gates.len(), 1);
+        assert!(Arc::ptr_eq(&gates[0], &state.request_gate));
+        assert_eq!(crate::api::gate::capacity_of(&gates), 1);
+        state.engines.write().await.push(
+            LoadedModelEntry::new("b".to_string(), engine(), Some(1)).with_replicas(vec![engine()]),
+        );
+        let gates = state.gates().await;
+        assert_eq!(gates.len(), 2);
+        assert_eq!(crate::api::gate::capacity_of(&gates), 3);
+        let own = gates[1]
+            .acquire_with_info_timeout(
+                crate::api::gate::Priority::Interactive,
+                "b".to_string(),
+                "/test",
+                Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+        assert_eq!(state.request_gate.snapshot().await.in_flight, 0);
+        assert_eq!(
+            crate::api::gate::snapshot_of(&gates).await.in_flight,
+            1,
+            "a request on the model's own gate shows in the server's figures"
+        );
+        drop(own);
+    }
+
     /// A server holding nothing frees nothing, and says so - for every engine on the
     /// walk, named the way a client would name it. Answering "unload" here is what made
     /// a stuck resident indistinguishable from a freed one.

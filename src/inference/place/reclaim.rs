@@ -6,6 +6,9 @@
 //! A placement that finds a card short asks the holders on that card, the cheapest kind first,
 //! before it unloads a model or plans further off the card.
 //! A holder serving a request gives back only what that request does not use.
+//! A component loading onto the cards is listed as an arrival, a holder of nothing on every
+//! card, until it is loaded.
+//! A holder knows which of its cards another owner's holder runs on.
 
 use std::sync::{Arc, Mutex, Weak};
 
@@ -43,7 +46,10 @@ pub trait Holder: Send + Sync {
     /// that much. True when anything was given back.
     fn give_back(&self, kind: Kind, card: usize, bytes: u64) -> bool;
     /// Brings what the holder declared on its cards up to date, when it can without waiting.
-    fn refresh(&self) {}
+    /// `shared` lists its cards another owner's holder runs on.
+    fn refresh(&self, shared: &[usize]) {
+        let _ = shared;
+    }
 }
 
 fn holders() -> &'static Mutex<Vec<Weak<dyn Holder>>> {
@@ -52,10 +58,14 @@ fn holders() -> &'static Mutex<Vec<Weak<dyn Holder>>> {
 }
 
 /// Lists `holder` until it is dropped.
+/// Every live holder then brings its declarations up to date.
 pub fn register(holder: &Arc<dyn Holder>) {
-    let mut list = holders().lock().unwrap_or_else(|e| e.into_inner());
-    list.retain(|w| w.strong_count() > 0);
-    list.push(Arc::downgrade(holder));
+    {
+        let mut list = holders().lock().unwrap_or_else(|e| e.into_inner());
+        list.retain(|w| w.strong_count() > 0);
+        list.push(Arc::downgrade(holder));
+    }
+    refresh();
 }
 
 /// Has every live holder bring its declarations up to date, before a placement reads them.
@@ -65,9 +75,70 @@ pub fn refresh() {
         list.retain(|w| w.strong_count() > 0);
         list.iter().filter_map(Weak::upgrade).collect()
     };
-    for holder in live {
-        holder.refresh();
+    let cards: Vec<Vec<usize>> = live.iter().map(|h| h.cards()).collect();
+    for (i, holder) in live.iter().enumerate() {
+        let shared: Vec<usize> = cards[i]
+            .iter()
+            .copied()
+            .filter(|card| {
+                live.iter()
+                    .zip(&cards)
+                    .any(|(other, on)| other.owner() != holder.owner() && on.contains(card))
+            })
+            .collect();
+        holder.refresh(&shared);
     }
+}
+
+/// A component loading onto `cards`: it holds nothing and gives nothing back.
+struct Arriving {
+    owner: String,
+    cards: Vec<usize>,
+}
+
+impl Holder for Arriving {
+    fn owner(&self) -> &str {
+        &self.owner
+    }
+
+    fn cards(&self) -> Vec<usize> {
+        self.cards.clone()
+    }
+
+    fn give_back(&self, _kind: Kind, _card: usize, _bytes: u64) -> bool {
+        false
+    }
+}
+
+/// Lists a component as loading until it drops; the other holders then bring their
+/// declarations up to date.
+pub struct Arrival(Option<Arc<dyn Holder>>);
+
+impl Drop for Arrival {
+    fn drop(&mut self) {
+        if self.0.take().is_some() {
+            refresh();
+        }
+    }
+}
+
+/// Lists `owner` as loading onto `cards` until the returned arrival drops.
+pub fn arrive_on(owner: &str, cards: Vec<usize>) -> Arrival {
+    let holder: Arc<dyn Holder> = Arc::new(Arriving {
+        owner: owner.to_string(),
+        cards,
+    });
+    register(&holder);
+    Arrival(Some(holder))
+}
+
+/// Lists `owner` as loading onto any card of the machine until the returned arrival drops.
+pub fn arrive(owner: &str) -> Arrival {
+    let cards = super::device_probe::probe_cuda_gpus()
+        .iter()
+        .map(|g| g.index)
+        .collect();
+    arrive_on(owner, cards)
 }
 
 /// The live holders other than `except` that run on `card`.

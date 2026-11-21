@@ -7,6 +7,8 @@
 //! The growth its quantised caches were planned for and have not taken is declared on each
 //! card, so no other placement takes it.
 //! A request declares the memory its prompt reads in while it runs.
+//! On a card another model is resident on, or is loading onto, that memory stays declared
+//! between requests too.
 
 use super::load::LoadedModelState;
 use super::LlmEngine;
@@ -31,9 +33,87 @@ pub(super) struct ModelHolder {
     growth: std::sync::Mutex<Vec<(usize, DemandLease)>>,
     /// The context the load planned the caches at, in positions; 0 when it planned none.
     planned: Arc<AtomicUsize>,
+    /// The memory a prompt read takes on each card, as the last request declared it.
+    work: std::sync::Mutex<Vec<(usize, u64)>>,
+    /// The requests that declared their work and still run.
+    working: AtomicUsize,
+    /// The model's cards another owner is resident on or loading onto.
+    shared: std::sync::Mutex<Vec<usize>>,
+    /// The work declared on the shared cards while no request declares its own.
+    kept_work: std::sync::Mutex<Vec<(usize, DemandLease)>>,
 }
 
 impl ModelHolder {
+    fn new(
+        owner: String,
+        cards: Vec<usize>,
+        state: Weak<State>,
+        active: Weak<AtomicUsize>,
+        #[cfg(feature = "gpu")] kept: Option<
+            crate::inference::generic_transformer::hetero::KeptPool,
+        >,
+        planned: Arc<AtomicUsize>,
+        work: Vec<(usize, u64)>,
+    ) -> Self {
+        Self {
+            owner,
+            cards,
+            state,
+            active,
+            #[cfg(feature = "gpu")]
+            kept,
+            growth: Default::default(),
+            planned,
+            work: std::sync::Mutex::new(work),
+            working: AtomicUsize::new(0),
+            shared: Default::default(),
+            kept_work: Default::default(),
+        }
+    }
+
+    /// Declares the prompt work on each shared card while no request runs, and nothing on
+    /// the other cards.
+    fn keep_work(&self) {
+        let mut kept = self.kept_work.lock().unwrap_or_else(|e| e.into_inner());
+        let idle = self.working.load(Ordering::Acquire) == 0;
+        let shared = self
+            .shared
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let work = self.work.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let keep: Vec<(usize, u64)> = work
+            .into_iter()
+            .filter(|(card, _)| idle && shared.contains(card))
+            .collect();
+        kept.retain(|(card, _)| keep.iter().any(|(c, _)| c == card));
+        for (card, bytes) in keep {
+            match kept.iter().find(|(c, _)| *c == card) {
+                Some((_, lease)) => lease.set(bytes),
+                None => kept.push((
+                    card,
+                    crate::inference::place::room::hold_on(&self.owner, card, bytes),
+                )),
+            }
+        }
+    }
+
+    /// Declares `work`, the memory a prompt read takes on each card, until the returned guard
+    /// drops. The work kept between requests gives way to it meanwhile.
+    pub(super) fn begin_work(self: &Arc<Self>, work: Vec<(usize, u64)>) -> RequestWork {
+        let leases = work
+            .iter()
+            .map(|&(card, bytes)| crate::inference::place::room::hold_on(&self.owner, card, bytes))
+            .collect();
+        *self.work.lock().unwrap_or_else(|e| e.into_inner()) = work;
+        self.working.fetch_add(1, Ordering::AcqRel);
+        self.keep_work();
+        RequestWork {
+            _leases: leases,
+            holder: Arc::downgrade(self),
+        }
+    }
+
     /// Declares what the model's caches still grow by on each card, from the model as it is now.
     /// Nothing changes while a request holds the model.
     fn declare_growth(&self) {
@@ -100,8 +180,10 @@ impl Holder for ModelHolder {
         self.cards.clone()
     }
 
-    fn refresh(&self) {
+    fn refresh(&self, shared: &[usize]) {
         self.declare_growth();
+        *self.shared.lock().unwrap_or_else(|e| e.into_inner()) = shared.to_vec();
+        self.keep_work();
     }
 
     fn give_back(&self, kind: Kind, card: usize, bytes: u64) -> bool {
@@ -161,11 +243,45 @@ impl Holder for ModelHolder {
     }
 }
 
+/// The memory a request's prompt reads take, declared until it drops.
+pub(super) struct RequestWork {
+    _leases: Vec<DemandLease>,
+    holder: Weak<ModelHolder>,
+}
+
+impl Drop for RequestWork {
+    fn drop(&mut self) {
+        // The kept work comes back before the request's own leases drop with the fields.
+        if let Some(holder) = self.holder.upgrade() {
+            holder.working.fetch_sub(1, Ordering::AcqRel);
+            holder.keep_work();
+        }
+    }
+}
+
+/// The memory the prompt reads of `state` take on each of its cards.
+fn prompt_work(state: &LoadedModelState) -> Vec<(usize, u64)> {
+    let shape = state.model.prefill_shape();
+    let chunk = crate::inference::engine::model_backend::adaptive_prefill_chunk(shape);
+    let bytes = (chunk * shape.bytes_per_token + shape.fixed_bytes) as u64;
+    #[cfg(feature = "gpu")]
+    let cards = state.model.cuda_device_ordinals();
+    #[cfg(not(feature = "gpu"))]
+    let cards = std::collections::HashSet::<usize>::new();
+    let mut work: Vec<(usize, u64)> = cards
+        .into_iter()
+        .filter(|card| shape.cards == 0 || shape.cards >> card & 1 == 1)
+        .map(|card| (card, bytes))
+        .collect();
+    work.sort_unstable();
+    work
+}
+
 impl LlmEngine {
     /// Lists the loaded model as a holder of kept memory, and declares the growth its caches
     /// were planned for. Replaces what an earlier load of this engine listed.
     pub(super) async fn list_kept_memory(&self) {
-        let (cards, kept) = {
+        let (cards, kept, work) = {
             let mut guard = self.model_state.lock().await;
             let Some(state) = guard.as_mut() else {
                 return;
@@ -179,53 +295,149 @@ impl LlmEngine {
             let kept = state.model.generic_mut().map(|m| m.kept_pool());
             #[cfg(not(feature = "gpu"))]
             let kept: Option<()> = None;
-            (cards, kept)
+            (cards, kept, prompt_work(state))
         };
-        let holder = Arc::new(ModelHolder {
-            owner: self.config.model_id.clone(),
+        let holder = Arc::new(ModelHolder::new(
+            self.config.model_id.clone(),
             cards,
-            state: Arc::downgrade(&self.model_state),
-            active: Arc::downgrade(&self.active),
+            Arc::downgrade(&self.model_state),
+            Arc::downgrade(&self.active),
             #[cfg(feature = "gpu")]
             kept,
-            growth: Default::default(),
-            planned: self.planned_kv.clone(),
-        });
+            self.planned_kv.clone(),
+            work,
+        ));
         #[cfg(not(feature = "gpu"))]
         let _ = kept;
         holder.declare_growth();
-        let listed: Arc<dyn Holder> = holder;
+        let listed: Arc<dyn Holder> = holder.clone();
+        *self.kept_memory.lock().unwrap_or_else(|e| e.into_inner()) = Some(holder);
         crate::inference::place::reclaim::register(&listed);
-        *self.kept_memory.lock().unwrap_or_else(|e| e.into_inner()) = Some(listed);
     }
 
-    /// Withdraws the model from the holders of kept memory, and its declared growth with it.
+    /// Withdraws the model from the holders of kept memory, and its declarations with it.
     pub(super) fn unlist_kept_memory(&self) {
-        self.kept_memory
+        let listed = self
+            .kept_memory
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .take();
+        if listed.is_some() {
+            drop(listed);
+            crate::inference::place::reclaim::refresh();
+        }
     }
 
-    /// Declares, for as long as the returned leases live, the memory the loaded model's prompt
+    /// The cards of the loaded model, `None` while no model is listed.
+    pub(super) fn listed_cards(&self) -> Option<Vec<usize>> {
+        self.kept_memory
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(|h| h.cards.clone())
+    }
+
+    /// Declares, for as long as the returned guard lives, the memory the loaded model's prompt
     /// reads take on each of its cards: what another placement leaves free while a request
     /// runs.
-    pub(super) async fn declare_request_work(&self) -> Vec<DemandLease> {
-        let guard = self.model_state.lock().await;
-        let Some(state) = guard.as_ref() else {
-            return Vec::new();
+    pub(super) async fn declare_request_work(&self) -> RequestWork {
+        let work = {
+            let guard = self.model_state.lock().await;
+            guard.as_ref().map(prompt_work).unwrap_or_default()
         };
-        let shape = state.model.prefill_shape();
-        let chunk = crate::inference::engine::model_backend::adaptive_prefill_chunk(shape);
-        let bytes = (chunk * shape.bytes_per_token + shape.fixed_bytes) as u64;
-        #[cfg(feature = "gpu")]
-        let cards = state.model.cuda_device_ordinals();
-        #[cfg(not(feature = "gpu"))]
-        let cards = std::collections::HashSet::<usize>::new();
-        cards
-            .into_iter()
-            .filter(|card| shape.cards == 0 || shape.cards >> card & 1 == 1)
-            .map(|card| crate::inference::place::room::hold_on(&self.config.model_id, card, bytes))
-            .collect()
+        let holder = self
+            .kept_memory
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        match holder {
+            Some(holder) => holder.begin_work(work),
+            None => RequestWork {
+                _leases: work
+                    .into_iter()
+                    .map(|(card, bytes)| {
+                        crate::inference::place::room::hold_on(&self.config.model_id, card, bytes)
+                    })
+                    .collect(),
+                holder: Weak::new(),
+            },
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::inference::place::reclaim;
+    use crate::inference::place::vram_manager::card_demand_excluding;
+
+    /// Cards no machine has: the holders of other tests never run on them.
+    const CARD: usize = usize::MAX - 21;
+    const ALONE: usize = usize::MAX - 22;
+    const SAME: usize = usize::MAX - 23;
+
+    /// A model listed on `cards`, whose prompt reads take `work` on each.
+    fn listed(owner: &str, cards: &[usize], work: u64) -> Arc<ModelHolder> {
+        let holder = Arc::new(ModelHolder::new(
+            owner.to_string(),
+            cards.to_vec(),
+            Weak::new(),
+            Weak::new(),
+            #[cfg(feature = "gpu")]
+            None,
+            Arc::default(),
+            cards.iter().map(|&c| (c, work)).collect(),
+        ));
+        let as_holder: Arc<dyn Holder> = holder.clone();
+        reclaim::register(&as_holder);
+        holder
+    }
+
+    /// An idle model declares its prompt work on a card while another model loads onto it or
+    /// is resident on it, and stops when the other leaves.
+    /// A request's own work replaces the kept work, so it is never counted twice.
+    #[test]
+    fn an_idle_model_keeps_its_work_while_another_is_on_its_card() {
+        let (mine, theirs) = ("kept-work-test-mine", "kept-work-test-theirs");
+        let work = 3 << 20;
+        let model = listed(mine, &[CARD, ALONE], work);
+        assert_eq!(card_demand_excluding(theirs, CARD), 0, "alone, as before");
+        let arrival = reclaim::arrive_on(theirs, vec![CARD]);
+        assert_eq!(card_demand_excluding(theirs, CARD), work);
+        assert_eq!(
+            card_demand_excluding(theirs, ALONE),
+            0,
+            "a card the other does not reach"
+        );
+        let request = model.begin_work(vec![(CARD, work), (ALONE, work)]);
+        assert_eq!(card_demand_excluding(theirs, CARD), work);
+        assert_eq!(card_demand_excluding(theirs, ALONE), work);
+        drop(request);
+        assert_eq!(card_demand_excluding(theirs, CARD), work);
+        assert_eq!(card_demand_excluding(theirs, ALONE), 0);
+        drop(arrival);
+        assert_eq!(card_demand_excluding(theirs, CARD), 0, "the other left");
+        let resident = arrive_resident(theirs);
+        assert_eq!(card_demand_excluding(theirs, CARD), work);
+        drop(resident);
+        reclaim::refresh();
+        assert_eq!(card_demand_excluding(theirs, CARD), 0);
+        drop(model);
+    }
+
+    /// Two copies of one model never keep their work for each other.
+    #[test]
+    fn a_model_does_not_keep_its_work_for_its_own_owner() {
+        let owner = "kept-work-test-same";
+        let model = listed(owner, &[SAME], 5 << 20);
+        let arrival = reclaim::arrive_on(owner, vec![SAME]);
+        assert_eq!(card_demand_excluding("kept-work-test-reader", SAME), 0);
+        drop(arrival);
+        drop(model);
+    }
+
+    /// Another model listed on [`CARD`], as a load lists it once placed.
+    fn arrive_resident(owner: &str) -> Arc<ModelHolder> {
+        listed(owner, &[CARD], 0)
     }
 }

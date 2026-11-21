@@ -24,7 +24,11 @@ impl LlmEngine {
     /// generation takes the model lock a step at a time and holds the gate throughout, so only
     /// the gate keeps the move off a running answer.
     pub async fn admit_request(&self) -> super::ActiveRequest {
-        let mut request = super::batching::ActiveRequest::enter(&self.active);
+        // A request counts on the cards of the listed model, or on every card before one is.
+        let mut request = match self.listed_cards() {
+            Some(cards) => super::batching::ActiveRequest::enter_on(&self.active, cards),
+            None => super::batching::ActiveRequest::enter(&self.active),
+        };
         let batched = self.is_continuous().await;
         let switch = self
             .batching

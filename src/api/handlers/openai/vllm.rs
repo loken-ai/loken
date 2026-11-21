@@ -662,7 +662,7 @@ pub(crate) async fn version() -> Json<serde_json::Value> {
 
 /// vLLM's `/load`: the requests running and waiting.
 pub(crate) async fn load(State(state): State<APIServer>) -> Json<serde_json::Value> {
-    let g = state.request_gate.snapshot().await;
+    let g = crate::api::gate::snapshot_of(&state.gates().await).await;
     Json(serde_json::json!({ "server_load": g.in_flight + g.queue_depth }))
 }
 
