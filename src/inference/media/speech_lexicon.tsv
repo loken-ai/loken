@@ -1,0 +1,13 @@
+# Speech lexicon for text preparation
+# Format: TERM<TAB>say|ipa<TAB>TEXT or IPA
+
+VRAM	say	V RAM
+GGUF	say	G G U F
+CUDA	say	cooda
+ROCm	say	rock em
+MoE	say	M O E
+KV	say	K V
+OOM	say	O O M
+TP	say	T P
+loken	ipa	lˈoʊkən
+lokode	ipa	lˈoʊkoʊd
