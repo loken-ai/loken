@@ -396,6 +396,29 @@ impl OllamaManager {
             .await
             .map_err(|e| anyhow!("Failed to parse manifest: {}", e))?;
 
+        let blob_url = |digest: &str| {
+            format!("https://registry.ollama.ai/v2/{registry_namespace}/blobs/{digest}")
+        };
+        self.store_pulled(name, tag, &manifest, &client, blob_url, progress)
+            .await?;
+        info!("   ✅ Successfully pulled {}:{}", name, tag);
+        Ok(())
+    }
+
+    /// Stores the model `name:tag` that `manifest` describes: each blob it lacks fetched from
+    /// `blob_url` of its digest, then the manifest.
+    ///
+    /// Every digest is checked to be `sha256:` and 64 hex digits before it names a file.
+    /// A blob already in the store is kept.
+    pub(crate) async fn store_pulled(
+        &self,
+        name: &str,
+        tag: &str,
+        manifest: &OllamaManifest,
+        client: &reqwest::Client,
+        blob_url: impl Fn(&str) -> String,
+        progress: Option<ProgressCallback>,
+    ) -> Result<()> {
         let layers_count = manifest
             .layers
             .as_ref()
@@ -407,6 +430,12 @@ impl OllamaManager {
         let mut all_blobs = vec![manifest.config.clone()];
         if let Some(ref layers) = manifest.layers {
             all_blobs.extend(layers.clone());
+        }
+        if let Some(bad) = all_blobs.iter().find(|b| !is_blob_digest(&b.digest)) {
+            return Err(anyhow!(
+                "Manifest of {name}:{tag} names a blob {:?} that is not a sha256 digest",
+                bad.digest
+            ));
         }
 
         let total_size: u64 = all_blobs.iter().map(|b| b.size as u64).sum();
@@ -434,70 +463,13 @@ impl OllamaManager {
                 continue;
             }
 
-            // Download blob
-            let blob_url = format!(
-                "https://registry.ollama.ai/v2/{}/blobs/{}",
-                registry_namespace, blob.digest
-            );
-
             info!("   ⬇ Downloading blob {} ({} bytes)...", i + 1, blob.size);
-
-            let mut blob_resp = client
-                .get(&blob_url)
-                .send()
-                .await
-                .map_err(|e| anyhow!("Failed to download blob: {}", e))?;
-
-            if !blob_resp.status().is_success() {
-                return Err(anyhow!(
-                    "Failed to download blob {}: {}",
-                    blob.digest,
-                    blob_resp.status()
-                ));
-            }
-
-            // Streamed to a partial file as it arrives, hashed on the way, and renamed into
-            // the store only once the digest matches: a blob is never held whole in memory,
-            // and an interrupted or corrupted download never lands under its final name.
-            let partial_path = blobs_dir.join(format!("{blob_filename}.partial"));
-            let mut file = std::fs::File::create(&partial_path)
-                .map_err(|e| anyhow!("Failed to create {}: {e}", partial_path.display()))?;
-            let mut hasher = <sha2::Sha256 as sha2::Digest>::new();
-            let base = downloaded_size;
-            let mut received: u64 = 0;
-            // One report per thousandth of the whole pull keeps a progress bar live without a
-            // frame per network chunk.
-            let report_step = (total_size / 1000).max(1);
-            let mut reported = base;
-            while let Some(chunk) = blob_resp
-                .chunk()
-                .await
-                .map_err(|e| anyhow!("Failed to read blob {}: {e}", blob.digest))?
-            {
-                std::io::Write::write_all(&mut file, &chunk)
-                    .map_err(|e| anyhow!("Failed to write {}: {e}", partial_path.display()))?;
-                sha2::Digest::update(&mut hasher, &chunk);
-                received += chunk.len() as u64;
-                if base + received - reported >= report_step {
-                    reported = base + received;
-                    if let Some(ref cb) = progress {
-                        cb(reported, total_size);
-                    }
-                }
-            }
-            std::io::Write::flush(&mut file)
-                .map_err(|e| anyhow!("Failed to flush {}: {e}", partial_path.display()))?;
-            drop(file);
-            let digest = format!("sha256:{}", hex::encode(sha2::Digest::finalize(hasher)));
-            if digest != blob.digest {
-                let _ = std::fs::remove_file(&partial_path);
-                return Err(anyhow!(
-                    "Blob {} arrived with digest {digest}; discarded",
-                    blob.digest
-                ));
-            }
-            std::fs::rename(&partial_path, &blob_path)
-                .map_err(|e| anyhow!("Failed to store {}: {e}", blob_path.display()))?;
+            let sink = Progress {
+                callback: progress.as_ref(),
+                base: downloaded_size,
+                total: total_size,
+            };
+            fetch_blob(client, &blob_url(&blob.digest), blob, &blobs_dir, &sink).await?;
 
             downloaded_size += blob.size as u64;
             if let Some(ref cb) = progress {
@@ -508,15 +480,13 @@ impl OllamaManager {
         }
 
         // Write manifest to disk
-        let manifest_json = serde_json::to_string_pretty(&manifest)?;
+        let manifest_json = serde_json::to_string_pretty(manifest)?;
         std::fs::write(&manifest_path, manifest_json)?;
         self.drop_other_copies(&dest, name, tag);
 
         if let Some(ref cb) = progress {
             cb(total_size, total_size);
         }
-
-        info!("   ✅ Successfully pulled {}:{}", name, tag);
         Ok(())
     }
 
@@ -597,6 +567,25 @@ impl OllamaManager {
             .find(|p| p.file_name().is_some_and(|n| n == "manifests"))?
             .parent()?;
         Some(root.join("blobs").join(digest.replace(':', "-")))
+    }
+
+    /// The file of the blob `digest` when a model this store lists names it in its manifest.
+    ///
+    /// `None` for a string that is not a sha256 digest, so no request names a path.
+    /// `None` for a blob no listed manifest names, even when a file of that name exists.
+    pub fn listed_blob(&self, digest: &str) -> Option<PathBuf> {
+        if !is_blob_digest(digest) {
+            return None;
+        }
+        self.list_models().ok()?.into_iter().find_map(|model| {
+            let manifest = self.get_model_path(&model.name, &model.tag)?;
+            let json: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&manifest).ok()?).ok()?;
+            if !manifest_digests(&json).iter().any(|d| d == digest) {
+                return None;
+            }
+            Self::blob_for(&manifest, digest).filter(|p| p.is_file())
+        })
     }
 
     /// Writes `content` as a blob and returns its `sha256:<hex>` digest; a blob that is
@@ -828,6 +817,139 @@ impl OllamaManager {
     }
 }
 
+/// Whether `digest` is `sha256:` followed by 64 lower-case hex digits, the only form a blob
+/// file is named from.
+pub fn is_blob_digest(digest: &str) -> bool {
+    digest.strip_prefix("sha256:").is_some_and(|hex| {
+        hex.len() == 64
+            && hex
+                .bytes()
+                .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+    })
+}
+
+/// Where a blob download reports its bytes: the bytes of the pull before this blob and the
+/// bytes of the whole pull.
+struct Progress<'a> {
+    callback: Option<&'a ProgressCallback>,
+    base: u64,
+    total: u64,
+}
+
+/// Fetches `blob` from `url` into `blobs_dir`, under its digest.
+///
+/// The bytes go to `<blob>.partial`.
+/// A partial file left by an earlier call is resumed with a Range request.
+/// A cut resumes at once, as long as each attempt brings bytes.
+/// A source that ignores the Range sends the whole blob, and the partial file restarts.
+///
+/// The partial file is renamed under the digest once its sha256 matches.
+/// A mismatch deletes the partial file.
+async fn fetch_blob(
+    client: &reqwest::Client,
+    url: &str,
+    blob: &OllamaDescriptor,
+    blobs_dir: &Path,
+    progress: &Progress<'_>,
+) -> Result<()> {
+    use sha2::Digest;
+    let file_name = blob.digest.replace(':', "-");
+    let blob_path = blobs_dir.join(&file_name);
+    let partial_path = blobs_dir.join(format!("{file_name}.partial"));
+    let size = blob.size as u64;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&partial_path)
+        .map_err(|e| anyhow!("Failed to open {}: {e}", partial_path.display()))?;
+    let mut hasher = sha2::Sha256::new();
+    let mut held = std::io::copy(&mut std::fs::File::open(&partial_path)?, &mut hasher)
+        .map_err(|e| anyhow!("Failed to read {}: {e}", partial_path.display()))?;
+    if held > 0 {
+        info!(
+            "   ↻ Resuming blob {} at {held} of {size} bytes",
+            blob.digest
+        );
+    }
+    // One report per thousandth of the whole pull keeps a progress bar live without a
+    // frame per network chunk.
+    let report_step = (progress.total / 1000).max(1);
+    let mut reported = progress.base + held;
+    while held < size {
+        let mut request = client.get(url);
+        if held > 0 {
+            request = request.header(reqwest::header::RANGE, format!("bytes={held}-"));
+        }
+        let mut resp = request
+            .send()
+            .await
+            .map_err(|e| anyhow!("Failed to download blob {}: {e}", blob.digest))?;
+        if !resp.status().is_success() {
+            return Err(anyhow!(
+                "Failed to download blob {}: {}",
+                blob.digest,
+                resp.status()
+            ));
+        }
+        if held > 0 && resp.status() != reqwest::StatusCode::PARTIAL_CONTENT {
+            file.set_len(0)
+                .map_err(|e| anyhow!("Failed to truncate {}: {e}", partial_path.display()))?;
+            hasher = sha2::Sha256::new();
+            held = 0;
+        }
+        let mut received: u64 = 0;
+        let cut = loop {
+            match resp.chunk().await {
+                Ok(Some(chunk)) => {
+                    std::io::Write::write_all(&mut file, &chunk)
+                        .map_err(|e| anyhow!("Failed to write {}: {e}", partial_path.display()))?;
+                    hasher.update(&chunk);
+                    received += chunk.len() as u64;
+                    held += chunk.len() as u64;
+                    if progress.base + held >= reported + report_step {
+                        reported = progress.base + held;
+                        if let Some(cb) = progress.callback {
+                            cb(reported, progress.total);
+                        }
+                    }
+                }
+                Ok(None) => break None,
+                Err(e) => break Some(e),
+            }
+        };
+        std::io::Write::flush(&mut file)
+            .map_err(|e| anyhow!("Failed to flush {}: {e}", partial_path.display()))?;
+        match cut {
+            Some(e) if received == 0 => {
+                return Err(anyhow!("Failed to read blob {}: {e}", blob.digest));
+            }
+            None if received == 0 && held < size => {
+                return Err(anyhow!(
+                    "Blob {} ended at {held} of {size} bytes",
+                    blob.digest
+                ));
+            }
+            Some(e) => warn!(
+                "   Blob {} cut at {held} of {size} bytes ({e}); resuming",
+                blob.digest
+            ),
+            None => {}
+        }
+    }
+    drop(file);
+    let digest = format!("sha256:{}", hex::encode(hasher.finalize()));
+    if digest != blob.digest {
+        let _ = std::fs::remove_file(&partial_path);
+        return Err(anyhow!(
+            "Blob {} arrived with digest {digest}; discarded",
+            blob.digest
+        ));
+    }
+    std::fs::rename(&partial_path, &blob_path)
+        .map_err(|e| anyhow!("Failed to store {}: {e}", blob_path.display()))?;
+    Ok(())
+}
+
 /// Every digest a manifest names: its config and its layers.
 fn manifest_digests(manifest: &serde_json::Value) -> Vec<String> {
     let config = manifest
@@ -850,9 +972,13 @@ fn manifest_digests(manifest: &serde_json::Value) -> Vec<String> {
 /// Ollama manifest structure (Docker V2 format)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OllamaManifest {
-    #[serde(default, rename = "schemaVersion")]
+    #[serde(
+        default,
+        rename = "schemaVersion",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub schema_version: Option<u32>,
-    #[serde(default, rename = "mediaType")]
+    #[serde(default, rename = "mediaType", skip_serializing_if = "Option::is_none")]
     pub media_type: Option<String>,
     pub config: OllamaDescriptor,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -862,7 +988,7 @@ pub struct OllamaManifest {
 /// Descriptor for a layer or config blob
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OllamaDescriptor {
-    #[serde(default, rename = "mediaType")]
+    #[serde(default, rename = "mediaType", skip_serializing_if = "Option::is_none")]
     pub media_type: Option<String>,
     pub digest: String,
     pub size: usize,

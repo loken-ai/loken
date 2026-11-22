@@ -344,11 +344,15 @@ impl ModelManager {
         })
     }
 
-    /// Pull a model with explicit source
-    pub async fn pull_model_with_source(
+    /// Pull a model with explicit source.
+    ///
+    /// An Ollama model is copied from the first of `peers` that completes it.
+    /// The registry is asked when no peer completes it.
+    pub async fn pull_model_from(
         &self,
         model_id: &str,
         source: &str,
+        peers: &[String],
         progress: Option<ProgressCallback>,
     ) -> Result<ModelMetadata> {
         info!("Pulling {} model: {}", source, model_id);
@@ -360,7 +364,22 @@ impl ModelManager {
                 let name = parts.first().copied().unwrap_or(model_id);
                 let tag = parts.get(1).copied().unwrap_or("latest");
 
-                self.ollama_manager.pull_model(name, tag, progress).await?;
+                let copied = match peers.is_empty() {
+                    true => false,
+                    false => crate::distributed::model_copy::copy_from_peers(
+                        &self.ollama_manager,
+                        name,
+                        tag,
+                        peers,
+                        progress.clone(),
+                    )
+                    .await
+                    .map_err(|e| tracing::warn!("{e}; pulling from the registry"))
+                    .is_ok(),
+                };
+                if !copied {
+                    self.ollama_manager.pull_model(name, tag, progress).await?;
+                }
 
                 // Compute digest and modification time from the newly downloaded model
                 let digest_info = self

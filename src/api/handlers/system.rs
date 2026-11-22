@@ -803,6 +803,35 @@ pub(crate) async fn cluster_peers(
     })))
 }
 
+#[derive(serde::Deserialize)]
+pub(crate) struct ClusterManifestRequest {
+    pub model: String,
+}
+
+/// The manifest of an Ollama model this node lists, for a peer that copies the model.
+/// Not an operator endpoint: it is the cluster talking to itself.
+pub(crate) async fn cluster_manifest(
+    State(state): State<APIServer>,
+    Json(req): Json<ClusterManifestRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    validate_model_id(&req.model)?;
+    let name = normalize_model_id(&req.model);
+    crate::distributed::model_copy::listed_manifest(state.model_manager.ollama(), &name)
+        .map(Json)
+        .ok_or_else(|| ApiError::NotFound(format!("this node lists no model {name}")))
+}
+
+/// A blob of a model this node lists, by its digest, with Range support, for a peer that
+/// copies the model.
+/// Not an operator endpoint: it is the cluster talking to itself.
+pub(crate) async fn cluster_blob(
+    State(state): State<APIServer>,
+    axum::extract::Path(digest): axum::extract::Path<String>,
+    request: axum::extract::Request,
+) -> axum::response::Response {
+    crate::distributed::model_copy::serve_blob(state.model_manager.ollama(), &digest, request).await
+}
+
 /// What this node has to execute with, and what is running on it.
 ///
 /// Read from the state the server already holds. It used to build a `DistributedEngine` and

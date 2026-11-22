@@ -15,6 +15,7 @@ pub mod kv_tiers;
 pub mod layer_scheduler;
 pub mod link_matrix;
 pub mod membership;
+pub mod model_copy;
 pub mod network;
 pub mod prefill_stream;
 pub mod protocol;
@@ -57,7 +58,7 @@ mod wiring_gate {
     ///
     /// One table, not two: a module that appears in neither list is the case a pair of tables
     /// lets through.
-    const MODULES: [(&str, &str, bool); 22] = [
+    const MODULES: [(&str, &str, bool); 23] = [
         ("auto_tune", "auto_distribution", true),
         ("cluster", "distributed::cluster::", true),
         ("cluster_runtime", "cluster_runtime::", true),
@@ -70,6 +71,7 @@ mod wiring_gate {
         ("layer_scheduler", "LayerScheduler", false),
         ("link_matrix", "LinkMatrix", false),
         ("membership", "membership::", true),
+        ("model_copy", "model_copy::", true),
         ("network", "NetworkClient", false),
         ("prefill_stream", "prefill_stream::", true),
         ("protocol", "protocol::", true),

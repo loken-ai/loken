@@ -752,6 +752,7 @@ pub(crate) async fn ollama_pull_model(
         let manager = state.model_manager.clone();
         let source = request.source.clone();
         let model = model_name.clone();
+        let peers = state.model_holders(&model_name);
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(u64, u64)>();
         let progress: crate::inference::load::model_manager::ProgressCallback =
@@ -764,7 +765,7 @@ pub(crate) async fn ollama_pull_model(
         // below terminates and we can await the join handle for the result.
         let handle = tokio::spawn(async move {
             manager
-                .pull_model_with_source(&model, &source, Some(progress))
+                .pull_model_from(&model, &source, &peers, Some(progress))
                 .await
         });
 
@@ -834,12 +835,10 @@ pub(crate) async fn ollama_pull_model(
             .unwrap());
     }
 
-    let manager = state.model_manager.clone();
-
     // 1. Download the model
     info!("   Step 1: Downloading model from {}...", request.source);
-    let metadata = manager
-        .pull_model_with_source(&model_name, &request.source, None)
+    let metadata = state
+        .pull_model(&model_name, &request.source, None)
         .await
         .map_err(|e| {
             error!("   ❌ Download failed: {}", e);

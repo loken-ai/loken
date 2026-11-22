@@ -45,9 +45,11 @@ Peers send no key, so a node with `require_auth` on refuses their polls.
 | `POST /api/cluster/prefix` | `model`, `prompt` | `cached_tokens`: how many tokens of the prompt this node holds in its prefix cache. A model that is not resident answers 0. |
 | `POST /api/cluster/measure` | `model` | `card_ms`, `host_ms`, `card_bytes`: what a layer of the model costs on this node. A head that plans the cut of a dense model asks it of a peer that has no cost for the model yet. |
 | `POST /api/cluster/prefill` | `model`, `prompt` | `application/octet-stream`: the KV cache after reading the prompt, which the asking node imports and decodes from. A node whose `Accept` names `application/vnd.loken.prefill-stream` gets lines of JSON instead: `done` and `total` as the reading goes, then `handover` with the byte length of the KV cache that follows. A failed reading sends `error`. |
+| `POST /api/cluster/manifest` | `model` | The manifest of an Ollama model this node lists. A model it does not list answers `404`. |
+| `GET /api/cluster/blobs/{digest}` | an optional `Range` | The bytes of a blob that a listed model's manifest names. A `Range` answers `206` with the bytes asked for. A digest that is not `sha256:` and 64 hex digits, or that no listed manifest names, answers `404`. |
 | `POST /api/pipeline/tail` | `model`, `from`, `to`, `next`, `context` | `port`: the wire port. The node serves layers `[from, to)` and relays to `next`, a `host:port`, unless it holds the last segment. |
 
-`measure`, `prefill` and `pipeline/tail` are calls between nodes.  
+`measure`, `prefill`, `manifest`, `blobs` and `pipeline/tail` are calls between nodes.  
 `GET /api/tags` lists the models of the peers beside the local ones, each under `node`.
 
 ## Discovery and membership
@@ -106,6 +108,26 @@ It imports the KV cache or the decode state the peer answers, and decodes from i
 The key needs no `[cluster]` table.
 The routing above plays no part.
 [Configuration](CONFIGURATION.md#prompts-read-by-another-instance) says when a prompt is handed over and when it is read here.
+
+## Copying a model from a peer
+
+A pull of an Ollama model asks the peers before the registry.
+So does a swap to a model the node lacks, and a create from a base the node lacks.
+
+| Step | Behaviour |
+|---|---|
+| Holders | The live peers whose `serves` lists the model. The peer with the shortest measured round trip comes first. A peer without a measured round trip comes after, in the order of `/api/cluster/peers`. |
+| Manifest | The node asks the holder for the manifest on `/api/cluster/manifest`. |
+| Blobs | Each blob the node lacks comes from `/api/cluster/blobs/{digest}` into `<blob>.partial` in the store. |
+| Cut | A connection that drops after bytes arrived is resumed at once with a `Range` request from the bytes held. A partial file left by an earlier pull is resumed the same way. A source that ignores the `Range` sends the whole blob again. |
+| Digest | The sha256 of the partial file must equal the digest. A match renames it under the digest. A mismatch deletes it and fails the copy from that peer. |
+| Manifest written | Once every blob is in, the node writes the manifest, and the model is listed. |
+| Failover | A failed copy moves to the next holder, which resumes a partial file left by the last one. With no holder left, the pull goes to the registry. |
+
+A peer serves only the blobs that the manifest of a model it lists names.
+The digest names the file, so no request reaches a path outside the store.
+A pull from the registry writes and resumes blobs the same way.
+A Hugging Face model is not copied from a peer.
 
 ## Planning a cut
 

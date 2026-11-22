@@ -1792,8 +1792,7 @@ impl APIServer {
                 "New model not found locally, pulling first: {}",
                 new_model_id
             );
-            self.model_manager
-                .pull_model_with_source(new_model_id, "ollama", None)
+            self.pull_model(new_model_id, "ollama", None)
                 .await
                 .map_err(|e| ApiError::Internal(format!("Failed to pull new model: {}", e)))?;
         }

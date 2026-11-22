@@ -827,8 +827,7 @@ pub(crate) async fn ollama_create_model(
         if !base_path.exists() {
             info!("Base model not found locally, pulling: {}", base_normalized);
             state
-                .model_manager
-                .pull_model_with_source(&base_normalized, "ollama", None)
+                .pull_model(&base_normalized, "ollama", None)
                 .await
                 .map_err(|e| ApiError::Internal(format!("Failed to pull base model: {}", e)))?;
         }

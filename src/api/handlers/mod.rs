@@ -1302,6 +1302,29 @@ impl APIServer {
         entry.engine.cached_prompt_tokens(model, &templated).await
     }
 
+    /// The endpoints of the peers that list `model_id`, the nearest first: where a pull of an
+    /// Ollama model copies it from before it asks the registry. Empty outside a cluster.
+    pub(crate) fn model_holders(&self, model_id: &str) -> Vec<String> {
+        let Some(cluster) = self.cluster_handle() else {
+            return Vec::new();
+        };
+        let now = crate::distributed::cluster_runtime::now_ms(self.cluster_started());
+        crate::distributed::model_copy::holders(&cluster.peer_view(now), model_id)
+    }
+
+    /// Pull `model_id` from `source`, from a peer that lists it first.
+    pub(crate) async fn pull_model(
+        &self,
+        model_id: &str,
+        source: &str,
+        progress: Option<crate::inference::load::model_manager::ProgressCallback>,
+    ) -> anyhow::Result<crate::inference::load::model_manager::ModelMetadata> {
+        let peers = self.model_holders(model_id);
+        self.model_manager
+            .pull_model_from(model_id, source, &peers, progress)
+            .await
+    }
+
     /// What this node publishes to its peers.
     ///
     /// `prefix_blocks` is empty for now and that is deliberate rather than forgotten: the
@@ -3094,6 +3117,14 @@ impl APIServer {
             .route("/api/cluster/state", axum::routing::get(cluster_state))
             .route("/api/cluster/prefix", axum::routing::post(cluster_prefix))
             .route("/api/cluster/peers", axum::routing::get(cluster_peers))
+            .route(
+                crate::distributed::model_copy::MANIFEST_ROUTE,
+                axum::routing::post(cluster_manifest),
+            )
+            .route(
+                &format!("{}/{{digest}}", crate::distributed::model_copy::BLOB_ROUTE),
+                axum::routing::get(cluster_blob),
+            )
             .route(
                 "/api/distributed/stats",
                 axum::routing::get(distributed_stats),
