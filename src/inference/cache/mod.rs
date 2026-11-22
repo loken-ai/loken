@@ -46,6 +46,7 @@ pub mod cpu_q8_kv;
 pub mod hf;
 pub mod kv_core;
 pub mod kv_disk;
+pub mod kv_host_tier;
 pub mod paged_attention;
 pub mod paged_kv;
 #[cfg(feature = "gpu")]

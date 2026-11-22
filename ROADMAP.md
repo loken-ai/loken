@@ -122,7 +122,7 @@ Smaller, by state then by priority:
 | Placement preview | API | `loken fit` and a plan route tell, for a model file, the layers per device, the host share and the context that fits, from the code a real load runs. | Partial |
 | Authenticated cluster | Cluster | Nodes sign their announcements and their peer calls with a shared secret, and a node without it is refused. | Planned |
 | Model copy between nodes | Cluster | A node fetches a model file from a peer that holds it, checks its digest and resumes after a cut. | Done |
-| Host tier for the KV cache | Serving | The KV of a long context lives in host memory, a working set stays on the card, and the pages a query selects are fetched, so a long context is no longer bounded by card memory. | Planned |
+| Host tier for the KV cache | Serving | The KV of a long context lives in host memory, a working set stays on the card, and the pages a query selects are fetched, so a long context is no longer bounded by card memory. | Started |
 | Suffix drafting across requests | Speculation | A draft index built from earlier answers of the same model, kept in memory and cleared on unload, drafts faster than prompt lookup alone on repeated agent work. | Planned |
 | Tree drafting | Speculation | The verification pass checks a tree of candidates, and the width of the tree follows the cost of the experts it adds. | Planned |
 | Chunked pipeline prefill | Cluster | The chunks of a prompt cross a cut pipeline one behind the other, so every stage works at once, and a long prompt reaches its first token sooner than with each chunk waiting for the whole chain. | Planned |
