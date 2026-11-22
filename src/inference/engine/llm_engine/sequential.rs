@@ -6,6 +6,9 @@
 //! or a prefix it keeps to itself. No prompt-lookup drafts, no captured graphs, no prefix
 //! reuse: the prompt is prefilled from its first token, and the records of what the resident
 //! KV held are dropped, since this path rewrites it.
+//!
+//! A request that selects adapters decodes here too, one request at a time.
+//! Its adapters are selected on the model before its prompt and cleared after its last token.
 
 use super::params::{FinishReason, TokenLogprob};
 use super::*;
@@ -20,8 +23,35 @@ struct Outlet<'a> {
     logprob: &'a mut dyn FnMut(TokenLogprob),
 }
 
-/// One sequential generation, under the model lock.
+/// One sequential generation, under the model lock, with the request's adapters selected
+/// for its forwards alone.
 fn decode_sequential(
+    state: &mut LoadedModelState,
+    config: &InferenceConfig,
+    prompt: &str,
+    params: GenerationParams,
+    cancel: &std::sync::atomic::AtomicBool,
+    out: Outlet<'_>,
+) -> AnyResult<GenerationResult> {
+    let adapters = params.rules.adapters.clone();
+    if adapters.is_empty() {
+        return decode_on_selection(state, config, prompt, params, cancel, out);
+    }
+    let selected = state
+        .model
+        .select_adapters(&adapters)
+        .map_err(|e| anyhow!("{e}"));
+    let run =
+        selected.and_then(|()| decode_on_selection(state, config, prompt, params, cancel, out));
+    // The next request runs on the base whatever this one ended with.
+    let cleared = state.model.select_adapters(&[]).map_err(|e| anyhow!("{e}"));
+    let result = run?;
+    cleared?;
+    Ok(result)
+}
+
+/// One sequential generation on the adapters the model has selected.
+fn decode_on_selection(
     state: &mut LoadedModelState,
     config: &InferenceConfig,
     prompt: &str,

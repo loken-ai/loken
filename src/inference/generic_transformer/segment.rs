@@ -47,7 +47,7 @@ impl GenericHeteroTransformer {
         if self.spliced_vision.is_some() {
             return Some("it carries an image tower that splices into the embeddings");
         }
-        if !self.adapters.is_empty() {
+        if !self.adapters.is_empty() || !self.selected_adapters().is_empty() {
             return Some("an adapter is applied to its layers");
         }
         if self.has_block_draft() {

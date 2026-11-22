@@ -52,8 +52,10 @@ impl GenericTransformerLayer {
         // Q4_0, Q4_K, Q5_K, Q6_K, Q8_0).
         use crate::inference::quantized_cuda::mvq_plain_any_via_shared_q8_1;
 
-        let ffn_up_arc = self.ffn_up.qtensor().ok_or_else(|| {
-            crate::tensor::Error::msg("forward_ffn_phi2_pre_bias_from_q8_1: ffn_up not a QTensor")
+        let ffn_up_arc = self.ffn_up.bare_qtensor().ok_or_else(|| {
+            crate::tensor::Error::msg(
+                "forward_ffn_phi2_pre_bias_from_q8_1: ffn_up holds no bare quantised weight",
+            )
         })?;
         let intermediate = ffn_up_arc.shape().dims()[0];
         let dev = self
@@ -103,8 +105,10 @@ impl GenericTransformerLayer {
         use crate::inference::quantized_cuda::mvq_plain_any_via_shared_q8_1_on_stream;
         use crate::tensor::quantized::QStorage;
 
-        let ffn_up_arc = self.ffn_up.qtensor().ok_or_else(|| {
-            crate::tensor::Error::msg("start_alt_stream_ffn_up_from_q8_1: ffn_up not a QTensor")
+        let ffn_up_arc = self.ffn_up.bare_qtensor().ok_or_else(|| {
+            crate::tensor::Error::msg(
+                "start_alt_stream_ffn_up_from_q8_1: ffn_up holds no bare quantised weight",
+            )
         })?;
         let intermediate = ffn_up_arc.shape().dims()[0];
         let dev = self
@@ -225,10 +229,9 @@ impl GenericTransformerLayer {
         .map_err(|e| crate::tensor::Error::msg(format!("alt-full quantize: {e}")))?;
         drop(act_sl);
 
-        let ffn_down_arc = self
-            .ffn_down
-            .qtensor()
-            .ok_or_else(|| crate::tensor::Error::msg("alt-full FFN: ffn_down not a QTensor"))?;
+        let ffn_down_arc = self.ffn_down.bare_qtensor().ok_or_else(|| {
+            crate::tensor::Error::msg("alt-full FFN: ffn_down holds no bare quantised weight")
+        })?;
         let down_rows = ffn_down_arc.shape().dims()[0];
         let qstor = match ffn_down_arc.storage() {
             QStorage::Cuda(s) => s,
@@ -452,8 +455,9 @@ impl GenericTransformerLayer {
                 let is_big_multitok = seq_len >= 64;
                 let on_cuda = x.device().is_cuda();
                 let candidate_qt = if is_big_multitok && on_cuda {
-                    let gq = self.ffn_gate.as_ref().unwrap().qtensor();
-                    let uq = self.ffn_up.qtensor();
+                    // An adapted projection has no bare weight: `forward` serves it.
+                    let gq = self.ffn_gate.as_ref().unwrap().bare_qtensor();
+                    let uq = self.ffn_up.bare_qtensor();
                     //  REFUTED for gate/up too: the default fused path here would
                     // route Q5_K through dense_q5k_imma_m8 (m8 IMMA), but the kernel
                     // A/B shows QMatMul MMQ is 6-8x faster at prefill. Keep Q4_K only
@@ -511,8 +515,9 @@ impl GenericTransformerLayer {
                     // CUDA with an F32 input; it returns None for a pair it has no kernel for,
                     // and the unfused 3-launch chain runs.
                     let fused_si = if on_cuda && !use_gelu && x.dim(1).unwrap_or(0) == 1 {
-                        let gq = self.ffn_gate.as_ref().unwrap().qtensor();
-                        let uq = self.ffn_up.qtensor();
+                        // An adapted projection has no bare weight: `forward` serves it.
+                        let gq = self.ffn_gate.as_ref().unwrap().bare_qtensor();
+                        let uq = self.ffn_up.bare_qtensor();
                         // The launch declines a pair of formats it has no kernel for.
                         match (gq, uq) {
                             (Some(gqt), Some(uqt))
@@ -569,8 +574,9 @@ impl GenericTransformerLayer {
                         && x.dim(1).unwrap_or(0) == 1
                     {
                         use crate::tensor::quantized::GgmlDType;
-                        let gq = self.ffn_gate.as_ref().unwrap().qtensor();
-                        let uq = self.ffn_up.qtensor();
+                        // An adapted projection has no bare weight: `forward` serves it.
+                        let gq = self.ffn_gate.as_ref().unwrap().bare_qtensor();
+                        let uq = self.ffn_up.bare_qtensor();
                         match (gq, uq) {
                             (Some(gqt), Some(uqt))
                                 if gqt.dtype() == GgmlDType::Q4K

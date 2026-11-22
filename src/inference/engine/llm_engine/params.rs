@@ -660,11 +660,14 @@ pub struct RequestRules {
     pub truncate_prompt: Option<PromptTruncation>,
     /// A prefix cached for this request is shared only with requests naming the same salt.
     pub cache_salt: Option<String>,
+    /// The adapters the request adds to the base model, by name, each at its strength.
+    pub adapters: Vec<(String, f32)>,
 }
 
 impl RequestRules {
     /// Whether the request decodes one token per step on the sequential path: its rules read
-    /// the tokens already generated, or mask the whole row, or keep its prefix to itself.
+    /// the tokens already generated, or mask the whole row, or keep its prefix to itself, or
+    /// it selects adapters.
     pub fn decodes_sequentially(&self) -> bool {
         self.min_p.is_some()
             || self.allowed_token_ids.is_some()
@@ -672,6 +675,7 @@ impl RequestRules {
             || self.min_tokens > 0
             || self.keep_special_tokens
             || self.cache_salt.is_some()
+            || !self.adapters.is_empty()
     }
 
     /// The tokens that end this request: the model's end tokens, unless the request ignores

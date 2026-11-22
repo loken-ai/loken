@@ -555,6 +555,19 @@ pub(crate) trait ModelBackend: Send {
         ))
     }
 
+    /// Select the adapters the next forwards of one request add to the base, each at its
+    /// strength. An empty list returns the model to the base and its attached adapters.
+    ///
+    /// The default refuses a non-empty list, as [`Self::set_adapters`] does.
+    fn select_adapters(&mut self, wanted: &[(String, f32)]) -> crate::tensor::Result<()> {
+        if wanted.is_empty() {
+            return Ok(());
+        }
+        Err(crate::tensor::Error(
+            "this model family cannot carry adapters".into(),
+        ))
+    }
+
     fn trim_kv(&mut self, _new_len: usize) {}
 
     /// Whether the model came with a draft head, and the head is now reading the hidden state
@@ -1951,6 +1964,10 @@ impl ModelBackend for GenericBackend {
         wanted: &[(String, f32)],
     ) -> crate::tensor::Result<crate::inference::load::lora::AdapterReport> {
         self.0.set_adapters(wanted)
+    }
+
+    fn select_adapters(&mut self, wanted: &[(String, f32)]) -> crate::tensor::Result<()> {
+        self.0.select_adapters(wanted)
     }
 
     fn forward(&mut self, x: &Tensor, index_pos: usize) -> crate::tensor::Result<Tensor> {

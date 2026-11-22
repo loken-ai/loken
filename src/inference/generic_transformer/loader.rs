@@ -620,12 +620,7 @@ impl<'a> TensorSource<'a> {
             device,
             part.owner.as_ref(),
         )?;
-        // A projection in a format only the experts' kernels read is requantised, for a card, to
-        // the widest block format the dense kernels read. The experts keep theirs.
-        // A tensor in a format no card kernel reads is requantised the same way, experts included.
-        let card_requantises = host_only_format(qt.dtype())
-            || (!name.contains("_exps") && codebook_format(qt.dtype()));
-        if device.runs_as_card() && card_requantises {
+        if device.runs_as_card() && card_requantises(qt.dtype(), name.contains("_exps")) {
             // CONVERSION: no card kernel reads the format: dequantised, then held Q8_0.
             let values = qt.dequantize(&Device::Cpu)?;
             return QTensor::quantize_onto(
@@ -701,6 +696,39 @@ fn codebook_format(dtype: crate::tensor::quantized::GgmlDType) -> bool {
 fn host_only_format(dtype: crate::tensor::quantized::GgmlDType) -> bool {
     use crate::tensor::quantized::GgmlDType::*;
     matches!(dtype, Iq1S | Iq1M | Tq1_0 | Tq2_0 | NvFp4)
+}
+
+/// Whether a card holds a tensor stored in `dtype` requantised to Q8_0, the widest block format
+/// the dense kernels read.
+///
+/// A format no card kernel reads is requantised, expert stacks included.
+/// A format only the experts' kernels read is requantised for a weight that is not an expert
+/// stack (`expert` false).
+pub(super) fn card_requantises(dtype: crate::tensor::quantized::GgmlDType, expert: bool) -> bool {
+    host_only_format(dtype) || (!expert && codebook_format(dtype))
+}
+
+/// `qt` requantised to Q8_0 on the device it sits on, for a card to read, when
+/// [`card_requantises`] says so for a weight that is not an expert stack.
+/// `None` when the card reads the stored format.
+pub(super) fn card_requantised(qt: &QTensor) -> crate::tensor::Result<Option<QTensor>> {
+    if !card_requantises(qt.dtype(), false) {
+        return Ok(None);
+    }
+    // CONVERSION: no card kernel reads the format: dequantised, then held Q8_0.
+    let values = qt.dequantize(&Device::Cpu)?;
+    QTensor::quantize_onto(
+        &values,
+        crate::tensor::quantized::GgmlDType::Q8_0,
+        qt.device(),
+    )
+    .map(Some)
+}
+
+/// `qt` in a format a card reads, on the device it sits on: [`card_requantised`], or `qt` as
+/// stored.
+fn card_readable(qt: QTensor) -> crate::tensor::Result<QTensor> {
+    Ok(card_requantised(&qt)?.unwrap_or(qt))
 }
 
 /// A quantised weight built on `device` from its block bytes, `rows` x `cols`.
@@ -1260,15 +1288,17 @@ fn tp_share(
 ) -> Result<RawGenericLayer> {
     let host = |qt: &QTensor| QTensor::from_native(qt.native_qtensor().clone(), &Device::Cpu);
     let whole = |qt: &Option<QTensor>| qt.as_ref().map(host).transpose();
+    // A share goes to its card in a format the card reads.
     let rows = |qt: &QTensor, (from, per): (usize, usize)| -> Result<QTensor> {
-        crate::tensor::quant_view::rows_view(&std::sync::Arc::new(host(qt)?), from, per)?
-            .to_device(card)
+        let view =
+            crate::tensor::quant_view::rows_view(&std::sync::Arc::new(host(qt)?), from, per)?;
+        card_readable(view)?.to_device(card)
     };
     let rows_opt = |qt: &Option<QTensor>, range: (usize, usize)| {
         qt.as_ref().map(|q| rows(q, range)).transpose()
     };
     let columns = |qt: &QTensor, (from, per): (usize, usize)| {
-        crate::tensor::quant_view::columns_copy(qt, from, per)?.to_device(card)
+        card_readable(crate::tensor::quant_view::columns_copy(qt, from, per)?)?.to_device(card)
     };
     let vector = |qt: &Option<QTensor>, (from, per): (usize, usize)| -> Result<Option<QTensor>> {
         qt.as_ref()
@@ -1280,7 +1310,7 @@ fn tp_share(
             .transpose()
     };
     let first = |qt: &Option<QTensor>| if rank == 0 { whole(qt) } else { Ok(None) };
-    let on_card = |qt: &QTensor| host(qt)?.to_device(card);
+    let on_card = |qt: &QTensor| card_readable(host(qt)?)?.to_device(card);
     let on_card_opt = |qt: &Option<QTensor>| qt.as_ref().map(on_card).transpose();
     let first_on_card = |qt: &Option<QTensor>| if rank == 0 { on_card_opt(qt) } else { Ok(None) };
     let hd = config.head_dim;
@@ -1754,10 +1784,11 @@ fn build_generic_layer(
     // on a path that our fast `mul_mat_vec_q*_K_q8_1` kernel dominates.
     // Requantize them to Q6_K at load time so every per-layer matmul
     // takes the fast path.
-    // A weight read on the host for a fusion the build does not make goes to the layer's card.
+    // A weight read on the host for a fusion the build does not make goes to the layer's card, in
+    // a format the card reads.
     let to_card = |qt: QTensor| -> Result<QTensor> {
         match on_gpu && qt.device().is_cpu() {
-            true => qt.to_device(device),
+            true => card_readable(qt)?.to_device(device),
             false => Ok(qt),
         }
     };
@@ -1786,11 +1817,13 @@ fn build_generic_layer(
     // Saves 2 matmul launches + 2 q8_1 quantize launches per layer.
     //
     // Helper: requant a QTensor to the block format if it's F16/F32/BF16 (returns QTensor).
+    // A weight read on the host for a card layer takes a format the card reads before the fusion.
     let requant_qt = |qt: QTensor| -> Result<QTensor> {
         match requant_dtype {
             Some(requant_dtype) if is_float_format(qt.dtype()) => {
                 requant_float_weight(qt, requant_dtype, device, "projection")
             }
+            _ if on_gpu && qt.device().is_cpu() => card_readable(qt),
             _ => Ok(qt),
         }
     };
@@ -5668,6 +5701,7 @@ impl GenericHeteroTransformer {
         };
         let mut model = Self {
             adapters: Vec::new(),
+            adapter_library: Default::default(),
             config,
             embeddings,
             position_embd,
@@ -6298,6 +6332,7 @@ impl GenericHeteroTransformer {
         let sliding_window = config.sliding_window;
         Ok(Self {
             adapters: Vec::new(),
+            adapter_library: Default::default(),
             config,
             embeddings,
             position_embd: None,
@@ -7053,5 +7088,46 @@ mod load_progress_tests {
             0
         );
         super::super::tiny_model::remove(&path);
+    }
+}
+
+#[cfg(test)]
+mod card_format_tests {
+    use super::*;
+    use crate::tensor::quantized::GgmlDType;
+
+    fn values(n: usize) -> Tensor {
+        let v: Vec<f32> = (0..n)
+            .map(|i| ((i * 37) % 101) as f32 / 50.0 - 1.0)
+            .collect();
+        Tensor::from_vec(v, (2usize, n / 2), &Device::Cpu).unwrap()
+    }
+
+    /// A weight read on the host for a card takes the format the read onto the card gives it.
+    /// A format no card kernel reads is requantised to Q8_0 from its own values.
+    /// A format the card reads stays as stored.
+    /// An expert stack keeps a format the experts' kernels read.
+    #[test]
+    fn a_weight_bound_for_a_card_takes_a_format_the_card_reads() {
+        let w = values(1024);
+        let ternary = QTensor::quantize(&w, GgmlDType::Tq2_0).unwrap();
+        let held = card_requantised(&ternary)
+            .unwrap()
+            .expect("no card kernel reads TQ2_0");
+        assert_eq!(held.dtype(), GgmlDType::Q8_0);
+        assert_eq!(held.shape().dims(), ternary.shape().dims());
+        let want = ternary.dequantize(&Device::Cpu).unwrap();
+        let again = QTensor::quantize(&want, GgmlDType::Q8_0).unwrap();
+        let bits = |q: &QTensor| q.data().unwrap().into_owned();
+        assert_eq!(bits(&held), bits(&again), "the stored values requantised");
+
+        let k_quant = QTensor::quantize(&w, GgmlDType::Q4K).unwrap();
+        assert!(card_requantised(&k_quant).unwrap().is_none());
+        assert_eq!(card_readable(k_quant).unwrap().dtype(), GgmlDType::Q4K);
+
+        assert!(card_requantises(GgmlDType::Iq4Nl, false));
+        assert!(!card_requantises(GgmlDType::Iq4Nl, true));
+        assert!(card_requantises(GgmlDType::Iq1S, true));
+        assert!(!card_requantises(GgmlDType::Q8_0, false));
     }
 }

@@ -194,8 +194,12 @@ fn is_consistency(header: Option<&str>) -> bool {
 
 /// The safetensors header of an adapter, as text.
 fn header_text(name: &str) -> Option<String> {
+    header_at(&resolve(name).ok()?)
+}
+
+/// The safetensors header of the file at `path`, as text.
+fn header_at(path: &Path) -> Option<String> {
     use std::io::Read;
-    let path = resolve(name).ok()?;
     let mut f = std::fs::File::open(path).ok()?;
     let mut len8 = [0u8; 8];
     f.read_exact(&mut len8).ok()?;
@@ -213,6 +217,16 @@ fn header_text(name: &str) -> Option<String> {
 /// scaled by `alpha / rank`, so that changing the rank does not change the strength.
 /// Files that omit alpha are trained at `alpha == rank`, i.e. a scale of 1.
 const DEFAULT_ALPHA_IS_RANK: f32 = 1.0;
+
+/// The suffixes of the `down` half of a pair: diffusers, PEFT, then the XLabs layout.
+const DOWN_SUFFIXES: [&str; 3] = [".lora_down.weight", ".lora_A.weight", ".down.weight"];
+/// The suffixes of the `up` half of a pair, in the order of [`DOWN_SUFFIXES`].
+const UP_SUFFIXES: [&str; 3] = [".lora_up.weight", ".lora_B.weight", ".up.weight"];
+
+/// `name` without the first of `suffixes` it ends with.
+fn strip_any<'a>(name: &'a str, suffixes: &[&str]) -> Option<&'a str> {
+    suffixes.iter().find_map(|s| name.strip_suffix(s))
+}
 
 /// One loaded adapter file: the low-rank pairs, keyed by the flattened module name.
 pub struct LoraFile {
@@ -240,17 +254,9 @@ impl LoraFile {
         // subpath. Accepting only the first two meant an XLabs file did not even LOAD -
         // it produced no pairs at all, so the adapter reported as matching nothing.
         for n in &names {
-            if let Some(base) = n
-                .strip_suffix(".lora_down.weight")
-                .or_else(|| n.strip_suffix(".lora_A.weight"))
-                .or_else(|| n.strip_suffix(".down.weight"))
-            {
+            if let Some(base) = strip_any(n, &DOWN_SUFFIXES) {
                 downs.insert(base.to_string(), n.clone());
-            } else if let Some(base) = n
-                .strip_suffix(".lora_up.weight")
-                .or_else(|| n.strip_suffix(".lora_B.weight"))
-                .or_else(|| n.strip_suffix(".up.weight"))
-            {
+            } else if let Some(base) = strip_any(n, &UP_SUFFIXES) {
                 ups.insert(base.to_string(), n.clone());
             } else if let Some(base) = n.strip_suffix(".alpha") {
                 alphas.insert(base.to_string(), n.clone());
@@ -558,6 +564,111 @@ pub struct AdapterReport {
     pub projections: usize,
     /// Entries in the files that matched no projection.
     pub unmatched: usize,
+}
+
+/// The projections of a transformer layer a text adapter may correct, by checkpoint name.
+///
+/// The flag says how a tensor-parallel share cuts the projection.
+/// `true` cuts its outputs, so a share takes a slice of the delta's `up`.
+/// `false` cuts its inputs, so a share takes a slice of the delta's `down`.
+pub const ADAPTER_SITES: [(&str, bool); 7] = [
+    ("self_attn.q_proj", true),
+    ("self_attn.k_proj", true),
+    ("self_attn.v_proj", true),
+    ("self_attn.o_proj", false),
+    ("mlp.gate_proj", true),
+    ("mlp.up_proj", true),
+    ("mlp.down_proj", false),
+];
+
+/// The widths of a model that decide what its adapters take.
+#[derive(Debug, Clone, Copy)]
+pub struct AdapterWidths {
+    /// The hidden width.
+    pub hidden: usize,
+    /// The outputs of q, k and v together, the width of a fused QKV projection.
+    pub qkv: usize,
+}
+
+/// Bytes the text adapters of the adapter directory take beside the layers `layers` of a
+/// model of the widths `widths`.
+///
+/// Read from the files' headers.
+/// A pair counts when it names a projection of [`ADAPTER_SITES`] in one of those layers and its
+/// hidden side is `widths.hidden` wide.
+/// The `up` of a q, k or v pair counts at the width of the fused QKV projection, the most it
+/// takes.
+/// The `up` of a gate or up pair counts at twice its width, the width of a fused gate and up
+/// projection.
+/// A pair counts at the width of F32, the width [`LoraFile::load`] holds it in.
+pub fn text_adapter_bytes(layers: std::ops::Range<usize>, widths: AdapterWidths) -> u64 {
+    lora_dir().map_or(0, |dir| text_adapter_bytes_in(dir, layers, widths))
+}
+
+/// [`text_adapter_bytes`] of the adapters in `dir`.
+pub fn text_adapter_bytes_in(
+    dir: &Path,
+    layers: std::ops::Range<usize>,
+    widths: AdapterWidths,
+) -> u64 {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    rd.filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "safetensors"))
+        .map(|p| file_text_bytes(&p, layers.clone(), widths))
+        .sum()
+}
+
+/// The bytes one adapter file's fitting pairs take; see [`text_adapter_bytes`].
+fn file_text_bytes(path: &Path, layers: std::ops::Range<usize>, widths: AdapterWidths) -> u64 {
+    let Some(header) = header_at(path) else {
+        return 0;
+    };
+    let Ok(serde_json::Value::Object(tensors)) = serde_json::from_str(&header) else {
+        return 0;
+    };
+    let shape = |name: &str| -> Option<Vec<usize>> {
+        tensors
+            .get(name)?
+            .get("shape")?
+            .as_array()?
+            .iter()
+            .map(|d| d.as_u64().map(|d| d as usize))
+            .collect()
+    };
+    let half = |base: &str, suffixes: &[&str]| -> Option<Vec<usize>> {
+        suffixes
+            .iter()
+            .find_map(|s| shape(&format!("{base}{s}")))
+            .filter(|d| d.len() == 2)
+    };
+    let mut bytes = 0u64;
+    for layer in layers {
+        for (site, (projection, hidden_in)) in ADAPTER_SITES.into_iter().enumerate() {
+            for key in transformer_keys(layer, projection) {
+                let (Some(down), Some(up)) = (half(&key, &DOWN_SUFFIXES), half(&key, &UP_SUFFIXES))
+                else {
+                    continue;
+                };
+                // Stored `down` `[r, in]` and `up` `[out, r]`.
+                let side = if hidden_in { down[1] } else { up[0] };
+                // The first 3 sites are q, k and v, the next 2 the gate and the up.
+                let up_width = match site {
+                    0..=2 => widths.qkv.max(up[0]),
+                    4 | 5 => 2 * up[0],
+                    _ => up[0],
+                };
+                if side == widths.hidden {
+                    let values = down[0] * down[1] + up_width * up[1];
+                    bytes += (values * DType::F32.size_in_bytes()) as u64;
+                }
+                break;
+            }
+        }
+    }
+    bytes
 }
 
 /// The names a PEFT adapter may use for one projection of one transformer layer.

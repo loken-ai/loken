@@ -15,6 +15,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 - API: classify texts and score pairs with a model's classification head.
 - Models: load GGUF tensors in IQ1_S, IQ1_M, TQ1_0, TQ2_0 and NVFP4.
 - Cluster: copy a model from a peer that holds it, resuming after a cut.
+- Models: share one base model between text adapters picked per request.
 
 ### Changed
 

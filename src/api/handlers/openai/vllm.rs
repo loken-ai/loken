@@ -141,6 +141,7 @@ impl VllmFields {
             keep_special_tokens: self.skip_special_tokens == Some(false),
             truncate_prompt,
             cache_salt: self.cache_salt.clone(),
+            adapters: Vec::new(),
         })
     }
 
@@ -149,6 +150,9 @@ impl VllmFields {
     pub(crate) fn beam_search(&self, n: usize) -> Result<Option<BeamSearch>, ApiError> {
         if self.use_beam_search != Some(true) {
             return Ok(None);
+        }
+        if self.adapters.as_ref().is_some_and(|a| !a.is_empty()) {
+            return Err(invalid("`adapters` are not supported with beam search"));
         }
         let early_stopping = match &self.early_stopping {
             None | Some(serde_json::Value::Bool(false)) => EarlyStopping::Heuristic,

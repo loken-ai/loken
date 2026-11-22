@@ -135,6 +135,38 @@ A `{base}ForSequenceClassification` checkpoint loads as `{base}ForCausalLM` with
 A pair is written in the GGUF template `tokenizer.chat_template.rerank` when the file has one, with `{query}` and `{document}` replaced.
 Without it the tokenizer encodes the 2 texts as a pair.
 
+### Adapters per request
+
+A request adds text adapters to the loaded base model with `adapters`, a list of `{"name": ..., "strength": ...}` objects.
+
+| Route | Where the field is read |
+|---|---|
+| `/v1/chat/completions`, `/v1/completions` | at the top of the body |
+| `/api/chat`, `/api/generate` | in `options` |
+
+- `name` is a file of the adapter directory, `lora_dir`, without its `.safetensors` suffix. `GET /v1/loras` lists them.
+- `strength` multiplies the adapter's own `alpha / r` scale. It is 1 when absent.
+- A name given twice, or a strength that is not a finite number, answers 400.
+- Several adapters in one request add up.
+- A request without `adapters` runs on the base weights alone.
+
+The base weights are loaded once.
+Each adapter is read on the first request that names it.
+It then stays resident beside the layers it corrects, on their devices.
+The placement counts the bytes of every text adapter of the directory that fits the model, read from the files' headers.
+
+An adapter is a PEFT file in safetensors.
+It corrects the `q_proj`, `k_proj`, `v_proj`, `o_proj`, `gate_proj`, `up_proj` and `down_proj` projections of the layers it names.
+A layer that fuses q, k and v into 1 projection takes their 3 deltas on it.
+A layer that fuses the gate and the up into 1 projection takes their 2 deltas on it.
+An adapter that corrects no projection of the model is refused.
+A model with layers on a Vulkan or OpenCL device refuses adapters.
+
+A request with `adapters` decodes 1 token per step on the sequential path, 1 request at a time.
+It is not batched with other requests.
+Beam search with `adapters` answers 400.
+The adapters `POST /api/layers/swap` attaches apply to every request of the model, and those of a request add to them.
+
 ### vLLM's extensions
 
 `/v1/completions` and `/v1/chat/completions` read the fields vLLM's server adds to OpenAI's.
@@ -171,6 +203,7 @@ These fields decode 1 token per step, without prompt-lookup drafts, captured gra
 - `skip_special_tokens: false`
 - `cache_salt`
 - a structured output
+- `adapters`, described in [Adapters per request](#adapters-per-request)
 
 These answer 400: `prompt_logprobs`, a request `chat_template`, and `continue_final_message` with `add_generation_prompt: true`.
 
@@ -231,7 +264,7 @@ A route in the Feature column exists when its Cargo feature is compiled.
 | `POST /conversation` | `audio` | 1 turn of a conversation, routed by what the prompt asks for: chat, vision on an attached image, image generation, speech or sound. Rules decide the clear cases and a small classifier model the rest. The reply carries `route`, `routed_by` and the picture or clip beside the message. `stream` sends events, `model` is the chat model to prefer, `image_model` and `tts_model` name the renderers. |
 | `POST /voice` | `audio` | Speech in, speech out: transcription, a chat turn, then the reply spoken. |
 | `POST /v1/images/generations`, `POST /v1/images/edits`, `POST /v1/images/variations` | `image` | Image generation. `edits` and `variations` take a multipart form with `image` (PNG or JPEG), `prompt` (not for `variations`), `model`, `n`, `size`, `response_format` and the extension fields `strength` and `seed`. `response_format` is `url` by default: the picture is stored as a file and answered as a URL built on `public_url`, or on the request's `Host`. `b64_json` returns the picture inline. Any other value answers 400. |
-| `GET /v1/loras` | `image` | The adapters this server can apply, by name. |
+| `GET /v1/loras` | `image` | The adapters of the adapter directory, by name: image adapters and the text adapters of [Adapters per request](#adapters-per-request). |
 | `POST /v1/video/generations` | `video` | Text- and image-conditioned clips. |
 | `POST /api/video/plan` | `video` | What a clip of a given length will cost, before rendering it. |
 | `GET /v1/renders`, `POST /v1/renders/{id}/cancel` | none | Renders in flight of the calling key, and cancelling 1. See [Naming a render](#naming-a-render). |
@@ -586,7 +619,7 @@ A client that follows the SSE specification ignores comment lines.
 | `POST /api/swap` | Replace the resident model. |
 | `POST /api/calibrate` | Record the activations of a released checkpoint, named by its Hugging Face id, on the given `texts`, as the calibration `name`. `excerpt`, `tokens` and `rows` size the pass. Streams NDJSON unless `stream: false`. |
 | `POST /api/convert` | Convert a released checkpoint into the model `name:tag`, from the calibration record named by `calibration`. `complete` finishes an existing conversion instead. Streams NDJSON unless `stream: false`. |
-| `POST /api/layers/swap` | Attach or detach adapters on a loaded model without reloading it. The body is the set the model should end up with. |
+| `POST /api/layers/swap` | Attach or detach adapters on a loaded model without reloading it. The body is the set the model should end up with. The adapters apply to every request. A request picks its own with [`adapters`](#adapters-per-request). |
 | `POST /api/draft/attach`, `POST /api/draft/detach`, `GET /api/draft/status` | Speculative decoding for the resident model, after a tokenizer compatibility check. |
 | `GET /api/inflight` | Requests in flight and queued, by priority. A completion with a `suffix` is an editor filling in the middle and goes first. The lines of the batch APIs yield the cards to whoever is waiting. The rest is interactive. |
 | `GET /api/layer_perf`, `GET /api/stage_perf` | Where a decode step's time goes, per layer and per stage. Both record only while measurement is on. `?enable=1` on either switches it on and zeroes the counters, `?enable=0` switches it off, and each reply says whether it is on. It is off by default because it costs a device synchronisation per stage. A layer's figure is what issuing it costs the calling thread. A streamed decode also times each token's iteration and its parts (`token: prepare`, `token: launch`, `token: sample`, `token: stream`) under `offload_stages`. The batched decode of a wide-residual model times its stages there too: `mix_token`, `token mixer`, `output projection`, `combine`, `mix_ffn`, `experts`, `engram`, `exchange` and `head`. The parts of `experts` are `experts: router`, `experts: tier`, `experts: reads asked`, `experts: shared on the host`, `experts: host` and `experts: card wait`. The parts of a prompt's `token mixer` in a compressed band layer are `token mixer: front`, `token mixer: pool`, `token mixer: index keys`, `token mixer: index queries`, `token mixer: scores`, `token mixer: candidates`, `token mixer: top rows` and `token mixer: attend`. The host tier of a wide-residual model counts its decoded rows' misses by cause under `prediction` (`never_kept`, `left_at_prompt`, `left_at_decode`, `missed_ahead`) with the bytes not in memory when asked for (`absent_kept`, `absent_missed`, `absent_ahead`). Under the `fast` level, `replaced` counts the routed slots given to an expert outside the exact choice and `skipped` the slots left empty. The host tier also traces every forward of each layer under `host_tier_trace`. A read of the trace empties it. |

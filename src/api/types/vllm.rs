@@ -87,6 +87,9 @@ pub struct VllmFields {
     pub guided_whitespace_pattern: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_salt: Option<String>,
+    /// loken's own field: the adapters the request adds to the base model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adapters: Option<Vec<super::SwapAdapter>>,
     /// Chat: whether the template opens the assistant's turn.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub add_generation_prompt: Option<bool>,

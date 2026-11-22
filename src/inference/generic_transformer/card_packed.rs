@@ -529,7 +529,12 @@ impl PackedDev {
         let mut unit = None;
         let (form, bytes) = match p {
             Projection::Quant(q) => {
-                let on_card = q.to_device(&Device::Cuda(dev.clone()))?;
+                // A format the card's quantised matmul does not read goes up requantised.
+                let readable = super::loader::card_requantised(q)?;
+                let held = readable.as_ref().unwrap_or(q.as_ref());
+                let on_card = held.to_device(&Device::Cuda(dev.clone()))?;
+                let held_bytes = held.shape().elem_count() / held.dtype().block_size()
+                    * held.dtype().type_size();
                 let qmm = Box::new(QMatMul::from_arc(Arc::new(on_card))?);
                 let form = match (exact_kernel(q.dtype(), inp), f32_kernel(q.dtype())) {
                     (Some(kernel), Some((expand, _))) => {
@@ -541,7 +546,7 @@ impl PackedDev {
                     }
                     _ => Form::Blocks(qmm),
                 };
-                (form, p.bytes())
+                (form, held_bytes)
             }
             Projection::Fp8(f) if f.scale_format == ScaleFormat::E8m0 => {
                 // The scales of the tile rows the view touches, addressed from the first of them.

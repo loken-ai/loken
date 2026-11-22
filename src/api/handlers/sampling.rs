@@ -144,6 +144,34 @@ pub(crate) struct SamplingRequest {
     /// vLLM's multiplicative penalty over every token of the prompt and the answer.
     pub repetition_penalty: Option<f64>,
     pub rules: crate::inference::engine::llm_engine::RequestRules,
+    /// The adapters the request adds to the base model, or why the field was refused.
+    pub adapters: Result<Vec<(String, f32)>, String>,
+}
+
+/// The adapters a request names under `field`, as the engine takes them.
+///
+/// Each name is screened as a model name is, since it indexes the adapter directory.
+/// Each strength must be finite.
+/// A name may come once.
+pub(crate) fn request_adapters(
+    field: &str,
+    list: &[crate::api::types::SwapAdapter],
+) -> Result<Vec<(String, f32)>, String> {
+    let mut out: Vec<(String, f32)> = Vec::with_capacity(list.len());
+    for a in list {
+        validate_model_id(&a.name).map_err(|e| format!("`{field}`: {e}"))?;
+        if !a.strength.is_finite() {
+            return Err(format!(
+                "`{field}`: the strength of {} is {}",
+                a.name, a.strength
+            ));
+        }
+        if out.iter().any(|(n, _)| *n == a.name) {
+            return Err(format!("`{field}` names {} twice", a.name));
+        }
+        out.push((a.name.clone(), a.strength));
+    }
+    Ok(out)
 }
 
 fn f64_of(v: &serde_json::Value, key: &str) -> Option<f64> {
@@ -189,6 +217,7 @@ impl SamplingRequest {
             grammar: None,
             repetition_penalty: None,
             rules: Default::default(),
+            adapters: Ok(Vec::new()),
         }
     }
 
@@ -199,6 +228,11 @@ impl SamplingRequest {
     ) -> Result<Self, ApiError> {
         self.repetition_penalty = fields.repetition_penalty()?;
         self.rules = fields.rules(self.max_tokens)?;
+        self.adapters = Ok(request_adapters(
+            "adapters",
+            fields.adapters.as_deref().unwrap_or_default(),
+        )
+        .map_err(ApiError::Validation)?);
         Ok(self)
     }
 
@@ -294,6 +328,14 @@ impl SamplingRequest {
             .get("grammar")
             .and_then(serde_json::Value::as_str)
             .map(str::to_string);
+        // A malformed adapter list is refused: run on the base, the request would read as
+        // answered by its adapters.
+        if let Some(list) = o.get("adapters") {
+            s.adapters =
+                serde_json::from_value::<Vec<crate::api::types::SwapAdapter>>(list.clone())
+                    .map_err(|e| format!("`options.adapters`: {e}"))
+                    .and_then(|l| request_adapters("options.adapters", &l));
+        }
         s
     }
 
@@ -335,6 +377,9 @@ impl SamplingRequest {
 
     /// The bounds every dialect shares.
     pub(crate) fn validate(&self) -> Result<(), ApiError> {
+        if let Err(e) = &self.adapters {
+            return Err(ApiError::Validation(e.clone()));
+        }
         self.in_range("temperature", self.temperature, 0.0, 2.0)?;
         self.in_range("top_p", self.top_p, 0.0, 1.0)?;
         self.in_range("frequency_penalty", self.frequency_penalty, -2.0, 2.0)?;
@@ -416,7 +461,10 @@ impl SamplingRequest {
             top_logprobs: self.top_logprobs.map(|v| v as usize),
             drawn_logprobs: Default::default(),
             cancel: None,
-            rules: self.rules,
+            rules: crate::inference::engine::llm_engine::RequestRules {
+                adapters: self.adapters.unwrap_or_default(),
+                ..self.rules
+            },
             probe: None,
             for_peer: false,
         }
@@ -583,5 +631,51 @@ mod tests {
             SamplingRequest::from_ollama(Some(&serde_json::json!({"num_predict": -1})), None, None);
         assert!(s.validate().is_ok());
         assert_eq!(s.into_params().max_tokens, None);
+    }
+
+    /// A request's adapters reach the engine from the OpenAI body and the Ollama options, and
+    /// they send it to the sequential path.
+    /// A malformed list, a name given twice or a strength that is not finite is refused.
+    #[test]
+    fn adapters_reach_the_engine_from_every_dialect() {
+        let want = vec![("tone".to_string(), 1.0f32), ("law".to_string(), 0.5)];
+        let list = serde_json::json!([{"name": "tone"}, {"name": "law", "strength": 0.5}]);
+        let body = serde_json::json!({"adapters": list});
+        let fields = crate::api::types::vllm::VllmFields::of_body(&body).unwrap();
+        let p = SamplingRequest::from_completions(&body)
+            .with_vllm(&fields)
+            .unwrap()
+            .into_params();
+        assert_eq!(p.rules.adapters, want);
+        assert!(p.rules.decodes_sequentially());
+        let s =
+            SamplingRequest::from_ollama(Some(&serde_json::json!({"adapters": list})), None, None);
+        assert!(s.validate().is_ok());
+        assert_eq!(s.into_params().rules.adapters, want);
+        let none = SamplingRequest::from_ollama(None, None, None).into_params();
+        assert!(none.rules.adapters.is_empty() && !none.rules.decodes_sequentially());
+
+        let refused = |list: serde_json::Value| {
+            let ollama = SamplingRequest::from_ollama(
+                Some(&serde_json::json!({"adapters": list})),
+                None,
+                None,
+            );
+            let body = serde_json::json!({"adapters": list});
+            let openai = crate::api::types::vllm::VllmFields::of_body(&body)
+                .map_err(|_| ())
+                .and_then(|f| {
+                    SamplingRequest::from_completions(&body)
+                        .with_vllm(&f)
+                        .map_err(|_| ())
+                });
+            ollama.validate().is_err() && openai.is_err()
+        };
+        assert!(refused(serde_json::json!("tone")), "not a list");
+        assert!(
+            refused(serde_json::json!([{"name": "tone"}, {"name": "tone"}])),
+            "twice"
+        );
+        assert!(refused(serde_json::json!([{"name": "../tone"}])), "a path");
     }
 }

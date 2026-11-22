@@ -437,6 +437,9 @@ pub struct QMatMul {
     /// Empty is the weight exactly as the file wrote it.
     lora: Vec<crate::tensor::lora::LoraDelta>,
     lora_fused: Option<(Tensor, Tensor)>,
+    /// The adapters the running request selected, fused into one `([1, in, R], [1, R, out])`
+    /// pair. `None` runs the request on the weight and the attached adapters alone.
+    selected: Option<(Tensor, Tensor)>,
 }
 
 impl QMatMul {
@@ -464,7 +467,7 @@ impl QMatMul {
     /// launch reads in place of the projection.
     pub fn dense(&self) -> Option<&Tensor> {
         match &self.inner {
-            QMatMulKind::Gguf(inner) if self.lora.is_empty() => inner.dense(),
+            QMatMulKind::Gguf(inner) if !self.adapted() => inner.dense(),
             _ => None,
         }
     }
@@ -472,7 +475,7 @@ impl QMatMul {
     /// The BF16 weight a card holds, when it carries no adapter.
     pub fn bf16(&self) -> Option<&Tensor> {
         match &self.inner {
-            QMatMulKind::Gguf(inner) if self.lora.is_empty() => inner.bf16(),
+            QMatMulKind::Gguf(inner) if !self.adapted() => inner.bf16(),
             _ => None,
         }
     }
@@ -483,6 +486,7 @@ impl QMatMul {
             inner: QMatMulKind::Gguf(inner),
             lora: Vec::new(),
             lora_fused: None,
+            selected: None,
         })
     }
 
@@ -492,6 +496,7 @@ impl QMatMul {
             inner: QMatMulKind::Gguf(crate::tensor::quantized::QMatMul::bf16_onto(qt, dev)?),
             lora: Vec::new(),
             lora_fused: None,
+            selected: None,
         })
     }
 
@@ -590,6 +595,7 @@ impl QMatMul {
             inner: QMatMulKind::Awq(std::sync::Arc::new(w)),
             lora: Vec::new(),
             lora_fused: None,
+            selected: None,
         }
     }
 
@@ -600,7 +606,7 @@ impl QMatMul {
         // An attached adapter is not part of the quantised weight, so this path cannot
         // produce it. Declining sends the caller to `forward`, which applies it; running
         // here would return the base weight's answer and call it the adapted one.
-        if self.lora_fused.is_some() {
+        if self.adapted() {
             return Ok(false);
         }
         match &self.inner {
@@ -612,7 +618,7 @@ impl QMatMul {
     /// [`Self::forward_slice_cpu`] over several rows at once, each row bit-identical to a
     /// one-row call. `Ok(false)` where the one-row call declines.
     pub fn forward_rows_cpu(&self, x: &[f32], out: &mut [f32]) -> Result<bool> {
-        if self.lora_fused.is_some() {
+        if self.adapted() {
             return Ok(false);
         }
         match &self.inner {
@@ -634,7 +640,7 @@ impl QMatMul {
     ) -> Result<bool> {
         let mut inners = Vec::with_capacity(mats.len());
         for m in mats {
-            if m.lora_fused.is_some() {
+            if m.adapted() {
                 return Ok(false);
             }
             match &m.inner {
@@ -650,7 +656,7 @@ impl QMatMul {
     pub fn cpu_raw(&self) -> Option<(crate::tensor::quantized::GgmlDType, usize, usize, &[u8])> {
         // Same reason as the slice path: a caller reading the raw weight would compute
         // without the adapter and never know it was there.
-        if self.lora_fused.is_some() {
+        if self.adapted() {
             return None;
         }
         match &self.inner {
@@ -673,10 +679,15 @@ impl QMatMul {
     /// paths - a CPU k-quant one and more than one CUDA kernel - and adding the delta at each
     /// is how a family silently ends up without its adapter.
     pub fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        let base = self.forward_base(xs)?;
-        let Some((down, up)) = &self.lora_fused else {
-            return Ok(base);
-        };
+        let mut out = self.forward_base(xs)?;
+        for pair in [&self.lora_fused, &self.selected].into_iter().flatten() {
+            out = Self::add_low_rank(xs, out, pair)?;
+        }
+        Ok(out)
+    }
+
+    /// `base` plus `((xs @ down) @ up)`, the pair already scaled.
+    fn add_low_rank(xs: &Tensor, base: Tensor, (down, up): &(Tensor, Tensor)) -> Result<Tensor> {
         let xdims = xs.dims().to_vec();
         let k = *xdims
             .last()
@@ -722,6 +733,20 @@ impl QMatMul {
     pub fn clear_lora(&mut self) {
         self.lora.clear();
         self.lora_fused = None;
+    }
+
+    /// Whether a low-rank term is added to the weight's answer: an attached adapter or one the
+    /// running request selected.
+    pub fn adapted(&self) -> bool {
+        self.lora_fused.is_some() || self.selected.is_some()
+    }
+
+    /// Set the fused pair of the adapters the running request selected, `None` to run on the
+    /// weight and the attached adapters alone.
+    ///
+    /// The pair is `([1, in, R], [1, R, out])` with the strengths folded into `up`.
+    pub fn select_lora(&mut self, pair: Option<(Tensor, Tensor)>) {
+        self.selected = pair;
     }
 
     pub fn lora_count(&self) -> usize {
@@ -817,8 +842,8 @@ impl QMatMul {
             || !fused_formats.contains(&uq.dtype())
             || !x.device().is_cuda()
             || x.dims().last().is_none_or(|&k| x.elem_count() != k)
-            || !gate.lora.is_empty()
-            || !up.lora.is_empty()
+            || gate.adapted()
+            || up.adapted()
         {
             declined(format!(
                 "gate {:?} up {:?} x {:?} {:?} on {:?}, adapters {} and {}",
@@ -827,8 +852,8 @@ impl QMatMul {
                 x.dtype(),
                 x.dims(),
                 x.device().location(),
-                gate.lora.len(),
-                up.lora.len()
+                gate.lora.len() + usize::from(gate.selected.is_some()),
+                up.lora.len() + usize::from(up.selected.is_some())
             ));
             return Ok(None);
         }
@@ -863,6 +888,9 @@ impl QMatMul {
 
     /// Borrow the underlying QTensor if this matmul stores its weight as
     /// quantized GGUF data. Returns None for AWQ or dequantized weights.
+    ///
+    /// It gives the weight's shape and format.
+    /// A path that computes with the weight in place of `forward` reads [`Self::bare_qtensor`].
     pub fn qtensor(&self) -> Option<&std::sync::Arc<crate::tensor::quantized::QTensor>> {
         match &self.inner {
             QMatMulKind::Gguf(crate::tensor::quantized::QMatMul::QTensor(t)) => Some(t),
@@ -870,13 +898,21 @@ impl QMatMul {
         }
     }
 
+    /// The quantised weight a fast path computes with in place of `forward`, when no adapter adds
+    /// a term to the weight's answer.
+    ///
+    /// `None` sends the caller to `forward`, which adds the adapters.
+    pub fn bare_qtensor(&self) -> Option<&std::sync::Arc<crate::tensor::quantized::QTensor>> {
+        if self.adapted() {
+            return None;
+        }
+        self.qtensor()
+    }
+
     /// The kernel matmul `forward` runs when nothing is added on top of it.
     #[cfg(feature = "gpu")]
     fn bare_kernel(&self) -> Option<&crate::tensor::quantized::QKernelMatMul> {
-        if self.lora_fused.is_some() {
-            return None;
-        }
-        self.qtensor()?.native_qmm().ok()
+        self.bare_qtensor()?.native_qmm().ok()
     }
 
     /// `xs` quantised once for several projections of the same input: see
@@ -1360,6 +1396,47 @@ mod lora_tests {
             w.cpu_raw().is_none(),
             "the raw weight would omit the adapter"
         );
+    }
+
+    /// The card fast paths read the bare weight, which an adapted projection does not hand out.
+    /// A pair a request selects and an attached adapter each send the caller to `forward`.
+    /// The weight's shape and format stay readable through `qtensor`.
+    #[test]
+    fn an_adapted_projection_hands_out_no_bare_weight() {
+        let (k, n, r) = (64usize, 32usize, 4usize);
+        let mut w = weight(k, n);
+        assert!(
+            w.bare_qtensor().is_some(),
+            "a plain weight has a bare weight"
+        );
+        let down = Tensor::from_vec_f32(
+            (0..k * r).map(|i| ((i % 5) as f32 - 2.0) / 10.0).collect(),
+            vec![k, r],
+        )
+        .expect("down");
+        let up = Tensor::from_vec_f32(
+            (0..r * n).map(|i| ((i % 3) as f32 - 1.0) / 10.0).collect(),
+            vec![r, n],
+        )
+        .expect("up");
+        let pair = (
+            down.unsqueeze(0).expect("down"),
+            up.unsqueeze(0).expect("up"),
+        );
+        w.select_lora(Some(pair));
+        assert!(w.bare_qtensor().is_none(), "a selected pair");
+        assert!(w.qtensor().is_some(), "the shape stays readable");
+        w.select_lora(None);
+        assert!(w.bare_qtensor().is_some(), "the selection cleared");
+        w.add_lora(LoraDelta {
+            down,
+            up,
+            scale: 1.0,
+        })
+        .expect("attach");
+        assert!(w.bare_qtensor().is_none(), "an attached adapter");
+        w.clear_lora();
+        assert!(w.bare_qtensor().is_some(), "the adapter detached");
     }
 }
 

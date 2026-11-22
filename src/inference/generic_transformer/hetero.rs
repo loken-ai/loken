@@ -399,34 +399,24 @@ impl GenericHeteroTransformer {
     /// Applied all-or-nothing. A file that resolves but matches nothing leaves the model on
     /// its base weights and says so, because an adapter on some projections and not others is
     /// worse than one that did not apply.
+    ///
+    /// A change of the attached adapters moves the graph generation.
     pub fn set_adapters(
         &mut self,
         wanted: &[(String, f32)],
     ) -> Result<crate::inference::load::lora::AdapterReport> {
-        use crate::inference::load::lora::{transformer_keys, AdapterReport, LoraFile};
+        use crate::inference::load::lora::{AdapterReport, LoraFile};
         use crate::tensor::Error;
 
-        for layer in self.layers.iter_mut() {
-            let mut shards = std::mem::take(&mut layer.tp_shards);
-            for part in std::iter::once(&mut *layer).chain(shards.iter_mut()) {
-                for p in [
-                    part.attn_q.as_mut(),
-                    part.attn_k.as_mut(),
-                    part.attn_v.as_mut(),
-                    part.attn_qkv.as_mut(),
-                    part.ffn_gate.as_mut(),
-                ]
-                .into_iter()
-                .flatten()
-                {
-                    p.clear_lora();
-                }
-                part.attn_output.clear_lora();
-                part.ffn_up.clear_lora();
-                part.ffn_down.clear_lora();
+        if !wanted.is_empty() {
+            if let Some(why) = self.adapter_refusal() {
+                return Err(Error(format!("adapters refused: {why}")));
             }
-            layer.tp_shards = shards;
         }
+        if !wanted.is_empty() || !self.adapters.is_empty() {
+            self.note_adapters_changed();
+        }
+        self.each_adapted_projection(|p| p.clear_lora());
         self.adapters.clear();
         if wanted.is_empty() {
             return Ok(AdapterReport::default());
@@ -447,83 +437,24 @@ impl GenericHeteroTransformer {
         let mut report = AdapterReport::default();
         let mut matched_entries = 0usize;
         for (name, strength, file) in &files {
-            let mut hits = 0usize;
-            for (i, layer) in self.layers.iter_mut().enumerate() {
-                // Fused QKV is deliberately absent: an adapter names q, k and v separately and
-                // splitting a fused weight to take them is a different piece of work. A
-                // projection cut by rows across a layer's shares takes its slice of the delta's
-                // outputs, one cut by columns its slice of the delta's inputs.
-                const SITES: [(&str, bool); 7] = [
-                    ("self_attn.q_proj", true),
-                    ("self_attn.k_proj", true),
-                    ("self_attn.v_proj", true),
-                    ("self_attn.o_proj", false),
-                    ("mlp.gate_proj", true),
-                    ("mlp.up_proj", true),
-                    ("mlp.down_proj", false),
-                ];
-                let ranks = 1 + layer.tp_shards.len();
-                for (site, (projection, by_rows)) in SITES.iter().enumerate() {
-                    let mut delta = None;
-                    for key in transformer_keys(i, projection) {
-                        if let Some(d) = file.delta_for_key(&key, *strength)? {
-                            delta = Some(d);
-                            break;
-                        }
-                    }
-                    let Some(delta) = delta else { continue };
-                    let mut shards = std::mem::take(&mut layer.tp_shards);
-                    let parts = std::iter::once(&mut *layer).chain(shards.iter_mut());
-                    let mut applied = false;
-                    for (rank, part) in parts.enumerate() {
-                        let slot = match site {
-                            0 => part.attn_q.as_mut(),
-                            1 => part.attn_k.as_mut(),
-                            2 => part.attn_v.as_mut(),
-                            3 => Some(&mut part.attn_output),
-                            4 => part.ffn_gate.as_mut(),
-                            5 => Some(&mut part.ffn_up),
-                            _ => Some(&mut part.ffn_down),
-                        };
-                        let Some(weight) = slot else { continue };
-                        let (down, up) = match (ranks, by_rows) {
-                            (1, _) => (delta.down.clone(), delta.up.clone()),
-                            (_, true) => {
-                                let per = delta.up.dim(1)? / ranks;
-                                (
-                                    delta.down.clone(),
-                                    delta.up.narrow(1, rank * per, per)?.contiguous()?,
-                                )
-                            }
-                            (_, false) => {
-                                let per = delta.down.dim(0)? / ranks;
-                                (
-                                    delta.down.narrow(0, rank * per, per)?.contiguous()?,
-                                    delta.up.clone(),
-                                )
-                            }
-                        };
-                        let device = weight.device();
-                        weight.add_lora(crate::tensor::lora::LoraDelta {
-                            down: down.to_device(&device)?,
-                            up: up.to_device(&device)?,
-                            scale: delta.scale,
-                        })?;
-                        applied = true;
-                    }
-                    layer.tp_shards = shards;
-                    hits += usize::from(applied);
+            let mut sites = std::collections::BTreeSet::new();
+            for d in self.adapter_deltas(file, *strength)? {
+                let mut part = &mut self.layers[d.layer];
+                if d.share > 0 {
+                    part = &mut part.tp_shards[d.share - 1];
+                }
+                if let Some(weight) = super::adapters::site_mut(part, d.slot) {
+                    weight.add_lora(d.delta)?;
+                    sites.insert((d.layer, d.site));
                 }
             }
-            if hits == 0 {
-                let held = self.adapters.clone();
+            if sites.is_empty() {
                 self.set_adapters(&[])?;
-                let _ = held;
                 return Err(Error(format!(
                     "adapter {name} matched no projection on this checkpoint"
                 )));
             }
-            matched_entries += hits;
+            matched_entries += sites.len();
             report.attached.push(name.clone());
             self.adapters.push(name.clone());
         }

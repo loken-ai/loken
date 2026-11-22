@@ -429,17 +429,18 @@ impl GenericTransformerLayer {
         if !self.flags.fused_qkv {
             return Ok((None, None));
         }
-        // Need attn_qkv as QTensor and ffn_up as QTensor - otherwise the
-        // mvq path doesn't apply.
+        // The prelude and the feed-forward it starts read attn_qkv, ffn_up and ffn_down as bare
+        // quantised weights.
+        // A projection without one, as an adapted projection, sends the layer to the general path.
         let attn_qkv = match &self.attn_qkv {
             Some(qm) => qm,
             None => return Ok((None, None)),
         };
-        let attn_qkv_arc = match attn_qkv.qtensor() {
+        let attn_qkv_arc = match attn_qkv.bare_qtensor() {
             Some(q) => q.clone(),
             None => return Ok((None, None)),
         };
-        if self.ffn_up.qtensor().is_none() {
+        if self.ffn_up.bare_qtensor().is_none() || self.ffn_down.bare_qtensor().is_none() {
             return Ok((None, None));
         }
         // Q4_K mvq fast path requires ncols multiple of 256.

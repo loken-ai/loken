@@ -1019,6 +1019,7 @@ impl GenericHeteroTransformer {
         tensors.finish();
         let mut model = Self {
             adapters: Vec::new(),
+            adapter_library: Default::default(),
             config,
             embeddings,
             position_embd: None,

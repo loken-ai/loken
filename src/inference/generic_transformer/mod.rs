@@ -68,6 +68,9 @@ pub use draft_head::set_probe_dir;
 #[cfg(test)]
 pub(crate) use loader::LEVEL_LOCK;
 pub use loader::{set_float_weights, set_narrows};
+mod adapters;
+#[cfg(test)]
+mod adapters_tests;
 mod context_parallel;
 #[cfg(test)]
 mod conversation_tests;
@@ -651,6 +654,8 @@ pub struct GenericHeteroTransformer {
     /// Adapters attached after the load, in the order they were applied. Empty is the
     /// checkpoint as it was read.
     adapters: Vec<String>,
+    /// The adapters resident for the requests that select them.
+    adapter_library: adapters::AdapterLibrary,
     layer_devs: Vec<LayerDevice>, // parallel to `layers`
     /// The layers the plan gives a Vulkan device, which run there instead of on their host
     /// build.

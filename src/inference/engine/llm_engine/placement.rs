@@ -785,6 +785,20 @@ pub(crate) fn plan(
             .block_and_head_bytes(content, layer_share, num_layers)
             .unwrap_or((file_size, 0)),
     };
+    // The adapters a request may select sit beside the layers they correct.
+    let (from, to) = layer_share.unwrap_or((0, num_layers));
+    let adapter_widths = crate::inference::load::lora::AdapterWidths {
+        hidden: dims.hidden_size,
+        qkv: (dims.num_heads + 2 * dims.num_kv_heads) * dims.head_dim,
+    };
+    let adapter_bytes = crate::inference::load::lora::text_adapter_bytes(from..to, adapter_widths);
+    if adapter_bytes > 0 {
+        info!(
+            "placement holds {:.1} MB beside the layers for the adapters requests may select",
+            adapter_bytes as f64 / 1e6
+        );
+    }
+    let block_bytes = block_bytes + adapter_bytes;
     let demand_at = |ctx: u64| Demand {
         layers: layer_share.map_or(num_layers, |(from, to)| to - from),
         block_bytes,

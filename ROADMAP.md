@@ -111,7 +111,7 @@ Smaller, by state then by priority:
 | Lower precision on a miss | Performance | An expert that is not in memory and weighs little in the routing is read from a smaller copy, and the answers stay inside the bounds of the quality harness. | Planned |
 | Expert deferral | Performance | At the fast level the host's expert work overlaps the next layer's attention, decode is faster than without, and the answers stay inside the bounds of the quality harness. | Planned |
 | Decision route | Models | A decision route takes a block of state and typed questions (choice, score, yes or no) and returns one calibrated probability per option in one pass, and several questions on one state cost one reading. Strands Decider 2B matches its reference on a fixed set, on the host and on a card. | Planned |
-| Adapters per request | Models | Several text adapters share one base model, and each request picks its own. | Planned |
+| Adapters per request | Models | Several text adapters share one base model, and each request picks its own. | Done |
 | Pooling and classification | API | The classify, score and pooling routes work on the loaded models. | Partial |
 | Encoder-decoder models | Models | An encoder-decoder family serves text and speech as the reference implementation does. | Planned |
 | Vision and video speed | Performance | An image or a video clip is read at most 1.2x slower than the reference engines. | Planned |
