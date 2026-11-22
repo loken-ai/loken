@@ -12,8 +12,12 @@
 //! A clip longer than 1 encoder window is read as the reference transcription reads it.
 //! Each window decodes with timestamps.
 //! The next window starts where the last segment the model left unfinished starts.
+//! A window that does not reach the end of the clip ends inside a silence of the clip.
+//!
+//! A request for word times gets them from the cross attention of the alignment heads the
+//! checkpoint names, and from its timestamp tokens when it names none.
 
-use crate::inference::model::whisper::{self as m, audio, Config};
+use crate::inference::model::whisper::{self as m, align, audio, silence, Config};
 use crate::tensor::VarBuilder;
 use crate::tensor::{DType, Device, Tensor};
 use anyhow::{anyhow, Context, Result as AnyResult};
@@ -26,6 +30,9 @@ use std::sync::Arc;
 use tokenizers::Tokenizer;
 use tokio::sync::Mutex;
 use tracing::{info, warn};
+
+/// A word of a transcript and the seconds it spans in the recording.
+pub use crate::inference::model::whisper::align::TimedWord as WhisperWord;
 
 /// Sample rate whisper was trained on. Audio coming in at any other rate
 /// must be resampled before `transcribe()`.
@@ -68,6 +75,9 @@ pub struct AudioTranscribeParams {
     /// false to skip the per-token softmax + d2h round-trip
     /// (~7 ms / chunk on whisper-small).
     pub collect_metrics: bool,
+    /// Return the time of each word.
+    /// Word times come with segment timestamps.
+    pub words: bool,
     /// Optional context prompt - text the model will see before the
     /// SOT prompt as `<|startofprev|>` + tokens. Whisper's documented
     /// way to bias vocabulary / continue a previous segment. Caller
@@ -125,6 +135,8 @@ pub struct TranscribeResult {
     /// Real per-utterance segments when timestamps were requested;
     /// a single full-duration placeholder otherwise.
     pub segments: Vec<WhisperSegment>,
+    /// The words and their times when the request asked for them, in order.
+    pub words: Option<Vec<WhisperWord>>,
 }
 
 /// The control tokens a decode is steered with: what opens a transcript, which of the two
@@ -198,6 +210,9 @@ pub struct WhisperModelState {
     /// One encoder pass's activation peak over one audio window: what each further window
     /// in the same pass adds.
     window_bytes: u64,
+    /// The `(layer, head)` pairs of the decoder whose cross attention times the words.
+    /// Empty when the checkpoint names none.
+    alignment_heads: Vec<(usize, usize)>,
 }
 
 pub struct AudioModelInfo {
@@ -441,6 +456,7 @@ fn load_whisper_blocking(model_id: &str, narrows: bool) -> AnyResult<WhisperMode
 
     let config: Config = serde_json::from_str(&std::fs::read_to_string(&config_path)?)
         .context("parse whisper config.json")?;
+    let alignment_heads = alignment_heads_of(&repo, &config);
     let tokenizer =
         Tokenizer::from_file(&tokenizer_path).map_err(|e| anyhow!("load tokenizer.json: {e}"))?;
 
@@ -543,7 +559,31 @@ fn load_whisper_blocking(model_id: &str, narrows: bool) -> AnyResult<WhisperMode
             languages: lang_tokens,
         },
         window_bytes,
+        alignment_heads,
     })
+}
+
+/// The `(layer, head)` pairs the checkpoint's generation config names as alignment heads.
+///
+/// A pair outside the decoder is dropped.
+/// A checkpoint without the file or the list has none.
+fn alignment_heads_of(repo: &hf_hub::api::sync::ApiRepo, config: &Config) -> Vec<(usize, usize)> {
+    let generation = repo
+        .get("generation_config.json")
+        .ok()
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .and_then(|text| serde_json::from_str::<m::GenerationConfig>(&text).ok())
+        .unwrap_or_default();
+    let heads: Vec<(usize, usize)> = generation
+        .alignment_heads
+        .iter()
+        .map(|&[layer, head]| (layer, head))
+        .filter(|&(layer, head)| {
+            layer < config.decoder_layers && head < config.decoder_attention_heads
+        })
+        .collect();
+    info!("Whisper alignment heads: {}", heads.len());
+    heads
 }
 
 /// The Hugging Face id a whisper load fetches: the caller's id, which the API has already
@@ -684,6 +724,12 @@ struct LongMel {
     mel: Tensor,
     /// The frames that hold audio.
     content: usize,
+    /// The level of each frame that holds audio.
+    levels: Vec<f32>,
+    /// The level a frame is silent below, from the clip's own levels.
+    silence: Option<f32>,
+    /// The value of a frame of padding, which a window holds after the frames it keeps.
+    quiet: f32,
 }
 
 /// The frames of `samples` that hold audio: a frame per hop, the last one partial.
@@ -691,14 +737,24 @@ fn content_frames(samples: usize) -> usize {
     samples.div_ceil(m::HOP_LENGTH)
 }
 
-/// The encoder window of `mel` (`[1, n_mels, frames]`) that starts at mel frame `seek`.
-/// A window that runs past the last frame is zero-padded at its end.
-fn window_at(mel: &Tensor, seek: usize) -> AnyResult<Tensor> {
+/// The encoder window of `window` frames of `mel` (`[1, n_mels, frames]`) that starts at mel
+/// frame `seek` and keeps `size` frames of it.
+/// The frames after those it keeps hold `fill`.
+fn window_at(
+    mel: &Tensor,
+    seek: usize,
+    size: usize,
+    window: usize,
+    fill: f32,
+) -> AnyResult<Tensor> {
     let (_, n_mels, n_frames) = mel.shape().dims3()?;
-    let size = n_frames.saturating_sub(seek).min(m::N_FRAMES);
+    let size = size.min(window).min(n_frames.saturating_sub(seek));
     let segment = mel.narrow(2, seek, size)?;
-    Ok(if size < m::N_FRAMES {
-        let pad = Tensor::zeros(vec![1, n_mels, m::N_FRAMES - size], DType::F32)?;
+    Ok(if size < window {
+        let pad = Tensor::from_vec_f32(
+            vec![fill; n_mels * (window - size)],
+            vec![1, n_mels, window - size],
+        )?;
         Tensor::cat(&[&segment, &pad], 2)?
     } else {
         segment.contiguous()?
@@ -728,12 +784,27 @@ fn mel_windows(s: &WhisperModelState, samples: &[f32]) -> AnyResult<MelWindows> 
     if n_frames == 0 {
         return Ok(windows);
     }
-    let mel = Tensor::from_vec_f32(mel, vec![1, n_mels, n_frames])?;
     let content = content_frames(samples.len());
-    if content > m::N_FRAMES {
-        windows.long = Some(LongMel { mel, content });
+    let window = s.config.window_frames();
+    // The spectrogram carries padding after its audio, which every band holds at 1 value.
+    let quiet = mel.get(content.min(n_frames - 1)).copied().unwrap_or(0.0);
+    let levels = match content > window {
+        true => silence::frame_levels(&mel, n_mels, n_frames, content),
+        false => Vec::new(),
+    };
+    let mel = Tensor::from_vec_f32(mel, vec![1, n_mels, n_frames])?;
+    if content > window {
+        windows.long = Some(LongMel {
+            mel,
+            content,
+            silence: silence::silence_level(&levels),
+            levels,
+            quiet,
+        });
     } else {
-        windows.mels.push(window_at(&mel, 0)?);
+        windows
+            .mels
+            .push(window_at(&mel, 0, n_frames, window, quiet)?);
         windows.starts.push(0);
     }
     Ok(windows)
@@ -780,7 +851,9 @@ fn seek_step(
         .find(|&i| is_timestamp(body[i - 1]) && is_timestamp(body[i]));
     match last_pair {
         Some(i) if !ends_closed => {
-            let advance = (body[i - 1] - timestamp_begin) as usize * frames_per_timestamp;
+            // A timestamp past the frames the window holds never skips audio after them.
+            let advance = ((body[i - 1] - timestamp_begin) as usize * frames_per_timestamp)
+                .min(segment_frames);
             match advance {
                 0 => whole,
                 advance => SeekStep { kept: i, advance },
@@ -878,6 +951,7 @@ fn transcribe_windows(
             duration_s,
             tokens: Vec::new(),
             segments: Vec::new(),
+            words: params.words.then(Vec::new),
         });
     }
 
@@ -888,6 +962,7 @@ fn transcribe_windows(
     let mut all_text = String::new();
     let mut all_tokens: Vec<u32> = Vec::new();
     let mut all_segments: Vec<WhisperSegment> = Vec::new();
+    let mut all_words: Vec<WhisperWord> = Vec::new();
     let mut detected_lang: Option<String> = None;
     // Token-weighted logprob aggregate for the placeholder segment.
     let mut total_lp_sum: f64 = 0.0;
@@ -897,6 +972,9 @@ fn transcribe_windows(
     // A clip of 1 window decodes the features of the shared pass.
     // A longer clip encodes the window at its seek, decodes it, and moves the seek to the
     // start of the last segment the window left unfinished.
+    // Its window ends inside a silence when it does not reach the end of the clip.
+    let window = s.config.window_frames();
+    let frame_seconds = s.config.frame_seconds();
     let mut shared = windows.starts.iter().zip(features);
     let mut seek = 0usize;
     loop {
@@ -905,9 +983,10 @@ fn transcribe_windows(
         }
         let (start, audio_features, segment_frames) = match &windows.long {
             Some(long) if seek < long.content => {
-                let window = window_at(&long.mel, seek)?;
-                let encoded = encode_pass(s, &[&window])?.remove(0);
-                (seek, encoded, Some((long.content - seek).min(m::N_FRAMES)))
+                let kept = silence::window_length(&long.levels, long.silence, seek, window);
+                let mel = window_at(&long.mel, seek, kept, window, long.quiet)?;
+                let encoded = encode_pass(s, &[&mel])?.remove(0);
+                (seek, encoded, Some(kept))
             }
             Some(_) => break,
             None => match shared.next() {
@@ -915,13 +994,15 @@ fn transcribe_windows(
                 None => break,
             },
         };
-        let chunk_offset_s = (start as f32) * 0.01; // 1 frame = 10 ms in whisper's mel
+        let content = segment_frames.unwrap_or(content_frames(n_samples).min(window));
+        let chunk_offset_s = start as f32 * frame_seconds;
         let audio_features = audio_features.to_device(&s.device)?;
         let dec = decode_segment(
             s,
             &audio_features,
             &effective,
             chunk_offset_s,
+            content,
             segment_frames,
         )?;
         tracing::debug!(
@@ -946,6 +1027,8 @@ fn transcribe_windows(
         }
         all_tokens.extend_from_slice(&dec.body);
         all_segments.extend(dec.segments);
+        let window_end = (chunk_offset_s + content as f32 * frame_seconds).min(duration_s);
+        align::stitch_words(&mut all_words, dec.words, chunk_offset_s, window_end);
         total_lp_sum += dec.logprob_sum;
         total_lp_count += dec.logprob_count;
         if first_chunk_no_speech.is_none() && dec.chunk_no_speech_prob > 0.0 {
@@ -959,10 +1042,8 @@ fn transcribe_windows(
         0.0
     };
     let placeholder_no_speech_prob = first_chunk_no_speech.unwrap_or(0.0);
-    // Clamp open-ended segment ends to the actual file duration. The
-    // chunk-level parser pads to `chunk_offset_s + 30.0` for open
-    // tails since it doesn't know `duration_s`; trim those down here
-    // so the surfaced range never exceeds the audio length.
+    // Clamp segment ends to the actual file duration.
+    // An open segment ends where its window's audio ends.
     for seg in all_segments.iter_mut() {
         if seg.end > duration_s {
             seg.end = duration_s;
@@ -996,6 +1077,7 @@ fn transcribe_windows(
         duration_s,
         tokens: all_tokens,
         segments: all_segments,
+        words: params.words.then_some(all_words),
     })
 }
 
@@ -1015,6 +1097,9 @@ struct ChunkDecode {
     chunk_no_speech_prob: f32,
     /// The mel frames from this window's start to the next window's start.
     advance: usize,
+    /// The words of the kept segments, timed from the window's start, when the request asked
+    /// for them.
+    words: Vec<WhisperWord>,
     timing: ChunkTiming,
 }
 
@@ -1030,8 +1115,8 @@ struct ChunkTiming {
 
 /// Decode one window from its encoded `audio_features`.
 ///
-/// `segment_frames` is set for a window of a clip longer than 1 window: the audio frames the
-/// window holds.
+/// `content` is the audio frames the window holds.
+/// `segment_frames` is set for a window of a clip longer than 1 window, to `content`.
 /// Such a window decodes with timestamps under the reference rules.
 /// Its output keeps its complete segments, and `advance` says where the next window starts.
 fn decode_segment(
@@ -1039,9 +1124,10 @@ fn decode_segment(
     audio_features: &Tensor,
     params: &AudioTranscribeParams,
     chunk_offset_s: f32,
+    content: usize,
     segment_frames: Option<usize>,
 ) -> AnyResult<ChunkDecode> {
-    let timestamps = params.timestamps || segment_frames.is_some();
+    let timestamps = params.timestamps || params.words || segment_frames.is_some();
     let timestamp_begin = s.control.no_timestamps + 1;
     let mut timing = ChunkTiming::default();
     let t_prompt = std::time::Instant::now();
@@ -1262,12 +1348,11 @@ fn decode_segment(
     // The unfinished one is decoded again from the next window, which starts where it starts.
     let advance = match segment_frames {
         Some(frames) => {
-            let per_step = m::N_FRAMES / s.config.max_source_positions.max(1);
-            let step = seek_step(&body, timestamp_begin, frames, per_step);
+            let step = seek_step(&body, timestamp_begin, frames, m::FRAMES_PER_POSITION);
             body.truncate(step.kept);
             step.advance
         }
-        None => m::N_FRAMES,
+        None => s.config.window_frames(),
     };
 
     // Parse segments when timestamps were requested AND the model
@@ -1282,18 +1367,39 @@ fn decode_segment(
         logprobs.truncate(body.len());
     }
     let temperature_f32 = params.temperature.max(0.0);
-    let segments = if params.timestamps {
+    let window_s = content as f32 * s.config.frame_seconds();
+    let segments = if params.timestamps || params.words {
         parse_timestamp_segments(
             s,
             &body,
             &logprobs,
             timestamp_begin,
-            chunk_offset_s,
+            (chunk_offset_s, window_s),
             temperature_f32,
             no_speech_prob,
         )?
     } else {
         Vec::new()
+    };
+    let words = match params.words {
+        true => {
+            let sot_sequence: Vec<u32> = std::iter::once(s.control.sot)
+                .chain(lang_token)
+                .chain(std::iter::once(task_token))
+                .collect();
+            let spans: Vec<(f32, f32, Vec<u32>)> = match segments.is_empty() {
+                true => vec![(0.0, window_s, body.clone())],
+                false => segments
+                    .iter()
+                    .map(|seg| {
+                        let start = seg.start - chunk_offset_s;
+                        (start, seg.end - chunk_offset_s, seg.tokens.clone())
+                    })
+                    .collect(),
+            };
+            window_words(s, audio_features, &sot_sequence, &spans, content)?
+        }
+        false => Vec::new(),
     };
 
     // Full-segment text. When timestamps are on, build it by joining
@@ -1337,24 +1443,143 @@ fn decode_segment(
         logprob_count,
         chunk_no_speech_prob: no_speech_prob,
         advance,
+        words,
         timing,
     })
+}
+
+/// The words of a window, timed from the window's start.
+///
+/// `spans` holds the start, the end and the tokens of each segment the window keeps.
+/// `sot_sequence` is the prompt that opens a transcript in the window's language and task.
+/// `content` is the audio frames the window holds.
+///
+/// With alignment heads, the words of every span are timed together through the cross
+/// attention.
+/// Without, or when the transcript does not fit the decoder, each span's time is shared among
+/// its words.
+fn window_words(
+    s: &mut WhisperModelState,
+    audio_features: &Tensor,
+    sot_sequence: &[u32],
+    spans: &[(f32, f32, Vec<u32>)],
+    content: usize,
+) -> AnyResult<Vec<WhisperWord>> {
+    let eot = s.control.eot;
+    let text_of = |ids: &[u32]| -> Vec<u32> { ids.iter().copied().filter(|&t| t < eot).collect() };
+    let all: Vec<u32> = spans.iter().flat_map(|(_, _, ids)| text_of(ids)).collect();
+    if all.is_empty() {
+        return Ok(Vec::new());
+    }
+    let spaced = align::is_spaced(&text_decoder(&s.tokenizer)(&all));
+    if !s.alignment_heads.is_empty() {
+        let words = align::split_words(&all, text_decoder(&s.tokenizer), spaced);
+        if let Some(timed) = aligned_words(s, audio_features, sot_sequence, &all, &words, content)?
+        {
+            return Ok(timed);
+        }
+    }
+    let decode = text_decoder(&s.tokenizer);
+    Ok(spans
+        .iter()
+        .flat_map(|(start, end, ids)| {
+            let words = align::split_words(&text_of(ids), decode, spaced);
+            align::timed_by_tokens(&words, *start, *end)
+        })
+        .collect())
+}
+
+/// The text of a run of tokens, special tokens included.
+/// A run that ends inside a character ends on a replacement character.
+fn text_decoder(tokenizer: &Tokenizer) -> impl Fn(&[u32]) -> String + Copy + '_ {
+    move |ids: &[u32]| tokenizer.decode(ids, false).unwrap_or_default()
+}
+
+/// The times of `words`, the words of the text tokens `text`, from the cross attention of the
+/// alignment heads over the window's `content` audio frames.
+///
+/// The decoder reads the transcript again from `sot_sequence`, without timestamps.
+/// Each head's scores become weights over the audio positions that hold audio.
+/// The path through their alignment matrix gives the position each token starts at.
+/// None when the transcript does not fit the decoder.
+fn aligned_words(
+    s: &mut WhisperModelState,
+    audio_features: &Tensor,
+    sot_sequence: &[u32],
+    text: &[u32],
+    words: &[(String, Vec<u32>)],
+    content: usize,
+) -> AnyResult<Option<Vec<WhisperWord>>> {
+    let sequence: Vec<u32> = sot_sequence
+        .iter()
+        .copied()
+        .chain(std::iter::once(s.control.no_timestamps))
+        .chain(text.iter().copied())
+        .chain(std::iter::once(s.control.eot))
+        .collect();
+    let n = sequence.len();
+    if n > s.config.max_target_positions {
+        return Ok(None);
+    }
+    let mut layers: Vec<usize> = s.alignment_heads.iter().map(|&(l, _)| l).collect();
+    layers.sort_unstable();
+    layers.dedup();
+    s.model.decoder.restart_sequence();
+    let ids = Tensor::from_vec_u32(sequence, vec![1, n])?;
+    let (_, scores) = s
+        .model
+        .decoder
+        .forward_scored(&ids, audio_features, &layers)?;
+    let stride = audio_features.dim(1)?;
+    let positions = (content / m::FRAMES_PER_POSITION).clamp(1, stride);
+    let mut heads = Vec::with_capacity(s.alignment_heads.len());
+    for &(layer, head) in &s.alignment_heads {
+        let Some(Some(scored)) = scores.get(layer) else {
+            continue;
+        };
+        let rows = scored
+            .narrow(1, head, 1)?
+            .to_device(&Device::Cpu)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        heads.push(align::softmax_rows(&rows, n, stride, positions));
+    }
+    if heads.is_empty() {
+        return Ok(None);
+    }
+    let matrix = align::alignment_matrix(&heads, n, positions, align::MEDIAN_WIDTH);
+    // The row of each position predicts the token after it: from the row that predicts the
+    // first text token to the row that predicts the closing token.
+    let first = sot_sequence.len() * positions;
+    let cost: Vec<f32> = matrix[first..(n - 1) * positions]
+        .iter()
+        .map(|w| -w)
+        .collect();
+    let (path_rows, path_cols) = align::dtw(&cost, text.len() + 1, positions);
+    let starts = align::row_starts(&path_rows, &path_cols);
+    Ok(Some(align::timed_by_alignment(
+        words,
+        &starts,
+        s.config.position_seconds(),
+    )))
 }
 
 /// Walk `body` (the model's output tokens for this chunk) and split it
 /// into (start_ts, end_ts, inner_text_tokens) tuples. Whisper's
 /// convention: a segment starts at the first timestamp token after the
-/// previous one closed, and ends at the next timestamp token. The
-/// "20 ms per step" rate is fixed for all whisper variants.
+/// previous one closed, and ends at the next timestamp token.
+/// A timestamp step lasts 1 audio position of the encoder.
+/// The window starts `chunk_offset_s` into the clip and holds `window_s` seconds of audio.
 fn parse_timestamp_segments(
     s: &WhisperModelState,
     body: &[u32],
     logprobs: &[f32],
     timestamp_begin: u32,
-    chunk_offset_s: f32,
+    (chunk_offset_s, window_s): (f32, f32),
     temperature: f32,
     no_speech_prob: f32,
 ) -> AnyResult<Vec<WhisperSegment>> {
+    let step_s = s.config.position_seconds();
     // Helper: mean logprob across body[lo..hi] using the parallel
     // `logprobs` slice (one entry per body token). Returns 0.0 when
     // the range is empty.
@@ -1406,15 +1631,14 @@ fn parse_timestamp_segments(
             continue;
         }
         let start_id = body[i];
-        let start_s = (start_id - timestamp_begin) as f32 * 0.02 + chunk_offset_s;
+        let start_s = (start_id - timestamp_begin) as f32 * step_s + chunk_offset_s;
         // Find the matching closing timestamp.
         let mut j = i + 1;
         while j < body.len() && body[j] < timestamp_begin {
             j += 1;
         }
         if j >= body.len() {
-            // Open-ended last segment: clamp the end to the chunk's
-            // logical end (the next 30 s boundary).
+            // An open last segment ends where the window's audio ends.
             let inner: Vec<u32> = body[i + 1..]
                 .iter()
                 .copied()
@@ -1422,12 +1646,13 @@ fn parse_timestamp_segments(
                 .collect();
             if !inner.is_empty() {
                 let avg = avg_lp(i + 1, body.len());
-                out.push(build(start_s, chunk_offset_s + 30.0, inner, avg, "open")?);
+                let end_s = (chunk_offset_s + window_s).max(start_s);
+                out.push(build(start_s, end_s, inner, avg, "open")?);
             }
             break;
         }
         let end_id = body[j];
-        let end_s = (end_id - timestamp_begin) as f32 * 0.02 + chunk_offset_s;
+        let end_s = (end_id - timestamp_begin) as f32 * step_s + chunk_offset_s;
         let inner: Vec<u32> = body[i + 1..j].to_vec();
         // Sanity-check the timestamp pair. Whisper's logit rules
         // normally enforce monotonic non-decreasing timestamps, but
@@ -2048,13 +2273,53 @@ mod tests {
         assert_eq!(content_frames(m::N_SAMPLES + 1), m::N_FRAMES + 1);
         assert_eq!(content_frames(1), 1);
         let mel = Tensor::from_vec_f32(vec![1.0; 2 * 4000], vec![1, 2, 4000]).unwrap();
-        let tail = window_at(&mel, 3000).unwrap();
+        let tail = window_at(&mel, 3000, 3000, m::N_FRAMES, -0.5).unwrap();
         assert_eq!(tail.shape().dims3().unwrap(), (1, 2, m::N_FRAMES));
         let row = tail.narrow(1, 0, 1).unwrap().to_vec_f32();
         assert!(row[..1000].iter().all(|&v| v == 1.0));
         assert!(
-            row[1000..].iter().all(|&v| v == 0.0),
-            "past the last frame is zeros"
+            row[1000..].iter().all(|&v| v == -0.5),
+            "past the last frame is the padding value"
         );
+        let cut = window_at(&mel, 0, 1200, m::N_FRAMES, -0.5).unwrap();
+        let row = cut
+            .narrow(1, 1, 1)
+            .unwrap()
+            .contiguous()
+            .unwrap()
+            .to_vec_f32();
+        assert!(row[..1200].iter().all(|&v| v == 1.0));
+        assert!(
+            row[1200..].iter().all(|&v| v == -0.5),
+            "past the cut is the padding value"
+        );
+    }
+
+    /// Windows cut at the silences between the words of the toy recording keep every word
+    /// once, and each window but the last ends between 2 words.
+    #[test]
+    fn windows_cut_at_silences_keep_every_word_once() {
+        let words = toy_words();
+        let content = words[words.len() - 1].2;
+        let mut levels = vec![0.0f32; content];
+        for &(_, from, to) in &words {
+            levels[from..to].iter_mut().for_each(|l| *l = 1.0);
+        }
+        let level = silence::silence_level(&levels);
+        let said: Vec<u32> = words.iter().map(|w| w.0).collect();
+        let (mut seek, mut heard) = (0, Vec::<u32>::new());
+        while seek < content {
+            let frames = silence::window_length(&levels, level, seek, m::N_FRAMES);
+            let end = seek + frames;
+            assert!(
+                end == content || levels[end] == 0.0,
+                "the window at {seek} ends inside a word at {end}"
+            );
+            let body = toy_decode(&words, seek, frames);
+            let step = seek_step(&body, TB, frames, 2);
+            heard.extend(body[..step.kept].iter().copied().filter(|&t| t < TB));
+            seek += step.advance;
+        }
+        assert_eq!(heard, said);
     }
 }

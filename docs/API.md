@@ -219,7 +219,7 @@ A route in the Feature column exists when its Cargo feature is compiled.
 
 | Route | Feature | What it does |
 |---|---|---|
-| `POST /v1/audio/transcriptions`, `POST /v1/audio/translations` | `audio` | Speech to text. |
+| `POST /v1/audio/transcriptions`, `POST /v1/audio/translations` | `audio` | Speech to text. See [Transcription requests](#transcription-requests) for the formats and the times of segments and words. |
 | `POST /v1/audio/speech` | `audio` | Text to speech. `response_format` is `wav` (default), `pcm`, `mp3`, `flac`, `opus` (Ogg) or `aac` (ADTS). Another name answers 400 with the list. `GET /v1/audio/voices` lists the voices. See [Speech requests](#speech-requests) for the formats, the stream and the fields each kind of checkpoint takes. |
 | `POST /v1/audio/separate` | `audio` | Split a mix into stems. |
 | `GET /v1/audio/voices` | `audio` | The `voice` presets in `data`, and the stored voices as Voice objects in `custom_voices`, oldest first. `data` also lists the speakers of each checkpoint of the store that names its voices. Such an entry has the speaker's name as `voice`, the checkpoint's id as `family` and `model`, its dialect as `accent` or `null`, `gender` `null` and `is_default` false. |
@@ -235,6 +235,44 @@ A route in the Feature column exists when its Cargo feature is compiled.
 | `POST /v1/video/generations` | `video` | Text- and image-conditioned clips. |
 | `POST /api/video/plan` | `video` | What a clip of a given length will cost, before rendering it. |
 | `GET /v1/renders`, `POST /v1/renders/{id}/cancel` | none | Renders in flight of the calling key, and cancelling 1. See [Naming a render](#naming-a-render). |
+
+### Transcription requests
+
+`response_format` is `json` (default), `text`, `verbose_json`, `srt` or `vtt`.
+Another name answers 400 with the list.
+
+| Field or format | What it gives |
+|---|---|
+| `json` | `text` alone. |
+| `text` | The transcript as plain text. |
+| `verbose_json` | `task`, `language`, `duration`, `text` and `segments`. |
+| `srt`, `vtt` | 1 cue per segment, at the segment's times. |
+| `timestamp_granularities[]` `segment` | Each segment of `verbose_json` carries `start` and `end` in seconds from the timestamps the model emits. |
+| `timestamp_granularities[]` `word` | `verbose_json` also carries `words`, 1 object per word in order, with `word`, `start` and `end` in seconds. |
+
+Without `timestamp_granularities[]`, `verbose_json` carries 1 segment that spans the whole recording.
+`srt` and `vtt` always carry the segment times.
+`word` is read with `verbose_json` alone, as OpenAI does.
+
+The times of the words come from the checkpoint:
+
+- A checkpoint whose `generation_config.json` lists `alignment_heads` times its words through the cross attention of those heads. The decoder reads each window's transcript again, and dynamic time warping over the attention of those heads gives the start of each token.
+- Any other checkpoint shares the span of each segment among its words, in proportion to their tokens.
+
+A word opens at a token that starts with white space.
+A transcript without white space, such as Japanese or Chinese, gives 1 word per run of tokens that decodes to whole characters.
+A model that takes the clip in its prompt answers no `words`.
+
+A recording longer than 1 encoder window is read in windows.
+The window length is the encoder's input, read from the checkpoint's `config.json`, which is 30 s for Whisper.
+A window that does not reach the end of the recording ends inside a silence:
+
+- The level of a frame is the mean of its log mel bands.
+- The silence level is the split of the recording's own levels into a quiet class and a loud class that maximises the variance between them.
+- The window ends at the middle of the silent run whose length, times the audio the window keeps up to it, is the largest.
+- A window without a silent run after the speech it opens on keeps its full length.
+
+The texts, the segments and the words of the windows are joined in order, with their times counted from the start of the recording.
 
 ### Speech requests
 
@@ -345,7 +383,7 @@ A valid identifier has letters, digits, dot, underscore and dash, 64 characters 
 
 | Route | Grouped when | Shared pass |
 |---|---|---|
-| `POST /v1/audio/transcriptions`, `/translations` (Whisper) | the same resident model | The window of every clip of 30 s or less runs through the encoder as 1 batch. Each clip decodes on its own window. A longer clip is read as the model's reference transcription reads it. Each window decodes with timestamps, and the next window starts where the last segment the model left unfinished starts. That clip encodes each window when its decode reaches it. |
+| `POST /v1/audio/transcriptions`, `/translations` (Whisper) | the same resident model | The window of every clip of 30 s or less runs through the encoder as 1 batch. Each clip decodes on its own window. A longer clip is read as the model's reference transcription reads it. Each window decodes with timestamps, and the next window starts where the last segment the model left unfinished starts. A window that does not reach the end of the clip ends inside a silence. That clip encodes each window when its decode reaches it. |
 | `POST /v1/images/generations` (an SDXL checkpoint) | not streamed, `n` 1, no `control_image`, no `regions`, and the same model, `size`, step count, `sampler`, `scheduler` and `loras` | The group takes the media gate once. Its renders denoise as 1 batch, with the prompt, `negative_prompt`, `guidance` and `seed` of each request. |
 
 A request starts at once when no group of its kind runs, and queues behind the group otherwise:

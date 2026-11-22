@@ -159,7 +159,10 @@ impl AudioEncoder {
         // The mel front-end: a three-tap convolution that keeps the length, then the same
         // one striding by two, which is where the sequence halves.
         let taps = same_length_1d(3, 1);
-        let halving = Conv1dConfig { stride: 2, ..taps };
+        let halving = Conv1dConfig {
+            stride: super::FRAMES_PER_POSITION,
+            ..taps
+        };
         Ok(Self {
             conv1: conv1d(cfg.num_mel_bins, width, 3, taps, &vb.pp("conv1"))?,
             conv2: conv1d(width, width, 3, halving, &vb.pp("conv2"))?,
@@ -266,10 +269,25 @@ impl TextDecoder {
     /// The ids are read on the host, where both tables are; the embedded rows are what goes to
     /// the device. Each block's self attention sees the positions up to its own.
     pub fn forward(&mut self, x: &Tensor, xa: &Tensor, flush_kv_cache: bool) -> Result<Tensor> {
-        let last = *x.dims().last().unwrap_or(&0);
         if flush_kv_cache {
             self.reset_kv_cache();
         }
+        Ok(self.forward_scored(x, xa, &[])?.0)
+    }
+
+    /// [`Self::forward`], and the cross-attention scores of the blocks `layers` names.
+    ///
+    /// The scores hold 1 entry per block, in block order.
+    /// The entry of a block that `layers` names is `[1, heads, n, audio positions]` in F32,
+    /// before any softmax.
+    /// The entry of any other block is None.
+    pub fn forward_scored(
+        &mut self,
+        x: &Tensor,
+        xa: &Tensor,
+        layers: &[usize],
+    ) -> Result<(Tensor, Vec<Option<Tensor>>)> {
+        let last = *x.dims().last().unwrap_or(&0);
         let token_embedding = self.token_embedding.forward(&x.to_device(&Device::Cpu)?)?;
         // With incremental decode (self-attn KV cache + caller supplying
         // only the new token), `x` is the tail of the prefix that hasn't
@@ -282,11 +300,15 @@ impl TextDecoder {
         let mut x = token_embedding
             .broadcast_add(&positional_embedding)?
             .to_device(&xa.device())?;
-        for block in self.blocks.iter_mut() {
-            x = block.forward(&x, Some(xa), Mask::Causal)?;
+        let mut scores = Vec::with_capacity(self.blocks.len());
+        for (i, block) in self.blocks.iter_mut().enumerate() {
+            let (out, scored) =
+                block.forward_scored(&x, Some(xa), Mask::Causal, layers.contains(&i))?;
+            x = out;
+            scores.push(scored);
         }
         self.cache_offset += last;
-        self.ln.forward(&x)
+        Ok((self.ln.forward(&x)?, scores))
     }
 
     /// Hidden `[1, n, n_state]` -> logits `[1, n, vocab]` (weight-tied head).

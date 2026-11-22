@@ -340,6 +340,27 @@ impl MultiHeadAttention {
         self.attend(&q, k, v, b, tgt, mask)
     }
 
+    /// The scaled scores of the queries read from `xs` against the keys a fixed cache holds:
+    /// `[batch, heads, positions, kept]` in F32, before any softmax.
+    ///
+    /// None when nothing is kept.
+    /// The scores are the ones [`Self::forward`] turns into weights over the same cache.
+    pub fn kept_scores(&self, xs: &Tensor) -> Result<Option<Tensor>> {
+        let Kv::Fixed(Some((k, _))) = &self.kv else {
+            return Ok(None);
+        };
+        let (b, _, _) = xs.dims3()?;
+        let q = self
+            .in_heads(self.q.forward(xs)?, self.heads, b)?
+            .to_dtype(crate::tensor::DType::F32)?;
+        let k = repeat_kv(k.clone(), self.heads / self.kv_heads)?
+            .to_dtype(crate::tensor::DType::F32)?;
+        let kt = k
+            .transpose(crate::tensor::D::Minus2, crate::tensor::D::Minus1)?
+            .contiguous()?;
+        Ok(Some(q.affine(self.scale, 0.0)?.matmul(&kt)?))
+    }
+
     /// [`Self::forward`] for an attention that keeps nothing.
     ///
     /// A stack that is always handed its whole sequence - an encoder, or a text tower run once
@@ -480,6 +501,37 @@ mod tests {
             gap < 1e-5,
             "cached and whole-sequence attention differ by {gap}"
         );
+    }
+
+    /// The kept scores, turned into weights over the kept values, give the attention's answer.
+    #[test]
+    fn the_kept_scores_are_the_weights_the_attention_reads() {
+        let (width, heads, n, src_len) = (16usize, 4usize, 3usize, 6usize);
+        let xs = deterministic((n, width), 5).reshape((1, n, width)).unwrap();
+        let source = deterministic((src_len, width), 7)
+            .reshape((1, src_len, width))
+            .unwrap();
+        let mut attn = build(width, heads, heads, Kv::Fixed(None));
+        assert!(attn.kept_scores(&xs).unwrap().is_none());
+        let answer = attn.forward(&xs, Some(&source), Mask::All).unwrap();
+        let scores = attn.kept_scores(&xs).unwrap().unwrap();
+        assert_eq!(scores.dims(), &[1, heads, n, src_len]);
+        let Kv::Fixed(Some((_, v))) = &attn.kv else {
+            panic!("the forward keeps the projection");
+        };
+        let rebuilt = scores
+            .softmax_last_dim()
+            .unwrap()
+            .matmul(v)
+            .unwrap()
+            .transpose(1, 2)
+            .unwrap()
+            .reshape((1, n, width))
+            .unwrap()
+            .apply(&attn.out)
+            .unwrap();
+        let gap = worst(&answer, &rebuilt);
+        assert!(gap < 1e-5, "the scores rebuild the answer within {gap}");
     }
 
     /// A kept cross-attention is a recomputed one.

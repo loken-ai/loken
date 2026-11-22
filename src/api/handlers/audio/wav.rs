@@ -102,6 +102,7 @@ pub(super) fn plain_transcription() -> AudioTranscribeParams {
         task: WhisperTask::Transcribe,
         timestamps: false,
         collect_metrics: false,
+        words: false,
         initial_prompt: None,
         cancel: None,
     }

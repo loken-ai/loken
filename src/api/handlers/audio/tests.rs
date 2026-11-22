@@ -996,6 +996,7 @@ fn format_srt_emits_canonical_subtitle_blocks() {
         duration_s: 5.0,
         tokens: vec![],
         segments: segs,
+        words: None,
     };
     let srt = format_srt(&r);
     assert_eq!(
@@ -1027,6 +1028,7 @@ fn format_vtt_emits_canonical_header_and_dot_timestamps() {
         duration_s: 2.5,
         tokens: vec![],
         segments: segs,
+        words: None,
     };
     let vtt = format_vtt(&r);
     assert_eq!(
@@ -1044,6 +1046,7 @@ fn format_srt_with_no_segments_is_empty_body() {
         duration_s: 0.0,
         tokens: vec![],
         segments: vec![],
+        words: None,
     };
     assert_eq!(format_srt(&r), "");
 }
@@ -1058,8 +1061,59 @@ fn format_vtt_with_no_segments_keeps_webvtt_header() {
         duration_s: 0.0,
         tokens: vec![],
         segments: vec![],
+        words: None,
     };
     assert_eq!(format_vtt(&r), "WEBVTT\n\n");
+}
+
+/// verbose_json carries the segments, and the words with their times when they were asked for.
+#[tokio::test]
+async fn verbose_json_carries_words_when_asked() {
+    use crate::inference::engine::audio_engine::{WhisperSegment, WhisperWord};
+    let segment = WhisperSegment {
+        start: 0.0,
+        end: 1.5,
+        text: "Hello world.".into(),
+        tokens: vec![1, 2, 3],
+        compression_ratio: 1.0,
+        temperature: 0.0,
+        avg_logprob: -0.1,
+        no_speech_prob: 0.01,
+    };
+    let word = |w: &str, start: f32, end: f32| WhisperWord {
+        word: w.into(),
+        start,
+        end,
+    };
+    let mut r = TranscribeResult {
+        text: "Hello world.".into(),
+        language: "en".into(),
+        duration_s: 1.5,
+        tokens: vec![1, 2, 3],
+        segments: vec![segment],
+        words: Some(vec![word("Hello", 0.0, 0.5), word("world.", 0.5, 1.25)]),
+    };
+    let body = |r: &TranscribeResult| {
+        let response = format_transcribe_response("verbose_json", r, WhisperTask::Transcribe);
+        async move {
+            let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+                .await
+                .unwrap();
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
+        }
+    };
+    let answer = body(&r).await;
+    assert_eq!(answer["task"], "transcribe");
+    assert_eq!(answer["segments"][0]["end"], 1.5);
+    let words = answer["words"].as_array().expect("a words array");
+    assert_eq!(words.len(), 2);
+    assert_eq!(words[1]["word"], "world.");
+    assert_eq!(words[1]["start"], 0.5);
+    assert_eq!(words[1]["end"], 1.25);
+    r.words = None;
+    let answer = body(&r).await;
+    assert!(answer.get("words").is_none(), "no words unless asked");
+    assert_eq!(answer["segments"].as_array().map(Vec::len), Some(1));
 }
 
 #[test]
@@ -1645,9 +1699,20 @@ fn word_error(said: &[String], heard: &[String]) -> f64 {
 
 /// The transcript of the WAV `wav` by the transcription route.
 async fn transcribe_wav(state: &APIServer, model: &str, language: &str, wav: Vec<u8>) -> String {
+    let fields = [("model", model), ("language", language)];
+    let answer = transcribe_form(state, &fields, wav).await;
+    answer["text"].as_str().unwrap_or_default().to_string()
+}
+
+/// The answer of the transcription route to the WAV `wav` and the form fields `fields`.
+async fn transcribe_form(
+    state: &APIServer,
+    fields: &[(&str, &str)],
+    wav: Vec<u8>,
+) -> serde_json::Value {
     let boundary = "transcription-test";
     let mut body = Vec::new();
-    for (name, value) in [("model", model), ("language", language)] {
+    for &(name, value) in fields {
         body.extend(
             format!("--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n")
                 .as_bytes(),
@@ -1680,8 +1745,7 @@ async fn transcribe_wav(state: &APIServer, model: &str, language: &str, wav: Vec
     let bytes = axum::body::to_bytes(response.into_body(), 1 << 24)
         .await
         .unwrap();
-    let answer: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    answer["text"].as_str().unwrap_or_default().to_string()
+    serde_json::from_slice(&bytes).unwrap()
 }
 
 /// A spoken paragraph longer than 1 recognition window is transcribed whole with no more word
@@ -1761,6 +1825,88 @@ async fn a_recording_longer_than_a_window_keeps_the_words_at_its_edges() {
     assert!(
         whole_error <= halves_error,
         "whole {whole_error} against halves {halves_error}"
+    );
+    let _ = std::fs::remove_dir_all(&hf);
+}
+
+/// A spoken paragraph longer than 1 recognition window comes back with the time of each word:
+/// the words spell the transcript, their times run forward and stay inside the recording, and
+/// some fall after the first window.
+#[tokio::test]
+#[ignore = "needs the CustomVoice and whisper-large-v3-turbo checkpoints in the test store"]
+async fn a_recording_longer_than_a_window_returns_the_time_of_each_word() {
+    const SPEECH: &str = "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice";
+    const ASR: &str = "openai/whisper-large-v3-turbo";
+    let source = crate::config::Config::load_test()
+        .get_hf_models_dir()
+        .join("hub");
+    let hf = crate::inference::generic_transformer::class_load::tests::scratch("word-times");
+    std::fs::create_dir_all(hf.join("hub")).unwrap();
+    for repo in [SPEECH, ASR] {
+        let dir = format!("models--{}", repo.replace('/', "--"));
+        if !source.join(&dir).is_dir() {
+            eprintln!("{repo} is not in the test store");
+            return;
+        }
+        std::os::unix::fs::symlink(source.join(&dir), hf.join("hub").join(&dir)).unwrap();
+    }
+    let state = APIServer::new(
+        "/nonexistent-ollama-models".to_string(),
+        hf.to_string_lossy().to_string(),
+    );
+    let text = "The museum on Harbour Street opened its doors at nine in the morning. \
+        Within an hour, three hundred visitors had walked through the main hall, many of them \
+        students from the university next door. The director, a patient man named Thomas Lee, \
+        told reporters that they had waited seven years for this day. He explained that the \
+        building once housed the first radio station of the city. Why wait so long? Money, \
+        paperwork, and a roof that leaked every winter.";
+    let spoken = super::decode::audio_speech(
+        axum::extract::State(state.clone()),
+        axum::http::HeaderMap::new(),
+        Json(serde_json::json!({
+            "model": SPEECH, "voice": "ryan", "language": "en", "input": text,
+        })),
+    )
+    .await;
+    assert_eq!(spoken.status().as_u16(), 200);
+    let wav = axum::body::to_bytes(spoken.into_body(), 1 << 28)
+        .await
+        .unwrap()
+        .to_vec();
+    let (pcm, _, rate) = super::decode::decode_audio_planar(&wav).unwrap();
+    let window = crate::inference::model::whisper::CHUNK_LENGTH as f64;
+    let seconds = pcm.len() as f64 / rate as f64;
+    assert!(
+        seconds > window,
+        "the paragraph is spoken in more than 1 window"
+    );
+
+    let fields = [
+        ("model", ASR),
+        ("language", "en"),
+        ("response_format", "verbose_json"),
+        ("timestamp_granularities[]", "word"),
+        ("timestamp_granularities[]", "segment"),
+    ];
+    let answer = transcribe_form(&state, &fields, wav).await;
+    let words = answer["words"].as_array().expect("a words array");
+    let spelled: Vec<String> = words
+        .iter()
+        .map(|w| w["word"].as_str().unwrap_or_default().to_string())
+        .collect();
+    let transcript = answer["text"].as_str().unwrap_or_default();
+    eprintln!("{transcript}\n{answer:#}");
+    assert_eq!(words_of(&spelled.join(" ")), words_of(transcript));
+    let mut last_start = 0.0f64;
+    for w in words {
+        let (start, end) = (w["start"].as_f64().unwrap(), w["end"].as_f64().unwrap());
+        assert!(start <= end && start >= last_start, "{w}");
+        assert!(end <= seconds + 0.05, "{w} ends after the recording");
+        last_start = start;
+    }
+    assert!(
+        last_start > window,
+        "words are timed after the first window"
     );
     let _ = std::fs::remove_dir_all(&hf);
 }

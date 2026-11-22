@@ -37,6 +37,43 @@ pub struct Config {
     pub suppress_tokens: Vec<u32>,
 }
 
+/// The mel frames the encoder's halving convolution reads for each audio position.
+pub const FRAMES_PER_POSITION: usize = 2;
+
+impl Config {
+    /// The mel frames 1 encoder window reads.
+    pub fn window_frames(&self) -> usize {
+        self.max_source_positions * FRAMES_PER_POSITION
+    }
+
+    /// The seconds 1 mel frame covers.
+    pub fn frame_seconds(&self) -> f32 {
+        HOP_LENGTH as f32 / SAMPLE_RATE as f32
+    }
+
+    /// The seconds 1 audio position of the encoder covers.
+    /// A timestamp token steps by 1 audio position.
+    pub fn position_seconds(&self) -> f32 {
+        self.frame_seconds() * FRAMES_PER_POSITION as f32
+    }
+}
+
+/// What the checkpoint's `generation_config.json` says about word times.
+///
+/// `alignment_heads` lists the `[layer, head]` pairs of the decoder whose cross attention follows
+/// the speech.
+/// A checkpoint that names none loads, and its word times come from its timestamp tokens.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+pub struct GenerationConfig {
+    #[serde(default)]
+    pub alignment_heads: Vec<[usize; 2]>,
+}
+
+/// The word timing of a transcript: alignment through the cross attention.
+pub mod align;
+/// The cut of a long recording into encoder windows at its silences.
+pub mod silence;
+
 pub const DTYPE: crate::tensor::DType = crate::tensor::DType::F32;
 
 // Audio parameters.

@@ -136,7 +136,7 @@ Smaller, by state then by priority:
 | Block cache for diffusion transformers | Performance | An image or video model reuses the output of its blocks from one step to the next, renders faster than with whole steps skipped, and the quality score does not fall. | Planned |
 | Multi-vector embeddings | API | The embeddings and rerank routes return one vector for each token and score a query against a document by late interaction, for text and for page images. | Started |
 | Embeddings as integers and bits | API | The embeddings routes return a vector as int8 or as binary on request, and a client ranks with them as well as with the float vector. | Done |
-| Word timestamps and long recordings | Audio | The transcription route returns the time of each word, and a recording of any length is read in windows cut at silences. | Planned |
+| Word timestamps and long recordings | Audio | The transcription route returns the time of each word, and a recording of any length is read in windows cut at silences. | Done |
 | Several vision embeddings cached | Serving | The embeddings of several images are kept between requests, and a conversation that comes back to an image does not read it again. | Done |
 
 Fixes, by state then by priority:

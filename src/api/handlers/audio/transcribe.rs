@@ -129,6 +129,7 @@ async fn transcribe_with_audio_model(
             no_speech_prob: 0.0,
         }],
         text,
+        words: None,
     }))
 }
 
@@ -148,9 +149,10 @@ pub(super) async fn audio_decode_endpoint(
     let mut response_format = "json".to_string();
     let mut initial_prompt: Option<String> = None;
     // OpenAI accepts `timestamp_granularities[]` as a multipart array.
-    // We treat any non-empty value (`segment` or `word`) as a request
-    // for segment-level timestamps; word-level is not yet implemented.
+    // Any non-empty value asks for segment timestamps.
+    // The value `word` also asks for the time of each word.
     let mut request_timestamps = false;
+    let mut request_words = false;
 
     let err_resp = |code: axum::http::StatusCode, msg: String| -> axum::response::Response {
         (code, Json(openai_error_body(code, msg))).into_response()
@@ -236,9 +238,12 @@ pub(super) async fn audio_decode_endpoint(
             }
             "timestamp_granularities" | "timestamp_granularities[]" | "timestamps" => {
                 if let Ok(t) = field.text().await {
-                    let lower = t.to_lowercase();
+                    let lower = t.trim().to_lowercase();
                     if !lower.is_empty() && lower != "false" && lower != "0" && lower != "none" {
                         request_timestamps = true;
+                    }
+                    if lower == "word" {
+                        request_words = true;
                     }
                 }
             }
@@ -270,6 +275,8 @@ pub(super) async fn audio_decode_endpoint(
     if !surface_segments {
         request_timestamps = false;
     }
+    // Word times are answered in verbose_json alone.
+    let request_words = request_words && response_format == "verbose_json";
     // Reject unknown response_format up front (matches OpenAI spec),
     // rather than silently falling through to plain JSON in the
     // formatter - clients passing typos get a clear 400 instead.
@@ -338,6 +345,7 @@ pub(super) async fn audio_decode_endpoint(
         task,
         timestamps: request_timestamps,
         collect_metrics,
+        words: request_words,
         initial_prompt,
         cancel: Some(cancel),
     };
@@ -432,14 +440,20 @@ pub(super) fn format_transcribe_response(
                     })
                 })
                 .collect();
-            Json(serde_json::json!({
+            let mut body = serde_json::json!({
                 "task": task_str,
                 "language": r.language,
                 "duration": r.duration_s,
                 "text": r.text,
                 "segments": segments,
-            }))
-            .into_response()
+            });
+            if let Some(words) = &r.words {
+                body["words"] = words
+                    .iter()
+                    .map(|w| serde_json::json!({ "word": w.word, "start": w.start, "end": w.end }))
+                    .collect();
+            }
+            Json(body).into_response()
         }
         _ => {
             // Default: json

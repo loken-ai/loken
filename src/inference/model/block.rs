@@ -95,17 +95,36 @@ impl CrossAttentionBlock {
         encoder_xs: Option<&Tensor>,
         mask: Mask,
     ) -> Result<Tensor> {
+        Ok(self.forward_scored(xs, encoder_xs, mask, false)?.0)
+    }
+
+    /// [`Self::forward`], and with `scored` set the cross attention's scores before softmax:
+    /// `[batch, heads, positions, encoder positions]` in F32.
+    ///
+    /// The scores are None when `scored` is unset or the block has no cross attention.
+    pub fn forward_scored(
+        &mut self,
+        xs: &Tensor,
+        encoder_xs: Option<&Tensor>,
+        mask: Mask,
+        scored: bool,
+    ) -> Result<(Tensor, Option<Tensor>)> {
         let attended = self
             .self_attn
             .forward(&self.self_norm.forward(xs)?, None, mask)?;
         let mut xs = xs.add(&attended)?;
+        let mut scores = None;
         if let Some((attn, norm)) = &mut self.cross {
-            let crossed = attn.forward(&norm.forward(&xs)?, encoder_xs, Mask::All)?;
+            let normed = norm.forward(&xs)?;
+            let crossed = attn.forward(&normed, encoder_xs, Mask::All)?;
+            if scored {
+                scores = attn.kept_scores(&normed)?;
+            }
             xs = xs.add(&crossed)?;
         }
         let widened = self.ffn_norm.forward(&xs)?.apply(&self.fc1)?;
         let narrowed = self.activation.apply(&widened)?.apply(&self.fc2)?;
-        xs.add(&narrowed)
+        Ok((xs.add(&narrowed)?, scores))
     }
 
     /// Forget the self attention's cache and keep the cross attention's: the next call starts
