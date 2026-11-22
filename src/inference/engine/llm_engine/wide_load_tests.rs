@@ -511,3 +511,59 @@ async fn a_lone_serial_request_moves_into_the_worker_when_another_arrives() {
     drop(second);
     assert_eq!(batched, want.text, "the worker gives the lone answer");
 }
+
+/// A wide-residual file is previewed with the layers and the window its load builds.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_wide_file_is_previewed_with_the_layers_and_the_window_its_load_builds() {
+    let path = toy_on_disk(LAYOUTS[0], false);
+    let (previewed, previewed_window, loaded, loaded_window) =
+        super::placement_tests::previewed_and_loaded(InferenceConfig {
+            model_id: "toy".to_string(),
+            models_dir: Some(path.clone()),
+            context_length: 128,
+            ..InferenceConfig::default()
+        })
+        .await;
+    assert!(!loaded.is_empty(), "the load reports its layers");
+    assert_eq!(previewed, loaded);
+    assert_eq!(previewed_window, loaded_window);
+    let _ = std::fs::remove_dir_all(path.parent().unwrap());
+}
+
+/// A wide-residual checkpoint directory is previewed from the placement its load runs: the
+/// same layers on the same devices, and the same window.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_wide_checkpoint_is_previewed_with_the_layers_and_the_window_its_load_builds() {
+    use crate::inference::generic_transformer::block_scaled_engram_tests::engram_checkpoint;
+
+    let made = engram_checkpoint("preview");
+    let root = std::env::temp_dir().join(format!("loken-wide-preview-{}", std::process::id()));
+    let snapshot = root.join("models--org--toy").join("snapshots").join("s1");
+    std::fs::create_dir_all(snapshot.parent().unwrap()).unwrap();
+    std::fs::rename(&made, &snapshot).unwrap();
+    let listing = snapshot.join("tokenizer.json");
+    let mut tokenizer_file: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&listing).unwrap()).unwrap();
+    tokenizer_file["added_tokens"] = serde_json::json!([1, 2].map(|id| serde_json::json!({
+        "id": id, "content": format!("t{id}"), "single_word": false, "lstrip": false,
+        "rstrip": false, "normalized": false, "special": true
+    })));
+    std::fs::write(&listing, tokenizer_file.to_string()).unwrap();
+    for context_length in [0, 128] {
+        let (previewed, previewed_window, loaded, loaded_window) =
+            super::placement_tests::previewed_and_loaded(InferenceConfig {
+                model_id: "org/toy".to_string(),
+                models_dir: Some(root.clone()),
+                context_length,
+                ..InferenceConfig::default()
+            })
+            .await;
+        assert!(!loaded.is_empty(), "the load reports its layers");
+        assert_eq!(previewed, loaded, "layers at window {context_length}");
+        assert_eq!(
+            previewed_window, loaded_window,
+            "window at configured {context_length}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}

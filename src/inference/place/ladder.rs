@@ -1028,17 +1028,9 @@ pub fn load_whole_on<T>(
     cancel: Option<&crate::inference::serve::cancel::CancelToken>,
     mut build: impl FnMut(&Device) -> anyhow::Result<T>,
 ) -> anyhow::Result<(T, Device)> {
-    let ranked = whole_order(cards, need, want);
-    let demand = Demand {
-        layers: 1,
-        block_bytes: need,
-        ..Demand::default()
-    };
     let mut built_on = Device::Cpu;
-    let built = load_placed(
+    let built = Whole::among(need, want, cards).load(
         what,
-        &demand,
-        &ranked,
         || cancel.is_some_and(crate::inference::serve::cancel::CancelToken::is_cancelled),
         |plan| {
             let kind = plan.segments.first().map_or(DeviceKind::Cpu, |s| s.kind);
@@ -1243,6 +1235,61 @@ fn whole_demand(bytes: u64, reserve: u64) -> Demand {
     }
 }
 
+/// A component placed whole on one device: what it asks and the cards it is offered, in the
+/// order it takes them.
+#[derive(Debug, Clone, Default)]
+pub struct Whole {
+    /// One block of the component's bytes, with its reserve beside it.
+    pub demand: Demand,
+    /// The cards offered, each with the bytes it offers.
+    pub cards: Vec<(usize, u64)>,
+}
+
+impl Whole {
+    /// The component [`load_whole`] builds: `bytes` resident and `reserve` kept free beside
+    /// them, on the cards as they are now.
+    pub fn now(bytes: u64, reserve: u64) -> Self {
+        Self {
+            demand: whole_demand(bytes, reserve),
+            cards: cards(0),
+        }
+    }
+
+    /// The component [`load_whole_on`] builds among `cards`: `need` bytes, the cards offering
+    /// `want` first.
+    pub fn among(need: u64, want: u64, cards: &[(usize, u64)]) -> Self {
+        Self {
+            demand: Demand {
+                layers: 1,
+                block_bytes: need,
+                ..Demand::default()
+            },
+            cards: whole_order(cards, need, want),
+        }
+    }
+
+    /// The plan the ladder builds when no build runs out of memory.
+    /// `None` when the allowed backends refuse every rung.
+    pub fn planned(&self) -> Option<HeteroPlan> {
+        planned_rung(
+            self.demand.plan(&self.cards),
+            &self.demand,
+            &self.cards,
+            &[],
+        )
+    }
+
+    /// Builds the component on the plan of its demand, through the ladder.
+    pub fn load<T, E: std::fmt::Display + Refusal>(
+        &self,
+        what: &str,
+        cancelled: impl Fn() -> bool,
+        build: impl FnMut(&HeteroPlan) -> Result<T, E>,
+    ) -> Result<T, E> {
+        load_placed(what, &self.demand, &self.cards, cancelled, build)
+    }
+}
+
 /// Build a component that runs whole on one device through the ladder: the fastest card
 /// that holds it, else the host.
 pub fn load_whole<T, E: std::fmt::Display + Refusal>(
@@ -1251,9 +1298,7 @@ pub fn load_whole<T, E: std::fmt::Display + Refusal>(
     reserve: u64,
     mut build: impl FnMut(&Device) -> Result<T, E>,
 ) -> Result<T, E> {
-    load(what, &whole_demand(bytes, reserve), |plan| {
-        build(&primary_device(plan))
-    })
+    Whole::now(bytes, reserve).load(what, scoped_cancelled, |plan| build(&primary_device(plan)))
 }
 
 /// [`load_whole`] for a component that runs once per request: with more than one card it
@@ -1889,5 +1934,37 @@ mod tests {
             kinds(&d.plan(&[(0, 4 * GB), (1, 10 * GB)])),
             vec!["CUDA(1)".to_string()]
         );
+    }
+
+    /// The plan a whole component reports is the plan its load builds on, card or host.
+    #[test]
+    fn a_whole_component_reports_the_plan_its_load_builds_on() {
+        let whole = Whole::among(2 * GB, 3 * GB, &[(0, GB), (1, 4 * GB)]);
+        assert_eq!(
+            whole.cards,
+            vec![(1, 4 * GB)],
+            "a card short of the need is left out"
+        );
+        let mut built: Option<HeteroPlan> = None;
+        let got: Result<(), String> = whole.load(
+            "t",
+            || false,
+            |plan| {
+                built = Some(plan.clone());
+                Ok(())
+            },
+        );
+        assert!(got.is_ok());
+        let planned = whole.planned().expect("the host is allowed");
+        assert_eq!(kinds(&planned), vec!["CUDA(1)".to_string()]);
+        assert!(super::super::dry_plan::same_plan(
+            &planned,
+            &built.expect("the load built")
+        ));
+        let none = Whole::among(2 * GB, 2 * GB, &[]);
+        assert!(matches!(
+            primary_device(&none.planned().unwrap()),
+            Device::Cpu
+        ));
     }
 }

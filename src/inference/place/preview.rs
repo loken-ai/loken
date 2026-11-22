@@ -31,6 +31,11 @@ pub struct PlacementPreview {
     /// has.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
+    /// What a load would take back from the other models on the cards before it places this
+    /// one, present when it would take anything.
+    /// The devices then report the plan built on the room taken back.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reclaimed: Option<super::reclaim::Reclaimed>,
 }
 
 /// What one device takes.
@@ -49,6 +54,14 @@ pub struct DevicePreview {
     /// Bytes it offered the plan, absent for the host.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub offered_bytes: Option<u64>,
+    /// Bytes of routed experts a wide residual keeps on it in the room the plan leaves, counted
+    /// in `weight_bytes`.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub expert_bytes: u64,
+}
+
+fn is_zero(bytes: &u64) -> bool {
+    *bytes == 0
 }
 
 /// What stays in host memory.
@@ -231,6 +244,60 @@ pub fn build(facts: Facts<'_>, offered: impl Fn(DeviceKind) -> Option<u64>) -> P
         host,
         refused: None,
         warnings,
+        reclaimed: None,
+    }
+}
+
+/// The report of a component placed whole on one device by `plan`, `demand` its one block.
+/// `None` for `plan` when the allowed backends refuse every rung.
+pub fn whole(
+    model: &str,
+    architecture: &str,
+    plan: Option<&HeteroPlan>,
+    demand: &Demand,
+    context_length: usize,
+    kv_format: &str,
+    offered: impl Fn(DeviceKind) -> Option<u64>,
+) -> PlacementPreview {
+    let weight_bytes = demand.block_bytes.saturating_add(demand.head_bytes);
+    let Some(plan) = plan else {
+        return refused(model, architecture, demand.layers, weight_bytes);
+    };
+    build(
+        Facts {
+            model,
+            architecture,
+            plan,
+            demand,
+            per_layer: None,
+            routed_layer_bytes: None,
+            experts_in_blocks: true,
+            weight_bytes,
+            context_length,
+            kv_format,
+        },
+        offered,
+    )
+}
+
+/// The report of a model of `layers` blocks and `weight_bytes` of weights that the allowed
+/// backends refuse to place.
+pub fn refused(
+    model: &str,
+    architecture: &str,
+    layers: usize,
+    weight_bytes: u64,
+) -> PlacementPreview {
+    PlacementPreview {
+        model: model.to_string(),
+        architecture: architecture.to_string(),
+        layers,
+        weight_bytes,
+        refused: Some(
+            "the model does not fit the allowed backends, and the host is not one of them"
+                .to_string(),
+        ),
+        ..PlacementPreview::default()
     }
 }
 
@@ -240,6 +307,45 @@ fn gb(bytes: u64) -> String {
 }
 
 impl PlacementPreview {
+    /// Adds the routed experts each card keeps beside its layers: `(ordinal, offered, bytes)`.
+    /// A card the plan gives no layer joins the devices with its experts alone.
+    /// The host keeps what the cards then do not.
+    pub fn add_card_experts(&mut self, experts: &[(usize, u64, u64)]) {
+        for &(ordinal, offered, bytes) in experts.iter().filter(|e| e.2 > 0) {
+            let at = match self
+                .devices
+                .iter()
+                .position(|d| d.device == "CUDA" && d.index == ordinal)
+            {
+                Some(at) => at,
+                None => {
+                    self.devices.push(DevicePreview {
+                        device: "CUDA".to_string(),
+                        index: ordinal,
+                        offered_bytes: Some(offered),
+                        ..DevicePreview::default()
+                    });
+                    self.devices.len() - 1
+                }
+            };
+            let d = &mut self.devices[at];
+            d.weight_bytes = d.weight_bytes.saturating_add(bytes);
+            d.expert_bytes = d.expert_bytes.saturating_add(bytes);
+        }
+        let on_devices: u64 = self
+            .devices
+            .iter()
+            .filter(|d| d.device != "CPU")
+            .map(|d| d.weight_bytes)
+            .sum();
+        self.host.weight_bytes = self.weight_bytes.saturating_sub(on_devices);
+        self.host.share = if self.weight_bytes > 0 {
+            self.host.weight_bytes as f64 / self.weight_bytes as f64
+        } else {
+            0.0
+        };
+    }
+
     /// The report as a short table for a terminal.
     pub fn table(&self) -> String {
         let mut out = format!(
@@ -253,10 +359,12 @@ impl PlacementPreview {
             out.push_str(&format!("no plan: {why}\n"));
             return out;
         }
-        out.push_str(&format!(
-            "context {} tokens, cache {}\n",
-            self.context_length, self.kv_format
-        ));
+        if !self.kv_format.is_empty() {
+            out.push_str(&format!(
+                "context {} tokens, cache {}\n",
+                self.context_length, self.kv_format
+            ));
+        }
         let rows: Vec<[String; 5]> = self
             .devices
             .iter()
@@ -312,6 +420,25 @@ impl PlacementPreview {
             gb(self.host.weight_bytes),
             self.host.share * 100.0
         ));
+        let experts: u64 = self.devices.iter().map(|d| d.expert_bytes).sum();
+        if experts > 0 {
+            out.push_str(&format!(
+                "routed experts in the room the cards keep: {}\n",
+                gb(experts)
+            ));
+        }
+        if let Some(r) = &self.reclaimed {
+            let cards = r
+                .cards
+                .iter()
+                .map(|c| format!("CUDA {} {}", c.index, gb(c.bytes)))
+                .collect::<Vec<_>>()
+                .join(", ");
+            out.push_str(&format!("taken back from the other models: {cards}\n"));
+            if !r.models.is_empty() {
+                out.push_str(&format!("unloaded first: {}\n", r.models.join(", ")));
+            }
+        }
         for warning in &self.warnings {
             out.push_str(&format!("warning: {warning}\n"));
         }

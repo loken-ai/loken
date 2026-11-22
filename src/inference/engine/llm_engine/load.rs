@@ -424,11 +424,7 @@ pub(super) fn load_wide_checkpoint(
         .ok_or_else(|| anyhow!("{}: no eos_token in tokenizer_config.json", dir.display()))?;
     let eos_token_ids_extra =
         checkpoint_end_ids(dir, eos_token_id, &tokenizer, &generation_defaults.stop);
-    let context_length = if user_context_length > 0 {
-        user_context_length
-    } else {
-        declared_context(dir)
-    };
+    let context_length = checkpoint_window(dir, user_context_length);
     let mut model = place_wide_checkpoint(
         model_id,
         &checkpoint,
@@ -576,18 +572,7 @@ pub(crate) fn place_wide_checkpoint(
     use crate::inference::generic_transformer::GenericHeteroTransformer;
     use crate::inference::place::ladder::load_placed;
 
-    let planned_ctx = context_length.min(crate::inference::cache::KV_WORKING_WINDOW_TOKENS);
-    let reserve = crate::inference::place::runtime_demand::llm_work_reserve(
-        meta.d_model,
-        PREFILL_CHUNK_TOKENS,
-    );
-    let demand =
-        crate::inference::place::llm::wide_sparse_demand(meta, file_size, 0, planned_ctx, reserve);
-    let offer = if crate::gpu::cards_allowed() {
-        crate::inference::place::llm::offer(owner, None, file_size.saturating_add(reserve), 0)
-    } else {
-        crate::inference::place::llm::Offer::default()
-    };
+    let (demand, offer) = wide_checkpoint_placement(owner, meta, file_size, context_length, true);
     load_placed(
         "wide-residual checkpoint",
         &demand,
@@ -603,6 +588,53 @@ pub(crate) fn place_wide_checkpoint(
         },
     )
     .map_err(|e| anyhow!("Failed to load {}: {e}", checkpoint.dir.display()))
+}
+
+/// What the block-scaled checkpoint `meta` describes asks of the cards for a context of
+/// `context_length` tokens, and the cards it is offered.
+///
+/// `file_size` is the bytes of its shards.
+/// `reclaim` lets the offer ask the other models on the cards for the memory they keep.
+/// The placement preview reads the same demand and the same offer.
+pub(crate) fn wide_checkpoint_placement(
+    owner: &str,
+    meta: &crate::inference::generic_transformer::wide_sparse_config::WideSparseMeta,
+    file_size: u64,
+    context_length: usize,
+    reclaim: bool,
+) -> (
+    crate::inference::place::ladder::Demand,
+    crate::inference::place::llm::Offer,
+) {
+    let planned_ctx = context_length.min(crate::inference::cache::KV_WORKING_WINDOW_TOKENS);
+    let reserve = crate::inference::place::runtime_demand::llm_work_reserve(
+        meta.d_model,
+        PREFILL_CHUNK_TOKENS,
+    );
+    let demand =
+        crate::inference::place::llm::wide_sparse_demand(meta, file_size, 0, planned_ctx, reserve);
+    let offer = if crate::gpu::cards_allowed() {
+        crate::inference::place::llm::offer_reading(
+            owner,
+            None,
+            file_size.saturating_add(reserve),
+            0,
+            reclaim,
+        )
+    } else {
+        crate::inference::place::llm::Offer::default()
+    };
+    (demand, offer)
+}
+
+/// The window a load of the checkpoint in `dir` opens: `user_context_length` when set, else the
+/// context the checkpoint declares.
+pub(super) fn checkpoint_window(dir: &std::path::Path, user_context_length: usize) -> usize {
+    if user_context_length > 0 {
+        user_context_length
+    } else {
+        declared_context(dir)
+    }
 }
 
 /// The context a checkpoint directory declares (`max_position_embeddings` of its

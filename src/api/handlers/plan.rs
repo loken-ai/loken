@@ -8,6 +8,9 @@ use axum::extract::{Json, State};
 
 /// `POST /api/models/plan`: the placement of the model named by `model` (or `name`) on this
 /// server's devices as they are now.
+///
+/// When the load would take room back from the other models first, the preview reports what it
+/// takes and the placement on the room taken back.
 pub(crate) async fn plan_model(
     State(state): State<APIServer>,
     Json(request): Json<serde_json::Value>,
@@ -18,15 +21,19 @@ pub(crate) async fn plan_model(
         .and_then(|v| v.as_str())
         .ok_or_else(|| ApiError::Validation("Missing 'model' field".to_string()))?;
     validate_model_id(model)?;
-    let engine = LlmEngine::with_config(state.config_for_model(model));
+    let config = state.config_for_model(model);
+    let engine = LlmEngine::with_config(config.clone());
     if engine.resolve_model_file(model).is_none() {
         return Err(ApiError::NotFound(format!("model {model} not found")));
     }
-    engine
-        .placement_preview()
-        .await
-        .map(Json)
-        .map_err(ApiError::Validation)
+    let reclaimed = state.dry_reclaim(model, &config).await;
+    let preview = match &reclaimed {
+        Some(back) => engine.placement_preview_given(back.given_back()).await,
+        None => engine.placement_preview().await,
+    };
+    let mut preview = preview.map_err(ApiError::Validation)?;
+    preview.reclaimed = reclaimed;
+    Ok(Json(preview))
 }
 
 #[cfg(test)]

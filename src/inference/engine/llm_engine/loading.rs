@@ -493,8 +493,14 @@ impl LlmEngine {
         // A text-image pair is served on the embeddings routes, beside no language model.
         if crate::inference::model::clip::pair::claims_checkpoint_dir(&model_file) {
             let dir = model_file.clone();
+            // The placement preview reads the same placement.
+            // The pair is offered no card: every plan of it is the host's.
             let pair = tokio::task::spawn_blocking(move || {
-                crate::inference::model::clip::pair::DualEncoder::load(&dir)
+                crate::inference::model::clip::pair::placement(&dir).load(
+                    "text-image pair",
+                    || false,
+                    |_| crate::inference::model::clip::pair::DualEncoder::load(&dir),
+                )
             })
             .await??;
             info!(

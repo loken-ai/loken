@@ -638,9 +638,25 @@ A client that follows the SSE specification ignores comment lines.
 `name` is read when `model` is absent.
 The plan comes from the code the load runs: the same offer of the cards, the same context choice and the same first rung of the ladder.
 The cards are read as they are, under the load admission.
-The models already loaded keep the memory they hold for later requests.
-A load can ask them for it, so a load may fit where the preview spills.
 A load that runs out of memory takes a later rung, which the preview does not show.
+
+Each kind of model is previewed from its own load:
+
+| Kind | What the preview reports |
+|---|---|
+| A model the language model route places by layers | The plan of that route. |
+| A wide residual of that route | The plan, and the routed experts the load then keeps in the room each card leaves. |
+| A wide-residual checkpoint directory | The plan its load builds from the shards' bytes and its own offer of the cards. |
+| A file its own loader places whole | One block of the file's bytes, on the device the ladder builds it on. |
+| A text-image pair | One block of its weights. The pair is offered no card and runs on the host. |
+
+A load short of room first takes room back from the other models on the cards.
+It takes the memory they keep for later requests, then unloads the idle models, the least recently used first.
+The preview counts what the load would take back, without asking any model for anything.
+It then reports the plan on the cards with that room given back.
+A model counts the conversation states it keeps.
+It does not count its pools, its recorded graphs or its extra expert slots, so a load may take back more than the preview counts.
+A busy model gives nothing back in the count.
 
 | Field | What it holds |
 |---|---|
@@ -648,13 +664,23 @@ A load that runs out of memory takes a later rung, which the preview does not sh
 | `layers` | The repeating blocks the plan divides. |
 | `weight_bytes` | The bytes of weights the devices and the host place together. |
 | `context_length` | The tokens the cache is built for, the window a request may open. |
-| `kv_format` | The cache element format: `q8_0`, `q4_0`, `f16` or `f32`. |
+| `kv_format` | The cache element format: `q8_0`, `q4_0`, `f16` or `f32`. Empty for a model without a cache, whose `context_length` is 0. |
 | `devices` | Each device the layers cross, in order: `device` (`CUDA`, `Vulkan`, `OpenCL` or `CPU`), `index`, `layers` as `[first, end)` ranges with the end excluded, `weight_bytes`, `kv_bytes` at the planned context, and `offered_bytes` for a device other than the host. |
+| `devices[].expert_bytes` | Present for a wide residual: the bytes of routed experts the card keeps in the room the plan leaves, counted in its `weight_bytes`. A card the plan gives no layer is listed with these experts alone. |
 | `host` | What stays in host memory: `layers` it runs, `weight_bytes` no device holds and `share` of all the weights, from 0 to 1. The routed experts the plan keeps in host memory count here, not on the card of their layer. |
 | `refused` | Present when the allowed backends refuse every plan. |
 | `warnings` | Present when a device's `weight_bytes` exceed its `offered_bytes`, 1 line per device. |
+| `reclaimed` | Present when the load would take room back first: `models`, the idle models it unloads in order, and `cards`, each card's `index` and the `bytes` it gets back. |
+
+The experts of a wide residual are sized as the load sizes them.
+A card's room is the bytes it offered less its weights, its cache and a request's work.
+A model that holds its whole stack adds the cache room the working window leaves.
+The experts fill the rooms card by card, rank by rank across the layers.
+The load then keeps experts only on a card its measure finds faster than the host.
+It also shares the room with the weights every token reads.
+The preview cannot measure the cards, so it counts every card as one that keeps experts.
 
 A model that is not found answers 404.
-A model the language model route does not place by layers answers 400 with the reason.
+A model the load would refuse answers 400 with the reason.
 `loken fit <name>` prints the same plan as a table.
 

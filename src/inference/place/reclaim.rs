@@ -45,6 +45,13 @@ pub trait Holder: Send + Sync {
     /// Gives back what the model keeps of `kind` on `card`, at least `bytes` of it when it holds
     /// that much. True when anything was given back.
     fn give_back(&self, kind: Kind, card: usize, bytes: u64) -> bool;
+    /// The bytes of `kind` the model keeps on `card` and would give back, counted without giving
+    /// anything back.
+    /// A holder that cannot count a kind without dropping it counts 0.
+    fn keeps(&self, kind: Kind, card: usize) -> u64 {
+        let _ = (kind, card);
+        0
+    }
     /// Brings what the holder declared on its cards up to date, when it can without waiting.
     /// `shared` lists its cards another owner's holder runs on.
     fn refresh(&self, shared: &[usize]) {
@@ -187,6 +194,67 @@ pub fn make_room(card: usize, need: u64, except: &str, free: impl Fn() -> u64) -
     given
 }
 
+/// The bytes [`make_room`] would have the holders other than `except` on `card` give back for
+/// `need` bytes on a card that has `have` free, counted from what each holder keeps, without
+/// asking any of them.
+/// The kinds are counted in the order [`make_room`] asks for them, each whole.
+pub fn would_give(card: usize, need: u64, except: &str, have: u64) -> u64 {
+    let mut given = 0u64;
+    for kind in KINDS {
+        for holder in on_card(card, except) {
+            if have.saturating_add(given) >= need {
+                return given;
+            }
+            given = given.saturating_add(holder.keeps(kind, card));
+        }
+    }
+    given
+}
+
+/// What a load short of room takes back from the other models on the cards before it places
+/// its model.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Reclaimed {
+    /// The idle models the load unloads, the least recently used first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub models: Vec<String>,
+    /// The bytes each card gets back, cards in ordinal order.
+    pub cards: Vec<CardBack>,
+}
+
+/// The bytes one card gets back.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct CardBack {
+    pub index: usize,
+    pub bytes: u64,
+}
+
+impl Reclaimed {
+    /// Adds `bytes` given back on `card`.
+    pub fn give(&mut self, card: usize, bytes: u64) {
+        if bytes == 0 {
+            return;
+        }
+        match self.cards.iter_mut().find(|c| c.index == card) {
+            Some(c) => c.bytes = c.bytes.saturating_add(bytes),
+            None => {
+                self.cards.push(CardBack { index: card, bytes });
+                self.cards.sort_by_key(|c| c.index);
+            }
+        }
+    }
+
+    /// The bytes each card gets back, as `(ordinal, bytes)`.
+    pub fn given_back(&self) -> Vec<(usize, u64)> {
+        self.cards.iter().map(|c| (c.index, c.bytes)).collect()
+    }
+
+    /// Whether the load takes nothing back.
+    pub fn is_empty(&self) -> bool {
+        self.models.is_empty() && self.cards.is_empty()
+    }
+}
+
 /// [`make_room`] on `card` for `need` bytes, reading the card as `except` is offered it.
 pub fn make_room_for(card: usize, need: u64, except: &str) -> bool {
     make_room(card, need, except, || super::room::offered(card, except))
@@ -281,5 +349,63 @@ mod tests {
             .any(|h| same(h, &mine)));
         drop(other);
         assert!(on_card(CARD, "reclaim-test-mine").is_empty());
+    }
+
+    /// A card no machine has, apart from [`CARD`].
+    const COUNTED: usize = usize::MAX - 1;
+
+    /// A holder of `held` bytes of snapshots on [`COUNTED`] that counts them.
+    struct Counted {
+        name: &'static str,
+        held: u64,
+        given: Mutex<bool>,
+    }
+
+    impl Holder for Counted {
+        fn owner(&self) -> &str {
+            self.name
+        }
+        fn cards(&self) -> Vec<usize> {
+            vec![COUNTED]
+        }
+        fn give_back(&self, _kind: Kind, _card: usize, _bytes: u64) -> bool {
+            *self.given.lock().unwrap() = true;
+            true
+        }
+        fn keeps(&self, kind: Kind, _card: usize) -> u64 {
+            match kind {
+                Kind::Snapshots => self.held,
+                _ => 0,
+            }
+        }
+    }
+
+    /// The count reads what the other holders keep, stops once the card has the room, and
+    /// asks no holder for anything.
+    #[test]
+    fn the_count_reads_what_the_others_keep_and_takes_nothing() {
+        let other = Arc::new(Counted {
+            name: "reclaim-count-other",
+            held: 30,
+            given: Mutex::default(),
+        });
+        let mine = Arc::new(Counted {
+            name: "reclaim-count-mine",
+            held: 70,
+            given: Mutex::default(),
+        });
+        let (o, m): (Arc<dyn Holder>, Arc<dyn Holder>) = (other.clone(), mine.clone());
+        register(&o);
+        register(&m);
+        assert_eq!(would_give(COUNTED, 100, "reclaim-count-mine", 50), 30);
+        assert_eq!(would_give(COUNTED, 100, "reclaim-count-mine", 100), 0);
+        assert!(!*other.given.lock().unwrap());
+        assert!(!*mine.given.lock().unwrap());
+        let mut r = Reclaimed::default();
+        r.give(3, 10);
+        r.give(1, 5);
+        r.give(3, 2);
+        r.give(2, 0);
+        assert_eq!(r.given_back(), vec![(1, 5), (3, 12)]);
     }
 }

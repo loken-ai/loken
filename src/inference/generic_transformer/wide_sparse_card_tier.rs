@@ -63,6 +63,12 @@ impl LentRoom {
             .min(self.reserved)
     }
 
+    /// Bytes of the reservation the experts may borrow while every sequence stays within the
+    /// tokens whose largest layer's cache is `working`.
+    pub fn lendable(&self, working: u64) -> u64 {
+        self.reserved.saturating_sub(self.need(working))
+    }
+
     /// Bytes the cache must take back from the experts before a sequence holds the tokens whose
     /// largest layer's cache is `per_layer`.
     pub fn shortfall(&self, per_layer: u64) -> u64 {
@@ -169,7 +175,7 @@ impl GenericHeteroTransformer {
             .filter_map(|(ordinal, cache)| {
                 let dev = crate::tensor::Device::new_cuda(ordinal).ok()?;
                 let free = crate::inference::place::vram_manager::free_now(&dev)?;
-                let room = free.saturating_sub(cache).saturating_sub(runtime_reserve);
+                let room = card_room(free, cache, runtime_reserve);
                 tracing::info!(
                     "card {ordinal}: {} MB free after the load, {} MB kept for the cache, {} MB for a request's work: {} MB for routed experts",
                     free / 1_000_000,
@@ -386,7 +392,7 @@ impl GenericHeteroTransformer {
             .kv_bytes_per_layer(crate::inference::cache::KV_WORKING_WINDOW_TOKENS);
         let mut rooms = ws.card_rooms.clone();
         for l in &mut ws.lent {
-            l.lent = l.reserved.saturating_sub(l.need(working));
+            l.lent = l.lendable(working);
             if l.lent == 0 {
                 continue;
             }
@@ -839,6 +845,13 @@ impl GenericHeteroTransformer {
     ) -> std::result::Result<CardMeasure, String> {
         Err("the build has no card".into())
     }
+}
+
+/// The bytes routed experts may take on a card with `free` bytes free once the weights are on
+/// it: the free bytes less `cache` kept for the cache of its layers and less `runtime_reserve`
+/// for a request's work.
+pub fn card_room(free: u64, cache: u64, runtime_reserve: u64) -> u64 {
+    free.saturating_sub(cache).saturating_sub(runtime_reserve)
 }
 
 /// What the default memory pool of card `ordinal` reserves and what of it is in use.

@@ -136,6 +136,13 @@ pub fn weight_bytes(dir: &Path) -> u64 {
         .sum()
 }
 
+/// Where the pair in `dir` is placed: one block of its weights, offered no card.
+/// The pair runs on the host in f32.
+pub fn placement(dir: &Path) -> crate::inference::place::ladder::Whole {
+    let bytes = weight_bytes(dir);
+    crate::inference::place::ladder::Whole::among(bytes, bytes, &[])
+}
+
 /// Whether `dir` holds a text-image pair this module loads: the two tower configs, the
 /// tokenizer, the preprocessor config, and tensors of one of the two layouts.
 pub fn claims_checkpoint_dir(dir: &Path) -> bool {

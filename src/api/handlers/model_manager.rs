@@ -492,6 +492,71 @@ impl LoadedModelEntry {
     }
 }
 
+/// The model a load of `incoming_id` unloads next to make room: the least recently used of
+/// `engines` that serves no request and is not in `tried`.
+fn idle_victim<'a>(
+    engines: &'a [LoadedModelEntry],
+    incoming_id: &str,
+    tried: &std::collections::HashSet<String>,
+) -> Option<&'a LoadedModelEntry> {
+    engines
+        .iter()
+        .filter(|e| e.model_id != incoming_id && !tried.contains(&e.model_id))
+        .filter(|e| !e.busy())
+        .min_by_key(|e| e.last_used.load(Ordering::Relaxed))
+}
+
+/// What a load of `incoming_id` takes back from the models of `engines` for `need` bytes of
+/// weights with `per_card` kept free beside them, counted as the load takes it, without asking
+/// any model for its memory.
+///
+/// `cards` are the cards as the load is offered them.
+/// `kept` counts what the holders on a card would give back for a need, from what it has free.
+/// The kept memory is counted first, then the idle models, the least recently used first, each
+/// giving back the bytes its build took on its cards.
+/// `None` when the cards hold the model already.
+pub(crate) fn reclaim_count(
+    engines: &[LoadedModelEntry],
+    incoming_id: &str,
+    need: u64,
+    per_card: u64,
+    mut cards: Vec<crate::inference::place::CardRoom>,
+    kept: impl Fn(usize, u64, u64) -> u64,
+) -> Option<crate::inference::place::reclaim::Reclaimed> {
+    let demand = crate::inference::place::ladder::Demand {
+        block_bytes: need,
+        runtime_reserve: per_card,
+        ..Default::default()
+    };
+    let room = |cards: &[crate::inference::place::CardRoom]| {
+        crate::inference::place::room::room_for(&demand, cards)
+    };
+    if need <= room(&cards) {
+        return None;
+    }
+    let mut back = crate::inference::place::reclaim::Reclaimed::default();
+    for card in &mut cards {
+        let given = kept(card.index, need.saturating_add(per_card), card.available);
+        card.available = card.available.saturating_add(given);
+        back.give(card.index, given);
+    }
+    let mut tried = std::collections::HashSet::new();
+    while need > room(&cards) {
+        let Some(victim) = idle_victim(engines, incoming_id, &tried) else {
+            break;
+        };
+        tried.insert(victim.model_id.clone());
+        back.models.push(victim.model_id.clone());
+        for (index, bytes) in victim.copies().iter().flat_map(|c| c.pace().held()) {
+            if let Some(card) = cards.iter_mut().find(|c| c.index == index) {
+                card.available = card.available.saturating_add(bytes);
+            }
+            back.give(index, bytes);
+        }
+    }
+    (!back.is_empty()).then_some(back)
+}
+
 /// The models of `engines` other than `model_id`, by name, each with whether it serves a request.
 pub(crate) fn neighbours(engines: &[LoadedModelEntry], model_id: &str) -> Vec<(String, bool)> {
     let mut out: Vec<(String, bool)> = engines
@@ -1605,12 +1670,7 @@ impl APIServer {
             }
             let victim = {
                 let engines = self.engines.read().await;
-                engines
-                    .iter()
-                    .filter(|e| e.model_id != incoming_id && !tried.contains(&e.model_id))
-                    .filter(|e| !e.busy())
-                    .min_by_key(|e| e.last_used.load(Ordering::Relaxed))
-                    .map(|e| e.model_id.clone())
+                idle_victim(&engines, incoming_id, &tried).map(|e| e.model_id.clone())
             };
             let Some(victim) = victim else {
                 let busy = {
@@ -1690,6 +1750,30 @@ impl APIServer {
             tried.insert(victim.clone());
             let _ = self.unload_model(&victim).await;
         }
+    }
+
+    /// What [`Self::evict_to_make_room`] would take back from the other models for a load of
+    /// `incoming_id` with `config`, counted without asking any model for its memory.
+    /// `None` when the cards hold the model already.
+    pub(crate) async fn dry_reclaim(
+        &self,
+        incoming_id: &str,
+        config: &crate::inference::engine::llm_engine::InferenceConfig,
+    ) -> Option<crate::inference::place::reclaim::Reclaimed> {
+        let need = self.model_blob_size(incoming_id, config);
+        let per_card = self.model_load_reserve(incoming_id, config);
+        let cards = crate::inference::place::room::card_rooms_for(incoming_id);
+        let engines = self.engines.read().await;
+        reclaim_count(
+            &engines,
+            incoming_id,
+            need,
+            per_card,
+            cards,
+            |card, need, have| {
+                crate::inference::place::reclaim::would_give(card, need, incoming_id, have)
+            },
+        )
     }
 
     /// Unloads idle language models, least recently used first, while the host has no room
@@ -2701,5 +2785,80 @@ mod tests {
         assert_eq!(got.phase, phase::LOAD_MODEL);
         assert_eq!((got.done, got.total), (3, 5));
         drop(guard);
+    }
+
+    /// A load short of room counts the kept memory, then the idle model that holds the room,
+    /// the least recently used first, and passes over a busy model and its own entry.
+    /// The count asks no model for anything: every model stays loaded.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_reclaim_count_takes_an_idle_model_and_unloads_nothing() {
+        use crate::inference::engine::llm_engine::{InferenceConfig, LlmEngine};
+        use crate::inference::place::CardRoom;
+        const GB: u64 = 1 << 30;
+        let entry = |id: &str, last_used: i64, held: Vec<(usize, u64)>| {
+            let engine = Arc::new(LlmEngine::with_config(InferenceConfig {
+                model_id: id.to_string(),
+                ..InferenceConfig::default()
+            }));
+            engine.pace().placed(Default::default(), held);
+            let e = LoadedModelEntry::new(id.to_string(), engine, Some(1));
+            e.last_used.store(last_used, Ordering::Relaxed);
+            e
+        };
+        let engines = vec![
+            entry("reclaim-older", 1, vec![(0, 6 * GB)]),
+            entry("reclaim-newer", 2, vec![(0, 6 * GB)]),
+            entry("reclaim-incoming", 0, vec![(0, 9 * GB)]),
+        ];
+        let cards = vec![CardRoom {
+            index: 0,
+            perf: 1,
+            available: 4 * GB,
+            total: 24 * GB,
+        }];
+        let kept = |_: usize, _: u64, _: u64| GB;
+        // 8 GB of weights and 1 GB beside them: 4 GB free, 1 GB kept, then the older model's
+        // 6 GB.
+        let back = reclaim_count(
+            &engines,
+            "reclaim-incoming",
+            8 * GB,
+            GB,
+            cards.clone(),
+            kept,
+        )
+        .expect("the load takes room back");
+        assert_eq!(back.models, vec!["reclaim-older".to_string()]);
+        assert_eq!(back.given_back(), vec![(0, 7 * GB)]);
+        // A model the cards hold already takes nothing back.
+        assert_eq!(
+            reclaim_count(
+                &engines,
+                "reclaim-incoming",
+                2 * GB,
+                GB,
+                cards.clone(),
+                kept
+            ),
+            None
+        );
+        // Kept memory that covers the need unloads no model.
+        let back = reclaim_count(
+            &engines,
+            "reclaim-incoming",
+            4 * GB,
+            GB,
+            cards.clone(),
+            kept,
+        )
+        .unwrap();
+        assert!(back.models.is_empty());
+        assert_eq!(back.given_back(), vec![(0, GB)]);
+        // A busy model is passed over.
+        let busy = engines[0].engine.admit_request().await;
+        let back = reclaim_count(&engines, "reclaim-incoming", 8 * GB, GB, cards, kept).unwrap();
+        assert_eq!(back.models, vec!["reclaim-newer".to_string()]);
+        drop(busy);
+        assert!(engines.iter().all(|e| e.engine.pace().held().len() == 1));
     }
 }

@@ -8,7 +8,7 @@ use super::loading::{beside_the_tower, kv_cache_bytes, kv_cache_format, load_sta
 use super::*;
 use crate::inference::place::ladder::Demand;
 use crate::inference::place::layer_executor::{DeviceKind, HeteroPlan};
-use crate::inference::place::preview::{HostShare, PlacementPreview};
+use crate::inference::place::preview::PlacementPreview;
 
 /// What the configuration asks of a placement, read once from the engine.
 #[derive(Debug, Clone)]
@@ -31,6 +31,8 @@ pub(crate) struct Ask {
     /// Bytes each card offers on top of its free memory: what models unloaded before the load
     /// give back there.
     pub(crate) given_back: Vec<(usize, u64)>,
+    /// Every card takes a range of each attention layer's cache.
+    pub(crate) context_parallel: bool,
 }
 
 impl LlmEngine {
@@ -50,6 +52,7 @@ impl LlmEngine {
                 .prefill_row_bytes
                 .load(std::sync::atomic::Ordering::Relaxed),
             given_back: Vec::new(),
+            context_parallel: self.config.context_parallel,
         }
     }
 
@@ -58,7 +61,45 @@ impl LlmEngine {
     /// The cards are read as a load reads them, under the load admission.
     /// The other models on the cards are not asked for the memory they keep.
     pub async fn placement_preview(&self) -> Result<PlacementPreview, String> {
-        self.plan_now(preview_of).await
+        self.preview_with(self.placement_ask()).await
+    }
+
+    /// The placement a load of this engine's model would build once the bytes `given_back`
+    /// holds for each card are free there, as [`Self::placement_preview`] reads it.
+    pub async fn placement_preview_given(
+        &self,
+        given_back: Vec<(usize, u64)>,
+    ) -> Result<PlacementPreview, String> {
+        self.preview_with(Ask {
+            given_back,
+            ..self.placement_ask()
+        })
+        .await
+    }
+
+    /// The preview of the placement a load as `ask` asks would build now, under the load
+    /// admission.
+    async fn preview_with(&self, ask: Ask) -> Result<PlacementPreview, String> {
+        let model_file = self.placed_file()?;
+        let _admission = crate::inference::place::vram_manager::load_admission().await;
+        tokio::task::spawn_blocking(move || preview_file(&model_file, &ask))
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(|e| e.to_string())
+    }
+
+    /// The file or the directory a load of this engine's model reads, as the load resolves it.
+    fn placed_file(&self) -> Result<std::path::PathBuf, String> {
+        let model_id = &self.config.model_id;
+        let model_file = self
+            .find_model_file(model_id)
+            .ok_or_else(|| format!("model file not found for {model_id}"))?;
+        if let Some(why) =
+            crate::inference::load::awq_loader::text_route_refusal(&model_file.to_string_lossy())
+        {
+            return Err(why);
+        }
+        Ok(discover::composite_text_dir(&model_file, &self.hub_roots()).unwrap_or(model_file))
     }
 
     /// The plan a load of this engine's model would build now beside the models resident on
@@ -96,16 +137,7 @@ impl LlmEngine {
         admission: Option<tokio::sync::MutexGuard<'static, ()>>,
     ) -> Result<T, String> {
         let model_id = self.config.model_id.clone();
-        let model_file = self
-            .find_model_file(&model_id)
-            .ok_or_else(|| format!("model file not found for {model_id}"))?;
-        if let Some(why) =
-            crate::inference::load::awq_loader::text_route_refusal(&model_file.to_string_lossy())
-        {
-            return Err(why);
-        }
-        let model_file =
-            discover::composite_text_dir(&model_file, &self.hub_roots()).unwrap_or(model_file);
+        let model_file = self.placed_file()?;
         if crate::inference::model::clip::pair::claims_checkpoint_dir(&model_file)
             || crate::inference::generic_transformer::wide_sparse_config::WideSparseMeta::claims_checkpoint(&model_file)
         {
@@ -138,6 +170,181 @@ fn plan_file<T>(
     ask: &Ask,
     read: Report<T>,
 ) -> AnyResult<T> {
+    with_placement(model_file, file_len, ask, |source, _, placement| {
+        let layers = placement.layers.as_ref().ok_or_else(|| {
+            anyhow!(
+                "{} is placed whole on one device by its own loader",
+                ask.model_id
+            )
+        })?;
+        Ok(read(source, layers, ask))
+    })
+}
+
+/// The preview of the placement a load of `model_file` builds, as `ask` configures it.
+///
+/// A text-image pair and a wide-residual checkpoint directory are previewed from their own
+/// loads' placements.
+/// Every other model is previewed from the plan of the language model route.
+pub(super) fn preview_file(model_file: &std::path::Path, ask: &Ask) -> AnyResult<PlacementPreview> {
+    if crate::inference::model::clip::pair::claims_checkpoint_dir(model_file) {
+        return Ok(pair_preview(model_file, ask));
+    }
+    if crate::inference::generic_transformer::wide_sparse_config::WideSparseMeta::claims_checkpoint(
+        model_file,
+    ) {
+        return wide_checkpoint_preview(model_file, ask);
+    }
+    let file_len = std::fs::metadata(model_file)
+        .map_err(|e| anyhow!("{}: {e}", model_file.display()))?
+        .len();
+    with_placement(
+        model_file,
+        file_len,
+        ask,
+        |source, window, placement| match &placement.layers {
+            Some(layers) => Ok(preview_of(source, layers, ask)),
+            None => Ok(whole_file_preview(source, window, placement, ask)),
+        },
+    )
+}
+
+/// The cards a whole component placed by `whole` is offered, with what `ask` says other
+/// models give back.
+fn whole_given_back(
+    whole: crate::inference::place::ladder::Whole,
+    ask: &Ask,
+) -> crate::inference::place::ladder::Whole {
+    match ask.given_back.is_empty() {
+        true => whole,
+        false => crate::inference::place::ladder::Whole {
+            cards: with_given_back(&whole.cards, &ask.given_back, None),
+            ..whole
+        },
+    }
+}
+
+/// The bytes each card of `cards` offers, by device.
+fn offered_by(cards: &[(usize, u64)]) -> impl Fn(DeviceKind) -> Option<u64> + '_ {
+    move |kind| match kind {
+        DeviceKind::Cuda(idx) => cards.iter().find(|(i, _)| *i == idx).map(|(_, b)| *b),
+        _ => None,
+    }
+}
+
+/// The preview of a file its own loader places whole on one device: the block the load builds
+/// through `ladder::load_whole`, of the file's bytes with the runtime reserve beside them.
+/// Its cache grows in f32 up to the context the model reaches.
+fn whole_file_preview(
+    source: &Source<'_>,
+    window: &Window,
+    placement: &Placement,
+    ask: &Ask,
+) -> PlacementPreview {
+    let whole = whole_given_back(
+        crate::inference::place::ladder::Whole::now(source.file_size, placement.runtime_reserve),
+        ask,
+    );
+    crate::inference::place::preview::whole(
+        &ask.model_id,
+        source.arch,
+        whole.planned().as_ref(),
+        &whole.demand,
+        window.context_length,
+        "f32",
+        offered_by(&whole.cards),
+    )
+}
+
+/// The preview of the text-image pair in `dir`: the block its load builds through the ladder.
+/// The pair keeps no cache: the context is 0 and the format empty.
+fn pair_preview(dir: &std::path::Path, ask: &Ask) -> PlacementPreview {
+    let whole = crate::inference::model::clip::pair::placement(dir);
+    let architecture = std::fs::read_to_string(dir.join("config.json"))
+        .ok()
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+        .and_then(|c| c.get("model_type")?.as_str().map(str::to_string))
+        .unwrap_or_default();
+    crate::inference::place::preview::whole(
+        &ask.model_id,
+        &architecture,
+        whole.planned().as_ref(),
+        &whole.demand,
+        0,
+        "",
+        offered_by(&whole.cards),
+    )
+}
+
+/// The preview of the wide-residual checkpoint in `dir`: the demand and the offer its load
+/// places it with, and the plan the ladder builds first from them.
+fn wide_checkpoint_preview(dir: &std::path::Path, ask: &Ask) -> AnyResult<PlacementPreview> {
+    use crate::inference::generic_transformer::wide_sparse_config::WideSparseMeta;
+    use crate::inference::generic_transformer::BlockScaledCheckpoint;
+
+    let checkpoint =
+        BlockScaledCheckpoint::open(dir).map_err(|e| anyhow!("{}: {e}", dir.display()))?;
+    let meta = WideSparseMeta::from_reference(&checkpoint.reference, None)
+        .map_err(|e| anyhow!("{}: {e}", dir.display()))?;
+    let file_size = super::load::checkpoint_bytes(dir)?;
+    let context_length = super::load::checkpoint_window(dir, ask.context_length);
+    let (demand, offer) = super::load::wide_checkpoint_placement(
+        &ask.model_id,
+        &meta,
+        file_size,
+        context_length,
+        false,
+    );
+    // A checkpoint offered no card is offered none of what other models give back.
+    let cards = match crate::gpu::cards_allowed() && !ask.given_back.is_empty() {
+        true => with_given_back(&offer.cards, &ask.given_back, None),
+        false => offer.cards,
+    };
+    let Some(plan) =
+        crate::inference::place::ladder::planned_rung(demand.plan(&cards), &demand, &cards, &[])
+    else {
+        return Ok(crate::inference::place::preview::refused(
+            &ask.model_id,
+            crate::inference::generic_transformer::wide_sparse_names::ARCH,
+            demand.layers,
+            file_size,
+        ));
+    };
+    Ok(crate::inference::place::preview::build(
+        crate::inference::place::preview::Facts {
+            model: &ask.model_id,
+            architecture: crate::inference::generic_transformer::wide_sparse_names::ARCH,
+            plan: &plan,
+            demand: &demand,
+            per_layer: None,
+            routed_layer_bytes: None,
+            experts_in_blocks: true,
+            weight_bytes: file_size,
+            context_length,
+            kv_format: kv_format(ask.kv_quant, false),
+        },
+        offered_by(&cards),
+    ))
+}
+
+/// The name of the cache element format `kv` builds, 16-bit when `narrow` and unquantised.
+fn kv_format(kv: KvQuant, narrow: bool) -> &'static str {
+    match kv {
+        KvQuant::Q8 => "q8_0",
+        KvQuant::Q4 => "q4_0",
+        KvQuant::Off if narrow => "f16",
+        KvQuant::Off => "f32",
+    }
+}
+
+/// What `read` makes of the placement of `model_file`, `file_len` bytes on disk, placed as
+/// `ask` says, with the model it reads and the window it serves.
+fn with_placement<T>(
+    model_file: &std::path::Path,
+    file_len: u64,
+    ask: &Ask,
+    read: impl FnOnce(&Source<'_>, &Window, &Placement) -> AnyResult<T>,
+) -> AnyResult<T> {
     let Opened {
         mmap,
         content,
@@ -159,27 +366,151 @@ fn plan_file<T>(
         split: split.is_some(),
     };
     let placement = plan(&source, &window, ask, false)?;
-    let layers = placement.layers.as_ref().ok_or_else(|| {
-        anyhow!(
-            "{} is placed whole on one device by its own loader",
-            ask.model_id
-        )
-    })?;
-    Ok(read(&source, layers, ask))
+    read(&source, &window, &placement)
 }
 
 /// The preview of the plan of `layers`.
+/// A wide residual adds the routed experts its load places in the room the plan leaves.
 fn preview_of(source: &Source<'_>, layers: &Layers, ask: &Ask) -> PlacementPreview {
     let per_layer = source
         .weights
         .layer_dense_and_expert_bytes(source.content, source.dims.num_layers)
         .filter(|_| ask.layer_share.is_none());
-    layers.preview(
+    let mut preview = layers.preview(
         &ask.model_id,
         source.arch,
         source.file_size,
         per_layer.as_deref(),
+    );
+    if let Some(sizing) = wide_sizing(source, layers, per_layer.as_deref(), ask) {
+        let outside: Vec<(usize, u64)> = match ask.context_parallel {
+            true => Vec::new(),
+            false => layers.cards.clone(),
+        };
+        preview.add_card_experts(&card_experts(&preview.devices, &outside, &sizing));
+    }
+    preview
+}
+
+/// What sizes the routed experts a wide residual places in the room its cards keep.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct WideSizing {
+    /// What a card keeps free for a request's work.
+    pub(crate) runtime_reserve: u64,
+    /// The cache of the largest layer at the working window, when the model holds every layer
+    /// of its stack and lends the cache room it leaves; `None` otherwise.
+    pub(crate) working: Option<u64>,
+    /// The routed experts of each layer that has them.
+    pub(crate) experts: usize,
+    /// The bytes of one routed expert of each layer that has them.
+    pub(crate) expert_bytes: Vec<u64>,
+}
+
+/// The sizing of the routed experts of a wide residual placed by `layers`, `None` for another
+/// model.
+fn wide_sizing(
+    source: &Source<'_>,
+    layers: &Layers,
+    per_layer: Option<&[(u64, u64)]>,
+    ask: &Ask,
+) -> Option<WideSizing> {
+    use crate::inference::generic_transformer::wide_sparse_config::WideSparseMeta;
+    if layers.experts_in_blocks || !WideSparseMeta::claims(source.content) {
+        return None;
+    }
+    let meta = WideSparseMeta::from_file(source.content).ok()?;
+    let experts = meta.mixture.routed;
+    let expert_bytes: Vec<u64> = per_layer?
+        .iter()
+        .map(|&(_, routed)| routed / experts.max(1) as u64)
+        .filter(|&b| b > 0)
+        .collect();
+    Some(WideSizing {
+        runtime_reserve: layers.demand.runtime_reserve,
+        working: ask
+            .layer_share
+            .is_none()
+            .then(|| meta.kv_bytes_per_layer(crate::inference::cache::KV_WORKING_WINDOW_TOKENS)),
+        experts,
+        expert_bytes,
+    })
+}
+
+/// The routed experts each card keeps, `(ordinal, offered, bytes)`, sized as the load sizes
+/// them.
+///
+/// A card of `devices` has the bytes it offered less its weights as free, less the cache of
+/// its layers and a request's work (`card_room`).
+/// It adds the cache room the working window leaves (`LentRoom::lendable`).
+/// A card of `outside` the plan gives no layer has its offer less a request's work.
+/// The experts then fill the rooms in ordinal order, rank by rank across the layers
+/// (`expert_variants::plan`).
+/// The heat that orders them at the load is not known before it: each layer's experts count
+/// as equal.
+pub(crate) fn card_experts(
+    devices: &[crate::inference::place::preview::DevicePreview],
+    outside: &[(usize, u64)],
+    sizing: &WideSizing,
+) -> Vec<(usize, u64, u64)> {
+    use crate::inference::generic_transformer::wide_sparse_card_tier::{card_room, LentRoom};
+    use crate::inference::place::expert_variants::{plan, Tier, VariantChoice};
+    let reserve = sizing.runtime_reserve;
+    let mut rooms: Vec<(usize, u64, u64)> = devices
+        .iter()
+        .filter(|d| d.device == "CUDA")
+        .map(|d| {
+            let offered = d.offered_bytes.unwrap_or(0);
+            let free = offered.saturating_sub(d.weight_bytes);
+            let lent = sizing.working.map_or(0, |working| {
+                LentRoom {
+                    ordinal: d.index,
+                    layers: d.layers.iter().map(|[a, b]| (b - a) as u64).sum(),
+                    reserved: d.kv_bytes,
+                    lent: 0,
+                    work: reserve,
+                }
+                .lendable(working)
+            });
+            (
+                d.index,
+                offered,
+                card_room(free, d.kv_bytes, reserve).saturating_add(lent),
+            )
+        })
+        .collect();
+    for &(ordinal, offered) in outside {
+        if !rooms.iter().any(|&(o, _, _)| o == ordinal) {
+            rooms.push((ordinal, offered, card_room(offered, 0, reserve)));
+        }
+    }
+    rooms.retain(|&(_, _, room)| room > 0);
+    rooms.sort_unstable();
+    let tiers: Vec<Tier> = rooms
+        .iter()
+        .map(|&(_, _, bytes)| Tier {
+            bytes,
+            precise: true,
+        })
+        .collect();
+    let bytes = &sizing.expert_bytes;
+    let kept = plan(
+        bytes.len(),
+        sizing.experts,
+        1,
+        &|l, _, _| bytes[l],
+        &[],
+        &tiers,
+        VariantChoice::default(),
     )
+    .kept;
+    rooms
+        .iter()
+        .zip(kept)
+        .map(|(&(ordinal, offered, _), kept)| {
+            let held = kept.iter().zip(bytes).map(|(&n, &b)| n as u64 * b).sum();
+            (ordinal, offered, held)
+        })
+        .collect()
 }
 
 /// The plan of `layers` as a choice between models reads it.
@@ -1140,29 +1471,15 @@ impl Layers {
         per_layer: Option<&[(u64, u64)]>,
     ) -> PlacementPreview {
         let Some(plan) = self.planned_rung() else {
-            return PlacementPreview {
-                model: model.to_string(),
-                architecture: arch.to_string(),
-                layers: self.demand.layers,
-                weight_bytes: file_size,
-                context_length: 0,
-                kv_format: String::new(),
-                devices: Vec::new(),
-                host: HostShare::default(),
-                warnings: Vec::new(),
-                refused: Some(
-                    "the model does not fit the allowed backends, and the host is not one of them"
-                        .to_string(),
-                ),
-            };
+            return crate::inference::place::preview::refused(
+                model,
+                arch,
+                self.demand.layers,
+                file_size,
+            );
         };
         let (kv, ctx) = self.cache_for(&plan);
-        let kv_format = match kv {
-            KvQuant::Q8 => "q8_0",
-            KvQuant::Q4 => "q4_0",
-            KvQuant::Off if self.narrow_cache => "f16",
-            KvQuant::Off => "f32",
-        };
+        let kv_format = kv_format(kv, self.narrow_cache);
         let offered = |kind: DeviceKind| match kind {
             DeviceKind::Cuda(idx) => self.cards.iter().find(|(i, _)| *i == idx).map(|(_, b)| *b),
             DeviceKind::Cpu => None,

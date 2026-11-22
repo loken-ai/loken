@@ -186,6 +186,17 @@ impl Holder for ModelHolder {
         self.keep_work();
     }
 
+    /// The conversation states are counted, shared evenly by the model's cards.
+    /// The pools, the graphs and the expert slots are not counted: their bytes are known only
+    /// once dropped.
+    fn keeps(&self, kind: Kind, card: usize) -> u64 {
+        if kind != Kind::Snapshots || !self.cards.contains(&card) {
+            return 0;
+        }
+        self.when_free(|s| Some(s.model.generic_mut()?.kv_snapshot_bytes()))
+            .map_or(0, |bytes| bytes / self.cards.len() as u64)
+    }
+
     fn give_back(&self, kind: Kind, card: usize, bytes: u64) -> bool {
         match kind {
             #[cfg(feature = "gpu")]
