@@ -806,16 +806,12 @@ pub(crate) fn plan(
         user_context_length.min(context_length) as u64
     } else {
         let full = user_context_length as u64;
-        // The plan of a wide residual holds its token mixers only.
-        // The cards then keep its other weights in the room the plan leaves.
-        let room_keeps_weights = card_mixers.is_some();
         crate::inference::place::llm::context_the_cards_hold(
             full,
             lazy_kv_initial_cap,
             &cuda_devices,
             crate::inference::place::ladder::card_bandwidth,
             window_asked,
-            room_keeps_weights,
             demand_at,
         )
     };

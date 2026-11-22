@@ -152,31 +152,20 @@ fn cards_used(demand: &Demand, cards: &[(usize, u64)]) -> usize {
 /// A block on the host and a hop between two cards cost every token.
 /// An asked context is the request's to keep.
 ///
-/// `room_keeps_weights` says the cards keep weights of the model in the room the plan leaves.
-/// Then a context nobody asked for is `floor`: a cache row past it takes room from weights a token
-/// reads, and saves nothing until a prompt fills it.
-/// A prompt longer than `floor` reloads the model with a wider window.
+/// A model whose cards keep weights in the room the plan leaves lends that room back from its
+/// cache until a sequence needs it, so a wide window costs it no weights until a prompt fills it.
 pub fn context_the_cards_hold(
     full: u64,
     floor: u64,
     cards: &[(usize, u64)],
     bandwidth: impl Fn(usize) -> Option<f64>,
     asked: bool,
-    room_keeps_weights: bool,
     demand_at: impl Fn(u64) -> Demand,
 ) -> u64 {
     if cards.is_empty() {
         return full;
     }
     let floor = floor.min(full);
-    if !asked && room_keeps_weights {
-        if floor < full {
-            tracing::info!(
-                "KV context {full} -> {floor}: nobody asked for more, and the cards keep weights a token reads in the room a larger cache would take"
-            );
-        }
-        return floor;
-    }
     let fewest = cards_used(&demand_at(floor), cards);
     // Seconds per token (bytes over GB/s) of the plan a token takes at `ctx`.
     let token = |ctx: u64| -> Option<f64> {
@@ -296,15 +285,15 @@ mod tests {
             ..demand(8, 8)
         };
         assert_eq!(
-            context_the_cards_hold(32768, 4096, &cards, |_| None, false, false, at),
+            context_the_cards_hold(32768, 4096, &cards, |_| None, false, at),
             8192
         );
         assert_eq!(
-            context_the_cards_hold(32768, 4096, &[], |_| None, false, false, at),
+            context_the_cards_hold(32768, 4096, &[], |_| None, false, at),
             32768
         );
         assert_eq!(
-            context_the_cards_hold(32768, 32768, &cards, |_| None, false, false, at),
+            context_the_cards_hold(32768, 32768, &cards, |_| None, false, at),
             32768
         );
     }
@@ -312,28 +301,14 @@ mod tests {
     /// Cards that keep weights in the room the plan leaves give a context nobody asked for no more
     /// than the floor, and keep an asked context as before.
     #[test]
-    fn a_room_that_keeps_weights_leaves_an_unasked_context_at_the_floor() {
+    fn a_floor_above_the_full_context_is_the_full_context() {
         let cards = [(0, 64 * GB)];
         let at = |ctx: u64| Demand {
             kv_bytes_per_layer: ctx * (GB / 32768),
             ..demand(8, 8)
         };
-        // The cards hold the blocks at the full context.
         assert_eq!(
-            context_the_cards_hold(131072, 4096, &cards, |_| None, false, false, at),
-            131072
-        );
-        assert_eq!(
-            context_the_cards_hold(131072, 4096, &cards, |_| None, false, true, at),
-            4096
-        );
-        assert_eq!(
-            context_the_cards_hold(131072, 4096, &cards, |_| None, true, true, at),
-            131072
-        );
-        // A floor above the full context is the full context.
-        assert_eq!(
-            context_the_cards_hold(2048, 4096, &cards, |_| None, false, true, at),
+            context_the_cards_hold(2048, 4096, &cards, |_| None, false, at),
             2048
         );
     }
@@ -349,7 +324,7 @@ mod tests {
         };
         // At 131072 the cache is 32 GB over the 8 blocks: two cards hold it, one does not.
         assert_eq!(cards_used(&at(131072), &cards), 2);
-        let held = context_the_cards_hold(131072, 4096, &cards, |_| None, false, false, at);
+        let held = context_the_cards_hold(131072, 4096, &cards, |_| None, false, at);
         assert_eq!(cards_used(&at(held), &cards), 1);
         assert!(held >= 4096 && held < 131072);
         // A model that needs two cards at the floor keeps its context.
@@ -358,7 +333,7 @@ mod tests {
             ..demand(8, 20)
         };
         assert_eq!(
-            context_the_cards_hold(8192, 4096, &cards, |_| None, false, false, big),
+            context_the_cards_hold(8192, 4096, &cards, |_| None, false, big),
             8192
         );
     }
@@ -378,7 +353,7 @@ mod tests {
             runtime_reserve: 549 * MB,
         };
         assert_eq!(cards_used(&at(65536), &cards), 2);
-        let held = context_the_cards_hold(131072, 4096, &cards, |_| None, false, false, at);
+        let held = context_the_cards_hold(131072, 4096, &cards, |_| None, false, at);
         assert_eq!(held, 32768);
         assert_eq!(cards_used(&at(held), &cards), 1);
     }
@@ -407,7 +382,7 @@ mod tests {
                 .sum::<usize>()
         };
         assert!(on_fast(131072) < on_fast(4096));
-        let held = context_the_cards_hold(131072, 4096, &cards, bandwidth, false, false, at);
+        let held = context_the_cards_hold(131072, 4096, &cards, bandwidth, false, at);
         assert!(held < 131072);
         let cost = |ctx: u64| {
             let d = at(ctx);
@@ -416,9 +391,9 @@ mod tests {
         };
         assert!(cost(held) <= cost(4096) * 1.03);
         // Without bandwidths the speeds are unknown: only the host and the card count give way.
-        assert!(context_the_cards_hold(131072, 4096, &cards, |_| None, false, false, at) >= held);
+        assert!(context_the_cards_hold(131072, 4096, &cards, |_| None, false, at) >= held);
         // An asked context is kept while every block stays on a card.
-        let asked = context_the_cards_hold(131072, 4096, &cards, bandwidth, true, false, at);
+        let asked = context_the_cards_hold(131072, 4096, &cards, bandwidth, true, at);
         assert!(asked >= held);
         assert_eq!(host_blocks(&at(asked), &cards), 0);
     }

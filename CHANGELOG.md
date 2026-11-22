@@ -22,6 +22,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 
 ### Fixed
 
+- Placement: open the window the cards hold for a model that lends its cache room.
 - Placement: keep an idle model's prompt room when another model loads on its card.
 - Serving: wait for a busy model to finish rather than load a new one around it.
 

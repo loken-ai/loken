@@ -83,7 +83,6 @@ impl ClassDemand {
                 cards,
                 bandwidth,
                 false,
-                false,
                 |n| self.at(n),
             ) as usize,
         }
