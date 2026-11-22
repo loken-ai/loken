@@ -540,7 +540,8 @@ pub(crate) async fn chat_completion_at(
     // Aider) just name a model and expect it to be served - a 404 on the
     // first request breaks them. Falls through to the 404 below only if
     // the model genuinely can't be loaded (missing weights, bad arch).
-    let load = super::admission::LoadRequest::new(state.get_effective_keep_alive(None));
+    let load = super::admission::LoadRequest::new(state.get_effective_keep_alive(None))
+        .writing(request.completion_cap().map(|n| n as u64));
     let engine = state.load_for_request(&model_name, load).await?;
 
     // The model's template with the tools in its own syntax, the caller's reasoning
@@ -1326,7 +1327,8 @@ pub(crate) async fn text_completions_at(
     );
 
     // Loaded on first use, as on the chat route.
-    let load = super::admission::LoadRequest::new(state.get_effective_keep_alive(None));
+    let load = super::admission::LoadRequest::new(state.get_effective_keep_alive(None))
+        .writing(body["max_tokens"].as_u64());
     let engine = state.load_for_request(&model_name, load).await?;
 
     // `response_format` is documented on /v1/chat/completions and several SDKs send it

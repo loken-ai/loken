@@ -1710,7 +1710,7 @@ impl APIServer {
     }
 
     async fn ensure_loaded(&self, model_id: &str, keep_alive_minutes: i64) -> Result<(), String> {
-        self.ensure_loaded_with_window(model_id, keep_alive_minutes, None)
+        self.ensure_loaded_with_window(model_id, keep_alive_minutes, None, None)
             .await
     }
 
@@ -1723,15 +1723,26 @@ impl APIServer {
     ///
     /// Bounded by what the checkpoint declares, as the widening path is: a model cannot
     /// open a window past its own.
+    ///
+    /// `max_tokens` is what the request that asks for the model may write, `None` for a load
+    /// no request asks for.
+    /// A loaded model that a load in full serves faster loads again, as [`Self::replace_in_full`]
+    /// prices it.
     pub(crate) async fn ensure_loaded_with_window(
         &self,
         model_id: &str,
         keep_alive_minutes: i64,
         window: Option<usize>,
+        max_tokens: Option<u64>,
     ) -> Result<(), String> {
         // Fast path: already loaded, and still able to serve.
+        // A model unloaded for a load in full opens the window it held again.
+        let mut window = window;
         if self.engine_serves(model_id).await {
-            return Ok(());
+            match self.replace_in_full(model_id, Some(max_tokens)).await {
+                None => return Ok(()),
+                Some(held) => window = window.or((held > 0).then_some(held)),
+            }
         }
         let lock = self.loading_lock(model_id).await;
         let _g = lock.lock().await;
@@ -1766,7 +1777,7 @@ impl APIServer {
         // Resident language models stay while the cards hold the incoming one too; the
         // least recently used go first when they would push it off the cards.
         let per_card = self.model_load_reserve(model_id, &config);
-        self.evict_to_make_room(model_id, hot, per_card, &config)
+        self.evict_to_make_room(model_id, hot, per_card, &config, max_tokens)
             .await;
         self.evict_for_host_room(model_id).await;
         if hot > 0 {
@@ -1929,6 +1940,8 @@ impl APIServer {
         let mut entry =
             LoadedModelEntry::new(model_id.to_string(), engine, Some(keep_alive_minutes))
                 .with_replicas(replicas);
+        // The plan of the load is priced again once the other models change.
+        entry.priced = std::sync::Mutex::new(Some(model_manager::neighbours(&engines, model_id)));
         entry.expire_handle = expire_handle;
         entry.chat_format = Some(chat_format);
         engines.push(entry);

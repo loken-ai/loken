@@ -5,7 +5,7 @@
 use super::*;
 
 /// How an Ollama request wants its model loaded: the window `options.num_ctx` asks for, if
-/// it asks for one.
+/// it asks for one, and the tokens `options.num_predict` bounds the answer to.
 pub(super) fn ollama_load_request(
     state: &APIServer,
     options: Option<&serde_json::Value>,
@@ -16,6 +16,9 @@ pub(super) fn ollama_load_request(
             .and_then(|o| o.get("num_ctx"))
             .and_then(serde_json::Value::as_u64)
             .map(|v| v as usize),
+        max_tokens: options
+            .and_then(|o| o.get("num_predict"))
+            .and_then(serde_json::Value::as_u64),
         ..crate::api::handlers::admission::LoadRequest::new(
             state.get_effective_keep_alive(keep_alive),
         )
@@ -219,7 +222,7 @@ pub(crate) async fn ollama_chat(
             )
             .window;
             state
-                .ensure_loaded_with_window(&model_name, keep_alive_minutes, window)
+                .ensure_loaded_with_window(&model_name, keep_alive_minutes, window, None)
                 .await
                 .map_err(|e| ApiError::Internal(format!("load {model_name}: {e}")))?;
 
@@ -1068,7 +1071,7 @@ pub(crate) async fn ollama_generate(
             let mut load_successful = false;
             let mut load_error = String::new();
             match state
-                .ensure_loaded_with_window(&model_name, keep_alive_minutes, window)
+                .ensure_loaded_with_window(&model_name, keep_alive_minutes, window, None)
                 .await
             {
                 Ok(()) => {

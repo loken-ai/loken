@@ -378,6 +378,9 @@ pub(crate) struct LoadedModelEntry {
     sent: std::sync::Mutex<Vec<std::time::Instant>>,
     /// The copy the last request went to.
     last: std::sync::atomic::AtomicUsize,
+    /// The other models and whether each was busy, when a load in full of this one was last
+    /// priced or when it loaded; `None` before either.
+    pub(crate) priced: std::sync::Mutex<Option<Vec<(String, bool)>>>,
 }
 
 /// How long a copy counts as taken after a request was sent to it, before the request has
@@ -412,6 +415,7 @@ impl LoadedModelEntry {
             gate: crate::api::gate::RequestGate::new(1),
             sent: std::sync::Mutex::new(Vec::new()),
             last: std::sync::atomic::AtomicUsize::new(0),
+            priced: std::sync::Mutex::new(None),
         }
     }
 
@@ -488,6 +492,17 @@ impl LoadedModelEntry {
     }
 }
 
+/// The models of `engines` other than `model_id`, by name, each with whether it serves a request.
+pub(crate) fn neighbours(engines: &[LoadedModelEntry], model_id: &str) -> Vec<(String, bool)> {
+    let mut out: Vec<(String, bool)> = engines
+        .iter()
+        .filter(|e| e.model_id != model_id)
+        .map(|e| (e.model_id.clone(), e.busy()))
+        .collect();
+    out.sort();
+    out
+}
+
 /// Seconds until the requests running on `copies` are expected to end, `None` when a copy cannot
 /// say.
 pub(crate) fn expected_end_of(copies: &[Arc<LlmEngine>]) -> Option<f64> {
@@ -502,19 +517,36 @@ fn load_secs(model_id: &str) -> Option<f64> {
     (secs.is_finite() && secs > 0.0).then_some(secs)
 }
 
+/// The tokens a request writes: its `max_tokens`, else `mean`, the mean of the model's answers,
+/// else `expected`, the tokens the rate meter expects; `None` when none is known.
+pub(crate) fn request_tokens(
+    max_tokens: Option<u64>,
+    mean: Option<f64>,
+    expected: u32,
+) -> Option<f64> {
+    // The token limit bounds an answer: the mean length, when known, is what it writes.
+    max_tokens
+        .map(|n| mean.map_or(n as f64, |m| m.min(n as f64)))
+        .or(mean)
+        .or_else(|| (expected > 0).then_some(expected as f64))
+}
+
 /// `busy`, the figures of a busy model, with those of the incoming model `incoming_id` loaded
 /// with `config`: what its earlier loads and answers measured, and the plan it would build now
 /// beside the resident models.
+/// The request's `max_tokens` gives the tokens it writes.
 async fn incoming_figures(
     incoming_id: &str,
     config: &crate::inference::engine::llm_engine::InferenceConfig,
     busy: ShareInputs,
+    max_tokens: Option<u64>,
 ) -> ShareInputs {
     let kept = crate::inference::engine::llm_engine::Pace::load(incoming_id).unwrap_or_default();
-    let tokens_b = kept.mean_answer_tokens().or_else(|| {
-        let tokens = crate::distributed::rate_meter::expected_output_tokens(incoming_id);
-        (tokens > 0).then_some(tokens as f64)
-    });
+    let tokens_b = request_tokens(
+        max_tokens,
+        kept.mean_answer_tokens(),
+        crate::distributed::rate_meter::expected_output_tokens(incoming_id),
+    );
     let dry = LlmEngine::with_config(config.clone()).dry_plan().await;
     if let Err(e) = &dry {
         info!("⚖️  {incoming_id}: no plan beside the busy models ({e})");
@@ -531,8 +563,7 @@ async fn incoming_figures(
         rate_b: kept.decode_tok_s(),
         rate_b_beside: dry
             .as_ref()
-            .and_then(|d| d.predicted_tok_s)
-            .and_then(|p| kept.rate_on(p)),
+            .and_then(|d| kept.rate_on(d.predicted_tok_s, Some(&d.signature))),
         beside_on_cards: dry.as_ref().is_some_and(|d| d.on_cards),
         shares_card,
         ..busy
@@ -671,6 +702,106 @@ pub(crate) fn choose_share(i: &ShareInputs) -> ShareChoice {
     ShareChoice { costs, choice }
 }
 
+/// What the choice to load an idle model B again in full reads.
+/// Seconds, tokens and tokens per second, each `None` when it is not measured.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ReplaceInputs {
+    /// Seconds a load of B takes.
+    pub(crate) load_b: Option<f64>,
+    /// B's decode rate on the plan it holds.
+    pub(crate) rate_now: Option<f64>,
+    /// B's decode rate on the plan a load in full builds.
+    pub(crate) rate_full: Option<f64>,
+    /// Tokens the request on its way to B writes, `None` when no request is on its way.
+    pub(crate) tokens_arriving: Option<f64>,
+    /// Mean tokens of B's answers.
+    pub(crate) tokens_b: Option<f64>,
+    /// Mean seconds between 2 requests of B.
+    pub(crate) gap_b: Option<f64>,
+    /// Seconds until B's keep-alive ends, infinite when B stays loaded.
+    pub(crate) keep_left: f64,
+    /// The idle models a load in full may evict: their load seconds and mean gap between
+    /// requests.
+    pub(crate) evicted: Vec<(Option<f64>, Option<f64>)>,
+}
+
+impl Default for ReplaceInputs {
+    fn default() -> Self {
+        Self {
+            load_b: None,
+            rate_now: None,
+            rate_full: None,
+            tokens_arriving: None,
+            tokens_b: None,
+            gap_b: None,
+            keep_left: 0.0,
+            evicted: Vec::new(),
+        }
+    }
+}
+
+/// The load in full priced: its cost and its gain in seconds, the requests the gain counts, and
+/// the choice.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct ReplaceChoice {
+    pub(crate) cost: Option<f64>,
+    pub(crate) gain: Option<f64>,
+    pub(crate) requests: Option<f64>,
+    pub(crate) replace: bool,
+}
+
+/// The choice to load idle model B again in full, or to keep the plan it holds.
+///
+/// The load costs `L_B`.
+/// Each request gains `n_B * (1/r_B' - 1/r_B)`: `r_B'` is the rate on the plan B holds and `r_B`
+/// the rate on the plan in full.
+/// The requests are the one on its way, with its own tokens, and `K / g_B` more of `n_B` tokens:
+/// `K` is the keep-alive B has left and `g_B` the mean gap between its requests.
+/// An unknown `g_B` counts the request on its way alone.
+/// Each idle model X the load may evict adds `q_X * L_X`, as the wait and evict cost does:
+/// `q_X = min(1, K / g_X)` is the chance X is asked again while B holds the cards.
+/// An unknown `g_X` counts `q_X` as 1, an unknown `L_X` as 0.
+/// B loads again when the gain exceeds the cost.
+/// An unknown cost, rate or count of requests keeps B where it is.
+pub(crate) fn choose_replace(i: &ReplaceInputs) -> ReplaceChoice {
+    let fine = |v: Option<f64>| v.filter(|v| v.is_finite() && *v >= 0.0);
+    let rate = |v: Option<f64>| v.filter(|v| v.is_finite() && *v > 0.0);
+    let reloads: f64 = i
+        .evicted
+        .iter()
+        .map(|(load, gap)| {
+            let q = rate(*gap).map_or(1.0, |gap| (i.keep_left.max(0.0) / gap).min(1.0));
+            q * fine(*load).unwrap_or(0.0)
+        })
+        .sum();
+    let cost = fine(i.load_b).map(|load| load + reloads);
+    let saved = rate(i.rate_now)
+        .zip(rate(i.rate_full))
+        .map(|(now, full)| (1.0 / now - 1.0 / full).max(0.0));
+    let arriving = fine(i.tokens_arriving);
+    let later = rate(i.gap_b)
+        .zip(rate(i.tokens_b))
+        .map(|(gap, tokens)| (i.keep_left.max(0.0) / gap, tokens));
+    let requests = match (arriving, later) {
+        (None, None) => None,
+        (a, l) => Some(f64::from(u8::from(a.is_some())) + l.map_or(0.0, |(r, _)| r)),
+    };
+    let tokens = match (arriving, later) {
+        (None, None) => None,
+        (a, l) => Some(a.unwrap_or(0.0) + l.map_or(0.0, |(r, n)| r * n)),
+    };
+    let gain = saved
+        .zip(tokens)
+        .map(|(s, t)| if s > 0.0 && t > 0.0 { s * t } else { 0.0 });
+    let replace = matches!((gain, cost), (Some(g), Some(c)) if g > c);
+    ReplaceChoice {
+        cost,
+        gain,
+        requests,
+        replace,
+    }
+}
+
 /// Waits `period`, then until no request runs on the model, and returns the engine list locked.
 /// A model is idle when no request runs on it: a prompt read for minutes keeps the model, and
 /// the wait starts over once the request is done.
@@ -766,6 +897,8 @@ impl APIServer {
     /// to several, or partly to the host, because that card was full when it loaded. One pass
     /// at a time; a model serving a request is never moved, and one that gets a request while
     /// it reloads waits for the load like any cold request.
+    /// A model no card serves better loads again in full when [`Self::replace_in_full`] finds
+    /// that it pays.
     pub(crate) async fn migrate_idle_models(&self) {
         static MIGRATING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
         let Ok(_one_pass) = MIGRATING.try_lock() else {
@@ -815,9 +948,199 @@ impl APIServer {
                 break;
             }
             if !moved {
+                let idle: Vec<(String, i64)> = {
+                    let engines = self.engines.read().await;
+                    engines
+                        .iter()
+                        .filter(|e| !e.busy())
+                        .map(|e| {
+                            let keep_alive =
+                                e.keep_alive_minutes.unwrap_or(self.default_keep_alive);
+                            // The load in full keeps what was left of the keep-alive.
+                            let idle_minutes = (now_millis() - e.last_used.load(Ordering::Relaxed))
+                                .max(0)
+                                / 60_000;
+                            let left = match keep_alive {
+                                k if k < 0 => k,
+                                k => (k - idle_minutes).max(1),
+                            };
+                            (e.model_id.clone(), left)
+                        })
+                        .collect()
+                };
+                for (model_id, keep_alive) in idle {
+                    let Some(window) = self.replace_in_full(&model_id, None).await else {
+                        continue;
+                    };
+                    let window = (window > 0).then_some(window);
+                    if let Err(e) = self
+                        .ensure_loaded_with_window(&model_id, keep_alive, window, None)
+                        .await
+                    {
+                        warn!("⚖️  {model_id} could not be loaded again in full: {e}");
+                    }
+                    moved = true;
+                    break;
+                }
+            }
+            if !moved {
                 return;
             }
         }
+    }
+
+    /// Unloads `model_id` when a load of it in full pays, priced by [`choose_replace`]; returns
+    /// the window it held then, for the load in full to open again, or `None` when it stays.
+    ///
+    /// `arriving` holds the `max_tokens` of a request on its way to the model, `None` when no
+    /// request is on its way.
+    /// The plan in full is the plan a load builds once the model and the idle models give back
+    /// what they hold on the cards.
+    /// A load unloads the idle models whose room it needs.
+    /// It is priced only when the other models or their requests changed since the model loaded
+    /// or was last priced, and only while no request runs on the model.
+    /// A model with copies on other cards is whole on its card and stays.
+    pub(crate) async fn replace_in_full(
+        &self,
+        model_id: &str,
+        arriving: Option<Option<u64>>,
+    ) -> Option<usize> {
+        let (engine, state, given_back, keep_left, idle, holders) = {
+            let engines = self.engines.read().await;
+            let entry = engines.iter().find(|e| e.model_id == model_id)?;
+            if entry.busy() || !entry.replicas.is_empty() {
+                return None;
+            }
+            let state = neighbours(&engines, model_id);
+            if entry
+                .priced
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+                == Some(&state)
+            {
+                return None;
+            }
+            // A plan whole on one card with nothing on the host is already in full.
+            match entry.engine.pace().plan() {
+                Some(plan) if plan.host_bytes > 0 || plan.cards.len() > 1 => {}
+                _ => return None,
+            }
+            let mut given_back = entry.engine.pace().held();
+            let mut idle: Vec<(Vec<usize>, Option<f64>, Option<f64>)> = Vec::new();
+            for other in engines
+                .iter()
+                .filter(|e| e.model_id != model_id && !e.busy())
+            {
+                let cards = other
+                    .copies()
+                    .into_iter()
+                    .flat_map(|copy| copy.pace().held().into_iter().map(|(card, _)| card))
+                    .collect();
+                idle.push((
+                    cards,
+                    load_secs(&other.model_id),
+                    other.engine.pace().mean_gap_secs(),
+                ));
+                for copy in other.copies() {
+                    for (card, bytes) in copy.pace().held() {
+                        match given_back.iter_mut().find(|(c, _)| *c == card) {
+                            Some(held) => held.1 = held.1.saturating_add(bytes),
+                            None => given_back.push((card, bytes)),
+                        }
+                    }
+                }
+            }
+            let keep_alive = entry.keep_alive_minutes.unwrap_or(self.default_keep_alive);
+            let idle_secs =
+                (now_millis() - entry.last_used.load(Ordering::Relaxed)).max(0) as f64 / 1000.0;
+            let keep_left = match (keep_alive, arriving) {
+                (k, _) if k < 0 => f64::INFINITY,
+                // The request on its way starts the keep-alive again.
+                (k, Some(_)) => (k * 60) as f64,
+                (k, None) => ((k * 60) as f64 - idle_secs).max(0.0),
+            };
+            (
+                entry.engine.clone(),
+                state,
+                given_back,
+                keep_left,
+                idle,
+                // The holders of the engine now, this function's own copy included.
+                Arc::strong_count(&entry.engine),
+            )
+        };
+        let full = match engine.dry_plan_given(given_back).await {
+            Ok(full) => full,
+            Err(e) => {
+                tracing::debug!("⚖️  {model_id}: no plan in full ({e})");
+                return None;
+            }
+        };
+        if let Some(entry) = self
+            .engines
+            .read()
+            .await
+            .iter()
+            .find(|e| e.model_id == model_id)
+        {
+            *entry.priced.lock().unwrap_or_else(|e| e.into_inner()) = Some(state);
+        }
+        let pace = engine.pace();
+        let kept = pace.kept();
+        let plan = pace.plan();
+        let mean = kept.mean_answer_tokens();
+        let expected = crate::distributed::rate_meter::expected_output_tokens(model_id);
+        let inputs = ReplaceInputs {
+            load_b: load_secs(model_id),
+            rate_now: kept.rate_on(kept.planned_tok_s, plan.as_ref()),
+            rate_full: kept.rate_on(full.predicted_tok_s, Some(&full.signature)),
+            tokens_arriving: arriving.and_then(|max| request_tokens(max, mean, expected)),
+            tokens_b: request_tokens(None, mean, expected),
+            gap_b: pace.mean_gap_secs(),
+            keep_left,
+            // The idle models on the cards the plan in full uses may give their room to it.
+            evicted: idle
+                .into_iter()
+                .filter(|(cards, _, _)| cards.iter().any(|c| full.cards.contains(c)))
+                .map(|(_, load, gap)| (load, gap))
+                .collect(),
+        };
+        let choice = choose_replace(&inputs);
+        info!(
+            "⚖️  {model_id} in full: load {}, gain {} over {} requests at {} now and {} in full \
+             ({} MB on the host now, {} MB in full): {}",
+            seconds(choice.cost),
+            seconds(choice.gain),
+            choice
+                .requests
+                .map_or_else(|| "unknown".to_string(), |r| format!("{r:.1}")),
+            rate(inputs.rate_now),
+            rate(inputs.rate_full),
+            plan.as_ref().map_or(0, |p| p.host_bytes >> 20),
+            full.signature.host_bytes >> 20,
+            if choice.replace { "load again" } else { "keep" }
+        );
+        if !choice.replace {
+            return None;
+        }
+        let lock = self.loading_lock(model_id).await;
+        let _g = lock.lock().await;
+        let window = engine.config().context_length;
+        drop(engine);
+        // A request that took the engine since the pricing holds one more copy of it, before
+        // the engine counts it as running: the model stays for it.
+        let busy = {
+            let engines = self.engines.read().await;
+            engines
+                .iter()
+                .find(|e| e.model_id == model_id)
+                .is_none_or(|e| e.busy() || Arc::strong_count(&e.engine) >= holders)
+        };
+        if busy {
+            return None;
+        }
+        matches!(self.unload_model(model_id).await, Ok(UnloadOutcome::Freed)).then_some(window)
     }
 
     /// Reset model expiration timer (called on each use, like Ollama).
@@ -1237,12 +1560,14 @@ impl APIServer {
     ///
     /// `per_card` is what the load keeps free on each card it uses beyond the weights: the
     /// KV cache, workspaces and staging the loader reserves.
+    /// `max_tokens` is what the request that asks for the incoming model may write.
     pub(crate) async fn evict_to_make_room(
         &self,
         incoming_id: &str,
         need: u64,
         per_card: u64,
         config: &crate::inference::engine::llm_engine::InferenceConfig,
+        max_tokens: Option<u64>,
     ) {
         let mut tried: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut waited: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -1322,7 +1647,7 @@ impl APIServer {
                     }
                     return;
                 };
-                let inputs = incoming_figures(incoming_id, config, figures).await;
+                let inputs = incoming_figures(incoming_id, config, figures, max_tokens).await;
                 let choice = choose_share(&inputs);
                 let [wait_evict, beside, wait] = choice.costs.map(seconds);
                 info!(
@@ -2052,6 +2377,160 @@ mod tests {
         ] {
             assert_ne!(choose_share(&unknown).choice, Share::Beside, "{unknown:?}");
         }
+    }
+
+    /// B of the F36 measure, left beside A: 38 tok/s on its plan, 96 tok/s in full, a load of
+    /// 7 s, answers of 16 tokens, a request every 60 s and 5 minutes of keep-alive left.
+    fn beside_b() -> ReplaceInputs {
+        ReplaceInputs {
+            load_b: Some(7.0),
+            rate_now: Some(38.0),
+            rate_full: Some(96.0),
+            tokens_b: Some(16.0),
+            gap_b: Some(60.0),
+            keep_left: 300.0,
+            ..ReplaceInputs::default()
+        }
+    }
+
+    /// B loads again in full when the requests it expects gain more than the load costs.
+    #[test]
+    fn b_loads_again_when_the_gain_exceeds_the_load() {
+        // 5 requests of 16 tokens gain 5 * 16 * (1/38 - 1/96) = 1.3 s: less than 7 s.
+        let short = choose_replace(&beside_b());
+        assert!(!short.replace, "{short:?}");
+        assert!((short.requests.unwrap() - 5.0).abs() < 1e-9);
+        let gain = 5.0 * 16.0 * (1.0 / 38.0 - 1.0 / 96.0);
+        assert!((short.gain.unwrap() - gain).abs() < 1e-9);
+        // Answers of 512 tokens gain 40 s.
+        let long = choose_replace(&ReplaceInputs {
+            tokens_b: Some(512.0),
+            ..beside_b()
+        });
+        assert!(long.replace, "{long:?}");
+        // A request on its way of 2048 tokens gains 34 s alone.
+        let arriving = choose_replace(&ReplaceInputs {
+            tokens_arriving: Some(2048.0),
+            gap_b: None,
+            ..beside_b()
+        });
+        assert!(arriving.replace, "{arriving:?}");
+        assert_eq!(arriving.requests, Some(1.0));
+        // A model kept loaded for ever loads again as soon as the plan in full is faster.
+        let forever = choose_replace(&ReplaceInputs {
+            keep_left: f64::INFINITY,
+            ..beside_b()
+        });
+        assert!(forever.replace, "{forever:?}");
+        // A plan in full no faster gains nothing.
+        let same = choose_replace(&ReplaceInputs {
+            rate_full: Some(38.0),
+            keep_left: f64::INFINITY,
+            ..beside_b()
+        });
+        assert_eq!(same.gain, Some(0.0));
+        assert!(!same.replace);
+    }
+
+    /// An unknown load, rate or count of requests keeps B where it is.
+    /// An idle model the load in full evicts adds its reload, weighed by the chance it is
+    /// asked again while B holds the cards.
+    #[test]
+    fn an_evicted_idle_model_adds_its_reload() {
+        let base = ReplaceInputs {
+            load_b: Some(10.0),
+            rate_now: Some(40.0),
+            rate_full: Some(100.0),
+            tokens_arriving: Some(1000.0),
+            keep_left: 300.0,
+            ..Default::default()
+        };
+        // 1000 tokens save 1000 * (1/40 - 1/100) = 15 s against a load of 10 s.
+        assert!(choose_replace(&base).replace);
+        // An idle model asked every 100 s is asked again within 300 s: its 20 s reload count.
+        let busy_neighbour = ReplaceInputs {
+            evicted: vec![(Some(20.0), Some(100.0))],
+            ..base.clone()
+        };
+        assert_eq!(choose_replace(&busy_neighbour).cost, Some(30.0));
+        assert!(!choose_replace(&busy_neighbour).replace);
+        // One asked every 3000 s counts a tenth of its reload.
+        let rare = ReplaceInputs {
+            evicted: vec![(Some(20.0), Some(3000.0))],
+            ..base
+        };
+        assert_eq!(choose_replace(&rare).cost, Some(12.0));
+        assert!(choose_replace(&rare).replace);
+    }
+
+    #[test]
+    fn an_unknown_input_keeps_b_where_it_is() {
+        let known = ReplaceInputs {
+            tokens_b: Some(512.0),
+            ..beside_b()
+        };
+        assert!(choose_replace(&known).replace);
+        for unknown in [
+            ReplaceInputs {
+                load_b: None,
+                ..known.clone()
+            },
+            ReplaceInputs {
+                rate_now: None,
+                ..known.clone()
+            },
+            ReplaceInputs {
+                rate_full: Some(f64::NAN),
+                ..known.clone()
+            },
+            ReplaceInputs {
+                gap_b: None,
+                ..known.clone()
+            },
+            ReplaceInputs {
+                tokens_b: None,
+                ..known.clone()
+            },
+        ] {
+            assert!(!choose_replace(&unknown).replace, "{unknown:?}");
+        }
+        assert_eq!(choose_replace(&ReplaceInputs::default()).requests, None);
+    }
+
+    /// The tokens of a request are its `max_tokens`, else the mean of the model's answers, else
+    /// what the rate meter expects.
+    #[test]
+    fn the_request_max_tokens_comes_before_the_mean() {
+        // A token limit bounds the answer: the mean length, when known, is what it writes.
+        assert_eq!(request_tokens(Some(2048), Some(16.0), 40), Some(16.0));
+        assert_eq!(request_tokens(Some(8), Some(16.0), 40), Some(8.0));
+        assert_eq!(request_tokens(Some(2048), None, 40), Some(2048.0));
+        assert_eq!(request_tokens(None, Some(16.0), 40), Some(16.0));
+        assert_eq!(request_tokens(None, None, 40), Some(40.0));
+        assert_eq!(request_tokens(None, None, 0), None);
+        // A request's bound reaches the choice as the tokens B writes.
+        let inputs = ShareInputs {
+            tokens_b: request_tokens(Some(8), Some(16.0), 0),
+            ..f36()
+        };
+        assert_eq!(inputs.tokens_b, Some(8.0));
+    }
+
+    /// A load records the other models and their requests, so that it is priced again once they
+    /// change.
+    #[test]
+    fn the_neighbours_name_the_other_models_and_their_requests() {
+        let engine = || {
+            Arc::new(LlmEngine::with_config(
+                crate::inference::engine::llm_engine::InferenceConfig::default(),
+            ))
+        };
+        let engines = vec![
+            LoadedModelEntry::new("b".to_string(), engine(), Some(1)),
+            LoadedModelEntry::new("a".to_string(), engine(), Some(1)),
+        ];
+        assert_eq!(neighbours(&engines, "b"), vec![("a".to_string(), false)]);
+        assert_eq!(neighbours(&engines, "c").len(), 2);
     }
 
     /// A refused request is told to come back when the model's running requests end, never

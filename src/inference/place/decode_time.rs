@@ -134,6 +134,54 @@ impl Demand {
     }
 }
 
+/// What tells 2 plans of a model apart for its decode rate: the cards it runs on and the weight
+/// bytes it keeps on the host.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PlanSignature {
+    /// The cards of the plan, in the plan's order.
+    pub cards: Vec<usize>,
+    /// Weight bytes the host holds: the blocks it runs, the head with them, and the routed
+    /// experts kept apart from a layer on a card.
+    pub host_bytes: u64,
+}
+
+impl Demand {
+    /// The weight bytes `plan` keeps on the host, counted as [`Demand::decode_secs`] counts them.
+    ///
+    /// A block on the host holds its bytes.
+    /// The head is on the host when the last block is.
+    /// A layer on a card from `routed.apart_from` on leaves its routed experts on the host.
+    pub fn host_bytes(&self, plan: &HeteroPlan, routed: Option<&RoutedSets>) -> u64 {
+        let per_layer = self.block_bytes / self.layers.max(1) as u64;
+        let mut bytes = 0u64;
+        for segment in &plan.segments {
+            let layers = segment.num_layers() as u64;
+            match segment.kind {
+                DeviceKind::Cpu => bytes = bytes.saturating_add(per_layer.saturating_mul(layers)),
+                _ => {
+                    if let Some(r) = routed {
+                        let apart =
+                            (segment.layer_start.max(r.apart_from)..segment.layer_end).len() as u64;
+                        bytes = bytes.saturating_add(r.layer_bytes.saturating_mul(apart));
+                    }
+                }
+            }
+        }
+        if plan.segments.last().map(|s| s.kind) == Some(DeviceKind::Cpu) {
+            bytes = bytes.saturating_add(self.head_bytes);
+        }
+        bytes
+    }
+
+    /// The signature of `plan`.
+    pub fn signature(&self, plan: &HeteroPlan, routed: Option<&RoutedSets>) -> PlanSignature {
+        PlanSignature {
+            cards: super::ladder::cards_of(plan),
+            host_bytes: self.host_bytes(plan, routed),
+        }
+    }
+}
+
 /// `secs`, an estimate of a plan of a model, scaled by the rate the engine measured on the
 /// placement it loaded: `loaded_secs` is the estimate of that placement and `loaded_tok_s` the
 /// decode rate measured on it.
@@ -209,6 +257,38 @@ mod tests {
         // A card whose bandwidth is not known gives no estimate.
         let unknown = plan(vec![segment(DeviceKind::Cuda(2), 0, 10)], None);
         assert_eq!(d.decode_secs(&unknown, &card, &host, None), None);
+    }
+
+    /// The host bytes of a plan count its host blocks, the head after them, and the routed
+    /// experts a card layer keeps on the host.
+    #[test]
+    fn the_signature_counts_the_weights_the_host_holds() {
+        let d = Demand {
+            layers: 10,
+            block_bytes: 10 * GB,
+            head_bytes: GB,
+            ..Demand::default()
+        };
+        let spilled = plan(
+            vec![
+                segment(DeviceKind::Cuda(1), 0, 6),
+                segment(DeviceKind::Cpu, 6, 10),
+            ],
+            None,
+        );
+        assert_eq!(
+            d.signature(&spilled, None),
+            PlanSignature {
+                cards: vec![1],
+                host_bytes: 5 * GB,
+            }
+        );
+        let full = plan(vec![segment(DeviceKind::Cuda(0), 0, 10)], None);
+        assert_eq!(d.host_bytes(&full, None), 0);
+        let (d, experts) = mixture();
+        let apart = plan(vec![segment(DeviceKind::Cuda(0), 0, 4)], Some(1));
+        let sets = RoutedSets::on(&apart, experts, true, None);
+        assert_eq!(d.host_bytes(&apart, Some(&sets)), 3 * experts.bytes);
     }
 
     /// Blocks on the host cost their bytes over the host's bandwidth, the head with them.

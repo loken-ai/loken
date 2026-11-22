@@ -28,6 +28,9 @@ pub(crate) struct Ask {
     pub(crate) layer_share: Option<(usize, usize)>,
     /// What one prefill row was measured to keep live on a card, 0 before any measure.
     pub(crate) prefill_row_bytes: u64,
+    /// Bytes each card offers on top of its free memory: what models unloaded before the load
+    /// give back there.
+    pub(crate) given_back: Vec<(usize, u64)>,
 }
 
 impl LlmEngine {
@@ -46,6 +49,7 @@ impl LlmEngine {
             prefill_row_bytes: self
                 .prefill_row_bytes
                 .load(std::sync::atomic::Ordering::Relaxed),
+            given_back: Vec::new(),
         }
     }
 
@@ -63,8 +67,34 @@ impl LlmEngine {
         self.plan_now(dry_plan_of).await
     }
 
+    /// The plan a load of this engine's model would build once the bytes `given_back` holds
+    /// for each card are free there, as [`Self::dry_plan`] reads it.
+    ///
+    /// It does not wait for a load that runs: it answers an error then.
+    pub async fn dry_plan_given(&self, given_back: Vec<(usize, u64)>) -> Result<DryPlan, String> {
+        let Some(admission) = crate::inference::place::vram_manager::try_load_admission() else {
+            return Err("a load runs".to_string());
+        };
+        let ask = Ask {
+            given_back,
+            ..self.placement_ask()
+        };
+        self.plan_with(ask, dry_plan_of, Some(admission)).await
+    }
+
     /// What `read` reports of the plan a load of this engine's model would build now.
     async fn plan_now<T: Send + 'static>(&self, read: Report<T>) -> Result<T, String> {
+        self.plan_with(self.placement_ask(), read, None).await
+    }
+
+    /// What `read` reports of the plan a load as `ask` asks would build now.
+    /// It runs under `admission`, else under the load admission it waits for.
+    async fn plan_with<T: Send + 'static>(
+        &self,
+        ask: Ask,
+        read: Report<T>,
+        admission: Option<tokio::sync::MutexGuard<'static, ()>>,
+    ) -> Result<T, String> {
         let model_id = self.config.model_id.clone();
         let model_file = self
             .find_model_file(&model_id)
@@ -83,11 +113,13 @@ impl LlmEngine {
                 "{model_id} is not placed by layers through the language model route"
             ));
         }
-        let ask = self.placement_ask();
         let file_len = std::fs::metadata(&model_file)
             .map_err(|e| format!("{}: {e}", model_file.display()))?
             .len();
-        let _admission = crate::inference::place::vram_manager::load_admission().await;
+        let _admission = match admission {
+            Some(held) => held,
+            None => crate::inference::place::vram_manager::load_admission().await,
+        };
         tokio::task::spawn_blocking(move || plan_file(&model_file, file_len, &ask, read))
             .await
             .map_err(|e| e.to_string())?
@@ -166,6 +198,38 @@ fn dry_plan_of(_: &Source<'_>, layers: &Layers, _: &Ask) -> DryPlan {
         on_cards: !on_host,
         cards: crate::inference::place::ladder::cards_of(&plan),
         predicted_tok_s: layers.decode_secs(&plan).map(|secs| 1.0 / secs),
+        signature: layers.signature(&plan),
+    }
+}
+
+/// `cards` with the bytes `given_back` holds added to each card's offer.
+/// A card that offered nothing joins the cards, ranked by speed, the pinned card `pin` first.
+fn with_given_back(
+    cards: &[(usize, u64)],
+    given_back: &[(usize, u64)],
+    pin: Option<usize>,
+) -> Vec<(usize, u64)> {
+    let mut out = cards.to_vec();
+    let mut joined = false;
+    for &(card, bytes) in given_back {
+        if pin.is_some_and(|p| p != card) {
+            continue;
+        }
+        match out.iter_mut().find(|(idx, _)| *idx == card) {
+            Some(entry) => entry.1 = entry.1.saturating_add(bytes),
+            None if bytes > 0 => {
+                out.push((card, bytes));
+                joined = true;
+            }
+            None => {}
+        }
+    }
+    match joined {
+        true => crate::inference::place::ladder::prefer(
+            &crate::inference::place::ladder::fastest_first(&out),
+            pin,
+        ),
+        false => out,
     }
 }
 
@@ -178,6 +242,8 @@ pub struct DryPlan {
     pub cards: Vec<usize>,
     /// The decode rate the plan's estimate predicts, `None` when the estimate cannot say.
     pub predicted_tok_s: Option<f64>,
+    /// The cards the plan uses and the weight bytes it keeps on the host.
+    pub signature: crate::inference::place::decode_time::PlanSignature,
 }
 
 /// A model's header and its weights, as the cards will hold them.
@@ -585,8 +651,13 @@ pub(crate) fn plan(
         )
     };
     crate::inference::place::device_probe::debug_vram_by_card("after-offer");
+    // A model offered no card is offered none of what other models give back.
+    let offered = match ask.given_back.is_empty() || ask.cards_off || host_only.is_some() {
+        true => offer.cards.clone(),
+        false => with_given_back(&offer.cards, &ask.given_back, ask.pin),
+    };
     let cuda_devices: Vec<(usize, u64)> = beside_the_tower(
-        offer.cards.clone(),
+        offered,
         crate::inference::generic_transformer::splices_vision_tower(content, arch)
             .then(|| crate::inference::model::qwen35::vision::card_bytes(content)),
     );
@@ -1012,17 +1083,33 @@ impl Layers {
         )
     }
 
-    /// Seconds a decoded token is estimated to take on `plan`, `None` when the estimate cannot
-    /// say.
-    pub(crate) fn decode_secs(&self, plan: &HeteroPlan) -> Option<f64> {
-        let sets = self.routed.map(|r| {
+    /// The routed sets of the layers on `plan`, with no measure of a set.
+    fn routed_sets(
+        &self,
+        plan: &HeteroPlan,
+    ) -> Option<crate::inference::place::decode_time::RoutedSets> {
+        self.routed.map(|r| {
             crate::inference::place::decode_time::RoutedSets::on(
                 plan,
                 r,
                 self.experts_in_blocks,
                 None,
             )
-        });
+        })
+    }
+
+    /// The cards `plan` uses and the weight bytes it keeps on the host.
+    pub(crate) fn signature(
+        &self,
+        plan: &HeteroPlan,
+    ) -> crate::inference::place::decode_time::PlanSignature {
+        self.demand.signature(plan, self.routed_sets(plan).as_ref())
+    }
+
+    /// Seconds a decoded token is estimated to take on `plan`, `None` when the estimate cannot
+    /// say.
+    pub(crate) fn decode_secs(&self, plan: &HeteroPlan) -> Option<f64> {
+        let sets = self.routed_sets(plan);
         self.demand
             .decode_secs(
                 plan,
@@ -1090,5 +1177,24 @@ impl Layers {
             },
             offered,
         )
+    }
+}
+
+#[cfg(test)]
+mod given_back_tests {
+    use super::with_given_back;
+
+    /// The bytes given back join the offer of their card, and a pinned model takes only its card's.
+    #[test]
+    fn the_room_given_back_joins_the_offer_of_its_card() {
+        let cards = [(0, 10), (1, 4)];
+        assert_eq!(
+            with_given_back(&cards, &[(1, 6)], None),
+            vec![(0, 10), (1, 10)]
+        );
+        assert_eq!(with_given_back(&cards, &[(1, 6)], Some(0)), cards.to_vec());
+        let joined = with_given_back(&[(0, 10)], &[(1, 6), (2, 0)], None);
+        assert_eq!(joined.len(), 2);
+        assert!(joined.contains(&(1, 6)));
     }
 }

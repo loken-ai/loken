@@ -1634,7 +1634,9 @@ mod catalogue_tests {
         let shown =
             ollama_show_model(axum::extract::State(state.clone()), OllamaJson(request)).await;
         let served = state.served_model_id("a:t-dspark").await;
-        let loaded = state.ensure_loaded_with_window(&served, 0, None).await;
+        let loaded = state
+            .ensure_loaded_with_window(&served, 0, None, None)
+            .await;
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(served, "a:t-dspark");
         match shown {

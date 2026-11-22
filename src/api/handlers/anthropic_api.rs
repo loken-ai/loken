@@ -141,7 +141,8 @@ pub(crate) async fn anthropic_messages_at(
     }
 
     // Loaded on demand (Claude Code expects to just name a model).
-    let load = super::admission::LoadRequest::new(state.get_effective_keep_alive(None));
+    let load = super::admission::LoadRequest::new(state.get_effective_keep_alive(None))
+        .writing(req.max_tokens.map(|n| n as u64));
     let engine = match state.load_for_request(&model_name, load).await {
         Ok(e) => e,
         Err(e) => return anthropic_api_error(e),

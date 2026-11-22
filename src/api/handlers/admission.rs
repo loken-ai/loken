@@ -15,6 +15,8 @@ pub(crate) struct LoadRequest {
     /// The context window asked for, bounded by the checkpoint at load: the Ollama
     /// `options.num_ctx`, or the window a prompt needs (see [`APIServer::fit_window`]).
     pub window: Option<usize>,
+    /// The tokens the request may write, `None` when it sets no bound.
+    pub max_tokens: Option<u64>,
 }
 
 impl LoadRequest {
@@ -23,7 +25,13 @@ impl LoadRequest {
         Self {
             keep_alive_minutes,
             window: None,
+            max_tokens: None,
         }
+    }
+
+    /// The load of a request that may write `max_tokens` tokens.
+    pub(crate) fn writing(self, max_tokens: Option<u64>) -> Self {
+        Self { max_tokens, ..self }
     }
 }
 
@@ -79,9 +87,14 @@ impl APIServer {
         model_name: &str,
         load: LoadRequest,
     ) -> Result<Arc<LlmEngine>, ApiError> {
-        self.ensure_loaded_with_window(model_name, load.keep_alive_minutes, load.window)
-            .await
-            .map_err(|e| load_error(model_name, &e))?;
+        self.ensure_loaded_with_window(
+            model_name,
+            load.keep_alive_minutes,
+            load.window,
+            load.max_tokens,
+        )
+        .await
+        .map_err(|e| load_error(model_name, &e))?;
         if let Some(want) = load.window {
             self.ensure_engine_context(model_name, want)
                 .await

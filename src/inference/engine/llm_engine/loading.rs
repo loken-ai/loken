@@ -971,15 +971,24 @@ impl LlmEngine {
                                         }
                                         m.attach_context_shards(&cards);
                                     }
-                                    let grown: Option<u64> = cards
+                                    // The bytes the build took on each card it measured.
+                                    let held: Vec<(usize, Option<u64>)> = cards
                                         .iter()
                                         .zip(&free_before)
                                         .map(|(&i, before)| {
-                                            let after = crate::inference::place::vram_manager::free_on(i)?;
-                                            Some((*before)?.saturating_sub(after))
+                                            let after = crate::inference::place::vram_manager::free_on(i);
+                                            (i, before.zip(after).map(|(b, a)| b.saturating_sub(a)))
                                         })
+                                        .collect();
+                                    let grown: Option<u64> = held
+                                        .iter()
+                                        .map(|(_, bytes)| *bytes)
                                         .sum::<Option<u64>>()
                                         .filter(|_| !cards.is_empty());
+                                    let held: Vec<(usize, u64)> = held
+                                        .into_iter()
+                                        .filter_map(|(i, bytes)| Some((i, bytes?)))
+                                        .collect();
                                     let reserve = per_card_reserve(&model_file)
                                         .unwrap_or(0)
                                         .saturating_mul(cards.len() as u64);
@@ -1026,6 +1035,7 @@ impl LlmEngine {
                                         None => info!("{arch} decode not predicted on this plan: a device's bandwidth, a measure of the routed experts it runs on the host, or the cost of a split across cards is not known"),
                                     }
                                     pace.loaded(&model_id_clone, predicted);
+                                    pace.placed(layers.signature(plan), held);
                                     #[cfg(feature = "gpu")]
                                     for card in crate::inference::place::ladder::cards_of(plan) {
                                         if let Some((used, reserved)) = crate::inference::place::device_probe::pool_bytes(card) {

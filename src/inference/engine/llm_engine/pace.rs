@@ -1,6 +1,7 @@
 //! What one engine measured about its answers: how fast it decodes, how long its answers
 //! run, and how far its running requests have gone.
 
+use crate::inference::place::decode_time::PlanSignature;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -37,6 +38,31 @@ struct State {
     load: Option<Load>,
     /// The decode rate the plan of the last load predicts, `None` when its estimate cannot say.
     planned_tok_s: Option<f64>,
+    /// The signature of the plan of the last load, `None` before a load placed by layers.
+    plan: Option<PlanSignature>,
+    /// Bytes the last load took on each card.
+    held: Vec<(usize, u64)>,
+    /// The decode measured on each plan, of the answers that ran alone.
+    plans: Vec<PlanRate>,
+}
+
+/// The decode measured on one plan of a model.
+#[derive(Serialize, Deserialize, Default, Clone, Debug, PartialEq)]
+pub struct PlanRate {
+    pub plan: PlanSignature,
+    /// The decode rate the plan's estimate predicted when it was loaded.
+    #[serde(default)]
+    pub predicted_tok_s: Option<f64>,
+    /// Tokens decoded after the first token of each answer on the plan, and the seconds that took.
+    pub decoded: u64,
+    pub decode_secs: f64,
+}
+
+impl PlanRate {
+    /// The decode rate measured on the plan, `None` before a measure.
+    fn tok_s(&self) -> Option<f64> {
+        (self.decoded > 0 && self.decode_secs > 0.0).then(|| self.decoded as f64 / self.decode_secs)
+    }
 }
 
 /// A load's predicted decode rate, and the decode counts when it ended.
@@ -84,15 +110,53 @@ impl Pace {
     ///
     /// The first answer after it logs the rate it measured against the prediction.
     /// `None` clears the mark of an earlier load.
+    /// It forgets the plan of an earlier load: [`Self::placed`] gives the plan of this one.
     pub fn loaded(&self, model: &str, predicted_tok_s: Option<f64>) {
         let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
         s.planned_tok_s = predicted_tok_s;
+        s.plan = None;
+        s.held.clear();
         s.load = predicted_tok_s.map(|predicted_tok_s| Load {
             model: model.to_string(),
             predicted_tok_s,
             decoded: s.decoded,
             decode_secs: s.decode_secs,
         });
+    }
+
+    /// Gives the plan the last load built: its `signature`, and the bytes it `held` on each card.
+    /// The answers that run alone after it add their decode to the rate of that plan.
+    pub fn placed(&self, signature: PlanSignature, held: Vec<(usize, u64)>) {
+        let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let predicted_tok_s = s.planned_tok_s;
+        match s.plans.iter_mut().find(|r| r.plan == signature) {
+            Some(rate) => rate.predicted_tok_s = predicted_tok_s.or(rate.predicted_tok_s),
+            None => s.plans.push(PlanRate {
+                plan: signature.clone(),
+                predicted_tok_s,
+                ..Default::default()
+            }),
+        }
+        s.plan = Some(signature);
+        s.held = held;
+    }
+
+    /// The signature of the plan of the last load, `None` before a load placed by layers.
+    pub fn plan(&self) -> Option<PlanSignature> {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .plan
+            .clone()
+    }
+
+    /// Bytes the last load took on each card.
+    pub fn held(&self) -> Vec<(usize, u64)> {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .held
+            .clone()
     }
 
     /// Decode tokens per second, or `None` when no rate has been measured yet.
@@ -211,6 +275,13 @@ impl Pace {
                     } else {
                         s.decoded += running.generated - 1;
                         s.decode_secs += secs;
+                        let plan = s.plan.clone();
+                        if let Some(rate) =
+                            s.plans.iter_mut().find(|r| Some(&r.plan) == plan.as_ref())
+                        {
+                            rate.decoded += running.generated - 1;
+                            rate.decode_secs += secs;
+                        }
                     }
                 }
             }
@@ -354,6 +425,12 @@ pub struct Kept {
     /// The decode rate the plan of the last load predicts.
     #[serde(default)]
     pub planned_tok_s: Option<f64>,
+    /// The signature of the plan of the last load.
+    #[serde(default)]
+    pub planned_on: Option<PlanSignature>,
+    /// The decode measured on each plan.
+    #[serde(default)]
+    pub plans: Vec<PlanRate>,
 }
 
 impl Kept {
@@ -367,14 +444,46 @@ impl Kept {
         (self.answers > 0).then(|| self.answer_tokens as f64 / self.answers as f64)
     }
 
-    /// The decode rate of a plan whose estimate predicts `predicted_tok_s`: the estimate scaled
-    /// by the rate measured against the rate the plan of the last load predicted.
+    /// The decode rate measured on `plan`, `None` before an answer ran alone on it.
+    pub fn measured_on(&self, plan: &PlanSignature) -> Option<f64> {
+        self.plans.iter().find(|r| &r.plan == plan)?.tok_s()
+    }
+
+    /// The decode rate of `plan`, whose estimate predicts `predicted_tok_s`.
+    ///
+    /// The rate measured on the same plan comes first, with or without an estimate.
+    /// Else the estimate is scaled by a plan measured against its own prediction: the plan of
+    /// the last load, else the plan measured longest.
+    /// With no plan measured against its prediction, the rate of every answer scales it.
     /// `None` when a rate is not known.
-    pub fn rate_on(&self, predicted_tok_s: f64) -> Option<f64> {
+    pub fn rate_on(
+        &self,
+        predicted_tok_s: Option<f64>,
+        plan: Option<&PlanSignature>,
+    ) -> Option<f64> {
+        if let Some(rate) = plan.and_then(|p| self.measured_on(p)) {
+            return Some(rate);
+        }
+        let pair = |r: &PlanRate| Some((r.predicted_tok_s?, r.tok_s()?));
+        let last = self
+            .planned_on
+            .as_ref()
+            .and_then(|p| self.plans.iter().find(|r| &r.plan == p))
+            .and_then(pair);
+        let longest = || {
+            self.plans
+                .iter()
+                .filter(|r| pair(r).is_some())
+                .max_by_key(|r| r.decoded)
+                .and_then(pair)
+        };
+        let unsplit = || Some((self.planned_tok_s?, self.decode_tok_s()?));
+        let predicted_tok_s = predicted_tok_s?;
+        let (planned, measured) = last.or_else(longest).or_else(unsplit)?;
         let secs = crate::inference::place::decode_time::calibrated(
             1.0 / predicted_tok_s,
-            1.0 / self.planned_tok_s?,
-            self.decode_tok_s()?,
+            1.0 / planned,
+            measured,
         )?;
         Some(1.0 / secs)
     }
@@ -394,6 +503,8 @@ impl Pace {
             gaps: s.gaps,
             gap_secs: s.gap_secs,
             planned_tok_s: s.planned_tok_s,
+            planned_on: s.plan.clone(),
+            plans: s.plans.clone(),
         }
     }
 
@@ -408,6 +519,15 @@ impl Pace {
         s.answer_tokens = kept.answer_tokens;
         s.gaps = kept.gaps;
         s.gap_secs = kept.gap_secs;
+        // The plans kept replace the plans measured, and the plan of this load keeps its prediction.
+        let mut plans = kept.plans.clone();
+        for rate in &s.plans {
+            match plans.iter_mut().find(|r| r.plan == rate.plan) {
+                Some(kept) => kept.predicted_tok_s = rate.predicted_tok_s.or(kept.predicted_tok_s),
+                None => plans.push(rate.clone()),
+            }
+        }
+        s.plans = plans;
         // last_start is not persisted, will be initialized on next begin
         //
         // A load mark counts from the restored measures, so the first answer measures only itself.
@@ -610,12 +730,101 @@ mod tests {
         let kept = pace.kept();
         assert_eq!(kept.planned_tok_s, Some(20.0));
         assert_eq!(kept.decode_tok_s(), Some(10.0));
-        assert!((kept.rate_on(10.0).unwrap() - 5.0).abs() < 1e-9);
+        assert!((kept.rate_on(Some(10.0), None).unwrap() - 5.0).abs() < 1e-9);
         let unplanned = Kept {
             planned_tok_s: None,
             ..kept
         };
-        assert_eq!(unplanned.rate_on(10.0), None);
+        assert_eq!(unplanned.rate_on(Some(10.0), None), None);
+    }
+
+    /// An answer of `tokens` tokens decoded in `secs` seconds, run alone.
+    fn answer(pace: &Pace, tokens: u64, secs: f64) {
+        let id = pace.begin(None);
+        for _ in 0..tokens {
+            pace.token(id);
+        }
+        pace.end(id, Some(secs), false);
+    }
+
+    fn on(cards: &[usize], host_bytes: u64) -> PlanSignature {
+        PlanSignature {
+            cards: cards.to_vec(),
+            host_bytes,
+        }
+    }
+
+    /// Each plan keeps the rate its answers measured, and a plan measured before gives its own
+    /// rate, not the estimate.
+    #[test]
+    fn each_plan_keeps_the_rate_measured_on_it() {
+        let pace = Pace::default();
+        pace.loaded("m", Some(40.0));
+        pace.placed(on(&[0], 0), vec![(0, 8)]);
+        answer(&pace, 41, 1.0);
+        pace.loaded("m", Some(10.0));
+        pace.placed(on(&[0], 4), vec![(0, 4)]);
+        answer(&pace, 11, 1.0);
+        assert_eq!(pace.plan(), Some(on(&[0], 4)));
+        assert_eq!(pace.held(), vec![(0, 4)]);
+        let kept = pace.kept();
+        assert_eq!(kept.planned_on, Some(on(&[0], 4)));
+        assert_eq!(kept.measured_on(&on(&[0], 0)), Some(40.0));
+        assert_eq!(kept.measured_on(&on(&[0], 4)), Some(10.0));
+        // Every answer together decodes 50 tokens in 2 seconds.
+        assert_eq!(kept.decode_tok_s(), Some(25.0));
+        // The full plan measured gives its rate whatever its estimate says.
+        assert_eq!(kept.rate_on(Some(80.0), Some(&on(&[0], 0))), Some(40.0));
+        assert_eq!(kept.rate_on(None, Some(&on(&[0], 0))), Some(40.0));
+        // A plan never measured scales its estimate by the plan of the last load.
+        let other = kept.rate_on(Some(20.0), Some(&on(&[1], 0))).unwrap();
+        assert!((other - 20.0).abs() < 1e-9);
+        // An answer run beside another model adds to no plan.
+        let id = pace.begin(None);
+        for _ in 0..11 {
+            pace.token(id);
+        }
+        pace.end(id, Some(10.0), true);
+        assert_eq!(pace.kept().measured_on(&on(&[0], 4)), Some(10.0));
+    }
+
+    /// Measures restored after a load keep the plans measured before, and the plan of the load.
+    #[test]
+    fn a_restore_keeps_the_plans_and_the_plan_of_the_load() {
+        let pace = Pace::default();
+        pace.loaded("m", Some(10.0));
+        pace.placed(on(&[1], 0), Vec::new());
+        pace.restore(&Kept {
+            decoded: 40,
+            decode_secs: 1.0,
+            plans: vec![PlanRate {
+                plan: on(&[0], 0),
+                predicted_tok_s: Some(50.0),
+                decoded: 40,
+                decode_secs: 1.0,
+            }],
+            ..Default::default()
+        });
+        let kept = pace.kept();
+        assert_eq!(kept.plans.len(), 2);
+        assert_eq!(kept.measured_on(&on(&[0], 0)), Some(40.0));
+        // The plan of the load is not measured: the plan measured scales its estimate.
+        assert!((kept.rate_on(Some(10.0), Some(&on(&[1], 0))).unwrap() - 8.0).abs() < 1e-9);
+    }
+
+    /// A pace file written before plans were told apart reads with no plan, and its estimate
+    /// scales by the rate of every answer.
+    #[test]
+    fn an_old_pace_file_reads_without_plans() {
+        let text = r#"{"m|v|": {"decoded": 100, "decode_secs": 10.0, "beside_decoded": 0,
+            "beside_secs": 0.0, "answers": 2, "answer_tokens": 102, "gaps": 1,
+            "gap_secs": 3.0, "planned_tok_s": 20.0}}"#;
+        let map: std::collections::HashMap<String, Kept> = serde_json::from_str(text).unwrap();
+        let kept = &map["m|v|"];
+        assert!(kept.plans.is_empty());
+        assert_eq!(kept.planned_on, None);
+        assert_eq!(kept.measured_on(&on(&[0], 0)), None);
+        assert!((kept.rate_on(Some(10.0), Some(&on(&[0], 0))).unwrap() - 5.0).abs() < 1e-9);
     }
 
     /// Measures restored after a load leave the load mark measuring only the answers after it.
@@ -781,6 +990,7 @@ mod tests {
             gaps: 0,
             gap_secs: 0.0,
             planned_tok_s: None,
+            ..Default::default()
         };
         Pace::save_to("model1", &kept1, Some(dir));
 
@@ -799,6 +1009,19 @@ mod tests {
             gaps: 1,
             gap_secs: 2.0,
             planned_tok_s: Some(30.0),
+            planned_on: Some(PlanSignature {
+                cards: vec![0],
+                host_bytes: 0,
+            }),
+            plans: vec![PlanRate {
+                plan: PlanSignature {
+                    cards: vec![0],
+                    host_bytes: 0,
+                },
+                predicted_tok_s: Some(30.0),
+                decoded: 200,
+                decode_secs: 20.0,
+            }],
         };
         Pace::save_to("model2", &kept2, Some(dir));
 
