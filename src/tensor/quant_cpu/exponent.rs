@@ -25,23 +25,27 @@ enum Fields {
     DenseBf16,
 }
 
-/// The scale fields of `dtype`, `None` for a format whose blocks carry none.
+/// The scale fields of `dtype`.
+/// `None` for a format whose blocks carry none, or whose scales are not whole f16, f32 or E8M0
+/// fields: IQ1_M splits its f16 across 4 words and NVFP4 holds E4M3 scales.
 fn fields(dtype: GgmlDType) -> Option<Fields> {
     use GgmlDType::*;
     Some(match dtype {
         F32 => Fields::DenseF32,
         F16 => Fields::DenseF16,
         BF16 => Fields::DenseBf16,
-        Q4_0 | Q5_0 | Q8_0 | Q2_0 | Iq4Nl | Iq4Xs | Iq2Xxs | Iq2S | Iq3Xxs | Iq3S => {
+        Q4_0 | Q5_0 | Q8_0 | Q2_0 | Iq4Nl | Iq4Xs | Iq2Xxs | Iq2S | Iq3Xxs | Iq3S | Iq1S => {
             Fields::Half(&[0])
         }
+        Tq1_0 => Fields::Half(&[52]),
+        Tq2_0 => Fields::Half(&[64]),
         Q4_1 | Q5_1 | Q8_1 | Q4K | Q5K => Fields::Half(&[0, 2]),
         Q2K => Fields::Half(&[80, 82]),
         Q3K => Fields::Half(&[108]),
         Q6K => Fields::Half(&[208]),
         Q8K => Fields::Single(0),
         MxFp4 => Fields::Exponent(0),
-        I8 => return None,
+        I8 | Iq1M | NvFp4 => return None,
     })
 }
 
@@ -198,7 +202,7 @@ mod tests {
         use GgmlDType::*;
         let formats = [
             F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2K, Q3K, Q4K, Q5K, Q6K, Q8K, Iq4Nl,
-            Iq4Xs, Iq2Xxs, Iq2S, Iq3Xxs, Iq3S, Q2_0, MxFp4,
+            Iq4Xs, Iq2Xxs, Iq2S, Iq3Xxs, Iq3S, Q2_0, MxFp4, Iq1S, Tq1_0, Tq2_0,
         ];
         let (rows, row_len) = (6usize, 512usize);
         let exponents = [-3, -1, 0, 1, 2, 4];

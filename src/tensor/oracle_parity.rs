@@ -21,8 +21,9 @@
 //! when the block formats themselves change.
 
 use super::quant_cpu::{
-    BlockFormat, BlockMxFp4, BlockQ2K, BlockQ3K, BlockQ4K, BlockQ4_0, BlockQ4_1, BlockQ5K,
-    BlockQ5_0, BlockQ5_1, BlockQ6K, BlockQ8K, BlockQ8_0,
+    BlockFormat, BlockIq1M, BlockIq1S, BlockMxFp4, BlockNvFp4, BlockQ2K, BlockQ3K, BlockQ4K,
+    BlockQ4_0, BlockQ4_1, BlockQ5K, BlockQ5_0, BlockQ5_1, BlockQ6K, BlockQ8K, BlockQ8_0,
+    BlockTq1_0, BlockTq2_0,
 };
 
 /// One block format's reference data, as the oracle emitted it.
@@ -103,11 +104,37 @@ fn load_vectors() -> (Vec<f32>, std::collections::HashMap<String, Reference>) {
                     },
                 );
             }
+            Some("UE4M3") | Some("DOT") => {}
             other => panic!("oracle: unrecognised record {other:?}"),
         }
     }
     assert!(!input.is_empty(), "oracle: vectors carry no INPUT row");
     (input, refs)
+}
+
+/// The records that are not block formats: ggml's reading of every unsigned E4M3 code, and the
+/// dot of each format's blocks against the input, by format name.
+fn load_extras() -> (Vec<f32>, std::collections::HashMap<String, f32>) {
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/oracle/vectors.txt");
+    let text = std::fs::read_to_string(path).expect("oracle: cannot read the vectors");
+    let mut ue4m3 = Vec::new();
+    let mut dots = std::collections::HashMap::new();
+    for line in text.lines() {
+        let mut f = line.split_whitespace();
+        match f.next() {
+            Some("UE4M3") => {
+                let _n = f.next();
+                ue4m3 = hex_to_floats(f.next().expect("oracle: UE4M3 has no payload"));
+            }
+            Some("DOT") => {
+                let name = f.next().expect("oracle: DOT has no name").to_string();
+                let value = hex_to_floats(f.next().expect("oracle: DOT has no value"));
+                dots.insert(name, value[0]);
+            }
+            _ => {}
+        }
+    }
+    (ue4m3, dots)
 }
 
 /// Read ggml's own blocks and check we get ggml's floats, bit for bit.
@@ -211,6 +238,175 @@ fn q8_k_dequantises_like_ggml() {
 fn mxfp4_dequantises_like_ggml() {
     check_dequant::<BlockMxFp4>("mxfp4");
 }
+#[test]
+fn tq1_0_dequantises_like_ggml() {
+    check_dequant::<BlockTq1_0>("tq1_0");
+    check_dequant::<BlockTq1_0>("tq1_0.bytes");
+}
+#[test]
+fn tq2_0_dequantises_like_ggml() {
+    check_dequant::<BlockTq2_0>("tq2_0");
+    check_dequant::<BlockTq2_0>("tq2_0.bytes");
+}
+#[test]
+fn nvfp4_dequantises_like_ggml() {
+    check_dequant::<BlockNvFp4>("nvfp4");
+    check_dequant::<BlockNvFp4>("nvfp4.bytes");
+}
+#[test]
+fn iq1_s_dequantises_like_ggml() {
+    check_dequant::<BlockIq1S>("iq1_s");
+    check_dequant::<BlockIq1S>("iq1_s.bytes");
+}
+#[test]
+fn iq1_m_dequantises_like_ggml() {
+    check_dequant::<BlockIq1M>("iq1_m");
+    check_dequant::<BlockIq1M>("iq1_m.bytes");
+}
+
+/// Every unsigned E4M3 code reads as ggml reads it, bit for bit.
+#[test]
+fn every_nvfp4_scale_code_reads_like_ggml() {
+    let (ue4m3, _) = load_extras();
+    assert_eq!(ue4m3.len(), 256);
+    for (code, want) in ue4m3.iter().enumerate() {
+        let got = super::quant_cpu::format::nvfp4::ue4m3_to_fp32_half(code as u8);
+        assert_eq!(
+            got.to_bits(),
+            want.to_bits(),
+            "code {code:#x}: {got} against {want}"
+        );
+    }
+}
+
+/// A format whose encoder has no free parameter writes ggml's bytes: one scale from the
+/// extreme value, and each value at its nearest code.
+fn check_encode<T: BlockFormat>(name: &str) {
+    let (input, refs) = load_vectors();
+    let r = &refs[name];
+    let mut ours = vec![T::zeros(); input.len() / T::BLOCK_LEN];
+    T::quantize(&input, &mut ours);
+    // Safety: the blocks are `repr(C)` plain data, read as the bytes they occupy.
+    let bytes = unsafe {
+        std::slice::from_raw_parts(ours.as_ptr() as *const u8, std::mem::size_of_val(&ours[..]))
+    };
+    if let Some(i) = (0..bytes.len()).find(|&i| bytes[i] != r.quant[i]) {
+        panic!(
+            "{name}: byte {i} (block {}) is {:#04x}, ggml wrote {:#04x}",
+            i / r.block_bytes,
+            bytes[i],
+            r.quant[i]
+        );
+    }
+}
+
+#[test]
+fn the_reference_encoders_write_ggml_bytes() {
+    check_encode::<BlockTq1_0>("tq1_0");
+    check_encode::<BlockTq2_0>("tq2_0");
+    check_encode::<BlockNvFp4>("nvfp4");
+}
+
+/// ggml's blocks dotted against the input, quantised by our activation encoder, give ggml's
+/// dot bit for bit: the activation codes and the dot both match ggml's CPU backend.
+fn check_dot<T: BlockFormat>(name: &str) {
+    let (input, refs) = load_vectors();
+    let (_, dots) = load_extras();
+    let r = &refs[name];
+    let blocks: &[T] = unsafe {
+        std::slice::from_raw_parts(r.quant.as_ptr() as *const T, r.quant.len() / r.block_bytes)
+    };
+    let mut acts = vec![T::ActivationBlock::zeros(); input.len() / T::BLOCK_LEN];
+    T::ActivationBlock::quantize(&input, &mut acts);
+    let got = T::dot(blocks, &acts);
+    let want = dots[name];
+    assert_eq!(
+        got.to_bits(),
+        want.to_bits(),
+        "{name}: dot {got}, ggml {want}"
+    );
+}
+
+#[test]
+fn the_new_formats_dot_like_ggml() {
+    check_dot::<BlockTq1_0>("tq1_0");
+    check_dot::<BlockTq2_0>("tq2_0");
+    check_dot::<BlockNvFp4>("nvfp4");
+    check_dot::<BlockIq1S>("iq1_s");
+    check_dot::<BlockIq1M>("iq1_m");
+}
+
+/// A GGUF file holding one tensor of each format loads, and the product of each tensor with
+/// the input is ggml's dot of the same blocks, bit for bit.
+#[test]
+fn a_gguf_of_each_new_format_loads_and_answers_like_ggml() {
+    use super::quantized::gguf_file::{layout, Content};
+    use super::quantized::{GgmlDType, QMatMul};
+    use super::{Device, Module, Tensor};
+    let (input, refs) = load_vectors();
+    let (_, dots) = load_extras();
+    let formats = [
+        ("tq1_0", GgmlDType::Tq1_0),
+        ("tq2_0", GgmlDType::Tq2_0),
+        ("nvfp4", GgmlDType::NvFp4),
+        ("iq1_s", GgmlDType::Iq1S),
+        ("iq1_m", GgmlDType::Iq1M),
+    ];
+    let dims = [1usize, input.len()];
+
+    // The file as the writer lays it out: header, descriptors, then each payload at the next
+    // aligned offset.
+    let mut file = Vec::new();
+    layout::write_scalars(
+        &mut file,
+        &layout::FILE_HEADER,
+        &[
+            u64::from(layout::MAGIC),
+            u64::from(layout::WRITE_VERSION.to_u32()),
+            formats.len() as u64,
+            0,
+        ],
+    );
+    let mut offset = 0u64;
+    for (name, dtype) in formats {
+        layout::TensorDescriptor {
+            name,
+            dims: &dims,
+            dtype,
+            offset,
+        }
+        .encode(&mut file);
+        offset = layout::align_up(
+            offset + refs[name].quant.len() as u64,
+            layout::DEFAULT_ALIGNMENT,
+        );
+    }
+    for (name, _) in formats {
+        file.resize(
+            layout::align_up(file.len() as u64, layout::DEFAULT_ALIGNMENT) as usize,
+            0,
+        );
+        file.extend_from_slice(&refs[name].quant);
+    }
+
+    let mut cursor = std::io::Cursor::new(&file[..]);
+    let content = Content::read(&mut cursor).unwrap();
+    let x = Tensor::from_vec(input.clone(), (1, input.len()), &Device::Cpu).unwrap();
+    for (name, dtype) in formats {
+        assert_eq!(content.tensor_infos[name].ggml_dtype, dtype, "{name}");
+        let qt = content.tensor(&mut cursor, name, &Device::Cpu).unwrap();
+        let y = QMatMul::from_qtensor(qt).unwrap().forward(&x).unwrap();
+        let got = y.flatten_all().unwrap().to_vec1_f32().unwrap();
+        let want = dots[name];
+        assert_eq!(got.len(), 1, "{name}");
+        assert_eq!(
+            got[0].to_bits(),
+            want.to_bits(),
+            "{name}: answered {}, ggml {want}",
+            got[0]
+        );
+    }
+}
 
 // The encoder side has no test here on purpose. Quantising is a CHOICE - two sound encoders
 // pick different scales - so comparing bytes against ggml's asks the wrong question, and the
@@ -309,6 +505,11 @@ fn every_format_reconstructs_about_as_well_as_ggml() {
     measure!(BlockQ5K, "q5_K", 0.996);
     measure!(BlockQ6K, "q6_K", 0.978);
     measure!(BlockMxFp4, "mxfp4", 0.979);
+    measure!(BlockTq1_0, "tq1_0", 1.000);
+    measure!(BlockTq2_0, "tq2_0", 1.000);
+    measure!(BlockNvFp4, "nvfp4", 1.000);
+    measure!(BlockIq1S, "iq1_s", 0.975);
+    measure!(BlockIq1M, "iq1_m", 0.565);
     println!("{}", report.join("\n"));
     assert!(
         worse.is_empty(),

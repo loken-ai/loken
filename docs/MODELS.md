@@ -36,14 +36,20 @@ On the host, they need AVX2 (see [Building](BUILDING.md)).
 | Float | `F32`, `F16`, `BF16` |
 | Legacy blocks | `Q4_0`, `Q4_1`, `Q5_0`, `Q5_1`, `Q8_0`, `Q8_1` |
 | K-quants | `Q2_K`, `Q3_K`, `Q4_K`, `Q5_K`, `Q6_K`, `Q8_K` |
-| Codebook | `IQ2_XXS`, `IQ2_S`, `IQ3_XXS`, `IQ3_S`, `IQ4_NL`, `IQ4_XS`, `Q2_0` |
-| Others | `MXFP4`, `I8` (raw bytes, the fp8 engram rows and their scales) |
+| Codebook | `IQ1_S`, `IQ1_M`, `IQ2_XXS`, `IQ2_S`, `IQ3_XXS`, `IQ3_S`, `IQ4_NL`, `IQ4_XS`, `Q2_0` |
+| Ternary | `TQ1_0`, `TQ2_0` |
+| Others | `MXFP4`, `NVFP4`, `I8` (raw bytes, the fp8 engram rows and their scales) |
 
-The codebook formats run on a card for the experts, in decode and prefill.  
+The codebook formats from `IQ2_XXS` on run on a card for the experts, in decode and prefill.  
 On the host, they run through integer dot products that need AVX2.
 
 A dense projection stored in a codebook format is requantised once at load to `Q8_0` for a card.
 The experts keep their format.
+
+`IQ1_S`, `IQ1_M`, `TQ1_0`, `TQ2_0` and `NVFP4` have no card kernel.  
+On the host, they run through scalar integer dot products.  
+For a card, the transformer loader requantises each tensor in one of them once at load to `Q8_0`, the experts included.  
+Another model family decodes such a weight to `F32` on the card at its first product.
 
 A file that stores a tensor in another format is refused with the format's id.
 

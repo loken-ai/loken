@@ -81,11 +81,19 @@ ggml_dtypes! {
     Q6K                  = 14, 256, 210, "q6_K";
     Q8K                  = 15, 256, 292, "q8_K";
     Iq2Xxs               = 16, 256, 66, "iq2_xxs";
+    /// IQ1_S: 1.5625 bits a weight, codebook points under a 3-bit scale per 32 values.
+    Iq1S                 = 19, 256, 50, "iq1_s";
     Iq4Nl                = 20, 32, 18, "iq4_nl";
     Iq3Xxs               = 18, 256, 98, "iq3_xxs";
     Iq3S                 = 21, 256, 110, "iq3_s";
     Iq2S                 = 22, 256, 82, "iq2_s";
     Iq4Xs                = 23, 256, 136, "iq4_xs";
+    /// IQ1_M: 1.75 bits a weight, codebook points under a 3-bit scale per 16 values.
+    Iq1M                 = 29, 256, 56, "iq1_m";
+    /// TQ1_0: ternary weights, 5 to a byte, one f16 scale a block.
+    Tq1_0                = 34, 256, 54, "tq1_0";
+    /// TQ2_0: ternary weights, 2 bits each, one f16 scale a block.
+    Tq2_0                = 35, 256, 66, "tq2_0";
     Q2_0                 = 42, 64, 18, "q2_0";
     BF16                 = 30, 1, 2, "bf16";
     /// Raw bytes, no arithmetic: what a tensor carries when the file holds a layout only its own
@@ -93,4 +101,6 @@ ggml_dtypes! {
     I8                   = 24, 1, 1, "i8";
     /// OCP MXFP4: E2M1 codes against one E8M0 block scale - the format gpt-oss ships in.
     MxFp4                = 39, 32, 17, "mxfp4";
+    /// NVFP4: E2M1 codes against one UE4M3 scale per 16 values.
+    NvFp4                = 40, 64, 36, "nvfp4";
 }

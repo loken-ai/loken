@@ -622,8 +622,11 @@ impl<'a> TensorSource<'a> {
         )?;
         // A projection in a format only the experts' kernels read is requantised, for a card, to
         // the widest block format the dense kernels read. The experts keep theirs.
-        if device.runs_as_card() && !name.contains("_exps") && codebook_format(qt.dtype()) {
-            // CONVERSION: no dense kernel reads a codebook format on a card: dequantised, then held Q8_0.
+        // A tensor in a format no card kernel reads is requantised the same way, experts included.
+        let card_requantises = host_only_format(qt.dtype())
+            || (!name.contains("_exps") && codebook_format(qt.dtype()));
+        if device.runs_as_card() && card_requantises {
+            // CONVERSION: no card kernel reads the format: dequantised, then held Q8_0.
             let values = qt.dequantize(&Device::Cpu)?;
             return QTensor::quantize_onto(
                 &values,
@@ -692,6 +695,12 @@ impl<'a> TensorSource<'a> {
 fn codebook_format(dtype: crate::tensor::quantized::GgmlDType) -> bool {
     use crate::tensor::quantized::GgmlDType::*;
     matches!(dtype, Iq4Nl | Iq4Xs | Iq3Xxs | Iq3S | Iq2S | Q2_0)
+}
+
+/// Whether `dtype` is a format only the host reads: IQ1, the ternary formats and NVFP4.
+fn host_only_format(dtype: crate::tensor::quantized::GgmlDType) -> bool {
+    use crate::tensor::quantized::GgmlDType::*;
+    matches!(dtype, Iq1S | Iq1M | Tq1_0 | Tq2_0 | NvFp4)
 }
 
 /// A quantised weight built on `device` from its block bytes, `rows` x `cols`.

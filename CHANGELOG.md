@@ -13,6 +13,7 @@ All notable changes to loken. The format follows [Keep a Changelog](https://keep
 - API: return one vector per token on /pooling with token_embed and on /v1/multi-vector.
 - API: return Cohere embeddings as int8, uint8, binary and ubinary vectors.
 - API: classify texts and score pairs with a model's classification head.
+- Models: load GGUF tensors in IQ1_S, IQ1_M, TQ1_0, TQ2_0 and NVFP4.
 
 ### Changed
 

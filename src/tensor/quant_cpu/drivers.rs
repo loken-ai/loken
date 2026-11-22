@@ -1380,7 +1380,8 @@ macro_rules! verify_block_sizes {
 
 verify_block_sizes!(
     BlockQ4_0, BlockQ4_1, BlockQ5_0, BlockQ5_1, BlockQ8_0, BlockQ8_1, BlockQ2K, BlockQ3K, BlockQ4K,
-    BlockQ5K, BlockQ6K, BlockQ8K, BlockMxFp4, f32, f16, bf16
+    BlockQ5K, BlockQ6K, BlockQ8K, BlockMxFp4, BlockIq1S, BlockIq1M, BlockTq1_0, BlockTq2_0,
+    BlockNvFp4, f32, f16, bf16
 );
 
 #[cfg(test)]
@@ -1663,6 +1664,26 @@ macro_rules! with_blocks {
             }
             GgmlDType::Q2_0 => {
                 type $T = BlockQ2_0;
+                $body
+            }
+            GgmlDType::Iq1S => {
+                type $T = BlockIq1S;
+                $body
+            }
+            GgmlDType::Iq1M => {
+                type $T = BlockIq1M;
+                $body
+            }
+            GgmlDType::Tq1_0 => {
+                type $T = BlockTq1_0;
+                $body
+            }
+            GgmlDType::Tq2_0 => {
+                type $T = BlockTq2_0;
+                $body
+            }
+            GgmlDType::NvFp4 => {
+                type $T = BlockNvFp4;
                 $body
             }
             // Q8_1 is an activation-side format (no `dequantize`, never a GGUF
