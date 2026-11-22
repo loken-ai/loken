@@ -6,6 +6,8 @@
 //! LLM forward (`LlmEngine::rerank_score`) - no new model weights or kernels: any
 //! causal Qwen-family model can act as the reranker, Qwen3-Reranker being the tuned one.
 
+pub mod head;
+
 /// Default retrieval instruction used when the caller doesn't supply one.
 pub const DEFAULT_INSTRUCTION: &str =
     "Given a web search query, retrieve relevant passages that answer the query";

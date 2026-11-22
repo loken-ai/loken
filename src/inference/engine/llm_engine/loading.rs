@@ -1221,6 +1221,11 @@ impl LlmEngine {
                     content.metadata.keys().map(|k| k.as_str()),
                     &arch,
                 ),
+                classifier: super::classify::read_classifier(&content, &arch, &mmap, &awq, &split)
+                    .map(|h| {
+                        info!("classification head: {} labels", h.num_labels());
+                        std::sync::Arc::new(h)
+                    }),
                 generation_defaults: generation_defaults.clone(),
             };
             let mut guard = model_state.blocking_lock();

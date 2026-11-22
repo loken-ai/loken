@@ -522,6 +522,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             info!("  POST /v1/rerank               - Rerank documents");
             info!("  POST /v2/rerank, /v2/embed    - Cohere-shaped rerank and embed");
             info!("  POST /v1/score                - Score text pairs");
+            info!("  POST /v1/classify             - Classify texts");
             info!("  POST /v1/messages             - Anthropic Messages protocol");
             info!("");
             info!("Generative media:");

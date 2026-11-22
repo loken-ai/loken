@@ -524,6 +524,7 @@ pub(super) fn load_wide_checkpoint(
         // Whether the loaded GGUF declares `{architecture}.pooling_type`: the model is an
         // embedding model and reranks by late interaction over token vectors.
         pools: false,
+        classifier: None,
         generation_defaults,
     })
 }
@@ -1218,6 +1219,9 @@ pub(crate) struct LoadedModelState {
     /// Whether the loaded GGUF declares `{architecture}.pooling_type`: the model is an
     /// embedding model and reranks by late interaction over token vectors.
     pub(super) pools: bool,
+    /// The classification head the checkpoint holds after its final norm.
+    pub(super) classifier:
+        Option<std::sync::Arc<crate::inference::model::reranker::head::ClassifierHead>>,
     /// The sampling the model recommends, applied to every knob a request leaves unset.
     pub(super) generation_defaults: super::generation_defaults::GenerationDefaults,
 }

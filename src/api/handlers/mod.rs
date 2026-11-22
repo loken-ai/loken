@@ -2955,6 +2955,11 @@ impl APIServer {
                 axum::routing::post(openai::forecast::forecast),
             )
             .route("/v1/score", axum::routing::post(openai::pooling::score))
+            .route("/classify", axum::routing::post(openai::pooling::classify))
+            .route(
+                "/v1/classify",
+                axum::routing::post(openai::pooling::classify),
+            )
             .route("/api/create", axum::routing::post(ollama_create_model))
             .route(
                 "/api/calibrate",
@@ -3862,6 +3867,8 @@ mod level_tests;
 mod logprob_route_tests;
 #[cfg(test)]
 mod multi_model_tests;
+#[cfg(test)]
+mod pooling_route_tests;
 #[cfg(test)]
 mod request_figures_tests;
 #[cfg(test)]

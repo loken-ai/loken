@@ -40,11 +40,12 @@ With `[server] require_auth` on, every route needs a key, as `Authorization: Bea
 | `POST /v1/completions` | Text completion. Takes `suffix` (fill-in-the-middle), `echo`, an array of prompts, `logprobs`, `logit_bias`, `response_format` and [vLLM's extensions](#vllms-extensions). `prompt_embeds` sends the prompt as embedding rows of the model's width, in a form listed under [Prompt embeddings](#prompt-embeddings). It is refused while the model batches concurrent requests. |
 | `POST /v1/responses` | The Responses API, lowered to a chat completion and lifted back into output items. `GET` and `DELETE /v1/responses/{id}` read and drop a stored response. `previous_response_id` continues one. `input_image` (`image_url` as a base64 data URL, or the `file_id` of an upload) and `input_audio` (`data`, `format`) parts become the `image_url` and `input_audio` parts of a chat completion. Another part type answers 400 naming it. |
 | `POST /v1/embeddings` | Embeddings, loading the model on demand. `encoding_format` is `float` or `base64`, `dimensions` cuts the vector. `input` is a string, strings or 1 conversation. `messages` is 1 conversation or a list, as vLLM takes them. A conversation is 1 vector: its text parts joined by newlines, or its single `image_url` part for a CLIP or SigLIP model. The image is a base64 data URL or an http(s) URL from a host in `image_fetch_hosts`. Text beside an image is refused. A CLIP or SigLIP checkpoint is named by its Hugging Face id, such as `openai/clip-vit-large-patch14`. See [the embeddings guide](https://loken-ai.github.io/loken/embeddings/). |
-| `POST /v1/rerank`, `POST /rerank` | Score documents against a query with a cross-encoder. When the model declares `{architecture}.pooling_type` (an embedding model), ranks by late interaction over token vectors (the query's vector is compared with each document's vectors, the best match per query vector summed). The `instruction` field is ignored for embedding models. |
+| `POST /v1/rerank`, `POST /rerank` | Score documents against a query with a cross-encoder. A model with a 1-label [classification head](#classification-heads) reads each pair together and scores the sigmoid of its logit. When the model declares `{architecture}.pooling_type` (an embedding model), ranks by late interaction over token vectors (the query's vector is compared with each document's vectors, the best match per query vector summed). The `instruction` field is ignored for embedding models. |
 | `POST /v2/rerank` | Cohere's shape. `documents` are strings or `{text}` objects, with `top_n` and `return_documents`. Answers `{id, results, meta}`. |
 | `POST /v2/embed` | Cohere's shape. Takes exactly 1 of `texts`, `images` (data URIs) or `inputs` (`content` lists of `text` and `image_url` parts), and `output_dimension`. Answers `embeddings.float`, `embeddings.base64`, `embeddings.int8`, `embeddings.uint8`, `embeddings.binary`, `embeddings.ubinary` as `embedding_types` asks, `float` by default. Images need a CLIP or SigLIP model. |
-| `POST /score`, `POST /v1/score` | vLLM's pair scoring: `text_1` against `text_2`, 1 score per pair in `data[].score`. |
-| `POST /pooling` | vLLM's pooling shape over the embeddings route. `data[].data` is the pooled vector. Also supports `task: "token_embed"` for one vector per token, `input` as a string or list of strings, `data[].data` as `[[...], ...]` vectors, `usage.total_tokens` as the total number of vectors. |
+| `POST /score`, `POST /v1/score` | vLLM's pair scoring: `text_1` against `text_2`, 1 score per pair in `data[].score`. A string is scored against each entry of a list, 2 lists of the same length pair by position. A model with a 1-label [classification head](#classification-heads) scores as a cross-encoder: the pair is read together and the score is the sigmoid of the logit. An embedding model scores the cosine of the 2 embeddings. Another model scores the probability of `yes` against `no` after the reranker prompt. A head with several labels answers 400, as does a model with no head, no pooling and no `yes` and `no` tokens. |
+| `POST /classify`, `POST /v1/classify` | vLLM's classification. Takes `model` and `input`, a string or a list of strings. Answers `data[]` with `index`, `label`, `probs` and `num_classes`, from the model's [classification head](#classification-heads). `probs` is the softmax of the logits, the sigmoid for a single label. `label` names the most probable class. A model without a head answers 400. |
+| `POST /pooling` | vLLM's pooling shape. `task` is `embed` (the default), `token_embed`, `classify` or `token_classify`. `input` is a string or a list of strings. `embed` answers the pooled vector in `data[].data`, from the embeddings route. `token_embed` answers 1 vector per token as `[[...], ...]`, with `usage.total_tokens` the number of vectors. `classify` answers the class probabilities of each input, as `/classify` gives them. `token_classify` answers the class probabilities of each token. Another task answers 400. |
 | `POST /v1/multi-vector` | Jina's multi-vector shape. Takes `model` and `input` (a list of strings, or a list of `{text: ...}` objects). Answers `data[].embeddings` as `[[...], ...]` vectors, one per token. `usage.total_tokens` is the total number of vectors. |
 | `POST /tokenize` | vLLM's tokenizer. Takes a `prompt`, or chat `messages` rendered by the model's template (`add_generation_prompt`, `continue_final_message`, `chat_template_kwargs`, `tools`), with `add_special_tokens` and `return_token_strs`. Answers `count`, `max_model_len`, `tokens`, `token_strs`. |
 | `POST /detokenize` | `tokens` back to `prompt`, special tokens kept. |
@@ -117,6 +118,22 @@ The accepted globals are `torch._utils._rebuild_tensor_v2`, `collections.Ordered
 
 Every entry used is checked against its CRC-32.  
 Anything else is refused: compressed or big-endian archives, torch's legacy format, sparse and quantized tensors, and tensors carrying attributes or hooks.
+
+### Classification heads
+
+A classification head is read from the checkpoint when the model loads.
+It runs on the final hidden states of the loaded model.
+
+| Checkpoint | Head tensors | Labels | Positions read |
+|---|---|---|---|
+| GGUF | `cls` followed by tanh, then `cls.output`, either one alone | `{architecture}.classifier.output_labels` | `{architecture}.pooling_type`: the mean for 1, the first token for 2, the last token otherwise |
+| safetensors | `score` or `classifier` | `id2label` of `config.json` | the last token |
+
+A label without a name is called `LABEL_0`, `LABEL_1` and so on.
+A `{base}ForSequenceClassification` checkpoint loads as `{base}ForCausalLM` with its head.
+
+A pair is written in the GGUF template `tokenizer.chat_template.rerank` when the file has one, with `{query}` and `{document}` replaced.
+Without it the tokenizer encodes the 2 texts as a pair.
 
 ### vLLM's extensions
 

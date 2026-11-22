@@ -105,7 +105,8 @@ impl LlmEngine {
     /// Returns false when no model is loaded.
     pub async fn pools(&self) -> bool {
         self.model_state
-            .blocking_lock()
+            .lock()
+            .await
             .as_ref()
             .is_some_and(|s| s.pools)
     }

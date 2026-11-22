@@ -107,6 +107,7 @@ pub(super) async fn engine_holding(
         // Whether the loaded GGUF declares `{architecture}.pooling_type`: the model is an
         // embedding model and reranks by late interaction over token vectors.
         pools: false,
+        classifier: None,
         generation_defaults: Default::default(),
     });
     let prompt = prompt()

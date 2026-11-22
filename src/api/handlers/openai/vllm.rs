@@ -684,7 +684,7 @@ pub(crate) async fn reset_prefix_cache(State(state): State<APIServer>) -> Json<s
 
 /// The texts of an `input`: a string, a list of strings, or a list of objects with a
 /// `"text"` field.
-fn texts_of(input: Option<&serde_json::Value>) -> Result<Vec<String>, String> {
+pub(crate) fn texts_of(input: Option<&serde_json::Value>) -> Result<Vec<String>, String> {
     let item = |(i, v): (usize, &serde_json::Value)| match v {
         serde_json::Value::String(s) => Ok(s.clone()),
         serde_json::Value::Object(o) => o
@@ -755,16 +755,37 @@ pub(crate) async fn multi_vector(
     .into_response())
 }
 
-/// vLLM's `/pooling`: the pooled output of an embedding model, `{data: [{index, object:
-/// "pooling", data}]}`, from the embeddings route.
+/// The tasks `/pooling` serves.
+const POOLING_TASKS: [&str; 4] = ["embed", "token_embed", "classify", "token_classify"];
+
+/// vLLM's `/pooling`: the pooled output of a model, `{data: [{index, object: "pooling",
+/// data}]}`.
 ///
-/// The task `token_embed` answers one vector per token for each input instead.
+/// The task `embed`, the default, answers the embedding of each input from the embeddings
+/// route.
+/// The task `token_embed` answers one vector per token for each input.
+/// The task `classify` answers the class probabilities of each input.
+/// The task `token_classify` answers the class probabilities of each token of each input.
 pub(crate) async fn pooling(
     State(state): State<APIServer>,
     headers: axum::http::HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> Response {
-    if body.get("task").and_then(serde_json::Value::as_str) == Some("token_embed") {
+    let task = body
+        .get("task")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("embed");
+    if !POOLING_TASKS.contains(&task) {
+        return invalid(format!(
+            "task `{task}` is not served; ask for {}",
+            POOLING_TASKS.map(|t| format!("`{t}`")).join(", ")
+        ))
+        .into_response();
+    }
+    if task == "classify" || task == "token_classify" {
+        return super::pooling::pooled_classes(&state, &body, task == "token_classify").await;
+    }
+    if task == "token_embed" {
         return match token_vectors(&state, &body).await {
             Ok((all, total)) => {
                 let data: Vec<serde_json::Value> = all

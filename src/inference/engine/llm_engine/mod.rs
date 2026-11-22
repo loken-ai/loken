@@ -1906,6 +1906,7 @@ pub use batching::ActiveRequest;
 pub use batching::Arrived;
 mod beam;
 pub use beam::{BeamAnswer, BeamOutcome, BeamSearch, EarlyStopping};
+mod classify;
 pub(crate) mod discover;
 mod embed;
 mod end_tokens;

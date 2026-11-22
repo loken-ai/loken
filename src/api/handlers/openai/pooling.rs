@@ -1,8 +1,10 @@
-//! The scoring and embedding surfaces other servers name differently: Cohere's `/v2/rerank` and
-//! `/v2/embed`, and vLLM's `/score`. Each reads its own request shape, runs the handler that
-//! already serves the work, and writes its own response shape.
+//! The scoring, classification and embedding surfaces other servers name differently: Cohere's
+//! `/v2/rerank` and `/v2/embed`, vLLM's `/score`, `/classify` and the classification tasks of
+//! `/pooling`. Each reads its own request shape, runs the engine work that serves it, and writes
+//! its own response shape.
 
 use super::*;
+use crate::inference::model::reranker::head;
 use axum::response::IntoResponse;
 
 /// The JSON a handler answered with, and its status.
@@ -308,13 +310,199 @@ pub(crate) fn score_pairs(
     }
 }
 
+/// The engine serving the body's `model`, loaded when it is not, with the name it is served
+/// under.
+async fn serving_engine(
+    state: &APIServer,
+    body: &serde_json::Value,
+) -> Result<(String, Arc<LlmEngine>), Response> {
+    let model = text_field(body, "model");
+    if let Err(e) = validate_model_id(&model) {
+        return Err(e.into_response());
+    }
+    let model_name = state.served_model_id(&model).await;
+    let keep_alive = state.get_effective_keep_alive(None);
+    if let Err(e) = state.ensure_loaded(&model_name, keep_alive).await {
+        return Err(
+            ApiError::NotFound(format!("model '{model_name}' could not be loaded: {e}"))
+                .into_response(),
+        );
+    }
+    let Ok(engine) = state.get_engine(&model_name).await else {
+        return Err(ApiError::NotFound(format!("Model '{model_name}' not loaded")).into_response());
+    };
+    state.reset_expiration(&model_name).await;
+    Ok((model_name, engine))
+}
+
+/// The refusal of a classification task by a model without a classification head.
+fn no_head(model: &str, task: &str) -> ApiError {
+    ApiError::Validation(format!(
+        "model '{model}' cannot {task}: it has no classification head \
+         (no `cls`, `cls.output`, `score` or `classifier` tensor)"
+    ))
+}
+
+/// One classified input: the probabilities of the head's `logits` and the label of the most
+/// probable class.
+pub(crate) fn classification(index: usize, logits: &[f32], labels: &[String]) -> serde_json::Value {
+    let probs = head::probabilities(logits);
+    let label = labels.get(head::argmax(&probs)).cloned();
+    serde_json::json!({
+        "index": index,
+        "object": "classify",
+        "label": label,
+        "probs": probs,
+        "num_classes": probs.len(),
+    })
+}
+
+/// vLLM `/classify` and `/v1/classify`: `{model, input}`, `input` a text or a list of texts,
+/// answered with `{id, object: "list", created, model, data: [{index, label, probs,
+/// num_classes}], usage}` from the model's classification head.
+pub(crate) async fn classify(
+    State(state): State<APIServer>,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    let texts = match super::vllm::texts_of(body.get("input")) {
+        Ok(t) => t,
+        Err(why) => return ApiError::Validation(why).into_response(),
+    };
+    // An empty text has no token to read a class from.
+    if let Some(i) = texts.iter().position(|t| t.trim().is_empty()) {
+        return ApiError::Validation(format!("input {i} is empty")).into_response();
+    }
+    let (model_name, engine) = match serving_engine(&state, &body).await {
+        Ok(found) => found,
+        Err(refused) => return refused,
+    };
+    let Some(labels) = engine.classifier_labels().await else {
+        return no_head(&model_name, "classify").into_response();
+    };
+    let mut data = Vec::with_capacity(texts.len());
+    let mut tokens = 0usize;
+    for (i, text) in texts.iter().enumerate() {
+        tokens += engine.count_tokens(text).await.unwrap_or(0);
+        match engine.classify(text).await {
+            Ok(logits) => data.push(classification(i, &logits, &labels)),
+            Err(e) => {
+                return ApiError::Internal(format!("classify (idx={i}): {e}")).into_response();
+            }
+        }
+    }
+    Json(serde_json::json!({
+        "id": format!("classify-{}", request_id()),
+        "object": "list",
+        "created": crate::timestamp::now_secs(),
+        "model": model_name,
+        "data": data,
+        "usage": {"prompt_tokens": tokens, "total_tokens": tokens, "completion_tokens": 0},
+    }))
+    .into_response()
+}
+
+/// vLLM `/pooling` with the task `classify` or `token_classify`: the class probabilities of
+/// each input, or of each token of each input, in `data[].data`.
+pub(crate) async fn pooled_classes(
+    state: &APIServer,
+    body: &serde_json::Value,
+    per_token: bool,
+) -> Response {
+    let texts = match super::vllm::texts_of(body.get("input")) {
+        Ok(t) => t,
+        Err(why) => return ApiError::Validation(why).into_response(),
+    };
+    // An empty text has no token to read a class from.
+    if let Some(i) = texts.iter().position(|t| t.trim().is_empty()) {
+        return ApiError::Validation(format!("input {i} is empty")).into_response();
+    }
+    let (model_name, engine) = match serving_engine(state, body).await {
+        Ok(found) => found,
+        Err(refused) => return refused,
+    };
+    let task = if per_token {
+        "token_classify"
+    } else {
+        "classify"
+    };
+    if engine.classifier_labels().await.is_none() {
+        return no_head(&model_name, task).into_response();
+    }
+    let mut data = Vec::with_capacity(texts.len());
+    let mut tokens = 0usize;
+    for (i, text) in texts.iter().enumerate() {
+        let pooled = if per_token {
+            engine.classify_tokens(text).await.map(|rows| {
+                tokens += rows.len();
+                serde_json::json!(rows
+                    .iter()
+                    .map(|r| head::probabilities(r))
+                    .collect::<Vec<_>>())
+            })
+        } else {
+            tokens += engine.count_tokens(text).await.unwrap_or(0);
+            engine
+                .classify(text)
+                .await
+                .map(|logits| serde_json::json!(head::probabilities(&logits)))
+        };
+        match pooled {
+            Ok(v) => data.push(serde_json::json!({"index": i, "object": "pooling", "data": v})),
+            Err(e) => return ApiError::Internal(format!("{task} (idx={i}): {e}")).into_response(),
+        }
+    }
+    Json(serde_json::json!({
+        "id": format!("pool-{}", request_id()),
+        "object": "list",
+        "created": crate::timestamp::now_secs(),
+        "model": model_name,
+        "data": data,
+        "usage": {"prompt_tokens": tokens, "total_tokens": tokens},
+    }))
+    .into_response()
+}
+
+/// How a model scores a pair.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Scorer {
+    /// The sigmoid of its classification head's single logit, the pair read together.
+    Head,
+    /// The cosine of the embeddings of the 2 texts.
+    Cosine,
+    /// The probability of `yes` against `no` after the reranker prompt.
+    YesNo,
+}
+
+/// The scorer of a model whose head has `labels` labels (`None` without a head), that
+/// `embeds` texts, and whose vocabulary has the `yes` and `no` tokens when `yes_no`.
+///
+/// An error names why the model cannot score.
+pub(crate) fn scorer(labels: Option<usize>, embeds: bool, yes_no: bool) -> Result<Scorer, String> {
+    match labels {
+        Some(1) => Ok(Scorer::Head),
+        Some(n) => Err(format!(
+            "its classification head has {n} labels and a score needs 1"
+        )),
+        None if embeds => Ok(Scorer::Cosine),
+        None if yes_no => Ok(Scorer::YesNo),
+        None => Err(
+            "it has no classification head, it does not pool, and its vocabulary has no \
+             `yes` and `no` tokens"
+                .into(),
+        ),
+    }
+}
+
 /// vLLM `/score` and `/v1/score`: `{model, text_1, text_2}` answered with one relevance score
 /// per pair, `{id, object: "list", model, data: [{index, object: "score", score}], usage}`.
+///
+/// A model with a 1-label classification head scores each pair as a cross-encoder.
+/// An embedding model scores the cosine of the 2 embeddings.
+/// Another model scores `yes` against `no` after the reranker prompt.
 pub(crate) async fn score(
     State(state): State<APIServer>,
     Json(body): Json<serde_json::Value>,
 ) -> Response {
-    let model = text_field(&body, "model");
     let pairs = match score_pairs(
         body.get("text_1").unwrap_or(&serde_json::Value::Null),
         body.get("text_2").unwrap_or(&serde_json::Value::Null),
@@ -322,25 +510,55 @@ pub(crate) async fn score(
         Ok(p) => p,
         Err(why) => return ApiError::Validation(why).into_response(),
     };
-    if let Err(e) = validate_model_id(&model) {
-        return e.into_response();
-    }
-    let model_name = state.served_model_id(&model).await;
-    let keep_alive = state.get_effective_keep_alive(None);
-    if let Err(e) = state.ensure_loaded(&model_name, keep_alive).await {
-        return ApiError::NotFound(format!("model '{model_name}' could not be loaded: {e}"))
-            .into_response();
-    }
-    let Ok(engine) = state.get_engine(&model_name).await else {
-        return ApiError::NotFound(format!("Model '{model_name}' not loaded")).into_response();
+    let (model_name, engine) = match serving_engine(&state, &body).await {
+        Ok(found) => found,
+        Err(refused) => return refused,
     };
-    state.reset_expiration(&model_name).await;
+    let labels = engine.classifier_labels().await.map(|l| l.len());
+    let embeds = engine.pools().await || engine.embeds_images();
+    let scorer = match scorer(labels, embeds, engine.answers_yes_no().await) {
+        Ok(s) => s,
+        Err(why) => {
+            return ApiError::Validation(format!("model '{model_name}' cannot score: {why}"))
+                .into_response()
+        }
+    };
+    let mut embedded: std::collections::HashMap<String, Vec<f32>> = Default::default();
     let mut data = Vec::with_capacity(pairs.len());
     let mut tokens = 0usize;
     for (i, (query, document)) in pairs.into_iter().enumerate() {
         tokens += engine.count_tokens(&query).await.unwrap_or(0)
             + engine.count_tokens(&document).await.unwrap_or(0);
-        match engine.rerank_score(query, document, String::new()).await {
+        let scored: Result<f32, String> = match scorer {
+            Scorer::Head => engine
+                .classify_pair(&query, &document)
+                .await
+                .map(|l| head::sigmoid(l[0]))
+                .map_err(|e| e.to_string()),
+            Scorer::YesNo => engine
+                .rerank_score(query, document, String::new())
+                .await
+                .map_err(|e| e.to_string()),
+            Scorer::Cosine => {
+                let mut vectors = Vec::with_capacity(2);
+                for text in [query, document] {
+                    if !embedded.contains_key(&text) {
+                        match engine.generate_embeddings(&text).await {
+                            Ok(v) => {
+                                embedded.insert(text.clone(), v);
+                            }
+                            Err(e) => {
+                                return ApiError::Internal(format!("score (idx={i}): {e}"))
+                                    .into_response()
+                            }
+                        }
+                    }
+                    vectors.push(embedded[&text].clone());
+                }
+                Ok(head::cosine(&vectors[0], &vectors[1]))
+            }
+        };
+        match scored {
             Ok(s) => data.push(serde_json::json!({"index": i, "object": "score", "score": s})),
             Err(e) => {
                 return ApiError::Internal(format!("score (idx={i}): {e}")).into_response();
@@ -416,6 +634,42 @@ mod tests {
         assert!(score_pairs(&json!(["q1", "q2"]), &json!(["a", "b", "c"])).is_err());
         assert!(score_pairs(&json!([]), &json!("a")).is_err());
         assert!(score_pairs(&json!(1), &json!("a")).is_err());
+    }
+
+    /// A classified input carries the probabilities, their count and the most probable label.
+    #[test]
+    fn a_classification_names_the_most_probable_label() {
+        let labels = vec!["neg".to_string(), "pos".to_string()];
+        let c = classification(3, &[0.0, 2.0], &labels);
+        assert_eq!(c["index"], 3);
+        assert_eq!(c["label"], "pos");
+        assert_eq!(c["num_classes"], 2);
+        let probs: Vec<f64> = c["probs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p.as_f64().unwrap())
+            .collect();
+        let e = 2f64.exp();
+        assert!((probs[1] - e / (1.0 + e)).abs() < 1e-6, "{probs:?}");
+        let one = classification(0, &[-1.0], &["yes".to_string()]);
+        assert_eq!(one["label"], "yes");
+        let p = one["probs"][0].as_f64().unwrap();
+        assert!((p - 1.0 / (1.0 + 1f64.exp())).abs() < 1e-6);
+    }
+
+    /// A 1-label head scores first, then the embeddings, then the yes and no tokens.
+    #[test]
+    fn the_scorer_follows_what_the_model_has() {
+        assert_eq!(scorer(Some(1), true, true), Ok(Scorer::Head));
+        assert!(scorer(Some(2), true, true)
+            .unwrap_err()
+            .contains("2 labels"));
+        assert_eq!(scorer(None, true, true), Ok(Scorer::Cosine));
+        assert_eq!(scorer(None, false, true), Ok(Scorer::YesNo));
+        assert!(scorer(None, false, false)
+            .unwrap_err()
+            .contains("no classification head"));
     }
 
     /// The integer and bit encodings follow the spec exactly.

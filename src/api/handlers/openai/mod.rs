@@ -2138,13 +2138,31 @@ pub(crate) async fn openai_rerank(
     };
     state.reset_expiration(&model_name).await;
 
-    // Check if this is an embedding model (declares pooling_type)
+    // A 1-label classification head scores each pair as a cross-encoder.
+    let scores_with_head = engine
+        .classifier_labels()
+        .await
+        .is_some_and(|l| l.len() == 1);
+    // An embedding model declares `{architecture}.pooling_type`.
     let is_embedding_model = engine.pools().await;
 
     let t0 = std::time::Instant::now();
     let mut scored: Vec<(usize, f32)> = Vec::with_capacity(documents.len());
 
-    if is_embedding_model {
+    if scores_with_head {
+        use crate::inference::model::reranker::head::sigmoid;
+        for (i, doc) in documents.iter().enumerate() {
+            match engine.classify_pair(&query, doc).await {
+                Ok(l) => scored.push((i, sigmoid(l[0]))),
+                Err(e) => {
+                    return err(
+                        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("rerank (idx={i}): {e}"),
+                    )
+                }
+            }
+        }
+    } else if is_embedding_model {
         // Use late interaction for embedding models - instruction field does not apply
         let late_result = score_with_late_interaction(query, &documents, &engine).await;
         match late_result {

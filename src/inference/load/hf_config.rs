@@ -327,7 +327,14 @@ pub const CLASSES: &[HfClass] = &[
 ];
 
 /// The row of `name`, `None` for a class the loader does not read.
+///
+/// A `{base}ForSequenceClassification` class reads as `{base}ForCausalLM`.
+/// Its blocks are the same, and its classification head is read beside them.
 pub fn hf_class(name: &str) -> Option<&'static HfClass> {
+    let causal = name
+        .strip_suffix("ForSequenceClassification")
+        .map(|base| format!("{base}ForCausalLM"));
+    let name = causal.as_deref().unwrap_or(name);
     CLASSES.iter().find(|c| c.class == name)
 }
 
@@ -845,6 +852,18 @@ pub(crate) mod tests {
         assert!(!c.tie_word_embeddings && !c.quantized);
         assert!(c.sliding_window.is_none());
         assert!(hf_metadata(c).is_empty(), "{:?}", hf_metadata(c));
+    }
+
+    /// A sequence classification class takes the row of its causal class.
+    #[test]
+    fn a_sequence_classifier_reads_as_its_causal_class() {
+        for base in ["Llama", "Qwen2", "Qwen3"] {
+            let causal = hf_class(&format!("{base}ForCausalLM")).map(|c| c.class);
+            let classifier = hf_class(&format!("{base}ForSequenceClassification")).map(|c| c.class);
+            assert!(causal.is_some(), "{base}");
+            assert_eq!(classifier, causal, "{base}");
+        }
+        assert!(hf_class("UnknownForSequenceClassification").is_none());
     }
 
     #[test]
